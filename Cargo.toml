@@ -1,0 +1,9 @@
+[workspace]
+members = ["backend"]
+default-members = ["backend"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://example.local/gpt-sso"

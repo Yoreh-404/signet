@@ -1,0 +1,318 @@
+use crate::{
+    config::Settings,
+    error::{AppError, AppResult},
+};
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
+use axum::http::{HeaderMap, header};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand_core::RngCore;
+use rsa::{
+    RsaPrivateKey,
+    pkcs8::{EncodePrivateKey, LineEnding},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
+
+pub fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+pub fn random_token(bytes: usize) -> String {
+    let mut data = vec![0_u8; bytes];
+    OsRng.fill_bytes(&mut data);
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+pub fn generate_rsa_private_key_pem() -> AppResult<String> {
+    let mut rng = OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|err| AppError::Configuration(format!("failed to generate RSA key: {err}")))?;
+    private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map(|pem| pem.to_string())
+        .map_err(|err| AppError::Configuration(format!("failed to encode RSA key: {err}")))
+}
+
+pub fn sha256_base64url(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+pub fn hash_password(password: &str) -> AppResult<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|value| value.to_string())
+        .map_err(|err| AppError::Internal(format!("failed to hash password: {err}")))
+}
+
+pub fn verify_password(hash: &str, password: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+pub fn token_hash(token: &str) -> String {
+    sha256_base64url(token)
+}
+
+pub fn verification_code() -> String {
+    let mut bytes = [0_u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    let value = u32::from_be_bytes(bytes) % 1_000_000;
+    format!("{value:06}")
+}
+
+pub fn request_ip(headers: &HeaderMap) -> Option<String> {
+    forwarded_request_ip(headers)
+}
+
+pub fn request_ip_for(
+    trust_proxy_headers: bool,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Option<String> {
+    if trust_proxy_headers {
+        forwarded_request_ip(headers).or_else(|| remote_addr.map(|addr| addr.ip().to_string()))
+    } else {
+        remote_addr.map(|addr| addr.ip().to_string())
+    }
+}
+
+fn forwarded_request_ip(headers: &HeaderMap) -> Option<String> {
+    for name in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            let first = value.split(',').next().unwrap_or(value).trim();
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(512).collect())
+}
+
+pub fn external_base_url(settings: &Settings, headers: &HeaderMap, fallback: &str) -> String {
+    external_base_url_for(settings.server.trust_proxy_headers, headers, fallback)
+}
+
+pub fn external_base_url_for(
+    trust_proxy_headers: bool,
+    headers: &HeaderMap,
+    fallback: &str,
+) -> String {
+    let fallback = fallback.trim_end_matches('/');
+    if !trust_proxy_headers {
+        return fallback.to_string();
+    }
+    forwarded_base_url(headers, fallback).unwrap_or_else(|| fallback.to_string())
+}
+
+fn forwarded_base_url(headers: &HeaderMap, fallback: &str) -> Option<String> {
+    if let Some((scheme, host)) = forwarded_header_parts(headers) {
+        return build_base_url(&scheme, &host);
+    }
+    let scheme = first_header(headers, "x-forwarded-proto")
+        .or_else(|| first_header(headers, "x-forwarded-scheme"))
+        .or_else(|| first_header(headers, "x-url-scheme"))
+        .or_else(|| {
+            first_header(headers, "x-forwarded-ssl")
+                .filter(|value| value.eq_ignore_ascii_case("on"))
+                .map(|_| "https".to_string())
+        })
+        .unwrap_or_else(|| fallback_scheme(fallback).to_string());
+    let host = first_header(headers, "x-forwarded-host")
+        .or_else(|| first_header(headers, "host"))
+        .or_else(|| {
+            let forwarded_port = first_header(headers, "x-forwarded-port")?;
+            fallback_host(fallback).map(|host| format!("{host}:{forwarded_port}"))
+        })?;
+    build_base_url(&scheme, &host)
+}
+
+fn forwarded_header_parts(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get("forwarded")?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    let mut proto = None;
+    let mut host = None;
+    for pair in first.split(';') {
+        let Some((key, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "proto" => proto = Some(value),
+            "host" => host = Some(value),
+            _ => {}
+        }
+    }
+    Some((proto?, host?))
+}
+
+fn first_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn build_base_url(scheme: &str, host: &str) -> Option<String> {
+    let scheme = scheme.trim().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = host.trim();
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '/')
+    {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+fn fallback_scheme(value: &str) -> &str {
+    if value.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+fn fallback_host(value: &str) -> Option<String> {
+    value
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn url_encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+pub fn to_json<T: Serialize>(value: &T) -> AppResult<String> {
+    serde_json::to_string(value).map_err(|err| AppError::Internal(err.to_string()))
+}
+
+pub fn from_json<T: for<'de> Deserialize<'de>>(value: &str) -> AppResult<T> {
+    serde_json::from_str(value).map_err(|err| AppError::Internal(err.to_string()))
+}
+
+pub fn check_pkce(
+    challenge: Option<&str>,
+    method: Option<&str>,
+    verifier: Option<&str>,
+    required: bool,
+) -> AppResult<()> {
+    if challenge.is_none() && !required {
+        return Ok(());
+    }
+    let challenge =
+        challenge.ok_or_else(|| AppError::Oidc("missing code challenge".to_string()))?;
+    let verifier = verifier.ok_or_else(|| AppError::Oidc("missing code verifier".to_string()))?;
+    let method = method.unwrap_or("plain");
+    let candidate = match method {
+        "S256" => sha256_base64url(verifier),
+        "plain" => verifier.to_string(),
+        other => return Err(AppError::Oidc(format!("unsupported PKCE method: {other}"))),
+    };
+    if candidate == challenge {
+        Ok(())
+    } else {
+        Err(AppError::Oidc("invalid code verifier".to_string()))
+    }
+}
+
+pub fn normalize_scopes(requested: Option<&str>, supported: &[String]) -> AppResult<Vec<String>> {
+    let scopes: Vec<String> = requested
+        .unwrap_or("openid")
+        .split_whitespace()
+        .filter(|scope| !scope.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if scopes.is_empty() || !scopes.iter().any(|scope| scope == "openid") {
+        return Err(AppError::Oidc("scope must include openid".to_string()));
+    }
+    for scope in &scopes {
+        if !supported.iter().any(|allowed| allowed == scope) {
+            return Err(AppError::Oidc(format!("unsupported scope: {scope}")));
+        }
+    }
+    Ok(scopes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_header_builds_external_base_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            r#"for=192.0.2.60;proto=https;host="oidc.example.test""#
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            forwarded_base_url(&headers, "http://localhost:8080").as_deref(),
+            Some("https://oidc.example.test")
+        );
+    }
+
+    #[test]
+    fn x_forwarded_headers_build_external_base_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "oidc.example.test".parse().unwrap());
+        assert_eq!(
+            forwarded_base_url(&headers, "http://localhost:8080").as_deref(),
+            Some("https://oidc.example.test")
+        );
+    }
+
+    #[test]
+    fn request_ip_for_respects_proxy_trust() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        let remote = "192.0.2.10:443".parse().unwrap();
+        assert_eq!(
+            request_ip_for(false, &headers, Some(remote)).as_deref(),
+            Some("192.0.2.10")
+        );
+        assert_eq!(
+            request_ip_for(true, &headers, Some(remote)).as_deref(),
+            Some("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn invalid_host_is_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "bad host".parse().unwrap());
+        assert!(forwarded_base_url(&headers, "http://localhost:8080").is_none());
+    }
+}

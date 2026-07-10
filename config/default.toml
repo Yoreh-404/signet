@@ -1,0 +1,136 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+public_base_url = "http://localhost:8080"
+# Trust Forwarded / X-Forwarded-* / Host headers only behind a trusted reverse proxy or tunnel.
+# Keep false when you configure the public URL manually in the admin settings page.
+trust_proxy_headers = false
+
+[database]
+# kind: "sqlite", "postgres", or "mysql".
+# Build with the matching cargo feature and enter nix-shell for native libraries.
+kind = "sqlite"
+url = "data/gpt-sso.sqlite3"
+pool_size = 10
+run_migrations = true
+
+[oidc]
+issuer = "http://localhost:8080"
+authorization_endpoint = "/oauth2/authorize"
+token_endpoint = "/oauth2/token"
+userinfo_endpoint = "/oauth2/userinfo"
+jwks_uri = "/oauth2/jwks"
+end_session_endpoint = "/oauth2/logout"
+access_token_ttl_seconds = 900
+id_token_ttl_seconds = 900
+authorization_code_ttl_seconds = 300
+refresh_token_ttl_seconds = 2592000
+supported_scopes = ["openid", "profile", "email", "offline_access"]
+# If false, users see a consent page before a new client/scope set is authorized.
+skip_consent = true
+allow_dynamic_client_registration = false
+
+[security]
+cookie_name = "gpt_sso_session"
+cookie_domain = ""
+cookie_secure = false
+cookie_same_site = "Lax"
+session_ttl_seconds = 28800
+password_min_length = 10
+# Optional RS256 private key. If empty, the server generates an in-memory dev key on startup.
+rsa_private_key_pem = ""
+key_id = "dev-key-1"
+admin_api_prefix = "/api/admin"
+
+[registration]
+allow_password_registration = true
+require_email_verification = false
+require_phone_verification = false
+allow_external_oidc_registration = true
+require_invitation = false
+first_user_direct_admin = true
+default_user_active = true
+
+[verification.email]
+enabled = true
+delivery = "dev_log"
+code_ttl_seconds = 600
+resend_interval_seconds = 60
+max_attempts = 5
+# delivery = "webhook" sends JSON to webhook_url. Use this for company mail/SMS gateways.
+webhook_url = ""
+webhook_secret = ""
+webhook_timeout_seconds = 5
+smtp_host = ""
+smtp_port = 587
+smtp_username = ""
+smtp_password = ""
+smtp_from = ""
+smtp_starttls = true
+sms_provider = ""
+sms_api_key = ""
+
+[verification.phone]
+enabled = true
+delivery = "dev_log"
+code_ttl_seconds = 600
+resend_interval_seconds = 60
+max_attempts = 5
+# delivery = "webhook" sends JSON to webhook_url. delivery = "sms_provider" posts the same JSON to sms_provider with optional Bearer sms_api_key.
+webhook_url = ""
+webhook_secret = ""
+webhook_timeout_seconds = 5
+smtp_host = ""
+smtp_port = 587
+smtp_username = ""
+smtp_password = ""
+smtp_from = ""
+smtp_starttls = true
+sms_provider = ""
+sms_api_key = ""
+
+[i18n]
+default_locale = "zh-CN"
+supported_locales = ["zh-CN", "en-US"]
+
+[[external_oidc_providers]]
+slug = "example"
+display_name = "Example OIDC"
+organization_id = ""
+issuer = "https://accounts.example.com"
+client_id = ""
+client_secret = ""
+authorization_endpoint = "https://accounts.example.com/oauth2/authorize"
+token_endpoint = "https://accounts.example.com/oauth2/token"
+userinfo_endpoint = "https://accounts.example.com/oauth2/userinfo"
+redirect_path = "/api/register/oidc/example/callback"
+scopes = ["openid", "profile", "email"]
+email_domains = []
+enabled = false
+allow_login = true
+allow_registration = true
+
+[cors]
+allowed_origins = ["http://localhost:5173", "http://localhost:8080"]
+allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+allowed_headers = ["authorization", "content-type"]
+allow_credentials = true
+
+[bootstrap.admin]
+create_on_startup = false
+email = "admin@example.com"
+username = "admin"
+display_name = "SSO Admin"
+password = "ChangeMe123!"
+
+[[bootstrap.clients]]
+client_id = "demo-web"
+client_name = "Demo Web App"
+client_secret = "demo-secret-change-me"
+redirect_uris = ["http://localhost:3000/callback", "http://localhost:5173/callback"]
+post_logout_redirect_uris = ["http://localhost:3000/"]
+scopes = ["openid", "profile", "email", "offline_access"]
+grant_types = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code", "urn:ietf:params:oauth:grant-type:token-exchange"]
+response_types = ["code"]
+token_endpoint_auth_method = "client_secret_basic"
+require_pkce = false

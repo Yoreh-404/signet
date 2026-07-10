@@ -1,0 +1,9 @@
+/target/
+/frontend/node_modules/
+/frontend/dist/
+/frontend/*.tsbuildinfo
+/data/*.sqlite3
+/data/*.sqlite3-*
+/.logs/
+.env
+.DS_Store
