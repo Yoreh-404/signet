@@ -1,0 +1,11 @@
+.git
+.github
+.gitea
+.logs
+.env
+.DS_Store
+target
+data
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo

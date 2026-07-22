@@ -1,0 +1,89 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Derive image tags
+        id: image
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REF: ${{ github.ref }}
+          REVISION: ${{ github.sha }}
+        run: |
+          registry="${SERVER_URL#http://}"
+          registry="${registry#https://}"
+          registry="${registry%/}"
+          image="$(printf '%s' "$registry/$REPOSITORY_OWNER/signet" | tr '[:upper:]' '[:lower:]')"
+          short_revision="${REVISION::12}"
+
+          case "$REF" in
+            refs/tags/*)
+              ref_type=tag
+              ref_name="${REF#refs/tags/}"
+              ;;
+            refs/heads/*)
+              ref_type=branch
+              ref_name="${REF#refs/heads/}"
+              ;;
+            *)
+              echo "Unsupported ref: $REF" >&2
+              exit 1
+              ;;
+          esac
+          docker_tag="$(printf '%s' "$ref_name" | tr -c '[:alnum:]_.-' '-')"
+
+          {
+            echo "registry=$registry"
+            echo "image=$image"
+            echo "tags<<EOF"
+            echo "$image:sha-$short_revision"
+            if [ "$ref_type" = "tag" ]; then
+              echo "$image:$docker_tag"
+              version_tag="${docker_tag#v}"
+              if [ -n "$version_tag" ]; then
+                echo "$image:$version_tag"
+              fi
+            else
+              echo "$image:$docker_tag"
+              if [ "$ref_name" = "main" ] || [ "$ref_name" = "master" ]; then
+                echo "$image:latest"
+              fi
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Gitea container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.image.outputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
