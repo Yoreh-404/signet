@@ -231,41 +231,46 @@ async function main() {
           }
           await record(requestUrl, method, input, init);
           const path = requestUrl.pathname;
-          if (path === "/api/public/bootstrap") return response({
-            has_users: true,
-            issuer: location.origin,
-            registration: {
-              allow_password_registration: true,
-              require_email_verification: false,
-              require_phone_verification: false,
-              allow_external_oidc_registration: false,
-              require_invitation: false,
-              first_user_direct_admin: true,
-              default_user_active: true,
-            },
-            login: {
-              brand_logo_url: "https://assets.mock.example/signet.svg",
-              email_domains: ["mock.example"],
-              quick_links: [{
-                id: "mock-destination",
-                label: "Mock destination",
-                url: "https://destination.mock.example/",
-                icon: "link",
-                is_active: true,
+          if (path === "/api/public/bootstrap") {
+            const smokeParams = new URLSearchParams(location.search);
+            const requireInvitation = smokeParams.get("smoke_registration_code") !== "off";
+            const longRegistration = smokeParams.get("smoke_long_registration") === "1";
+            return response({
+              has_users: true,
+              issuer: location.origin,
+              registration: {
+                allow_password_registration: true,
+                require_email_verification: longRegistration,
+                require_phone_verification: longRegistration,
+                allow_external_oidc_registration: false,
+                require_invitation: requireInvitation,
+                first_user_direct_admin: true,
+                default_user_active: true,
+              },
+              login: {
+                brand_logo_url: "https://assets.mock.example/signet.svg",
+                email_domains: ["mock.example"],
+                quick_links: [{
+                  id: "mock-destination",
+                  label: "Mock destination",
+                  url: "https://destination.mock.example/",
+                  icon: "link",
+                  is_active: true,
+                }],
+              },
+              default_locale: "zh-CN",
+              supported_locales: ["zh-CN", "en-US"],
+              external_oidc_providers: [{
+                slug: "mock-identity",
+                display_name: "Mock Identity",
+                start_url: "/api/external/mock-identity/start",
+                email_domains: [],
+                allow_login: true,
+                allow_registration: true,
               }],
-            },
-            default_locale: "zh-CN",
-            supported_locales: ["zh-CN", "en-US"],
-            external_oidc_providers: [{
-              slug: "mock-identity",
-              display_name: "Mock Identity",
-              start_url: "/api/external/mock-identity/start",
-              email_domains: [],
-              allow_login: true,
-              allow_registration: true,
-            }],
-            ldap_providers: [],
-          });
+              ldap_providers: [],
+            });
+          }
           if (path === "/api/public/authorization-code/inspect" && method === "POST") {
             const payload = typeof init.body === "string" ? JSON.parse(init.body) : {};
             const mode = String(payload.authorization_code || "").trim().toUpperCase();
@@ -704,9 +709,29 @@ async function main() {
     await waitFor(
       async () => evaluate(`(() => {
         const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
-        return labels.includes('注册授权码') && labels.includes('密码') && labels.includes('用户名');
+        return labels.includes('注册授权码')
+          && labels.includes('邮箱')
+          && !labels.includes('密码')
+          && !labels.includes('用户名')
+          && !labels.includes('手机号');
       })()`),
-      "full registration form with registration authorization code",
+      "registration form waiting for an authorization code",
+    );
+    await inputByLabel("注册授权码", "REG-MOCK");
+    await waitFor(
+      async () => evaluate(`(() => {
+        const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
+        const password = [...document.querySelectorAll('label')]
+          .find((label) => label.textContent.trim() === '密码')?.nextElementSibling;
+        return labels.includes('注册授权码')
+          && labels.includes('用户名')
+          && password instanceof HTMLInputElement
+          && password.required
+          && !labels.includes('手机号')
+          && (document.body.innerText.includes('请继续填写用户名和密码')
+            || document.body.innerText.includes('此注册授权码绑定了特定邮箱'));
+      })()`),
+      "registration fields revealed after a valid authorization code",
     );
     await clearMockRequests();
     await inputByLabel("注册授权码", "TRIAL-MOCK");
@@ -733,9 +758,96 @@ async function main() {
     }
     await inputByLabel("注册授权码", "LOGIN-MOCK");
     await waitFor(
-      async () => evaluate(`document.body.innerText.includes('此授权码仅用于登录') && document.body.innerText.includes('密码')`),
+      async () => evaluate(`(() => {
+        const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
+        const submit = document.querySelector('.unified-auth-forms form button.primary');
+        return document.body.innerText.includes('此授权码仅用于登录')
+          && !labels.includes('密码')
+          && !labels.includes('用户名')
+          && submit instanceof HTMLButtonElement
+          && submit.disabled;
+      })()`),
       "sign-in-only authorization-code guidance",
     );
+
+    await navigate("/?auth=register&smoke_registration_code=off&smoke_reset=1&account_flow=alf1.mock_add_account_flow_token_123456");
+    await waitFor(
+      async () => evaluate(`(() => {
+        const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
+        return labels.includes('邮箱')
+          && labels.includes('用户名')
+          && labels.includes('密码')
+          && !labels.includes('注册授权码')
+          && !labels.includes('手机号');
+      })()`),
+      "ordinary registration omits an optional authorization-code field",
+    );
+
+    await navigate("/?auth=register&smoke_long_registration=1&smoke_reset=1&account_flow=alf1.mock_add_account_flow_token_123456");
+    await waitFor(
+      async () => evaluate(`(() => {
+        const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
+        return labels.includes('邮箱')
+          && labels.includes('注册授权码')
+          && !labels.includes('邮箱验证码')
+          && !labels.includes('手机验证码')
+          && !labels.includes('用户名')
+          && !labels.includes('密码');
+      })()`),
+      "long registration waits for its authorization code before rendering verification fields",
+    );
+    await inputByLabel("注册授权码", "REG-MOCK");
+    await waitFor(
+      async () => evaluate(`(() => {
+        const labels = [...document.querySelectorAll('label')].map((label) => label.textContent.trim());
+        return labels.includes('邮箱验证码')
+          && labels.includes('手机号')
+          && labels.includes('手机验证码')
+          && labels.includes('用户名')
+          && labels.includes('密码');
+      })()`),
+      "long registration exposes all required verification fields after code validation",
+    );
+    await screenshot("auth-ui-mock-long-registration-mobile", 390, 844);
+    const longRegistrationLayout = await evaluate(`(() => {
+      const header = document.querySelector('.unified-auth-header');
+      const main = document.querySelector('.unified-auth-main');
+      const form = document.querySelector('.unified-auth-forms form');
+      const firstField = form?.querySelector('input');
+      const submit = form?.querySelector('button.primary');
+      if (!(header instanceof HTMLElement) || !(main instanceof HTMLElement)
+        || !(form instanceof HTMLFormElement) || !(firstField instanceof HTMLInputElement)
+        || !(submit instanceof HTMLButtonElement)) return null;
+      main.scrollTop = 0;
+      const headerBottom = header.getBoundingClientRect().bottom;
+      const mainBounds = main.getBoundingClientRect();
+      const firstFieldTop = firstField.getBoundingClientRect().top;
+      const scrollable = main.scrollHeight > main.clientHeight;
+      main.scrollTop = main.scrollHeight;
+      const submitBounds = submit.getBoundingClientRect();
+      return {
+        headerBottom,
+        mainTop: mainBounds.top,
+        mainBottom: mainBounds.bottom,
+        firstFieldTop,
+        scrollable,
+        submitTop: submitBounds.top,
+        submitBottom: submitBounds.bottom,
+      };
+    })()`);
+    if (!longRegistrationLayout
+      || longRegistrationLayout.firstFieldTop < longRegistrationLayout.headerBottom
+      || !longRegistrationLayout.scrollable
+      || longRegistrationLayout.submitTop < longRegistrationLayout.mainTop
+      || longRegistrationLayout.submitBottom > longRegistrationLayout.mainBottom) {
+      throw new Error(`Long registration form is not fully reachable: ${JSON.stringify(longRegistrationLayout)}`);
+    }
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 1280,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
 
     await navigate("/?smoke_admin=1&smoke_trial_form=1#/invitations");
     await waitFor(
@@ -976,7 +1088,7 @@ async function main() {
         const selectedEmail = document.querySelector('.unified-auth-selection-email')?.textContent?.trim();
         const signIn = document.querySelector('.unified-auth-selection-actions .primary');
         return items.length === 3
-          && names.join(',') === 'bob,trial,alice'
+          && names.join(',') === 'bob,trial-user,alice'
           && selected.length === 1
           && selected[0] === items[0]
           && selectedEmail === 'bob@mock.example'
@@ -1005,7 +1117,7 @@ async function main() {
       || chooserAccessibility.listItems !== 3
       || chooserAccessibility.current !== 1
       || !chooserAccessibility.add
-      || chooserAccessibility.names.join(',') !== 'bob,trial,alice'
+      || chooserAccessibility.names.join(',') !== 'bob,trial-user,alice'
     ) {
       throw new Error(`Unified account strip accessibility or order is incomplete: ${JSON.stringify(chooserAccessibility)}`);
     }
@@ -1144,7 +1256,7 @@ async function main() {
         const names = items.map((item) => item.querySelector('.account-switcher-name')?.textContent?.trim());
         const selected = document.querySelector('.account-switcher-item[aria-current=true]');
         const email = document.querySelector('.unified-auth-selection-email')?.textContent?.trim();
-        return names.join(',') === 'bob,trial,alice'
+        return names.join(',') === 'bob,trial-user,alice'
           && selected === items[0]
           && email === 'bob@mock.example'
           && document.querySelector('.unified-auth-selection-actions .primary') instanceof HTMLButtonElement
