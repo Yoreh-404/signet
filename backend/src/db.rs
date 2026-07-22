@@ -1564,6 +1564,7 @@ pub struct QuickLink {
     pub id: String,
     pub label: String,
     pub url: String,
+    #[serde(default)]
     pub icon: String,
     pub is_active: bool,
 }
@@ -1614,7 +1615,9 @@ fn default_openai_quick_link() -> QuickLink {
         label: "OpenAI".to_string(),
         url: "https://chatgpt.com/auth/login?sso=true&connection=conn_01KTR8HRA3ZQR9S3EGT32TY3WT"
             .to_string(),
-        icon: "openai".to_string(),
+        // Retained in stored data for backward-compatible deserialization;
+        // the login page now derives icons from each destination URL.
+        icon: String::new(),
         is_active: true,
     }
 }

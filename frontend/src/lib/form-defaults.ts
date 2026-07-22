@@ -118,7 +118,6 @@ export const emptyQuickLinkForm = {
   id: "",
   label: "",
   url: "",
-  icon: "link",
   is_active: true
 };
 

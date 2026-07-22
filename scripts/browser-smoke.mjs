@@ -858,6 +858,20 @@ async function main() {
     if (!mockedCodeRows.includes("账户恢复码") || !mockedCodeRows.includes("体验入驻码") || !mockedCodeRows.includes("管理员通用码") || !mockedCodeRows.includes("Mock Club") || !mockedCodeRows.includes("App One")) {
       throw new Error("Authorization-code level or application scope badges are missing");
     }
+    const adminHeader = await evaluate(`(() => {
+      const brand = document.querySelector('.brand-row.compact');
+      const header = document.querySelector('.page-header');
+      const heading = document.querySelector('.page-heading');
+      return {
+        brandHasSubtitle: Boolean(brand?.querySelector('p')),
+        headingHasSubtitle: Boolean(heading?.querySelector('p')),
+        headerPosition: header ? getComputedStyle(header).position : '',
+      };
+    })()`);
+    if (adminHeader.brandHasSubtitle || adminHeader.headingHasSubtitle || adminHeader.headerPosition !== 'sticky') {
+      throw new Error(`Admin header chrome is incorrect: ${JSON.stringify(adminHeader)}`);
+    }
+    await screenshot("auth-ui-mock-admin-header-desktop", 1280, 900);
     await clickText("创建授权码");
     await waitFor(
       async () => evaluate("[...document.querySelectorAll('label')].some((label) => label.textContent.trim() === '授权码类型')"),
@@ -1584,6 +1598,23 @@ async function main() {
   if (quickLinks.some((link) => link.target !== "_blank")) {
     throw new Error("A quick link does not open outside the application");
   }
+  const quickLinkIcons = await evaluate(`[...document.querySelectorAll('.quick-jump a')].map((link) => {
+    const icon = link.querySelector('.quick-jump-icon');
+    return {
+      label: link.getAttribute('aria-label') ?? '',
+      href: link.href,
+      fallback: icon?.querySelector('.quick-jump-fallback')?.textContent ?? '',
+      favicon: icon?.querySelector('img')?.getAttribute('src') ?? '',
+    };
+  })`);
+  const invalidQuickLinkIcon = quickLinkIcons.find((icon) => {
+    const expectedFavicon = new URL("/favicon.ico", new URL(icon.href).origin).href;
+    const expectedFallback = Array.from(icon.label.trim())[0]?.toLocaleUpperCase() ?? "?";
+    return icon.favicon !== expectedFavicon || icon.fallback !== expectedFallback;
+  });
+  if (invalidQuickLinkIcon) {
+    throw new Error(`Quick link favicon or fallback initial is incorrect: ${JSON.stringify(invalidQuickLinkIcon)}`);
+  }
   await screenshot("auth-desktop", 1280, 900);
   await screenshot("auth-mobile", 390, 844);
 
@@ -1592,6 +1623,7 @@ async function main() {
     registerEmail,
     storedLocale,
     quickLinks,
+    quickLinkIcons,
     status: "passed",
   }, null, 2));
   cdp.close();

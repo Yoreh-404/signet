@@ -298,9 +298,9 @@ textarea {
   min-height: 32px;
   padding: 0 10px;
   border-radius: 6px;
-  border: 1px solid #d9dee7;
-  background: #ffffff;
-  color: #344054;
+  border: 1px solid var(--border);
+  background: var(--surface-solid);
+  color: var(--text-soft);
   text-decoration: none;
 }
 
@@ -347,14 +347,55 @@ textarea {
   justify-content: center;
   padding-top: 18px;
   margin-top: 18px;
-  border-top: 1px solid #edf0f4;
+  border-top: 1px solid var(--border);
 }
 
 .quick-jump a {
   width: 38px;
   height: 38px;
   padding: 0;
-  color: #0f766e;
+  color: var(--brand);
+}
+
+.quick-jump a:hover {
+  border-color: color-mix(in srgb, var(--brand) 45%, var(--border));
+  background: var(--brand-soft);
+}
+
+.quick-jump-icon {
+  position: relative;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 5px;
+  color: var(--brand-strong);
+  background: var(--brand-soft);
+}
+
+.quick-jump-fallback {
+  display: block;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.quick-jump-icon.has-favicon .quick-jump-fallback {
+  opacity: 0;
+}
+
+.quick-jump-icon img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+}
+
+.quick-jump-icon.has-favicon img {
+  opacity: 1;
 }
 
 .inline-code {
@@ -1893,8 +1934,9 @@ nav button.active {
   min-height: 68px;
   margin: -12px -8px 22px;
   padding: 12px 8px;
-  background: color-mix(in srgb, var(--page) 88%, transparent);
-  backdrop-filter: blur(16px);
+  /* Keep the toolbar available while letting the page gradient show through. */
+  background: color-mix(in srgb, var(--page) 38%, transparent);
+  backdrop-filter: blur(14px);
 }
 
 .page-heading {
@@ -1905,14 +1947,7 @@ nav button.active {
 .page-heading h2 {
   color: var(--text);
   font-size: clamp(22px, 2.4vw, 30px);
-  letter-spacing: -0.035em;
-}
-
-.page-heading p {
-  max-width: min(620px, 60vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  letter-spacing: 0;
 }
 
 .header-actions {
@@ -2570,10 +2605,6 @@ tbody tr:hover {
 
   .page-heading {
     flex: 1;
-  }
-
-  .page-heading p {
-    max-width: 62vw;
   }
 
   .header-actions {

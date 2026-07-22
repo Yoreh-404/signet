@@ -1403,21 +1403,13 @@ fn normalize_quick_links(values: Vec<QuickLink>) -> AppResult<Vec<QuickLink>> {
                 "quick link id must be unique".to_string(),
             ));
         }
-        let icon = value
-            .icon
-            .trim()
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-            .collect::<String>();
         links.push(QuickLink {
             id,
             label: label.chars().take(48).collect(),
             url: url.to_string(),
-            icon: if icon.is_empty() {
-                "link".to_string()
-            } else {
-                icon
-            },
+            // Preserve the serialized field for compatibility with existing
+            // data, but do not carry forward a preconfigured icon mapping.
+            icon: String::new(),
             is_active: value.is_active,
         });
     }
@@ -6496,7 +6488,7 @@ mod tests {
             links[0].url,
             "https://chatgpt.com/auth/login?sso=true&connection=conn_01KTR8HRA3ZQR9S3EGT32TY3WT"
         );
-        assert_eq!(links[0].icon, "openai");
+        assert!(links[0].icon.is_empty());
         assert!(links[0].is_active);
     }
 

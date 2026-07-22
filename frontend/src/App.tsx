@@ -4,7 +4,6 @@ import {
   ArrowLeftRight,
   AtSign,
   Ban,
-  Bot,
   Building2,
   ChevronDown,
   ChevronUp,
@@ -2216,7 +2215,9 @@ export function App() {
       id: quickLinkForm.id || createQuickLinkId(),
       label: quickLinkForm.label.trim(),
       url: quickLinkForm.url.trim(),
-      icon: quickLinkForm.icon.trim() || "link",
+      // Kept for API compatibility. Quick links derive their visual icon from
+      // the destination instead of relying on an application-side icon list.
+      icon: "",
       is_active: quickLinkForm.is_active
     };
     const nextLinks = quickLinkForm.id
@@ -2231,7 +2232,6 @@ export function App() {
       id: link.id,
       label: link.label,
       url: link.url,
-      icon: link.icon,
       is_active: link.is_active
     });
   }
@@ -3224,7 +3224,6 @@ export function App() {
           <span className="brand-mark"><Shield size={22} /></span>
           <div>
             <h1>Signet</h1>
-            <p>{overview?.issuer ?? bootstrap.issuer}</p>
           </div>
         </div>
         <TopLanguage locale={locale} supportedLocales={bootstrap.supported_locales} switchLocale={switchLocale} label={t("language")} compact />
@@ -3299,7 +3298,6 @@ export function App() {
           </button>
           <div className="page-heading">
             <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
-            <p>{tab === "account" ? user.email : overview?.issuer ?? bootstrap.issuer}</p>
           </div>
           <div className="header-actions">
             {searchEnabled && (
@@ -5025,12 +5023,6 @@ export function App() {
               <h3>{quickLinkForm.id ? t("updateQuickLink") : t("createQuickLink")}</h3>
               <Field label={t("linkLabel")} value={quickLinkForm.label} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, label: value })} />
               <Field label={t("linkUrl")} value={quickLinkForm.url} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, url: value })} />
-              <SelectField label={t("linkIcon")} value={quickLinkForm.icon} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, icon: value })}>
-                <option value="openai">OpenAI</option>
-                <option value="link">Link</option>
-                <option value="mail">Mail</option>
-                <option value="help">Help</option>
-              </SelectField>
               <Check label={t("active")} checked={quickLinkForm.is_active} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, is_active: value })} />
               <div className="actions">
                 <button type="submit" disabled={busy}>
@@ -5046,7 +5038,7 @@ export function App() {
                 <tbody>
                   {loginSettingsDraft.quick_links.map((link) => (
                     <tr key={link.id}>
-                      <td>{link.label}<br /><small>{link.icon}</small></td>
+                      <td>{link.label}</td>
                       <td>{link.url}</td>
                       <td>{link.is_active ? t("active") : t("disabled")}</td>
                       <td className="actions">
@@ -5656,29 +5648,46 @@ function QuickJump({ links }: { links: QuickLink[] }) {
   if (links.length === 0) return null;
   return (
     <div className="quick-jump">
-      {links.map((link) => {
-        const Icon = quickLinkIcon(link.icon);
-        return (
-          <a key={link.id} href={link.url} target="_blank" rel="noreferrer" title={link.label} aria-label={link.label}>
-            <Icon size={18} />
-          </a>
-        );
-      })}
+      {links.map((link) => <QuickJumpLink key={`${link.id}:${link.url}`} link={link} />)}
     </div>
   );
 }
 
-function quickLinkIcon(icon: string) {
-  switch (icon) {
-    case "openai":
-      return Bot;
-    case "mail":
-      return Mail;
-    case "help":
-      return Shield;
-    default:
-      return ExternalLink;
+function QuickJumpLink({ link }: { link: QuickLink }) {
+  const faviconUrl = quickLinkFaviconUrl(link.url);
+  const [faviconState, setFaviconState] = useState<"loading" | "loaded" | "failed">(
+    faviconUrl ? "loading" : "failed"
+  );
+
+  return (
+    <a className="quick-jump-link" href={link.url} target="_blank" rel="noreferrer" title={link.label} aria-label={link.label}>
+      <span className={`quick-jump-icon${faviconState === "loaded" ? " has-favicon" : ""}`} aria-hidden="true">
+        <span className="quick-jump-fallback">{quickLinkInitial(link.label)}</span>
+        {faviconUrl && (
+          <img
+            src={faviconUrl}
+            alt=""
+            referrerPolicy="no-referrer"
+            onLoad={() => setFaviconState("loaded")}
+            onError={() => setFaviconState("failed")}
+          />
+        )}
+      </span>
+    </a>
+  );
+}
+
+function quickLinkFaviconUrl(url: string): string | null {
+  try {
+    const target = new URL(url);
+    return new URL("/favicon.ico", target.origin).toString();
+  } catch {
+    return null;
   }
+}
+
+function quickLinkInitial(label: string): string {
+  return Array.from(label.trim())[0]?.toLocaleUpperCase() ?? "?";
 }
 
 function InlineCode({
