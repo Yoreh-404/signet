@@ -1120,7 +1120,6 @@ export function App() {
       bootstrap?.has_users
       && !bootstrap.registration.allow_password_registration
       && !bootstrap.registration.require_invitation
-      && !isCodeOnlyRegistration
     ) {
       setError(t("passwordRegistrationUnavailable"));
       return;
@@ -1128,7 +1127,7 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      const body: Record<string, string | null> = isCodeOnlyRegistration
+      const body: Record<string, string | null> = isTrialEnrollmentRegistration
         ? {
             // The server has classified this as an enrollment code.  Do not
             // manufacture usernames, passwords or code rules in the browser.
@@ -1139,12 +1138,14 @@ export function App() {
         : {
             email: authEmail,
             username: registerForm.username,
-            display_name: registerForm.display_name || null,
+            display_name: null,
             phone: registerForm.phone || null,
             password: registerForm.password,
             email_code: registerForm.email_code || null,
             phone_code: registerForm.phone_code || null,
-            authorization_code: registerForm.authorization_code || null,
+            authorization_code: registrationCodeRequired
+              ? registerForm.authorization_code.trim() || null
+              : null,
             account_flow: effectiveAccountFlow
           };
       const result = await api<{ user: User; first_admin: boolean } | OidcContinuationLoginResponse>("/api/register", {
@@ -2813,12 +2814,16 @@ export function App() {
 
   const hasRegistrationAuthorizationCode = Boolean(registerForm.authorization_code.trim());
   const registrationCodeMode = registrationCodeInspection?.mode;
-  const isCodeOnlyRegistration = registrationCodeMode === "registration"
+  const registrationCodeRequired = bootstrap.has_users
+    && authMode === "register"
+    && bootstrap.registration.require_invitation;
+  const isTrialEnrollmentRegistration = registrationCodeRequired
+    && registrationCodeMode === "trial_enrollment";
+  const registrationCodeAccepted = registrationCodeMode === "registration"
     || registrationCodeMode === "trial_enrollment";
-  const registrationCodeBlocksSubmit = hasRegistrationAuthorizationCode
-    && (registrationCodeInspecting
-      || registrationCodeMode === "unavailable"
-      || registrationCodeMode === "sign_in_only");
+  const registrationFieldsVisible = !registrationCodeRequired || registrationCodeMode === "registration";
+  const registrationCodeBlocksSubmit = registrationCodeRequired
+    && (!hasRegistrationAuthorizationCode || registrationCodeInspecting || !registrationCodeAccepted);
   const registrationCodeHint = registrationCodeInspecting
     ? t("authorizationCodeChecking")
     : registrationCodeMode === "trial_enrollment"
@@ -2835,7 +2840,7 @@ export function App() {
   const passwordRegistrationUnavailable =
     bootstrap.has_users
     && authMode === "register"
-    && !isCodeOnlyRegistration
+    && !registrationCodeRequired
     && !bootstrap.registration.allow_password_registration;
   const loginExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_login);
   const registerExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_registration);
@@ -3096,13 +3101,13 @@ export function App() {
                 customLabel={t("customDomain")}
                 applyLabel={t("applySuffix")}
               />
-              {bootstrap.has_users && (
+              {registrationCodeRequired && (
                 <>
                   <Field
                     label={t("registrationAuthorizationCode")}
                     value={registerForm.authorization_code}
                     onChange={(value) => setRegisterForm({ ...registerForm, authorization_code: value })}
-                    required={bootstrap.registration.require_invitation}
+                    required
                   />
                   {hasRegistrationAuthorizationCode && registrationCodeHint && (
                     <div
@@ -3115,7 +3120,7 @@ export function App() {
                   )}
                 </>
               )}
-              {!isCodeOnlyRegistration && (
+              {!isTrialEnrollmentRegistration && registrationFieldsVisible && (
                 <>
                   {registerDomainProvider && (
                     <a className="secondary-link" href={oidcStartUrl(registerDomainProvider.start_url, authEmail, "register", effectiveAccountFlow)}>
@@ -3147,21 +3152,22 @@ export function App() {
                       disabled={busy}
                     />
                   )}
-                  <Field label={t("phone")} type="tel" autoComplete="tel" value={registerForm.phone} onChange={(value) => setRegisterForm({ ...registerForm, phone: value })} />
-                  {bootstrap.registration.require_phone_verification && bootstrap.has_users && (
-                    <InlineCode
-                      icon={<Phone size={16} />}
-                      label={t("phoneCode")}
-                      button={t("sendPhoneCode")}
-                      value={registerForm.phone_code}
-                      onChange={(value) => setRegisterForm({ ...registerForm, phone_code: value })}
-                      onSend={() => sendVerification("phone")}
-                      disabled={busy}
-                    />
+                  {bootstrap.registration.require_phone_verification && (
+                    <>
+                      <Field label={t("phone")} type="tel" autoComplete="tel" value={registerForm.phone} onChange={(value) => setRegisterForm({ ...registerForm, phone: value })} required />
+                      <InlineCode
+                        icon={<Phone size={16} />}
+                        label={t("phoneCode")}
+                        button={t("sendPhoneCode")}
+                        value={registerForm.phone_code}
+                        onChange={(value) => setRegisterForm({ ...registerForm, phone_code: value })}
+                        onSend={() => sendVerification("phone")}
+                        disabled={busy}
+                      />
+                    </>
                   )}
                   <Field label={t("username")} autoComplete="username" value={registerForm.username} onChange={(value) => setRegisterForm({ ...registerForm, username: value })} />
-                  <Field label={t("displayName")} autoComplete="name" value={registerForm.display_name} onChange={(value) => setRegisterForm({ ...registerForm, display_name: value })} />
-                  <Field label={t("password")} type="password" autoComplete="new-password" value={registerForm.password} onChange={(value) => setRegisterForm({ ...registerForm, password: value })} />
+                  <Field label={t("password")} type="password" autoComplete="new-password" value={registerForm.password} onChange={(value) => setRegisterForm({ ...registerForm, password: value })} required />
                 </>
               )}
               <button className="primary" type="submit" disabled={busy || passwordRegistrationUnavailable || registrationCodeBlocksSubmit}>
@@ -5615,7 +5621,8 @@ function EmailField({
   customDomain,
   onCustomDomainChange,
   customLabel,
-  applyLabel
+  applyLabel,
+  required = true
 }: {
   label: string;
   value: string;
@@ -5625,11 +5632,12 @@ function EmailField({
   onCustomDomainChange: (value: string) => void;
   customLabel: string;
   applyLabel: string;
+  required?: boolean;
 }) {
   const customSuffix = usableEmailDomain(customDomain);
   return (
     <div className="email-field">
-      <Field label={label} value={value} onChange={onChange} type="email" autoComplete="email" />
+      <Field label={label} value={value} onChange={onChange} type="email" autoComplete="email" required={required} />
       {domains.length > 0 && (
         <div className="domain-pills" role="group" aria-label={label}>
           {domains.map((domain) => (

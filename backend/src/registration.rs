@@ -566,7 +566,7 @@ async fn register(
             code,
         ));
     }
-    if registration.require_phone_verification && !first_user {
+    if registration.require_phone_verification {
         let phone_value = phone
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("phone is required".to_string()))?;
@@ -595,13 +595,7 @@ async fn register(
                 } else {
                     None
                 },
-                phone_verified_at: if phone.is_some()
-                    && (registration.require_phone_verification || first_user)
-                {
-                    Some(now)
-                } else {
-                    None
-                },
+                phone_verified_at: registration.require_phone_verification.then_some(now),
                 is_admin: crate::db::registered_user_is_admin(first_user),
                 is_active: registration.default_user_active || first_user,
                 archived_at: None,
@@ -690,30 +684,28 @@ async fn register_with_registration_authorization_code(
         }
         None => register_username_or_email_local(&payload.username, &email),
     };
-    let password_hash = if let Some(password) = payload
-        .password
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        state.db.security_policy().await?.validate_password(
-            password,
-            PasswordSubject {
-                email: &email,
-                username: &username,
-            },
-        )?;
-        util::hash_password(password)?
-    } else {
-        // A registration code is the enrollment credential.  The password is
-        // intentionally non-recoverable until the person completes the normal
-        // password-reset flow, so a code-only form cannot accidentally create
-        // a known password or weaken the configured password policy.
-        util::hash_password(&util::random_token(32))?
-    };
+    let password = required_register_password(&payload.password)?;
+    state.db.security_policy().await?.validate_password(
+        password,
+        PasswordSubject {
+            email: &email,
+            username: &username,
+        },
+    )?;
+    let password_hash = util::hash_password(password)?;
     let phone = normalize_optional(&payload.phone);
     let mut verification_claims = Vec::new();
-    if let Some(verification_code) = normalize_optional(&payload.email_code) {
+    if registration.require_email_verification {
+        let verification_code = normalize_optional(&payload.email_code).ok_or_else(|| {
+            AppError::BadRequest("email verification code is required".to_string())
+        })?;
+        verification_claims.push(VerificationCodeClaim::new(
+            "email",
+            &email,
+            REGISTRATION_VERIFICATION_PURPOSE,
+            &verification_code,
+        ));
+    } else if let Some(verification_code) = normalize_optional(&payload.email_code) {
         verification_claims.push(VerificationCodeClaim::new(
             "email",
             &email,
@@ -721,7 +713,20 @@ async fn register_with_registration_authorization_code(
             &verification_code,
         ));
     }
-    if let Some(verification_code) = normalize_optional(&payload.phone_code) {
+    if registration.require_phone_verification {
+        let phone_value = phone
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("phone is required".to_string()))?;
+        let verification_code = normalize_optional(&payload.phone_code).ok_or_else(|| {
+            AppError::BadRequest("phone verification code is required".to_string())
+        })?;
+        verification_claims.push(VerificationCodeClaim::new(
+            "phone",
+            phone_value,
+            REGISTRATION_VERIFICATION_PURPOSE,
+            &verification_code,
+        ));
+    } else if let Some(verification_code) = normalize_optional(&payload.phone_code) {
         let phone_value = phone.as_deref().ok_or_else(|| {
             AppError::BadRequest(
                 "phone is required when a phone verification code is supplied".to_string(),

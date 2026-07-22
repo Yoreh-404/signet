@@ -20,7 +20,6 @@ export const emptyUserForm = {
 
 export const emptyRegisterForm = {
   username: "",
-  display_name: "",
   phone: "",
   password: "",
   email_code: "",

@@ -4105,6 +4105,10 @@ tbody tr:hover {
   overscroll-behavior: contain;
 }
 
+.unified-auth-main.auth-form-mode {
+  align-content: start;
+}
+
 .unified-auth-page .login-panel,
 .unified-auth-main.login-panel {
   width: min(100%, var(--unified-auth-content-width));
