@@ -1063,6 +1063,11 @@ export function App() {
   }
 
   async function handlePasskeyLogin() {
+    const email = authEmail.trim();
+    if (!email) {
+      setError(t("passkeyEmailRequired"));
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -1071,7 +1076,7 @@ export function App() {
       }
       const start = await api<PasskeyAuthenticationStart>("/api/passkeys/authentication/start", {
         method: "POST",
-        body: JSON.stringify({ email: authEmail, account_flow: effectiveAccountFlow })
+        body: JSON.stringify({ email, account_flow: effectiveAccountFlow })
       });
       const credential = await navigator.credentials.get(passkeyRequestOptions(start.public_key));
       if (!credential || credential.type !== "public-key") {
@@ -1098,7 +1103,9 @@ export function App() {
       if (finishInteractiveAuth(result.user)) return;
       await loadBootstrap();
     } catch (err) {
-      setError(messageOr(err, "passkeyLoginFailed"));
+      setError(err instanceof ApiError && err.status === 401
+        ? t("passkeyLoginFailed")
+        : messageOr(err, "passkeyLoginFailed"));
     } finally {
       setBusy(false);
     }

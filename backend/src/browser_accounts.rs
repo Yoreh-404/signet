@@ -250,15 +250,27 @@ async fn select_account(
             Some(&continuation.selected_user_id),
         )
         .await?;
-        format!(
-            "{}&account_flow={}",
-            redirects::frontend_login_url(&continuation.continue_to, None, true),
-            util::url_encode(&account_flow)
+        selected_account_reauthentication_url(
+            &continuation.continue_to,
+            &active.user.email,
+            &account_flow,
         )
     } else {
         continuation.continue_to
     };
     Ok((jar, Json(SelectAccountResponse { continue_to })))
+}
+
+fn selected_account_reauthentication_url(
+    return_to: &str,
+    email: &str,
+    account_flow: &str,
+) -> String {
+    format!(
+        "{}&account_flow={}",
+        redirects::frontend_login_url(return_to, Some(email), true),
+        util::url_encode(account_flow)
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,6 +442,26 @@ pub(crate) async fn ensure_browser_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_account_reauthentication_url_prefills_the_selected_email() {
+        let location = selected_account_reauthentication_url(
+            "/oauth2/authorize?interaction_request=request-123",
+            "alice@example.com",
+            "alf1.token_123",
+        );
+        let url = url::Url::parse(&format!("https://signet.example{location}")).unwrap();
+        let query = url.query_pairs().collect::<Vec<_>>();
+
+        assert!(query.contains(&("auth".into(), "login".into())));
+        assert!(query.contains(&(
+            "return_to".into(),
+            "/oauth2/authorize?interaction_request=request-123".into()
+        )));
+        assert!(query.contains(&("login_hint".into(), "alice@example.com".into())));
+        assert!(query.contains(&("force_login".into(), "1".into())));
+        assert!(query.contains(&("account_flow".into(), "alf1.token_123".into())));
+    }
 
     #[cfg(feature = "sqlite")]
     use crate::{
