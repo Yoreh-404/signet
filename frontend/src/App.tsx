@@ -257,9 +257,7 @@ function bulkImportOutcomeTone(outcome: BulkUserImportRow["outcome"]): "success"
 }
 
 function browserAccountShortName(account: BrowserAccount): string {
-  const email = account.user.email.trim();
-  const separator = email.indexOf("@");
-  return separator > 0 ? email.slice(0, separator) : email || account.user.username;
+  return account.user.username.trim() || account.user.email.trim();
 }
 
 /**
@@ -2930,9 +2928,6 @@ export function App() {
                 <p>{t("selectAccountForApplication")} · {browserAccountsContext.client_name}</p>
               )}
               <h2>{browserAccountShortName(selectedBrowserAccount)}</h2>
-              {selectedBrowserAccount.user.display_name && (
-                <p>{selectedBrowserAccount.user.display_name}</p>
-              )}
               <p className="unified-auth-selection-email">{selectedBrowserAccount.user.email}</p>
               <div className="unified-auth-selection-meta">
                 {selectedBrowserAccount.current && (
@@ -3264,7 +3259,7 @@ export function App() {
           >
             <UserRound size={18} />
             <span className="account-card-copy">
-              <strong>{user.display_name || user.username}</strong>
+              <strong>{user.username}</strong>
               <small>{user.email}</small>
             </span>
             <span id="account-tooltip" className="account-tooltip" role="tooltip">
@@ -3566,7 +3561,7 @@ export function App() {
             <article className="welcome-card">
               <div>
                 <StatusBadge tone="success"><Activity size={13} />{t("serviceHealthy")}</StatusBadge>
-                <h3>{t("welcomeBack")}，{user.display_name || user.username}</h3>
+                <h3>{t("welcomeBack")}，{user.username}</h3>
                 <p>{t("overviewIntro")}</p>
               </div>
               <div className="quick-actions" role="group" aria-label={t("quickActions")}>

@@ -200,10 +200,7 @@ function safeJson(value: string): unknown {
 }
 
 function accountHandle(account: BrowserAccount): string {
-  const email = account.user.email.trim();
-  const at = email.indexOf("@");
-  if (at > 0) return email.slice(0, at);
-  return email || account.user.username;
+  return account.user.username.trim() || account.user.email.trim();
 }
 
 function sortAccounts(accounts: BrowserAccount[]): BrowserAccount[] {
