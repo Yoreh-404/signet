@@ -7926,7 +7926,6 @@ impl Db {
         let identity = UserIdentityCandidate {
             email: user.email.clone(),
             username: user.username.clone(),
-            phone: None,
             exclude_user_id: None,
         };
         with_conn!(self, |conn, kind| {
