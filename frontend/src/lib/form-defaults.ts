@@ -5,8 +5,6 @@ import type {
   OrganizationMemberRole
 } from "../types";
 
-export const DEFAULT_LOGIN_EMAIL = "admin@example.com";
-
 export const emptyUserForm = {
   id: "",
   email: "",

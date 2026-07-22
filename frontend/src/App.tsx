@@ -87,7 +87,6 @@ import {
   toTimestamp
 } from "./lib/formatters";
 import {
-  DEFAULT_LOGIN_EMAIL,
   createQuickLinkId,
   emptyAuditWebhookForm,
   emptyAuthorizationCodeLoginForm,
@@ -399,7 +398,7 @@ export function App() {
     quick_links: []
   });
   const [quickLinkForm, setQuickLinkForm] = useState(emptyQuickLinkForm);
-  const [authEmail, setAuthEmail] = useState(initialAuth.loginHint || DEFAULT_LOGIN_EMAIL);
+  const [authEmail, setAuthEmail] = useState(initialAuth.loginHint || "");
   const [loginMethod, setLoginMethod] = useState<LoginMethod>("password");
   const [authorizationCodeLoginForm, setAuthorizationCodeLoginForm] = useState(emptyAuthorizationCodeLoginForm);
   const [loginPassword, setLoginPassword] = useState("");
@@ -602,13 +601,6 @@ export function App() {
     setBootstrap(next);
     if (!localStorage.getItem("gpt-sso-locale") && next.default_locale === "en-US") {
       setLocale("en-US");
-    }
-    const defaultDomain = next.login.email_domains[0];
-    if (defaultDomain) {
-      setAuthEmail((current) => {
-        if (current !== DEFAULT_LOGIN_EMAIL) return current;
-        return applyEmailDomain("admin", defaultDomain);
-      });
     }
     if (!next.has_users) {
       setAuthMode("register");
