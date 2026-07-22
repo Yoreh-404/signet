@@ -225,9 +225,8 @@ fn profile_from_entry(
     provider: &LdapProviderRecord,
     entry: SearchEntry,
 ) -> AppResult<DirectoryProfile> {
-    let subject =
-        attr_or_dn(&entry, &provider.user_id_attribute).ok_or_else(|| AppError::Unauthorized)?;
-    let email = attr(&entry, &provider.email_attribute).ok_or_else(|| AppError::Unauthorized)?;
+    let subject = attr_or_dn(&entry, &provider.user_id_attribute).ok_or(AppError::Unauthorized)?;
+    let email = attr(&entry, &provider.email_attribute).ok_or(AppError::Unauthorized)?;
     let username = attr(&entry, &provider.username_attribute)
         .or_else(|| email.split('@').next().map(ToOwned::to_owned))
         .unwrap_or_else(|| "directory-user".to_string());

@@ -126,7 +126,7 @@ async fn deliver_to_webhook(
     let mut request = client
         .post(&webhook.url)
         .header("content-type", "application/json")
-        .header("user-agent", "gpt-sso-webhook/0.1")
+        .header("user-agent", "signet-webhook/0.1")
         .header("x-gpt-sso-event-id", event.id.as_str())
         .header("x-gpt-sso-delivery-id", delivery_id);
 

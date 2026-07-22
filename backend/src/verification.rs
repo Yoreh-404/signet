@@ -98,22 +98,22 @@ pub async fn deliver_verification_code(
 struct DevLogVerificationSender;
 
 impl VerificationSender for DevLogVerificationSender {
-    fn send<'a>(
+    async fn send<'a>(
         &'a self,
         context: &'a VerificationDeliveryContext<'a>,
-    ) -> impl Future<Output = AppResult<VerificationDeliveryOutcome>> + Send + 'a {
-        async move {
-            tracing::info!(
-                channel = context.channel,
-                target = context.target,
-                purpose = context.purpose,
-                code = context.code,
-                log_message = context.message
-            );
-            Ok(VerificationDeliveryOutcome {
-                dev_code: Some(context.code.to_string()),
-            })
-        }
+    ) -> AppResult<VerificationDeliveryOutcome> {
+        tracing::info!(
+            channel = context.channel,
+            target = context.target,
+            purpose = context.purpose,
+            code = context.code,
+            log_message = context.message
+        );
+        // Development delivery writes the code to the local service log.
+        // Never echo a password-reset or registration secret to an HTTP
+        // caller, even when an instance was accidentally deployed with
+        // the development sender enabled.
+        Ok(VerificationDeliveryOutcome { dev_code: None })
     }
 }
 
@@ -125,43 +125,41 @@ struct HttpJsonVerificationSender<'a> {
 }
 
 impl VerificationSender for HttpJsonVerificationSender<'_> {
-    fn send<'a>(
+    async fn send<'a>(
         &'a self,
         context: &'a VerificationDeliveryContext<'a>,
-    ) -> impl Future<Output = AppResult<VerificationDeliveryOutcome>> + Send + 'a {
-        async move {
-            let payload = VerificationWebhookPayload::from_context(context);
-            let body = serde_json::to_string(&payload).map_err(|err| {
-                AppError::Internal(format!("failed to encode verification payload: {err}"))
+    ) -> AppResult<VerificationDeliveryOutcome> {
+        let payload = VerificationWebhookPayload::from_context(context);
+        let body = serde_json::to_string(&payload).map_err(|err| {
+            AppError::Internal(format!("failed to encode verification payload: {err}"))
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_seconds))
+            .build()
+            .map_err(|err| {
+                AppError::Internal(format!("failed to build verification HTTP client: {err}"))
             })?;
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(self.timeout_seconds))
-                .build()
-                .map_err(|err| {
-                    AppError::Internal(format!("failed to build verification HTTP client: {err}"))
-                })?;
-            let mut request = client
-                .post(self.url)
-                .header("content-type", "application/json")
-                .header("user-agent", "gpt-sso-verification/0.1")
-                .header("x-gpt-sso-verification-channel", context.channel)
-                .header("x-gpt-sso-verification-purpose", context.purpose)
-                .body(body.clone());
-            if let Some(token) = self.bearer_token {
-                request = request.header("authorization", format!("Bearer {token}"));
-            }
-            if let Some(secret) = self.hmac_secret {
-                request = request.header("x-gpt-sso-signature", sign_body(secret, &body)?);
-            }
-            let response = request.send().await.map_err(delivery_error)?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(AppError::Internal(format!(
-                    "verification delivery endpoint returned {status}"
-                )));
-            }
-            Ok(VerificationDeliveryOutcome { dev_code: None })
+        let mut request = client
+            .post(self.url)
+            .header("content-type", "application/json")
+            .header("user-agent", "signet-verification/0.1")
+            .header("x-gpt-sso-verification-channel", context.channel)
+            .header("x-gpt-sso-verification-purpose", context.purpose)
+            .body(body.clone());
+        if let Some(token) = self.bearer_token {
+            request = request.header("authorization", format!("Bearer {token}"));
         }
+        if let Some(secret) = self.hmac_secret {
+            request = request.header("x-gpt-sso-signature", sign_body(secret, &body)?);
+        }
+        let response = request.send().await.map_err(delivery_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Internal(format!(
+                "verification delivery endpoint returned {status}"
+            )));
+        }
+        Ok(VerificationDeliveryOutcome { dev_code: None })
     }
 }
 
@@ -175,41 +173,37 @@ struct SmtpVerificationSender<'a> {
 }
 
 impl VerificationSender for SmtpVerificationSender<'_> {
-    fn send<'a>(
+    async fn send<'a>(
         &'a self,
         context: &'a VerificationDeliveryContext<'a>,
-    ) -> impl Future<Output = AppResult<VerificationDeliveryOutcome>> + Send + 'a {
-        async move {
-            if context.channel != "email" {
-                return Err(AppError::Configuration(
-                    "smtp verification delivery can only send email codes".to_string(),
-                ));
-            }
-            let message = Message::builder()
-                .from(parse_mailbox(self.from, "verification.email.smtp_from")?)
-                .to(parse_mailbox(context.target, "verification email target")?)
-                .subject(smtp_subject(context))
-                .body(smtp_body(context))
-                .map_err(|err| {
-                    AppError::Internal(format!("failed to build SMTP message: {err}"))
-                })?;
-            let mut builder = if self.starttls {
-                AsyncSmtpTransport::<Tokio1Executor>::relay(self.host).map_err(|err| {
-                    AppError::Configuration(format!("invalid SMTP relay configuration: {err}"))
-                })?
-            } else {
-                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(self.host)
-            }
-            .port(self.port);
-            if let (Some(username), Some(password)) = (self.username, self.password) {
-                builder = builder
-                    .credentials(Credentials::new(username.to_string(), password.to_string()));
-            }
-            builder.build().send(message).await.map_err(|err| {
-                AppError::Internal(format!("SMTP verification delivery failed: {err}"))
-            })?;
-            Ok(VerificationDeliveryOutcome { dev_code: None })
+    ) -> AppResult<VerificationDeliveryOutcome> {
+        if context.channel != "email" {
+            return Err(AppError::Configuration(
+                "smtp verification delivery can only send email codes".to_string(),
+            ));
         }
+        let message = Message::builder()
+            .from(parse_mailbox(self.from, "verification.email.smtp_from")?)
+            .to(parse_mailbox(context.target, "verification email target")?)
+            .subject(smtp_subject(context))
+            .body(smtp_body(context))
+            .map_err(|err| AppError::Internal(format!("failed to build SMTP message: {err}")))?;
+        let mut builder = if self.starttls {
+            AsyncSmtpTransport::<Tokio1Executor>::relay(self.host).map_err(|err| {
+                AppError::Configuration(format!("invalid SMTP relay configuration: {err}"))
+            })?
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(self.host)
+        }
+        .port(self.port);
+        if let (Some(username), Some(password)) = (self.username, self.password) {
+            builder =
+                builder.credentials(Credentials::new(username.to_string(), password.to_string()));
+        }
+        builder.build().send(message).await.map_err(|err| {
+            AppError::Internal(format!("SMTP verification delivery failed: {err}"))
+        })?;
+        Ok(VerificationDeliveryOutcome { dev_code: None })
     }
 }
 
@@ -272,9 +266,9 @@ fn parse_mailbox(value: &str, label: &str) -> AppResult<Mailbox> {
 
 fn smtp_subject(context: &VerificationDeliveryContext<'_>) -> String {
     match context.purpose {
-        "password_reset" => "GPT SSO password reset code".to_string(),
-        "registration" => "GPT SSO registration verification code".to_string(),
-        _ => "GPT SSO verification code".to_string(),
+        "password_reset" => "Signet password reset code".to_string(),
+        "registration" => "Signet registration verification code".to_string(),
+        _ => "Signet verification code".to_string(),
     }
 }
 
@@ -299,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dev_log_returns_code_for_development_ui() {
+    async fn dev_log_keeps_code_out_of_http_response() {
         let settings = VerificationChannelSettings {
             enabled: true,
             delivery: VerificationDelivery::DevLog,
@@ -329,7 +323,7 @@ mod tests {
         let outcome = deliver_verification_code(&settings, &context)
             .await
             .unwrap();
-        assert_eq!(outcome.dev_code.as_deref(), Some("123456"));
+        assert!(outcome.dev_code.is_none());
     }
 
     #[test]
@@ -343,7 +337,7 @@ mod tests {
             message: "password reset verification code",
         };
 
-        assert_eq!(smtp_subject(&context), "GPT SSO password reset code");
+        assert_eq!(smtp_subject(&context), "Signet password reset code");
         let body = smtp_body(&context);
         assert!(body.contains("password reset verification code"));
         assert!(body.contains("654321"));

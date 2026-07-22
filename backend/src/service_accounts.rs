@@ -62,6 +62,7 @@ mod tests {
             client_id: "reports-worker".to_string(),
             client_secret_hash: None,
             client_name: "Reports worker".to_string(),
+            logo_uri: String::new(),
             organization_id: None,
             redirect_uris: "[]".to_string(),
             post_logout_redirect_uris: "[]".to_string(),

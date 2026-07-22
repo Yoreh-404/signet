@@ -132,6 +132,7 @@ struct StartAuthenticationResponse {
 struct FinishAuthenticationRequest {
     challenge_id: String,
     credential: PublicKeyCredential,
+    account_flow: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,7 +181,7 @@ impl WebauthnRuntimeConfig {
     pub fn build(&self) -> AppResult<Webauthn> {
         WebauthnBuilder::new(&self.rp_id, &self.origin)
             .map_err(webauthn_configuration_error)?
-            .rp_name("GPT SSO")
+            .rp_name("Signet")
             .build()
             .map_err(webauthn_configuration_error)
     }
@@ -204,7 +205,7 @@ async fn start_registration(
     Json(payload): Json<StartRegistrationRequest>,
 ) -> AppResult<Json<StartRegistrationResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     let user_uuid = passkey_user_uuid(&current.user)?;
     let webauthn = webauthn_for_request(&state, &headers).await?;
     let records = state.db.list_user_passkeys(&current.user.id).await?;
@@ -246,7 +247,7 @@ async fn finish_registration(
     Json(payload): Json<FinishRegistrationRequest>,
 ) -> AppResult<Json<PublicPasskey>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     let challenge = load_challenge(
         &state,
         &payload.challenge_id,
@@ -284,7 +285,7 @@ async fn delete_passkey(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     state.db.delete_user_passkey(&current.user.id, &id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -406,7 +407,19 @@ async fn finish_authentication(
         .db
         .update_user_passkey_after_authentication(&record.id, util::to_json(&passkey)?)
         .await?;
-    let jar = auth::issue_session(&state, jar, &headers, request_ip, &user, "passkey").await?;
+    let jar = auth::issue_session_with_login_event(
+        &state,
+        jar,
+        &headers,
+        request_ip,
+        &user,
+        "passkey",
+        auth::LoginEventContext {
+            account_flow: payload.account_flow,
+            ..Default::default()
+        },
+    )
+    .await?;
     auth::clear_login_failures(&state, &subject).await?;
     Ok((
         jar,
@@ -445,10 +458,10 @@ fn validate_challenge(
     if challenge.expires_at < util::now_ts() {
         return Err(AppError::Unauthorized);
     }
-    if let Some(expected_user_id) = user_id {
-        if challenge.user_id.as_deref() != Some(expected_user_id) {
-            return Err(AppError::Unauthorized);
-        }
+    if let Some(expected_user_id) = user_id
+        && challenge.user_id.as_deref() != Some(expected_user_id)
+    {
+        return Err(AppError::Unauthorized);
     }
     Ok(())
 }

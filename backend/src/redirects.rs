@@ -28,6 +28,18 @@ pub fn frontend_login_url(return_to: &str, login_hint: Option<&str>, force_login
     format!("/?{}", serde_urlencode(&pairs))
 }
 
+pub fn frontend_account_selection_url(return_to: &str, login_hint: Option<&str>) -> String {
+    let return_to = local_return_to(Some(return_to));
+    let mut pairs = vec![
+        ("auth", "select_account".to_string()),
+        ("return_to", return_to),
+    ];
+    if let Some(value) = login_hint.map(str::trim).filter(|value| !value.is_empty()) {
+        pairs.push(("login_hint", value.to_string()));
+    }
+    format!("/?{}", serde_urlencode(&pairs))
+}
+
 pub fn frontend_auth_error_url(return_to: Option<&str>, message: &str) -> String {
     let return_to = local_return_to(return_to);
     let pairs = vec![
@@ -127,6 +139,21 @@ mod tests {
         assert_eq!(
             frontend_login_url("https://evil.example", None, false),
             "/?auth=login&return_to=%2F"
+        );
+    }
+
+    #[test]
+    fn account_selection_url_preserves_only_a_local_target_and_hint() {
+        assert_eq!(
+            frontend_account_selection_url(
+                "/oauth2/authorize?interaction_request=opaque",
+                Some("alice@example.com")
+            ),
+            "/?auth=select_account&return_to=%2Foauth2%2Fauthorize%3Finteraction_request%3Dopaque&login_hint=alice%40example.com"
+        );
+        assert_eq!(
+            frontend_account_selection_url("https://evil.example", None),
+            "/?auth=select_account&return_to=%2F"
         );
     }
 

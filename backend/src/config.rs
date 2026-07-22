@@ -72,7 +72,7 @@ pub struct SecuritySettings {
     pub admin_api_prefix: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum SameSiteSetting {
     Strict,
     Lax,
@@ -185,6 +185,8 @@ pub struct BootstrapAdmin {
 pub struct BootstrapClient {
     pub client_id: String,
     pub client_name: String,
+    #[serde(default)]
+    pub logo_uri: String,
     pub client_secret: String,
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
@@ -261,6 +263,18 @@ impl Settings {
         if self.security.password_min_length < 8 {
             anyhow::bail!("security.password_min_length must be at least 8");
         }
+        if self.security.cookie_same_site == SameSiteSetting::None && !self.security.cookie_secure {
+            anyhow::bail!("security.cookie_secure must be true when cookie_same_site is None");
+        }
+        if self.cors.allow_credentials
+            && self
+                .cors
+                .allowed_origins
+                .iter()
+                .any(|origin| origin.trim() == "*")
+        {
+            anyhow::bail!("credentialed CORS cannot use a wildcard allowed origin");
+        }
         if self.bootstrap.admin.create_on_startup
             && self.bootstrap.admin.password.len() < self.security.password_min_length
         {
@@ -293,6 +307,7 @@ impl Settings {
         validate_verification_channel("email", &self.verification.email)?;
         validate_verification_channel("phone", &self.verification.phone)?;
         for client in &self.bootstrap.clients {
+            validate_bootstrap_client_logo_uri(&client.client_id, &client.logo_uri)?;
             if !matches!(
                 client.token_endpoint_auth_method.as_str(),
                 "client_secret_basic"
@@ -439,9 +454,36 @@ fn validate_http_delivery_url(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_bootstrap_client_logo_uri(client_id: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > 2048 {
+        anyhow::bail!("bootstrap client {client_id} logo_uri exceeds 2048 characters");
+    }
+    let label = format!("bootstrap client {client_id} logo_uri");
+    let parsed =
+        url::Url::parse(value).with_context(|| format!("{label} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("{label} must be an absolute http(s) URL");
+    }
+    if parsed.fragment().is_some() {
+        anyhow::bail!("{label} cannot contain a fragment");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{label} cannot include user info");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn default_settings() -> Settings {
+        toml::from_str(include_str!("../../config/default.toml")).unwrap()
+    }
 
     fn verification_channel(delivery: VerificationDelivery) -> VerificationChannelSettings {
         VerificationChannelSettings {
@@ -483,5 +525,27 @@ mod tests {
 
         email.smtp_password = Some("secret".to_string());
         assert!(validate_verification_channel("email", &email).is_ok());
+    }
+
+    #[test]
+    fn same_site_none_requires_secure_session_cookies() {
+        let mut settings = default_settings();
+        settings.security.cookie_same_site = SameSiteSetting::None;
+        settings.security.cookie_secure = false;
+        assert!(settings.validate().is_err());
+
+        settings.security.cookie_secure = true;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn credentialed_cors_rejects_wildcard_origins() {
+        let mut settings = default_settings();
+        settings.cors.allow_credentials = true;
+        settings.cors.allowed_origins = vec!["*".to_string()];
+        assert!(settings.validate().is_err());
+
+        settings.cors.allowed_origins = vec!["https://console.example".to_string()];
+        assert!(settings.validate().is_ok());
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     access::{Authorizer, Permission},
     archived_accounts,
     audit::{self, AuditSink},
-    db::{GroupRecord, NewGroup, NewUser, UserListScope, UserRecord},
+    db::{GroupRecord, NewGroup, NewUser, UserListScope, UserRecord, UserUpdate},
     error::AppError,
     security_policy::{self, PasswordPolicy, PasswordSubject},
     util,
@@ -24,6 +24,8 @@ const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 const LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
+const SCIM_READ_SCOPE: &str = "scim.read";
+const SCIM_WRITE_SCOPE: &str = "scim.write";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -218,6 +220,22 @@ struct ScimError {
     status: StatusCode,
     scim_type: Option<&'static str>,
     detail: String,
+    www_authenticate: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScimAccess {
+    Read,
+    Write,
+}
+
+impl ScimAccess {
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Read => SCIM_READ_SCOPE,
+            Self::Write => SCIM_WRITE_SCOPE,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -390,7 +408,7 @@ async fn service_provider_config() -> impl IntoResponse {
         etag: FeatureFlag { supported: false },
         authentication_schemes: vec![AuthScheme {
             name: "OAuth Bearer Token",
-            description: "Use a GPT SSO access token for an administrator or a user with SCIM permissions.",
+            description: "Use a Signet access token for an administrator or a user with SCIM permissions.",
             spec_uri: "https://www.rfc-editor.org/rfc/rfc6750",
             documentation_uri: "",
             kind: "oauthbearertoken",
@@ -458,7 +476,7 @@ async fn list_users(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ScimError> {
-    require_scim_permission(&state, &headers, Permission::UsersRead).await?;
+    require_scim_permission(&state, &headers, Permission::UsersRead, ScimAccess::Read).await?;
     let filter = parse_user_filter(query.filter.as_deref())?;
     let users = state
         .db
@@ -489,7 +507,7 @@ async fn get_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ScimError> {
-    require_scim_permission(&state, &headers, Permission::UsersRead).await?;
+    require_scim_permission(&state, &headers, Permission::UsersRead, ScimAccess::Read).await?;
     let user = state
         .db
         .find_user_by_id(&id)
@@ -503,7 +521,9 @@ async fn create_user(
     headers: HeaderMap,
     Json(payload): Json<ScimUserInput>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::UsersManage).await?;
+    let principal =
+        require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
+            .await?;
     let email = primary_email(&payload)?;
     let username = normalize_required(&payload.user_name, "userName")?;
     let display_name = payload.display_name.clone().or_else(|| {
@@ -554,7 +574,9 @@ async fn replace_user(
     Path(id): Path<String>,
     Json(payload): Json<ScimUserInput>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::UsersManage).await?;
+    let principal =
+        require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
+            .await?;
     let current = editable_user(&state, &id).await?;
     let email = primary_email(&payload)?;
     let username = normalize_required(&payload.user_name, "userName")?;
@@ -567,15 +589,15 @@ async fn replace_user(
     let phone = primary_phone(&payload);
     let user = state
         .db
-        .update_user(
-            &id,
-            security_policy::normalize_login_subject(&email),
+        .update_user(UserUpdate {
+            id: &id,
+            email: security_policy::normalize_login_subject(&email),
             username,
             display_name,
             phone,
-            current.is_admin == 1,
-            current.is_active == 1,
-        )
+            is_admin: current.is_admin == 1,
+            is_active: current.is_active == 1,
+        })
         .await?;
     if let Some(password) = payload
         .password
@@ -611,7 +633,9 @@ async fn patch_user(
     Path(id): Path<String>,
     Json(payload): Json<PatchRequest>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::UsersManage).await?;
+    let principal =
+        require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
+            .await?;
     let mut user = editable_user(&state, &id).await?;
     for operation in payload.operations {
         let op = operation.op.to_ascii_lowercase();
@@ -644,7 +668,9 @@ async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::UsersManage).await?;
+    let principal =
+        require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
+            .await?;
     let user = state
         .db
         .find_user_by_id(&id)
@@ -673,7 +699,13 @@ async fn list_groups(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ScimError> {
-    require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Read,
+    )
+    .await?;
     let filter = parse_group_filter(query.filter.as_deref())?;
     let groups = state
         .db
@@ -702,7 +734,13 @@ async fn get_group(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ScimError> {
-    require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Read,
+    )
+    .await?;
     let group = state
         .db
         .find_group_by_id(&id)
@@ -716,7 +754,13 @@ async fn create_group(
     headers: HeaderMap,
     Json(payload): Json<ScimGroupInput>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    let principal = require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Write,
+    )
+    .await?;
     let group = state
         .db
         .insert_group(NewGroup {
@@ -758,7 +802,13 @@ async fn replace_group(
     Path(id): Path<String>,
     Json(payload): Json<ScimGroupInput>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    let principal = require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Write,
+    )
+    .await?;
     let group = state
         .db
         .update_group(
@@ -796,7 +846,13 @@ async fn patch_group(
     Path(id): Path<String>,
     Json(payload): Json<PatchRequest>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    let principal = require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Write,
+    )
+    .await?;
     let mut group = state
         .db
         .find_group_by_id(&id)
@@ -826,7 +882,13 @@ async fn delete_group(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ScimError> {
-    let principal = require_scim_permission(&state, &headers, Permission::SecurityManage).await?;
+    let principal = require_scim_permission(
+        &state,
+        &headers,
+        Permission::SecurityManage,
+        ScimAccess::Write,
+    )
+    .await?;
     let group = state
         .db
         .find_group_by_id(&id)
@@ -876,7 +938,7 @@ async fn apply_patch_operation(
         }
         Some(path) => Err(ScimError::bad_request(
             "invalidPath",
-            &format!("unsupported path: {path}"),
+            format!("unsupported path: {path}"),
         )),
         None => apply_patch_object(state, id, user, operation.value).await,
     }
@@ -932,15 +994,15 @@ async fn replace_user_fields(
     let next_username = username.unwrap_or_else(|| user.username.clone());
     state
         .db
-        .update_user(
+        .update_user(UserUpdate {
             id,
-            next_email,
-            next_username,
-            display_name.or_else(|| user.display_name.clone()),
-            phone.unwrap_or_else(|| user.phone.clone()),
-            user.is_admin == 1,
-            user.is_active == 1,
-        )
+            email: next_email,
+            username: next_username,
+            display_name: display_name.or_else(|| user.display_name.clone()),
+            phone: phone.unwrap_or_else(|| user.phone.clone()),
+            is_admin: user.is_admin == 1,
+            is_active: user.is_active == 1,
+        })
         .await?;
     Ok(())
 }
@@ -1020,7 +1082,7 @@ async fn apply_group_patch_operation(
         }
         Some(path) => Err(ScimError::bad_request(
             "invalidPath",
-            &format!("unsupported path: {path}"),
+            format!("unsupported path: {path}"),
         )),
         None => {
             let object = operation.value.as_object().ok_or_else(|| {
@@ -1053,39 +1115,78 @@ async fn require_scim_permission(
     state: &AppState,
     headers: &HeaderMap,
     permission: Permission,
+    access: ScimAccess,
 ) -> Result<ScimPrincipal, ScimError> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ScimError::new(StatusCode::UNAUTHORIZED, None, "missing bearer token"))?;
+        .ok_or_else(|| ScimError::bearer_invalid("missing bearer token"))?;
     let issuers = state.accepted_issuers(headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
     let claims = state
         .jwt
         .verify_access_token_with_issuers(token, &issuer_refs)
-        .map_err(|_| ScimError::new(StatusCode::UNAUTHORIZED, None, "invalid bearer token"))?;
+        .map_err(|_| ScimError::bearer_invalid("invalid bearer token"))?;
     if claims.cnf.is_some() {
-        return Err(ScimError::new(
-            StatusCode::UNAUTHORIZED,
-            None,
+        return Err(ScimError::bearer_invalid(
             "DPoP-bound tokens require a DPoP-capable resource endpoint",
         ));
     }
+    let runtime = state.db.runtime_settings().await?;
+    let expected_audience = format!("{}/scim/v2", runtime.public_base_url.trim_end_matches('/'));
+    validate_scim_claims(&claims, &expected_audience, access)?;
     let user = state
         .db
         .find_user_by_id(&claims.sub)
         .await?
-        .ok_or_else(|| ScimError::new(StatusCode::UNAUTHORIZED, None, "subject user not found"))?;
+        .ok_or_else(|| ScimError::bearer_invalid("subject user not found"))?;
     if user.is_active != 1 || user.archived_at.is_some() {
-        return Err(ScimError::new(
-            StatusCode::UNAUTHORIZED,
-            None,
-            "subject user is not active",
+        return Err(ScimError::bearer_invalid("subject user is not active"));
+    }
+    if state
+        .db
+        .find_trial_enrollment_for_user(&user.id)
+        .await?
+        .is_some()
+    {
+        return Err(ScimError::bearer_invalid(
+            "trial enrollment accounts cannot access SCIM",
         ));
     }
     state.db.require_permission(&user, permission).await?;
     Ok(ScimPrincipal { user })
+}
+
+fn validate_scim_claims(
+    claims: &crate::jwt::TokenClaims,
+    expected_audience: &str,
+    access: ScimAccess,
+) -> Result<(), ScimError> {
+    if claims.gpt_sso_login_code_level.is_some() {
+        return Err(ScimError::bearer_invalid(
+            "authorization-code login tokens cannot access SCIM",
+        ));
+    }
+    if claims.aud != expected_audience {
+        return Err(ScimError::bearer_invalid(
+            "token audience is not valid for SCIM",
+        ));
+    }
+    if claims.sub == claims.client_id || claims.sub.starts_with("service-account:") {
+        return Err(ScimError::bearer_invalid(
+            "client credential subjects are not supported by SCIM",
+        ));
+    }
+    let required_scope = access.scope();
+    if !claims
+        .scope
+        .split_ascii_whitespace()
+        .any(|scope| scope == required_scope)
+    {
+        return Err(ScimError::insufficient_scope(required_scope));
+    }
+    Ok(())
 }
 
 async fn editable_user(state: &AppState, id: &str) -> Result<UserRecord, ScimError> {
@@ -1198,7 +1299,7 @@ fn parse_user_filter(value: Option<&str>) -> Result<ScimUserFilter, ScimError> {
         },
         _ => Err(ScimError::bad_request(
             "invalidFilter",
-            &format!("unsupported filter field: {field}"),
+            format!("unsupported filter field: {field}"),
         )),
     }
 }
@@ -1220,7 +1321,7 @@ fn parse_group_filter(value: Option<&str>) -> Result<ScimGroupFilter, ScimError>
         "id" => Ok(ScimGroupFilter::Id(raw_value.to_string())),
         _ => Err(ScimError::bad_request(
             "invalidFilter",
-            &format!("unsupported filter field: {field}"),
+            format!("unsupported filter field: {field}"),
         )),
     }
 }
@@ -1343,7 +1444,7 @@ fn json_string(value: &Value, field: &str) -> Result<String, ScimError> {
         .as_str()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ScimError::bad_request("invalidValue", &format!("{field} must be string")))
+        .ok_or_else(|| ScimError::bad_request("invalidValue", format!("{field} must be string")))
 }
 
 fn normalize_required(value: &str, field: &str) -> Result<String, ScimError> {
@@ -1351,7 +1452,7 @@ fn normalize_required(value: &str, field: &str) -> Result<String, ScimError> {
     if value.is_empty() {
         Err(ScimError::bad_request(
             "invalidValue",
-            &format!("{field} is required"),
+            format!("{field} is required"),
         ))
     } else {
         Ok(value)
@@ -1401,7 +1502,26 @@ impl ScimError {
             status,
             scim_type,
             detail: detail.into(),
+            www_authenticate: None,
         }
+    }
+
+    fn bearer_invalid(detail: impl Into<String>) -> Self {
+        let mut error = Self::new(StatusCode::UNAUTHORIZED, None, detail);
+        error.www_authenticate = Some("Bearer realm=\"scim\", error=\"invalid_token\"".to_string());
+        error
+    }
+
+    fn insufficient_scope(scope: &'static str) -> Self {
+        let mut error = Self::new(
+            StatusCode::FORBIDDEN,
+            None,
+            format!("required OAuth scope is missing: {scope}"),
+        );
+        error.www_authenticate = Some(format!(
+            "Bearer realm=\"scim\", error=\"insufficient_scope\", scope=\"{scope}\""
+        ));
+        error
     }
 
     fn not_found(detail: impl Into<String>) -> Self {
@@ -1421,25 +1541,65 @@ impl IntoResponse for ScimError {
             detail: self.detail,
             status: self.status.as_u16().to_string(),
         };
-        (self.status, scim_json(body)).into_response()
+        let mut response = (self.status, scim_json(body)).into_response();
+        if let Some(value) = self.www_authenticate.and_then(|value| value.parse().ok()) {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, value);
+        }
+        response
     }
 }
 
 impl From<AppError> for ScimError {
     fn from(value: AppError) -> Self {
         let status = value.status();
-        let scim_type = match value {
+        let is_internal = matches!(
+            &value,
+            AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+        );
+        if is_internal {
+            tracing::error!(error = %value, "SCIM request failed with an internal error");
+        }
+        let scim_type = match &value {
             AppError::BadRequest(_) | AppError::Oidc(_) => Some("invalidValue"),
-            AppError::Forbidden => Some("mutability"),
             _ => None,
         };
-        Self::new(status, scim_type, value.to_string())
+        let detail = if is_internal {
+            "internal server error".to_string()
+        } else {
+            value.to_string()
+        };
+        Self::new(status, scim_type, detail)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token_claims(audience: &str, scope: &str) -> crate::jwt::TokenClaims {
+        crate::jwt::TokenClaims {
+            iss: "https://sso.example".to_string(),
+            sub: "user-id".to_string(),
+            aud: audience.to_string(),
+            exp: util::now_ts() + 300,
+            iat: util::now_ts(),
+            token_use: "access_token".to_string(),
+            client_id: "scim-client".to_string(),
+            scope: scope.to_string(),
+            email: "admin@example.com".to_string(),
+            email_verified: true,
+            name: Some("Admin".to_string()),
+            preferred_username: "admin".to_string(),
+            nonce: None,
+            auth_time: None,
+            sid: None,
+            cnf: None,
+            authorization_details: None,
+            gpt_sso_login_code_level: None,
+        }
+    }
 
     #[test]
     fn user_filters_choose_live_scopes_for_scim_lists() {
@@ -1454,5 +1614,89 @@ mod tests {
 
         let filter = parse_user_filter(Some("active eq false")).unwrap();
         assert!(matches!(filter.list_scope(), UserListScope::Disabled));
+    }
+
+    #[test]
+    fn scim_claims_require_exact_audience_and_operation_scope() {
+        let expected = "https://sso.example/scim/v2";
+        let read = token_claims(expected, "openid scim.read");
+        assert!(validate_scim_claims(&read, expected, ScimAccess::Read).is_ok());
+        assert!(matches!(
+            validate_scim_claims(&read, expected, ScimAccess::Write),
+            Err(ScimError {
+                status: StatusCode::FORBIDDEN,
+                ..
+            })
+        ));
+
+        let wrong_audience = token_claims("https://api.example", "scim.read");
+        assert!(matches!(
+            validate_scim_claims(&wrong_audience, expected, ScimAccess::Read),
+            Err(ScimError {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+        let prefixed_scope = token_claims(expected, "scim.reader");
+        assert!(validate_scim_claims(&prefixed_scope, expected, ScimAccess::Read).is_err());
+    }
+
+    #[test]
+    fn scim_claims_reject_client_credential_subjects() {
+        let expected = "https://sso.example/scim/v2";
+        let mut claims = token_claims(expected, "scim.read");
+        claims.sub = claims.client_id.clone();
+        assert!(matches!(
+            validate_scim_claims(&claims, expected, ScimAccess::Read),
+            Err(ScimError {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+
+        claims.sub = "service-account:scim-client".to_string();
+        assert!(validate_scim_claims(&claims, expected, ScimAccess::Read).is_err());
+    }
+
+    #[test]
+    fn scim_claims_reject_login_code_tokens() {
+        let expected = "https://sso.example/scim/v2";
+        for level in [
+            "account_recovery",
+            "admin_universal",
+            "trial_enrollment",
+            "future_level",
+        ] {
+            let mut claims = token_claims(expected, "scim.read scim.write");
+            claims.gpt_sso_login_code_level = Some(level.to_string());
+            assert!(matches!(
+                validate_scim_claims(&claims, expected, ScimAccess::Read),
+                Err(ScimError {
+                    status: StatusCode::UNAUTHORIZED,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn scim_internal_errors_are_sanitized() {
+        let error = ScimError::from(AppError::Database("private SQL detail".to_string()));
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.detail, "internal server error");
+        assert!(!error.detail.contains("SQL"));
+    }
+
+    #[test]
+    fn scim_scope_errors_include_rfc6750_challenge() {
+        let response = ScimError::insufficient_scope(SCIM_WRITE_SCOPE).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer realm=\"scim\", error=\"insufficient_scope\", scope=\"scim.write\"")
+        );
     }
 }

@@ -98,13 +98,13 @@ impl TokenExchangePolicy for DefaultTokenExchangePolicy<'_> {
     }
 
     fn assert_target(&self, client: &ClientRecord) -> AppResult<()> {
-        if let Some(audience) = self.input.audience.as_deref() {
-            if audience != client.client_id {
-                return Err(oauth_error(
-                    "invalid_target",
-                    "audience must match the authenticated client",
-                ));
-            }
+        if let Some(audience) = self.input.audience.as_deref()
+            && audience != client.client_id
+        {
+            return Err(oauth_error(
+                "invalid_target",
+                "audience must match the authenticated client",
+            ));
         }
         Ok(())
     }
@@ -131,6 +131,13 @@ pub async fn exchange_token(
         return Err(oauth_error(
             "invalid_grant",
             "client credentials tokens cannot be used as subject_token",
+        ));
+    }
+    if token_exchange_forbidden_login_code_level(subject_claims.gpt_sso_login_code_level.as_deref())
+    {
+        return Err(oauth_error(
+            "invalid_grant",
+            "authorization-code login tokens cannot be used as subject_token",
         ));
     }
     let user = load_active_user(state, &subject_claims.sub).await?;
@@ -187,13 +194,13 @@ fn validate_token_type(input: &TokenExchangeInput) -> AppResult<()> {
             "only access_token subject_token_type is supported",
         ));
     }
-    if let Some(requested) = input.requested_token_type.as_deref() {
-        if requested != ACCESS_TOKEN_TYPE {
-            return Err(oauth_error(
-                "invalid_request",
-                "only access_token requested_token_type is supported",
-            ));
-        }
+    if let Some(requested) = input.requested_token_type.as_deref()
+        && requested != ACCESS_TOKEN_TYPE
+    {
+        return Err(oauth_error(
+            "invalid_request",
+            "only access_token requested_token_type is supported",
+        ));
     }
     if input.actor_token.is_some() {
         return Err(oauth_error(
@@ -210,7 +217,14 @@ async fn load_active_user(state: &AppState, user_id: &str) -> AppResult<UserReco
         .find_user_by_id(user_id)
         .await?
         .ok_or_else(|| oauth_error("invalid_grant", "subject user does not exist"))?;
-    if user.is_active == 1 && user.archived_at.is_none() {
+    if user.is_active == 1
+        && user.archived_at.is_none()
+        && state
+            .db
+            .find_trial_enrollment_for_user(&user.id)
+            .await?
+            .is_none()
+    {
         Ok(user)
     } else {
         Err(oauth_error("invalid_grant", "subject user is not active"))
@@ -226,6 +240,36 @@ fn scope_set(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn token_exchange_forbidden_login_code_level(level: Option<&str>) -> bool {
+    level.is_some()
+}
+
 fn oauth_error(error: &str, description: &str) -> AppError {
     AppError::oauth(error, description, StatusCode::BAD_REQUEST)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_exchange_forbidden_login_code_level;
+
+    #[test]
+    fn ordinary_access_tokens_remain_eligible_for_exchange() {
+        assert!(!token_exchange_forbidden_login_code_level(None));
+    }
+
+    #[test]
+    fn privileged_login_code_tokens_cannot_be_exchanged() {
+        assert!(token_exchange_forbidden_login_code_level(Some(
+            "account_recovery"
+        )));
+        assert!(token_exchange_forbidden_login_code_level(Some(
+            "admin_universal"
+        )));
+        assert!(token_exchange_forbidden_login_code_level(Some(
+            "trial_enrollment"
+        )));
+        assert!(token_exchange_forbidden_login_code_level(Some(
+            "future_login_code_level"
+        )));
+    }
 }

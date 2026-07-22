@@ -3,18 +3,20 @@ use crate::{
     access::{Authorizer, Permission, PermissionInfo, permission_catalog},
     archived_accounts,
     audit::{self, AuditSink},
-    auth, auth_flow, backchannel_logout, claim_mapper, client_assertion, client_policy,
+    auth::{self, AccountCapabilities},
+    auth_flow, backchannel_logout, claim_mapper, client_assertion, client_policy, csrf,
     db::{
-        AuditEventRecord, GroupRecord, LinkedIdentityRecord, LoginEventRecord, NewClient,
+        AuditEventRecord, AuthorizationCodeType, GroupRecord, InvitationUpdate,
+        LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord, NewBulkProvisionedUser, NewClient,
         NewClientClaimMapper, NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation,
         NewLdapProvider, NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole,
         NewRuntimeSettings, NewSecurityPolicy, NewUser, OrganizationMemberInput,
         OrganizationMemberWithUserRecord, OrganizationRecord, PublicAuditWebhook, PublicClient,
         PublicClientClaimMapper, PublicExternalOidcProvider, PublicIapApplication,
-        PublicInvitation, PublicLdapProvider, PublicLoginSettings, PublicRegistrationSettings,
-        PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord, SecurityPolicyRecord,
-        SessionRecord, SigningKeyRecord, UserConsentWithClientRecord, UserListScope,
-        UserOrganizationRecord,
+        PublicInvitation, PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
+        PublicRegistrationSettings, PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord,
+        SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserConsentWithClientRecord,
+        UserListScope, UserOrganizationRecord, UserUpdate,
     },
     directory,
     error::{AppError, AppResult},
@@ -23,17 +25,19 @@ use crate::{
     mfa::{self, RecoveryCodeIssuer},
     mfa_policy::MfaDecision,
     network_policy::{self, TrustedNetworkPolicy},
-    organizations,
+    organizations::{self, OrganizationEmailPolicy},
     security_policy::{self, PasswordPolicy, PasswordSubject},
     service_accounts, subject, util, webhooks,
 };
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use axum_extra::extract::cookie::CookieJar;
+use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -43,10 +47,10 @@ use url::Url;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/health", get(health))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/csrf", get(csrf_token))
         .route("/api/me/sessions", get(list_my_sessions))
         .route("/api/me/sessions/{session_id}", delete(revoke_my_session))
         .route("/api/me/consents", get(list_my_consents))
@@ -84,6 +88,7 @@ pub fn routes() -> Router<AppState> {
             get(list_signing_keys).post(rotate_signing_key),
         )
         .route("/api/admin/users", get(list_users).post(create_user))
+        .route("/api/admin/users/import-csv", post(import_users_csv))
         .route(
             "/api/admin/users/{id}",
             get(user_detail).put(update_user).delete(delete_user),
@@ -94,7 +99,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/users/{id}/login-events", get(user_login_events))
         .route("/api/admin/users/{id}/permissions", get(user_permissions))
         .route("/api/admin/clients", get(list_clients).post(create_client))
-        .route("/api/admin/clients/{id}", put(update_client))
+        .route(
+            "/api/admin/clients/{id}",
+            put(update_client).delete(delete_client),
+        )
         .route(
             "/api/admin/iap-applications",
             get(list_iap_applications).post(create_iap_application),
@@ -139,12 +147,16 @@ pub fn routes() -> Router<AppState> {
             get(list_organizations).post(create_organization),
         )
         .route(
+            "/api/admin/organization-options",
+            get(list_organization_options),
+        )
+        .route(
             "/api/admin/organizations/{id}",
             put(update_organization).delete(delete_organization),
         )
         .route(
             "/api/admin/organizations/{id}/members",
-            put(update_organization_members),
+            get(list_organization_members).put(update_organization_members),
         )
         .route("/api/admin/users/{id}/access", get(user_access))
         .route("/api/admin/users/{id}/roles", put(update_user_roles))
@@ -153,12 +165,28 @@ pub fn routes() -> Router<AppState> {
             get(list_invitations).post(create_invitation),
         )
         .route(
+            "/api/admin/authorization-codes/{id}/reveal",
+            post(reveal_invitation_code),
+        )
+        .route(
+            "/api/admin/authorization-codes/{id}/redemptions",
+            get(list_invitation_redemptions),
+        )
+        .route(
             "/api/admin/authorization-codes/{id}",
             put(update_invitation).delete(delete_invitation),
         )
         .route(
             "/api/admin/invitations",
             get(list_invitations).post(create_invitation),
+        )
+        .route(
+            "/api/admin/invitations/{id}/reveal",
+            post(reveal_invitation_code),
+        )
+        .route(
+            "/api/admin/invitations/{id}/redemptions",
+            get(list_invitation_redemptions),
         )
         .route(
             "/api/admin/invitations/{id}",
@@ -190,19 +218,6 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    ok: bool,
-    service: &'static str,
-}
-
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        service: "gpt-sso",
-    })
-}
-
 #[derive(Debug, Deserialize)]
 struct LoginRequest {
     email: String,
@@ -212,6 +227,7 @@ struct LoginRequest {
     captcha_challenge_id: Option<String>,
     captcha_answer: Option<String>,
     return_to: Option<String>,
+    account_flow: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,14 +400,18 @@ async fn login(
             } else {
                 completion.method
             };
-            let jar = issue_password_session(
+            let jar = auth::issue_session_with_login_event(
                 &state,
                 jar,
                 &headers,
                 request_ip.clone(),
                 &user,
                 &completed_method,
-                external_provider.clone(),
+                auth::LoginEventContext {
+                    external_provider: external_provider.clone(),
+                    account_flow: payload.account_flow.clone(),
+                    ..Default::default()
+                },
             )
             .await?;
             auth::clear_login_failures(&state, &subject).await?;
@@ -412,14 +432,18 @@ async fn login(
         MfaDecision::Satisfied => {}
     }
 
-    let jar = issue_password_session(
+    let jar = auth::issue_session_with_login_event(
         &state,
         jar,
         &headers,
         request_ip,
         &user,
         &login_method,
-        external_provider,
+        auth::LoginEventContext {
+            external_provider,
+            account_flow: payload.account_flow,
+            ..Default::default()
+        },
     )
     .await?;
     auth::clear_login_failures(&state, &subject).await?;
@@ -438,28 +462,6 @@ async fn login(
     ))
 }
 
-async fn issue_password_session(
-    state: &AppState,
-    jar: CookieJar,
-    headers: &HeaderMap,
-    request_ip: Option<String>,
-    user: &crate::db::UserRecord,
-    method: &str,
-    external_provider: Option<String>,
-) -> AppResult<CookieJar> {
-    auth::issue_session_with_login_event(
-        state,
-        jar,
-        headers,
-        request_ip,
-        user,
-        method,
-        None,
-        external_provider,
-    )
-    .await
-}
-
 async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -468,11 +470,12 @@ async fn logout(
     let current = auth::current_user_from_cookie(&state, &jar).await?;
     let mut frontchannel_frames = Vec::new();
     if let Some(current) = current.as_ref() {
+        let public_session_id = util::session_public_id(&current.session_id);
         frontchannel_frames = match frontchannel_logout::frames_for_user(
             &state,
             &headers,
             &current.user,
-            current.session_id.as_str(),
+            &public_session_id,
         )
         .await
         {
@@ -486,15 +489,15 @@ async fn logout(
             &state,
             &headers,
             &current.user,
-            Some(current.session_id.as_str()),
+            Some(&public_session_id),
         )
         .await
         {
             tracing::warn!(error = %err, "back-channel logout notification failed");
         }
     }
-    if let Some(cookie) = jar.get(&state.settings.security.cookie_name) {
-        state.db.delete_session(cookie.value()).await?;
+    if let Some(current) = current.as_ref() {
+        state.db.delete_session(&current.session_id).await?;
     }
     Ok((
         jar.add(auth::expired_session_cookie(&state)),
@@ -547,7 +550,7 @@ async fn start_totp_setup(
     headers: HeaderMap,
 ) -> AppResult<Json<TotpSetupResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     let secret = mfa::generate_totp_secret();
     let setup = state
         .db
@@ -569,7 +572,7 @@ async fn confirm_totp_setup(
     Json(payload): Json<ConfirmTotpInput>,
 ) -> AppResult<Json<ConfirmTotpResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     let setup = state
         .db
         .find_mfa_totp_setup(&payload.setup_id)
@@ -612,7 +615,7 @@ async fn rotate_recovery_codes(
     jar: CookieJar,
 ) -> AppResult<Json<ConfirmTotpResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     if state.db.find_totp_method(&current.user.id).await?.is_none() {
         return Err(AppError::BadRequest("MFA is not enabled".to_string()));
     }
@@ -642,7 +645,7 @@ async fn disable_mfa(
     jar: CookieJar,
 ) -> AppResult<Json<MfaStatusResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     state.db.delete_mfa_for_user(&current.user.id).await?;
     state
         .db
@@ -677,8 +680,22 @@ async fn me(
         return Ok(Json(None));
     };
     Ok(Json(Some(
-        auth::current_user_response(&state, current.user).await?,
+        auth::current_user_response_for_session(&state, current).await?,
     )))
+}
+
+#[derive(Debug, Serialize)]
+struct CsrfTokenResponse {
+    csrf_token: String,
+}
+
+async fn csrf_token(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> AppResult<Json<CsrfTokenResponse>> {
+    Ok(Json(CsrfTokenResponse {
+        csrf_token: csrf::token_for_current_session(&state, &jar).await?,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -696,7 +713,7 @@ impl MySessionResponse {
     fn from_record(record: SessionRecord, current_session_id: &str) -> Self {
         Self {
             current: record.id == current_session_id,
-            id: record.id,
+            id: util::session_public_id(&record.id),
             ip_address: record.ip_address,
             user_agent: record.user_agent,
             login_method: record.login_method,
@@ -724,18 +741,25 @@ async fn list_my_sessions(
 async fn revoke_my_session(
     State(state): State<AppState>,
     jar: CookieJar,
-    Path(session_id): Path<String>,
+    Path(session_handle): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
-    if session_id == current.session_id {
+    auth::ensure_current_account_mutable(&current)?;
+    let target = state
+        .db
+        .list_user_sessions(&current.user.id)
+        .await?
+        .into_iter()
+        .find(|record| util::session_public_id(&record.id) == session_handle)
+        .ok_or(AppError::NotFound)?;
+    if target.id == current.session_id {
         return Err(AppError::BadRequest(
             "current session must be ended with logout".to_string(),
         ));
     }
     let revoked = state
         .db
-        .delete_user_session(&current.user.id, &session_id)
+        .delete_user_session(&current.user.id, &target.id)
         .await?;
     if !revoked {
         return Err(AppError::NotFound);
@@ -746,7 +770,7 @@ async fn revoke_my_session(
             current.user.id,
             "session.revoke",
             "session",
-            Some(session_id),
+            Some(session_handle),
             serde_json::json!({}),
         ))
         .await?;
@@ -816,7 +840,7 @@ async fn revoke_my_consent(
     Path(client_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_account_mutable(&current.user)?;
+    auth::ensure_current_account_mutable(&current)?;
     let revoked = state
         .db
         .revoke_user_consent(&current.user.id, &client_id)
@@ -1266,6 +1290,7 @@ async fn runtime_settings_response(
 
 #[derive(Debug, Deserialize)]
 struct LoginSettingsInput {
+    brand_logo_url: Option<String>,
     email_domains: Vec<String>,
     quick_links: Vec<QuickLink>,
 }
@@ -1284,12 +1309,22 @@ async fn update_login_settings(
     Json(payload): Json<LoginSettingsInput>,
 ) -> AppResult<Json<PublicLoginSettings>> {
     let current = require_settings_manager(&state, &jar).await?;
-    let quick_link_count = payload.quick_links.len();
+    let LoginSettingsInput {
+        brand_logo_url,
+        email_domains,
+        quick_links,
+    } = payload;
+    let quick_link_count = quick_links.len();
+    let brand_logo_url = match brand_logo_url {
+        Some(value) => normalize_brand_logo_url(value)?,
+        None => state.db.login_settings().await?.brand_logo_url,
+    };
     let settings = state
         .db
         .upsert_login_settings(NewLoginSettings {
-            email_domains: normalize_email_domains(payload.email_domains)?,
-            quick_links: normalize_quick_links(payload.quick_links)?,
+            brand_logo_url,
+            email_domains: normalize_email_domains(email_domains)?,
+            quick_links: normalize_quick_links(quick_links)?,
         })
         .await?;
     state
@@ -1319,6 +1354,16 @@ fn normalize_base_url(value: &str, field: &str) -> AppResult<String> {
 
 fn normalize_email_domains(values: Vec<String>) -> AppResult<Vec<String>> {
     security_policy::normalize_email_domain_rules(values)
+}
+
+fn normalize_brand_logo_url(value: String) -> AppResult<String> {
+    let value = normalize_optional_http_url(value, "brand_logo_url", false)?;
+    if value.len() > 2048 {
+        return Err(AppError::BadRequest(
+            "brand_logo_url exceeds 2048 characters".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 fn normalize_quick_links(values: Vec<QuickLink>) -> AppResult<Vec<QuickLink>> {
@@ -1399,6 +1444,8 @@ fn normalize_optional_email(value: Option<String>) -> AppResult<Option<String>> 
 #[derive(Debug, Deserialize)]
 struct UserListQuery {
     status: Option<String>,
+    organization_id: Option<String>,
+    linked_identity: Option<String>,
 }
 
 async fn list_users(
@@ -1408,14 +1455,47 @@ async fn list_users(
 ) -> AppResult<Json<Vec<PublicUser>>> {
     require_user_reader(&state, &jar).await?;
     let scope = user_list_scope(query.status.as_deref())?;
-    let users = state
-        .db
-        .list_users(scope)
-        .await?
-        .into_iter()
-        .map(|user| user.public())
-        .collect();
-    Ok(Json(users))
+    let mut users = state.db.list_users(scope).await?;
+    if let Some(organization_id) = query
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let member_ids = state
+            .db
+            .list_organization_members(organization_id)
+            .await?
+            .into_iter()
+            .map(|member| member.user_id)
+            .collect::<BTreeSet<_>>();
+        users.retain(|user| member_ids.contains(&user.id));
+    }
+    let linked_identity_filter = query
+        .linked_identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    match linked_identity_filter {
+        "all" => {}
+        "linked" | "unlinked" => {
+            let linked_user_ids = state
+                .db
+                .list_user_ids_with_linked_identities()
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let has_linked_identity = linked_identity_filter == "linked";
+            users.retain(|user| linked_user_ids.contains(&user.id) == has_linked_identity);
+        }
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported linked identity filter: {other}"
+            )));
+        }
+    }
+    Ok(Json(users.into_iter().map(|user| user.public()).collect()))
 }
 
 fn user_list_scope(status: Option<&str>) -> AppResult<UserListScope> {
@@ -1424,6 +1504,7 @@ fn user_list_scope(status: Option<&str>) -> AppResult<UserListScope> {
         "active" => Ok(UserListScope::Active),
         "disabled" => Ok(UserListScope::Disabled),
         "archived" => Ok(UserListScope::Archived),
+        "authorization_code" => Ok(UserListScope::AuthorizationCode),
         "all" => Ok(UserListScope::All),
         other => Err(AppError::BadRequest(format!(
             "unsupported user status filter: {other}"
@@ -1632,9 +1713,17 @@ struct OrganizationResponse {
     description: Option<String>,
     allowed_email_domains: Vec<String>,
     is_active: bool,
-    members: Vec<OrganizationMemberResponse>,
+    member_count: i64,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct OrganizationOptionResponse {
+    id: String,
+    slug: String,
+    name: String,
+    is_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1725,13 +1814,33 @@ const USER_READ_PERMISSIONS: &[Permission] = &[
     Permission::OrganizationsManage,
     Permission::SecurityManage,
 ];
-const CLIENT_READ_PERMISSIONS: &[Permission] =
-    &[Permission::ClientsRead, Permission::ClientsManage];
+const CLIENT_READ_PERMISSIONS: &[Permission] = &[
+    Permission::ClientsRead,
+    Permission::ClientsManage,
+    // Authorization-code operators need the non-secret client metadata from
+    // this endpoint to bind a recovery, trial, or universal code to an
+    // existing application. Client writes remain clients.manage-only.
+    Permission::AuthorizationCodesManage,
+];
 const IAP_READ_PERMISSIONS: &[Permission] = &[Permission::IapRead, Permission::IapManage];
 const ORGANIZATION_READ_PERMISSIONS: &[Permission] = &[
     Permission::OrganizationsRead,
     Permission::OrganizationsManage,
+];
+const ORGANIZATION_OPTION_PERMISSIONS: &[Permission] = &[
+    Permission::OrganizationsRead,
+    Permission::OrganizationsManage,
+    // User-directory readers need organization names to narrow the account
+    // list, without receiving the organization member roster.
+    Permission::UsersRead,
+    Permission::UsersManage,
+    // Authorization-code managers need non-sensitive organization metadata to
+    // bind an enrollment code, without gaining access to organization members
+    // or full organization administration.
+    Permission::AuthorizationCodesManage,
     Permission::ClientsManage,
+    Permission::IapRead,
+    Permission::IapManage,
     Permission::ProvidersManage,
 ];
 
@@ -1798,6 +1907,13 @@ async fn require_organization_reader(
     require_any_permission(state, jar, ORGANIZATION_READ_PERMISSIONS).await
 }
 
+async fn require_organization_option_reader(
+    state: &AppState,
+    jar: &CookieJar,
+) -> AppResult<auth::CurrentUser> {
+    require_any_permission(state, jar, ORGANIZATION_OPTION_PERMISSIONS).await
+}
+
 async fn require_organization_manager(
     state: &AppState,
     jar: &CookieJar,
@@ -1811,6 +1927,9 @@ async fn require_permission(
     permission: Permission,
 ) -> AppResult<auth::CurrentUser> {
     let current = auth::require_current_user(state, jar).await?;
+    if !current.can_mutate_account() {
+        return Err(AppError::Forbidden);
+    }
     state
         .db
         .require_permission(&current.user, permission)
@@ -1824,6 +1943,9 @@ async fn require_any_permission(
     permissions: &[Permission],
 ) -> AppResult<auth::CurrentUser> {
     let current = auth::require_current_user(state, jar).await?;
+    if !current.can_mutate_account() {
+        return Err(AppError::Forbidden);
+    }
     state
         .db
         .require_any_permission(&current.user, permissions)
@@ -1868,13 +1990,17 @@ async fn organization_response(
     state: &AppState,
     organization: OrganizationRecord,
 ) -> AppResult<OrganizationResponse> {
-    let members = state
+    let member_count = state
         .db
-        .list_organization_members(&organization.id)
-        .await?
-        .into_iter()
-        .map(organization_member_response)
-        .collect();
+        .count_organization_members(&organization.id)
+        .await?;
+    organization_response_with_member_count(organization, member_count)
+}
+
+fn organization_response_with_member_count(
+    organization: OrganizationRecord,
+    member_count: i64,
+) -> AppResult<OrganizationResponse> {
     Ok(OrganizationResponse {
         id: organization.id,
         slug: organization.slug,
@@ -1886,7 +2012,7 @@ async fn organization_response(
             &organization.allowed_email_domains,
         )?)?,
         is_active: organization.is_active == 1,
-        members,
+        member_count,
         created_at: organization.created_at,
         updated_at: organization.updated_at,
     })
@@ -2205,11 +2331,40 @@ async fn list_organizations(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<OrganizationResponse>>> {
     require_organization_reader(&state, &jar).await?;
+    let member_counts = state.db.list_organization_member_counts().await?;
     let mut response = Vec::new();
     for organization in state.db.list_organizations().await? {
-        response.push(organization_response(&state, organization).await?);
+        let member_count = member_counts
+            .get(&organization.id)
+            .copied()
+            .unwrap_or_default();
+        response.push(organization_response_with_member_count(
+            organization,
+            member_count,
+        )?);
     }
     Ok(Json(response))
+}
+
+async fn list_organization_options(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> AppResult<Json<Vec<OrganizationOptionResponse>>> {
+    require_organization_option_reader(&state, &jar).await?;
+    Ok(Json(
+        state
+            .db
+            .list_organizations()
+            .await?
+            .into_iter()
+            .map(|organization| OrganizationOptionResponse {
+                id: organization.id,
+                slug: organization.slug,
+                name: organization.name,
+                is_active: organization.is_active == 1,
+            })
+            .collect(),
+    ))
 }
 
 async fn create_organization(
@@ -2282,6 +2437,28 @@ async fn delete_organization(
         ))
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn list_organization_members(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<OrganizationMemberResponse>>> {
+    require_organization_manager(&state, &jar).await?;
+    state
+        .db
+        .find_organization_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(
+        state
+            .db
+            .list_organization_members(&id)
+            .await?
+            .into_iter()
+            .map(organization_member_response)
+            .collect(),
+    ))
 }
 
 async fn update_organization_members(
@@ -2378,6 +2555,78 @@ struct UserInput {
     is_active: bool,
 }
 
+const BULK_IMPORT_MAX_BYTES: usize = 1_048_576;
+const BULK_IMPORT_MAX_ROWS: usize = 1_000;
+const BULK_IMPORT_HEADERS: [&str; 6] = [
+    "email",
+    "username",
+    "display_name",
+    "organization_slug",
+    "organization_role",
+    "is_active",
+];
+
+#[derive(Debug, Deserialize, Default)]
+struct BulkImportQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct BulkImportResponse {
+    dry_run: bool,
+    atomic: bool,
+    committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_error: Option<String>,
+    summary: BulkImportSummary,
+    rows: Vec<BulkImportRowResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct BulkImportSummary {
+    total: usize,
+    created: usize,
+    would_create: usize,
+    invalid: usize,
+    not_committed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BulkImportRowResponse {
+    /// The physical CSV line, where the header is line 1.
+    row: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    /// `created`, `would_create`, `invalid`, or `not_committed`.
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BulkImportCandidate {
+    result_index: usize,
+    email: String,
+    username: String,
+    display_name: Option<String>,
+    organization_slug: Option<String>,
+    organization_role: Option<String>,
+    organization_id: Option<String>,
+    is_active: bool,
+}
+
+#[derive(Debug)]
+struct ParsedBulkImport {
+    rows: Vec<BulkImportRowResponse>,
+    candidates: Vec<BulkImportCandidate>,
+    has_organization_assignments: bool,
+}
+
 #[derive(Debug)]
 struct NormalizedUserInput {
     email: String,
@@ -2416,6 +2665,599 @@ fn normalize_required_text(value: String, field: &str) -> AppResult<String> {
     } else {
         Ok(value)
     }
+}
+
+/// Import new enterprise accounts from a CSV document.
+///
+/// The endpoint is intentionally insert-only.  A dry run performs the same
+/// validation and collision checks as a commit, while a commit creates all
+/// users and organization memberships in one database transaction.
+async fn import_users_csv(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<BulkImportQuery>,
+    csv_document: String,
+) -> AppResult<Response> {
+    let current = require_user_manager(&state, &jar).await?;
+    if csv_document.len() > BULK_IMPORT_MAX_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "CSV import exceeds the {} byte limit",
+            BULK_IMPORT_MAX_BYTES
+        )));
+    }
+
+    let mut batch = match parse_bulk_import_csv(&csv_document) {
+        Ok(batch) => batch,
+        Err(message) => {
+            record_bulk_import_audit(
+                &state,
+                &current.user.id,
+                query.dry_run,
+                false,
+                &[],
+                Some(&message),
+            )
+            .await?;
+            return Err(AppError::BadRequest(message));
+        }
+    };
+
+    // A user manager may create unassigned accounts, but assigning an
+    // organization owner/admin/member is organization administration too.
+    if batch.has_organization_assignments {
+        state
+            .db
+            .require_permission(&current.user, Permission::OrganizationsManage)
+            .await?;
+    }
+
+    validate_bulk_import_duplicates(&mut batch);
+    validate_bulk_import_existing_identities(&state, &mut batch).await?;
+    validate_bulk_import_organizations(&state, &mut batch).await?;
+
+    if bulk_import_has_invalid_rows(&batch.rows) {
+        mark_bulk_import_not_committed(&mut batch.rows);
+        let batch_error = "the CSV contains invalid rows; no accounts were imported";
+        record_bulk_import_audit(
+            &state,
+            &current.user.id,
+            query.dry_run,
+            false,
+            &batch.rows,
+            Some(batch_error),
+        )
+        .await?;
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(bulk_import_response(
+                query.dry_run,
+                false,
+                Some(batch_error.to_string()),
+                batch.rows,
+            )),
+        )
+            .into_response());
+    }
+
+    if query.dry_run {
+        record_bulk_import_audit(&state, &current.user.id, true, false, &batch.rows, None).await?;
+        return Ok(Json(bulk_import_response(true, false, None, batch.rows)).into_response());
+    }
+
+    // Imported accounts have a cryptographically random, undisclosed initial
+    // password.  The same per-batch hash is safe because its plaintext is not
+    // returned, logged, or retained; it also avoids an expensive Argon2 run
+    // for every CSV row.  Administrators can subsequently use the ordinary
+    // password-reset/activation path for each account.
+    let initial_password_hash =
+        util::hash_password(&format!("BulkProvisioned-{}9!", util::random_token(48)))?;
+    let users = batch
+        .candidates
+        .iter()
+        .filter(|candidate| batch.rows[candidate.result_index].outcome == "would_create")
+        .map(|candidate| NewBulkProvisionedUser {
+            user: NewUser {
+                email: candidate.email.clone(),
+                username: candidate.username.clone(),
+                display_name: candidate.display_name.clone(),
+                phone: None,
+                password_hash: initial_password_hash.clone(),
+                email_verified_at: Some(util::now_ts()),
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: candidate.is_active,
+                archived_at: None,
+            },
+            organization_id: candidate.organization_id.clone(),
+            organization_role: candidate.organization_role.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let created = match state.db.insert_bulk_provisioned_users(users).await {
+        Ok(users) => users,
+        Err(error)
+            if matches!(
+                &error,
+                AppError::BadRequest(_) | AppError::Forbidden | AppError::NotFound
+            ) =>
+        {
+            // The preflight passed, so a validation failure here means the
+            // database changed between preflight and the transaction.  The DB
+            // method rolls the entire transaction back.
+            mark_bulk_import_not_committed(&mut batch.rows);
+            let batch_error =
+                "the directory changed while this batch was committing; no accounts were imported";
+            record_bulk_import_audit(
+                &state,
+                &current.user.id,
+                false,
+                false,
+                &batch.rows,
+                Some(batch_error),
+            )
+            .await?;
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(bulk_import_response(
+                    false,
+                    false,
+                    Some(batch_error.to_string()),
+                    batch.rows,
+                )),
+            )
+                .into_response());
+        }
+        Err(error) => return Err(error),
+    };
+
+    for (candidate, user) in batch.candidates.iter().zip(created) {
+        let row = &mut batch.rows[candidate.result_index];
+        row.outcome = "created".to_string();
+        row.user_id = Some(user.id);
+    }
+    record_bulk_import_audit(&state, &current.user.id, false, true, &batch.rows, None).await?;
+    Ok(Json(bulk_import_response(false, true, None, batch.rows)).into_response())
+}
+
+fn parse_bulk_import_csv(csv_document: &str) -> Result<ParsedBulkImport, String> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_reader(csv_document.as_bytes());
+    let header_positions = bulk_import_header_positions(
+        &reader
+            .headers()
+            .map_err(|error| format!("CSV header is invalid: {error}"))?
+            .clone(),
+    )?;
+
+    let mut rows = Vec::new();
+    let mut candidates = Vec::new();
+    let mut has_organization_assignments = false;
+    for (index, record) in reader.records().enumerate() {
+        if index >= BULK_IMPORT_MAX_ROWS {
+            return Err(format!(
+                "CSV import exceeds the {BULK_IMPORT_MAX_ROWS} row limit"
+            ));
+        }
+        let record = record.map_err(|error| format!("CSV row is invalid: {error}"))?;
+        let row = record
+            .position()
+            .map(|position| position.line() as usize)
+            .unwrap_or(index + 2);
+        let result_index = rows.len();
+        let email_raw = bulk_import_csv_value(&record, &header_positions, "email");
+        let username_raw = bulk_import_csv_value(&record, &header_positions, "username");
+        rows.push(BulkImportRowResponse {
+            row,
+            email: (!email_raw.is_empty()).then(|| email_raw.to_string()),
+            username: (!username_raw.is_empty()).then(|| username_raw.to_string()),
+            outcome: "would_create".to_string(),
+            user_id: None,
+            error: None,
+        });
+
+        if record.len() != BULK_IMPORT_HEADERS.len() {
+            mark_bulk_import_row_invalid(
+                &mut rows,
+                result_index,
+                format!(
+                    "expected {} columns but found {}",
+                    BULK_IMPORT_HEADERS.len(),
+                    record.len()
+                ),
+            );
+            continue;
+        }
+
+        let email = match normalize_required_email(email_raw.to_string()) {
+            Ok(value) => {
+                rows[result_index].email = Some(value.clone());
+                Some(value)
+            }
+            Err(error) => {
+                mark_bulk_import_row_invalid(&mut rows, result_index, error.to_string());
+                None
+            }
+        };
+        let username = match normalize_required_text(username_raw.to_string(), "username") {
+            Ok(value) => {
+                rows[result_index].username = Some(value.clone());
+                Some(value)
+            }
+            Err(error) => {
+                mark_bulk_import_row_invalid(&mut rows, result_index, error.to_string());
+                None
+            }
+        };
+        let display_name = normalize_optional_text(
+            (!bulk_import_csv_value(&record, &header_positions, "display_name").is_empty()).then(
+                || bulk_import_csv_value(&record, &header_positions, "display_name").to_string(),
+            ),
+        );
+        let organization_slug_raw =
+            bulk_import_csv_value(&record, &header_positions, "organization_slug");
+        let organization_role_raw =
+            bulk_import_csv_value(&record, &header_positions, "organization_role");
+        if !organization_slug_raw.is_empty() {
+            has_organization_assignments = true;
+        }
+        let organization_slug = if organization_slug_raw.is_empty() {
+            None
+        } else {
+            match organizations::normalize_slug(organization_slug_raw) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    mark_bulk_import_row_invalid(&mut rows, result_index, error.to_string());
+                    None
+                }
+            }
+        };
+        let organization_role = if organization_role_raw.is_empty() {
+            None
+        } else {
+            match organizations::normalize_role(organization_role_raw) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    mark_bulk_import_row_invalid(&mut rows, result_index, error.to_string());
+                    None
+                }
+            }
+        };
+        match (&organization_slug, &organization_role) {
+            (Some(_), None) => mark_bulk_import_row_invalid(
+                &mut rows,
+                result_index,
+                "organization_role is required when organization_slug is set",
+            ),
+            (None, Some(_)) => mark_bulk_import_row_invalid(
+                &mut rows,
+                result_index,
+                "organization_role must be empty when organization_slug is empty",
+            ),
+            _ => {}
+        }
+        let is_active = match parse_bulk_import_is_active(bulk_import_csv_value(
+            &record,
+            &header_positions,
+            "is_active",
+        )) {
+            Ok(value) => Some(value),
+            Err(message) => {
+                mark_bulk_import_row_invalid(&mut rows, result_index, message);
+                None
+            }
+        };
+
+        if let (Some(email), Some(username), Some(is_active)) = (email, username, is_active)
+            && rows[result_index].outcome != "invalid"
+        {
+            candidates.push(BulkImportCandidate {
+                result_index,
+                email,
+                username,
+                display_name,
+                organization_slug,
+                organization_role,
+                organization_id: None,
+                is_active,
+            });
+        }
+    }
+
+    if rows.is_empty() {
+        return Err("CSV import must contain at least one data row".to_string());
+    }
+    Ok(ParsedBulkImport {
+        rows,
+        candidates,
+        has_organization_assignments,
+    })
+}
+
+fn bulk_import_header_positions(
+    headers: &csv::StringRecord,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut positions = BTreeMap::new();
+    for (index, value) in headers.iter().enumerate() {
+        let value = if index == 0 {
+            value.strip_prefix('\u{feff}').unwrap_or(value)
+        } else {
+            value
+        };
+        let value = value.trim().to_ascii_lowercase();
+        if !BULK_IMPORT_HEADERS.contains(&value.as_str()) {
+            return Err(format!("unexpected CSV column: {value}"));
+        }
+        if positions.insert(value.clone(), index).is_some() {
+            return Err(format!("CSV column appears more than once: {value}"));
+        }
+    }
+    for required in BULK_IMPORT_HEADERS {
+        if !positions.contains_key(required) {
+            return Err(format!("CSV column is required: {required}"));
+        }
+    }
+    if headers.len() != BULK_IMPORT_HEADERS.len() {
+        return Err("CSV header must contain exactly the supported columns".to_string());
+    }
+    Ok(positions)
+}
+
+fn bulk_import_csv_value<'a>(
+    record: &'a csv::StringRecord,
+    header_positions: &BTreeMap<String, usize>,
+    field: &str,
+) -> &'a str {
+    record
+        .get(*header_positions.get(field).expect("validated CSV header"))
+        .unwrap_or_default()
+        .trim()
+}
+
+fn parse_bulk_import_is_active(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err("is_active must be true or false".to_string()),
+    }
+}
+
+fn mark_bulk_import_row_invalid(
+    rows: &mut [BulkImportRowResponse],
+    index: usize,
+    message: impl Into<String>,
+) {
+    let row = &mut rows[index];
+    let message = message.into();
+    row.outcome = "invalid".to_string();
+    match &mut row.error {
+        Some(existing) if !existing.contains(&message) => {
+            existing.push_str("; ");
+            existing.push_str(&message);
+        }
+        Some(_) => {}
+        None => row.error = Some(message),
+    }
+}
+
+fn validate_bulk_import_duplicates(batch: &mut ParsedBulkImport) {
+    let mut email_rows = BTreeMap::<String, usize>::new();
+    let mut username_rows = BTreeMap::<String, usize>::new();
+    for candidate in batch.candidates.clone() {
+        if let Some(first_index) =
+            email_rows.insert(candidate.email.clone(), candidate.result_index)
+            && first_index != candidate.result_index
+        {
+            let first_row = batch.rows[first_index].row;
+            let duplicate_row = batch.rows[candidate.result_index].row;
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                first_index,
+                format!("email duplicates CSV row {duplicate_row}"),
+            );
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                format!("email duplicates CSV row {first_row}"),
+            );
+        }
+        if let Some(first_index) =
+            username_rows.insert(candidate.username.clone(), candidate.result_index)
+            && first_index != candidate.result_index
+        {
+            let first_row = batch.rows[first_index].row;
+            let duplicate_row = batch.rows[candidate.result_index].row;
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                first_index,
+                format!("username duplicates CSV row {duplicate_row}"),
+            );
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                format!("username duplicates CSV row {first_row}"),
+            );
+        }
+    }
+}
+
+async fn validate_bulk_import_existing_identities(
+    state: &AppState,
+    batch: &mut ParsedBulkImport,
+) -> AppResult<()> {
+    for candidate in batch.candidates.clone() {
+        if batch.rows[candidate.result_index].outcome == "invalid" {
+            continue;
+        }
+        if state
+            .db
+            .find_user_by_email(&candidate.email)
+            .await?
+            .is_some()
+        {
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                "email already belongs to an existing account",
+            );
+        }
+        if state
+            .db
+            .find_user_by_username(&candidate.username)
+            .await?
+            .is_some()
+        {
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                "username already belongs to an existing account",
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn validate_bulk_import_organizations(
+    state: &AppState,
+    batch: &mut ParsedBulkImport,
+) -> AppResult<()> {
+    let organizations_by_slug = state
+        .db
+        .list_organizations()
+        .await?
+        .into_iter()
+        .map(|organization| (organization.slug.clone(), organization))
+        .collect::<BTreeMap<_, _>>();
+    for (candidate_index, candidate) in batch.candidates.clone().into_iter().enumerate() {
+        if batch.rows[candidate.result_index].outcome == "invalid" {
+            continue;
+        }
+        let Some(slug) = candidate.organization_slug.as_deref() else {
+            continue;
+        };
+        let Some(organization) = organizations_by_slug.get(slug) else {
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                "organization_slug does not reference an existing organization",
+            );
+            continue;
+        };
+        if organization.is_active != 1 {
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                "organization is inactive",
+            );
+            continue;
+        }
+        if !organization.allows_email(&candidate.email)? {
+            mark_bulk_import_row_invalid(
+                &mut batch.rows,
+                candidate.result_index,
+                "email is not allowed by the organization policy",
+            );
+            continue;
+        }
+        batch.candidates[candidate_index].organization_id = Some(organization.id.clone());
+    }
+    Ok(())
+}
+
+fn bulk_import_has_invalid_rows(rows: &[BulkImportRowResponse]) -> bool {
+    rows.iter().any(|row| row.outcome == "invalid")
+}
+
+fn mark_bulk_import_not_committed(rows: &mut [BulkImportRowResponse]) {
+    for row in rows {
+        if row.outcome == "would_create" {
+            row.outcome = "not_committed".to_string();
+        }
+    }
+}
+
+fn bulk_import_summary(rows: &[BulkImportRowResponse]) -> BulkImportSummary {
+    let mut summary = BulkImportSummary {
+        total: rows.len(),
+        created: 0,
+        would_create: 0,
+        invalid: 0,
+        not_committed: 0,
+    };
+    for row in rows {
+        match row.outcome.as_str() {
+            "created" => summary.created += 1,
+            "would_create" => summary.would_create += 1,
+            "invalid" => summary.invalid += 1,
+            "not_committed" => summary.not_committed += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+fn bulk_import_response(
+    dry_run: bool,
+    committed: bool,
+    batch_error: Option<String>,
+    rows: Vec<BulkImportRowResponse>,
+) -> BulkImportResponse {
+    BulkImportResponse {
+        dry_run,
+        atomic: true,
+        committed,
+        batch_error,
+        summary: bulk_import_summary(&rows),
+        rows,
+    }
+}
+
+async fn record_bulk_import_audit(
+    state: &AppState,
+    actor_user_id: &str,
+    dry_run: bool,
+    committed: bool,
+    rows: &[BulkImportRowResponse],
+    batch_error: Option<&str>,
+) -> AppResult<()> {
+    let summary = bulk_import_summary(rows);
+    let outcome = if committed || (dry_run && batch_error.is_none()) {
+        audit::AuditOutcome::Success
+    } else {
+        audit::AuditOutcome::Failure
+    };
+    let action = if dry_run && batch_error.is_none() {
+        "user.bulk_import.dry_run"
+    } else if committed {
+        "user.bulk_import"
+    } else {
+        "user.bulk_import.rejected"
+    };
+    state
+        .db
+        .record_audit_event(audit::AuditEvent {
+            actor_user_id: Some(actor_user_id.to_string()),
+            actor_client_id: None,
+            action: action.to_string(),
+            target_kind: "user_bulk_import".to_string(),
+            target_id: None,
+            outcome,
+            ip_address: None,
+            user_agent: None,
+            details: serde_json::json!({
+                "dry_run": dry_run,
+                "committed": committed,
+                "total": summary.total,
+                "created": summary.created,
+                "would_create": summary.would_create,
+                "invalid": summary.invalid,
+                "not_committed": summary.not_committed,
+                "error": batch_error,
+            }),
+        })
+        .await
 }
 
 async fn validate_password_for_subject(
@@ -2491,15 +3333,15 @@ async fn update_user(
     }
     let user = state
         .db
-        .update_user(
-            &id,
-            payload.email,
-            payload.username,
-            payload.display_name,
-            payload.phone,
-            payload.is_admin,
-            payload.is_active,
-        )
+        .update_user(UserUpdate {
+            id: &id,
+            email: payload.email,
+            username: payload.username,
+            display_name: payload.display_name,
+            phone: payload.phone,
+            is_admin: payload.is_admin,
+            is_active: payload.is_active,
+        })
         .await?;
     if let Some(password) = payload.password {
         state
@@ -2756,6 +3598,8 @@ struct ClientInput {
     client_id: String,
     client_name: String,
     #[serde(default)]
+    logo_uri: String,
+    #[serde(default)]
     organization_id: Option<String>,
     client_secret: Option<String>,
     redirect_uris: Vec<String>,
@@ -2921,6 +3765,34 @@ async fn update_client(
     ))
 }
 
+async fn delete_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = require_client_manager(&state, &jar).await?;
+    let client = state
+        .db
+        .find_client_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state.db.delete_client(&id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "client.delete",
+            "client",
+            Some(id),
+            serde_json::json!({
+                "client_id": client.client_id,
+                "organization_id": client.organization_id
+            }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 #[derive(Debug, Deserialize)]
 struct IapApplicationInput {
     slug: String,
@@ -3035,29 +3907,164 @@ async fn list_invitations(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicInvitation>>> {
     require_authorization_code_manager(&state, &jar).await?;
-    let mut redemptions = BTreeMap::<String, Vec<_>>::new();
-    for redemption in state.db.list_invitation_redemptions().await? {
-        redemptions
-            .entry(redemption.invitation_id.clone())
-            .or_default()
-            .push(redemption.public());
-    }
     Ok(Json(
         state
             .db
             .list_invitations()
             .await?
             .into_iter()
-            .map(|invitation| {
-                let id = invitation.id.clone();
-                invitation.public_with_redemptions(redemptions.remove(&id).unwrap_or_default())
-            })
-            .collect(),
+            .map(crate::db::InvitationRecord::public)
+            .collect::<AppResult<Vec<_>>>()?,
     ))
+}
+
+#[derive(Debug, Serialize)]
+struct InvitationRevealResponse {
+    code: String,
+}
+
+/// Deliberately uses POST: revealing a credential is sensitive, should not be
+/// link-prefetched, and receives the same CSRF protection as other management
+/// operations.  List responses never include the ciphertext or plaintext.
+async fn reveal_invitation_code(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<InvitationRevealResponse>> {
+    let current = require_authorization_code_manager(&state, &jar).await?;
+    let invitation = state
+        .db
+        .find_invitation_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let key_id = invitation.code_reveal_key_id.clone().ok_or_else(|| {
+        AppError::BadRequest(
+            "this authorization code was created before secure reveal was available".to_string(),
+        )
+    })?;
+    let ciphertext = invitation.code_reveal_ciphertext.clone().ok_or_else(|| {
+        AppError::BadRequest(
+            "this authorization code was created before secure reveal was available".to_string(),
+        )
+    })?;
+    let signing_key = state
+        .db
+        .list_signing_keys()
+        .await?
+        .into_iter()
+        .find(|key| key.kid == key_id)
+        .ok_or_else(|| {
+            AppError::Configuration(
+                "authorization code reveal key is unavailable; retain retired signing keys while revealable codes exist"
+                    .to_string(),
+            )
+        })?;
+    let code =
+        util::decrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &ciphertext)?;
+    if util::token_hash(&code) != invitation.code_hash {
+        return Err(AppError::Internal(
+            "decrypted authorization code does not match its stored verifier".to_string(),
+        ));
+    }
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "authorization_code.reveal",
+            "authorization_code",
+            Some(invitation.id),
+            serde_json::json!({
+                "code_type": invitation.code_type,
+                "login_code_level": invitation.login_code_level,
+            }),
+        ))
+        .await?;
+    Ok(Json(InvitationRevealResponse { code }))
+}
+
+const INVITATION_REDEMPTIONS_DEFAULT_PAGE_SIZE: usize = 50;
+const INVITATION_REDEMPTIONS_MAX_PAGE_SIZE: usize = 100;
+
+#[derive(Debug, Deserialize)]
+struct InvitationRedemptionsQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct InvitationRedemptionsResponse {
+    redemptions: Vec<PublicInvitationRedemption>,
+    next_cursor: Option<String>,
+}
+
+fn parse_invitation_redemptions_cursor(value: Option<&str>) -> AppResult<Option<(i64, String)>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (redeemed_at, id) = value.rsplit_once(':').ok_or_else(|| {
+        AppError::BadRequest("invalid authorization-code redemption cursor".to_string())
+    })?;
+    let redeemed_at = redeemed_at.parse::<i64>().map_err(|_| {
+        AppError::BadRequest("invalid authorization-code redemption cursor".to_string())
+    })?;
+    if id.is_empty() || id.len() > 128 {
+        return Err(AppError::BadRequest(
+            "invalid authorization-code redemption cursor".to_string(),
+        ));
+    }
+    Ok(Some((redeemed_at, id.to_string())))
+}
+
+async fn list_invitation_redemptions(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Query(query): Query<InvitationRedemptionsQuery>,
+) -> AppResult<Json<InvitationRedemptionsResponse>> {
+    require_authorization_code_manager(&state, &jar).await?;
+    state
+        .db
+        .find_invitation_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let limit = query
+        .limit
+        .unwrap_or(INVITATION_REDEMPTIONS_DEFAULT_PAGE_SIZE);
+    if !(1..=INVITATION_REDEMPTIONS_MAX_PAGE_SIZE).contains(&limit) {
+        return Err(AppError::BadRequest(format!(
+            "authorization-code redemption limit must be between 1 and {INVITATION_REDEMPTIONS_MAX_PAGE_SIZE}"
+        )));
+    }
+    let cursor = parse_invitation_redemptions_cursor(query.cursor.as_deref())?;
+    let mut records = state
+        .db
+        .list_invitation_redemptions_for_invitation(&id, cursor, (limit + 1) as i32)
+        .await?;
+    let has_more = records.len() > limit;
+    records.truncate(limit);
+    let next_cursor = has_more
+        .then(|| {
+            records
+                .last()
+                .map(|record| format!("{}:{}", record.redeemed_at, record.id))
+        })
+        .flatten();
+    Ok(Json(InvitationRedemptionsResponse {
+        redemptions: records
+            .into_iter()
+            .map(crate::db::InvitationRedemptionRecord::public)
+            .collect(),
+        next_cursor,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
 struct InvitationInput {
+    code_type: Option<AuthorizationCodeType>,
+    login_code_level: Option<LoginCodeLevel>,
+    allowed_client_ids: Option<Vec<String>>,
+    organization_id: Option<String>,
+    organization_role: Option<String>,
     description: Option<String>,
     authorized_email: Option<String>,
     authorized_username: Option<String>,
@@ -3065,6 +4072,329 @@ struct InvitationInput {
     expires_at: Option<i64>,
     max_uses: Option<i32>,
     is_active: bool,
+}
+
+fn normalized_client_ids(values: Option<Vec<String>>) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn immutable_allowed_client_ids(
+    existing: Vec<String>,
+    requested: Option<Vec<String>>,
+) -> AppResult<Vec<String>> {
+    let existing = normalized_client_ids(Some(existing));
+    let Some(requested) = requested else {
+        return Ok(existing);
+    };
+    if normalized_client_ids(Some(requested)) != existing {
+        return Err(AppError::BadRequest(
+            "allowed_client_ids cannot be changed after creation".to_string(),
+        ));
+    }
+    Ok(existing)
+}
+
+fn immutable_optional_text(
+    field: &str,
+    existing: Option<&str>,
+    requested: Option<String>,
+) -> AppResult<Option<String>> {
+    let existing = existing
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(requested) = requested else {
+        return Ok(existing);
+    };
+    let requested = normalize_optional_text(Some(requested));
+    if requested != existing {
+        return Err(AppError::BadRequest(format!(
+            "{field} cannot be changed after trial enrollment code creation"
+        )));
+    }
+    Ok(existing)
+}
+
+fn immutable_recovery_username(
+    existing: Option<&str>,
+    requested: Option<String>,
+) -> AppResult<Option<String>> {
+    let existing = existing
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Configuration(
+                "account recovery authorization code is missing its bound username".to_string(),
+            )
+        })?
+        .to_string();
+    let Some(requested) = requested else {
+        return Ok(Some(existing));
+    };
+    let requested = normalize_optional_text(Some(requested)).ok_or_else(|| {
+        AppError::BadRequest(
+            "authorized_username cannot be cleared after account recovery code creation"
+                .to_string(),
+        )
+    })?;
+    if requested != existing {
+        return Err(AppError::BadRequest(
+            "authorized_username cannot be changed after account recovery code creation"
+                .to_string(),
+        ));
+    }
+    Ok(Some(existing))
+}
+
+fn ensure_admin_universal_manager(
+    user: &crate::db::UserRecord,
+    code_type: AuthorizationCodeType,
+    login_code_level: LoginCodeLevel,
+) -> AppResult<()> {
+    if code_type == AuthorizationCodeType::Login
+        && login_code_level == LoginCodeLevel::AdminUniversal
+        && user.is_admin != 1
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn ensure_trial_enrollment_role_manager(
+    state: &AppState,
+    user: &crate::db::UserRecord,
+    code_type: AuthorizationCodeType,
+    login_code_level: LoginCodeLevel,
+    _organization_role: Option<&str>,
+) -> AppResult<()> {
+    if code_type == AuthorizationCodeType::Login
+        && login_code_level == LoginCodeLevel::TrialEnrollment
+    {
+        // An enrollment code grants organization membership, even for the
+        // default member role. Keep that authority with organization managers
+        // rather than broad authorization-code operators.
+        state
+            .db
+            .require_permission(user, Permission::OrganizationsManage)
+            .await?;
+    }
+    Ok(())
+}
+
+fn recovery_target_user_id(
+    username: &str,
+    user: Option<crate::db::UserRecord>,
+) -> AppResult<String> {
+    let user = user.ok_or_else(|| {
+        AppError::BadRequest(
+            "account recovery authorization codes require an existing account".to_string(),
+        )
+    })?;
+    if user.username != username {
+        return Err(AppError::BadRequest(
+            "authorized_username must exactly match the existing account username".to_string(),
+        ));
+    }
+    if user.is_active != 1 || user.archived_at.is_some() {
+        return Err(AppError::BadRequest(
+            "account recovery authorization codes require an active account".to_string(),
+        ));
+    }
+    Ok(user.id)
+}
+
+fn validate_login_code_binding_metadata(
+    login_code_level: LoginCodeLevel,
+    authorized_email: Option<&str>,
+    authorized_username: Option<&str>,
+    authorized_display_name: Option<&str>,
+) -> AppResult<()> {
+    if authorized_email.is_some() || authorized_display_name.is_some() {
+        return Err(AppError::BadRequest(
+            "login authorization codes cannot set email or display-name metadata".to_string(),
+        ));
+    }
+    if matches!(
+        login_code_level,
+        LoginCodeLevel::AdminUniversal | LoginCodeLevel::TrialEnrollment
+    ) && authorized_username.is_some()
+    {
+        return Err(AppError::BadRequest(
+            "this login authorization code cannot set account binding metadata".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct AuthorizationCodeValidationInput<'a> {
+    code_type: AuthorizationCodeType,
+    login_code_level: LoginCodeLevel,
+    authorized_email: Option<&'a str>,
+    authorized_username: Option<&'a str>,
+    authorized_display_name: Option<&'a str>,
+    allowed_client_ids: &'a [String],
+    organization_id: Option<&'a str>,
+    organization_role: Option<&'a str>,
+}
+
+async fn validate_authorization_code_input(
+    state: &AppState,
+    input: AuthorizationCodeValidationInput<'_>,
+) -> AppResult<()> {
+    let AuthorizationCodeValidationInput {
+        code_type,
+        login_code_level,
+        authorized_email,
+        authorized_username,
+        authorized_display_name,
+        allowed_client_ids,
+        organization_id,
+        organization_role,
+    } = input;
+    match code_type {
+        AuthorizationCodeType::Registration => {
+            if login_code_level != LoginCodeLevel::AccountRecovery {
+                return Err(AppError::BadRequest(
+                    "registration authorization codes cannot set a login code level".to_string(),
+                ));
+            }
+            if !allowed_client_ids.is_empty() {
+                return Err(AppError::BadRequest(
+                    "registration authorization codes cannot allow OIDC clients".to_string(),
+                ));
+            }
+            if organization_id.is_some() || organization_role.is_some() {
+                return Err(AppError::BadRequest(
+                    "registration authorization codes cannot bind an organization".to_string(),
+                ));
+            }
+        }
+        AuthorizationCodeType::Login => {
+            validate_login_code_binding_metadata(
+                login_code_level,
+                authorized_email,
+                authorized_username,
+                authorized_display_name,
+            )?;
+            match login_code_level {
+                LoginCodeLevel::AccountRecovery => {
+                    if authorized_username.is_none_or(|value| value.trim().is_empty()) {
+                        return Err(AppError::BadRequest(
+                            "account recovery authorization codes require authorized_username"
+                                .to_string(),
+                        ));
+                    }
+                    if !allowed_client_ids.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "account recovery authorization codes cannot allow OIDC clients"
+                                .to_string(),
+                        ));
+                    }
+                    if organization_id.is_some() || organization_role.is_some() {
+                        return Err(AppError::BadRequest(
+                            "account recovery authorization codes cannot bind an organization"
+                                .to_string(),
+                        ));
+                    }
+                }
+                LoginCodeLevel::AdminUniversal => {
+                    if allowed_client_ids.is_empty() {
+                        return Err(AppError::BadRequest(
+                        "admin universal authorization codes require at least one allowed OIDC client"
+                            .to_string(),
+                    ));
+                    }
+                    if organization_id.is_some() || organization_role.is_some() {
+                        return Err(AppError::BadRequest(
+                            "admin universal authorization codes cannot bind an organization"
+                                .to_string(),
+                        ));
+                    }
+                    for client_id in allowed_client_ids {
+                        let client = state
+                            .db
+                            .find_client_by_client_id(client_id)
+                            .await?
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "allowed OIDC client does not exist: {client_id}"
+                                ))
+                            })?;
+                        if client.is_active != 1 {
+                            return Err(AppError::BadRequest(format!(
+                                "allowed OIDC client is disabled: {client_id}"
+                            )));
+                        }
+                    }
+                }
+                LoginCodeLevel::TrialEnrollment => {
+                    let organization_id = organization_id
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "trial enrollment authorization codes require organization_id"
+                                    .to_string(),
+                            )
+                        })?;
+                    let role = organization_role
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "trial enrollment authorization codes require organization_role"
+                                    .to_string(),
+                            )
+                        })?;
+                    organizations::normalize_role(role)?;
+                    if allowed_client_ids.is_empty() {
+                        return Err(AppError::BadRequest(
+                            "trial enrollment authorization codes require at least one allowed OIDC client"
+                                .to_string(),
+                        ));
+                    }
+                    let organization = state
+                        .db
+                        .find_organization_by_id(organization_id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "trial enrollment organization does not exist".to_string(),
+                            )
+                        })?;
+                    if organization.is_active != 1 {
+                        return Err(AppError::BadRequest(
+                            "trial enrollment organization is disabled".to_string(),
+                        ));
+                    }
+                    for client_id in allowed_client_ids {
+                        let client = state
+                            .db
+                            .find_client_by_client_id(client_id)
+                            .await?
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "allowed OIDC client does not exist: {client_id}"
+                                ))
+                            })?;
+                        if client.is_active != 1 {
+                            return Err(AppError::BadRequest(format!(
+                                "allowed OIDC client is disabled: {client_id}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -3084,18 +4414,117 @@ async fn create_invitation(
             "max_uses must be positive when provided".to_string(),
         ));
     }
+    let code_type = payload.code_type.unwrap_or(AuthorizationCodeType::Login);
+    let login_code_level = payload
+        .login_code_level
+        .unwrap_or(LoginCodeLevel::AccountRecovery);
+    ensure_admin_universal_manager(&current.user, code_type, login_code_level)?;
+    let allowed_client_ids = normalized_client_ids(payload.allowed_client_ids);
+    let organization_id = normalize_optional_text(payload.organization_id);
+    let organization_role = normalize_optional_text(payload.organization_role)
+        .map(|value| organizations::normalize_role(&value))
+        .transpose()?;
+    let authorized_email = normalize_optional_email(payload.authorized_email)?;
+    let authorized_username = normalize_optional_text(payload.authorized_username);
+    let authorized_display_name = normalize_optional_text(payload.authorized_display_name);
+    validate_authorization_code_input(
+        &state,
+        AuthorizationCodeValidationInput {
+            code_type,
+            login_code_level,
+            authorized_email: authorized_email.as_deref(),
+            authorized_username: authorized_username.as_deref(),
+            authorized_display_name: authorized_display_name.as_deref(),
+            allowed_client_ids: &allowed_client_ids,
+            organization_id: organization_id.as_deref(),
+            organization_role: organization_role.as_deref(),
+        },
+    )
+    .await?;
+    ensure_trial_enrollment_role_manager(
+        &state,
+        &current.user,
+        code_type,
+        login_code_level,
+        organization_role.as_deref(),
+    )
+    .await?;
+    if login_code_level == LoginCodeLevel::TrialEnrollment {
+        if payload
+            .expires_at
+            .is_none_or(|expires_at| expires_at <= util::now_ts())
+        {
+            return Err(AppError::BadRequest(
+                "trial enrollment authorization codes require a future expires_at".to_string(),
+            ));
+        }
+        if payload.max_uses.is_none() {
+            return Err(AppError::BadRequest(
+                "trial enrollment authorization codes require max_uses".to_string(),
+            ));
+        }
+    }
+    let authorized_user_id = if code_type == AuthorizationCodeType::Login
+        && login_code_level == LoginCodeLevel::AccountRecovery
+    {
+        let username = authorized_username
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("authorized_username is required".to_string()))?;
+        Some(recovery_target_user_id(
+            username,
+            state.db.find_user_by_username(username).await?,
+        )?)
+    } else {
+        None
+    };
+    // Store a separate, OAEP-encrypted display copy before hashing the code
+    // for normal redemption.  The public list still receives only the prefix;
+    // full-code access is an explicit, audited POST to the reveal endpoint.
+    let code = format!(
+        "{}-{}",
+        match code_type {
+            AuthorizationCodeType::Registration => "REG",
+            AuthorizationCodeType::Login => "LOGIN",
+        },
+        util::random_token(18)
+    );
+    let signing_key = state
+        .db
+        .list_signing_keys()
+        .await?
+        .into_iter()
+        .find(|key| key.is_active == 1)
+        .ok_or_else(|| {
+            AppError::Configuration(
+                "an active signing key is required to create a revealable authorization code"
+                    .to_string(),
+            )
+        })?;
+    let code_reveal_ciphertext =
+        util::encrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &code)?;
     let (invitation, code) = state
         .db
-        .insert_invitation(NewInvitation {
-            description: payload.description,
-            authorized_email: normalize_optional_email(payload.authorized_email)?,
-            authorized_username: normalize_optional_text(payload.authorized_username),
-            authorized_display_name: normalize_optional_text(payload.authorized_display_name),
-            expires_at: payload.expires_at,
-            max_uses: payload.max_uses,
-            is_active: payload.is_active,
-            created_by: Some(current.user.id.clone()),
-        })
+        .insert_invitation_with_reveal_secret(
+            NewInvitation {
+                code_type,
+                login_code_level,
+                allowed_client_ids: allowed_client_ids.clone(),
+                organization_id: organization_id.clone(),
+                organization_role: organization_role.clone(),
+                description: payload.description,
+                authorized_email,
+                authorized_username,
+                authorized_user_id,
+                authorized_display_name,
+                expires_at: payload.expires_at,
+                max_uses: payload.max_uses,
+                is_active: payload.is_active,
+                created_by: Some(current.user.id.clone()),
+            },
+            code,
+            signing_key.kid,
+            code_reveal_ciphertext,
+        )
         .await?;
     state
         .db
@@ -3104,11 +4533,18 @@ async fn create_invitation(
             "authorization_code.create",
             "authorization_code",
             Some(invitation.id.clone()),
-            serde_json::json!({ "max_uses": invitation.max_uses }),
+            serde_json::json!({
+                "code_type": code_type,
+                "login_code_level": login_code_level,
+                "allowed_client_ids": allowed_client_ids,
+                "organization_id": invitation.organization_id.clone(),
+                "organization_role": invitation.organization_role.clone(),
+                "max_uses": invitation.max_uses
+            }),
         ))
         .await?;
     Ok(Json(InvitationCreateResponse {
-        invitation: invitation.public(),
+        invitation: invitation.public()?,
         code,
     }))
 }
@@ -3125,18 +4561,107 @@ async fn update_invitation(
             "max_uses must be positive when provided".to_string(),
         ));
     }
+    let existing = state
+        .db
+        .find_invitation_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let code_type = existing.authorization_code_type()?;
+    let login_code_level = existing.login_code_level()?;
+    ensure_admin_universal_manager(&current.user, code_type, login_code_level)?;
+    if payload.code_type.is_some_and(|value| value != code_type)
+        || payload
+            .login_code_level
+            .is_some_and(|value| value != login_code_level)
+    {
+        return Err(AppError::BadRequest(
+            "authorization code type cannot be changed after creation".to_string(),
+        ));
+    }
+    let allowed_client_ids =
+        immutable_allowed_client_ids(existing.allowed_client_ids()?, payload.allowed_client_ids)?;
+    let requested_organization_role = normalize_optional_text(payload.organization_role)
+        .map(|value| organizations::normalize_role(&value))
+        .transpose()?;
+    let organization_id = if login_code_level == LoginCodeLevel::TrialEnrollment {
+        immutable_optional_text(
+            "organization_id",
+            existing.organization_id.as_deref(),
+            payload.organization_id,
+        )?
+    } else {
+        normalize_optional_text(payload.organization_id)
+    };
+    let organization_role = if login_code_level == LoginCodeLevel::TrialEnrollment {
+        immutable_optional_text(
+            "organization_role",
+            existing.organization_role.as_deref(),
+            requested_organization_role,
+        )?
+    } else {
+        requested_organization_role
+    };
+    let authorized_email = normalize_optional_email(payload.authorized_email)?;
+    let authorized_username = if code_type == AuthorizationCodeType::Login
+        && login_code_level == LoginCodeLevel::AccountRecovery
+    {
+        immutable_recovery_username(
+            existing.authorized_username.as_deref(),
+            payload.authorized_username,
+        )?
+    } else {
+        normalize_optional_text(payload.authorized_username)
+    };
+    let authorized_display_name = normalize_optional_text(payload.authorized_display_name);
+    validate_authorization_code_input(
+        &state,
+        AuthorizationCodeValidationInput {
+            code_type,
+            login_code_level,
+            authorized_email: authorized_email.as_deref(),
+            authorized_username: authorized_username.as_deref(),
+            authorized_display_name: authorized_display_name.as_deref(),
+            allowed_client_ids: &allowed_client_ids,
+            organization_id: organization_id.as_deref(),
+            organization_role: organization_role.as_deref(),
+        },
+    )
+    .await?;
+    ensure_trial_enrollment_role_manager(
+        &state,
+        &current.user,
+        code_type,
+        login_code_level,
+        organization_role.as_deref(),
+    )
+    .await?;
+    if login_code_level == LoginCodeLevel::TrialEnrollment {
+        if payload
+            .expires_at
+            .is_none_or(|expires_at| expires_at <= util::now_ts())
+        {
+            return Err(AppError::BadRequest(
+                "trial enrollment authorization codes require a future expires_at".to_string(),
+            ));
+        }
+        if payload.max_uses.is_none() {
+            return Err(AppError::BadRequest(
+                "trial enrollment authorization codes require max_uses".to_string(),
+            ));
+        }
+    }
     let invitation = state
         .db
-        .update_invitation(
-            &id,
-            payload.description,
-            normalize_optional_email(payload.authorized_email)?,
-            normalize_optional_text(payload.authorized_username),
-            normalize_optional_text(payload.authorized_display_name),
-            payload.expires_at,
-            payload.max_uses,
-            payload.is_active,
-        )
+        .update_invitation(InvitationUpdate {
+            id: &id,
+            description: payload.description,
+            authorized_email,
+            authorized_username,
+            authorized_display_name,
+            expires_at: payload.expires_at,
+            max_uses: payload.max_uses,
+            is_active: payload.is_active,
+        })
         .await?;
     state
         .db
@@ -3145,10 +4670,17 @@ async fn update_invitation(
             "authorization_code.update",
             "authorization_code",
             Some(id),
-            serde_json::json!({ "is_active": invitation.is_active == 1 }),
+            serde_json::json!({
+                "code_type": code_type,
+                "login_code_level": login_code_level,
+                "allowed_client_ids": allowed_client_ids,
+                "organization_id": organization_id,
+                "organization_role": organization_role,
+                "is_active": invitation.is_active == 1
+            }),
         ))
         .await?;
-    Ok(Json(invitation.public()))
+    Ok(Json(invitation.public()?))
 }
 
 async fn delete_invitation(
@@ -3216,6 +4748,8 @@ struct ExternalOidcProviderInput {
     issuer: String,
     client_id: String,
     client_secret: String,
+    #[serde(default)]
+    clear_client_secret: bool,
     authorization_endpoint: String,
     token_endpoint: String,
     userinfo_endpoint: String,
@@ -3270,9 +4804,20 @@ async fn update_external_oidc_provider(
     Json(payload): Json<ExternalOidcProviderInput>,
 ) -> AppResult<Json<PublicExternalOidcProvider>> {
     let current = require_provider_manager(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_external_oidc_provider_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let organization_id =
         normalize_client_organization_id(&state, payload.organization_id.clone()).await?;
-    let provider_input = normalize_external_provider_input(payload, organization_id.clone())?;
+    let clear_client_secret = payload.clear_client_secret;
+    let mut provider_input = normalize_external_provider_input(payload, organization_id.clone())?;
+    apply_external_provider_secret_update(
+        &mut provider_input,
+        &existing.client_secret,
+        clear_client_secret,
+    );
     let provider = state
         .db
         .update_external_oidc_provider(&id, provider_input)
@@ -3472,6 +5017,18 @@ fn normalize_external_provider_input(
     })
 }
 
+fn apply_external_provider_secret_update(
+    provider: &mut NewExternalOidcProvider,
+    existing_secret: &str,
+    clear_secret: bool,
+) {
+    if clear_secret {
+        provider.client_secret.clear();
+    } else if provider.client_secret.is_empty() {
+        provider.client_secret = existing_secret.to_string();
+    }
+}
+
 fn normalize_ldap_provider_input(payload: LdapProviderInput) -> AppResult<NewLdapProvider> {
     let slug = normalize_provider_slug(payload.slug)?;
     let display_name = normalize_required_text(payload.display_name, "display_name")?;
@@ -3657,6 +5214,7 @@ fn validate_client_input(payload: &ClientInput) -> AppResult<()> {
     if payload.client_id.trim().is_empty() {
         return Err(AppError::BadRequest("client_id is required".to_string()));
     }
+    normalize_client_logo_uri(&payload.logo_uri)?;
     let redirect_uris = normalize_redirect_uri_list(&payload.redirect_uris, "redirect_uri")?;
     let post_logout_redirect_uris = normalize_redirect_uri_list(
         &payload.post_logout_redirect_uris,
@@ -3768,6 +5326,27 @@ fn validate_absolute_http_url(value: &str, field: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn normalize_client_logo_uri(value: &str) -> AppResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > 2048 {
+        return Err(AppError::BadRequest(
+            "logo_uri must not exceed 2048 characters".to_string(),
+        ));
+    }
+    validate_absolute_http_url(value, "logo_uri")?;
+    let parsed = Url::parse(value)
+        .map_err(|err| AppError::BadRequest(format!("logo_uri is invalid: {err}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::BadRequest(
+            "logo_uri cannot include user info".to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
 async fn public_client_with_claim_mappers(
     state: &AppState,
     client: crate::db::ClientRecord,
@@ -3780,11 +5359,11 @@ async fn public_client_with_claim_mappers(
         .map(|mapper| mapper.public())
         .collect::<Vec<PublicClientClaimMapper>>();
     let mut public = client.public()?;
-    if let Some(organization_id) = public.organization_id.as_deref() {
-        if let Some(organization) = state.db.find_organization_by_id(organization_id).await? {
-            public.organization_slug = Some(organization.slug);
-            public.organization_name = Some(organization.name);
-        }
+    if let Some(organization_id) = public.organization_id.as_deref()
+        && let Some(organization) = state.db.find_organization_by_id(organization_id).await?
+    {
+        public.organization_slug = Some(organization.slug);
+        public.organization_name = Some(organization.name);
     }
     public.claim_mappers = mappers;
     Ok(public)
@@ -3895,6 +5474,7 @@ fn client_input_to_new(
     };
     let jwks_uri = client_assertion::validate_jwks_uri(&payload.jwks_uri)?;
     let jwks = client_assertion::normalize_jwks_json(&payload.jwks)?;
+    let logo_uri = normalize_client_logo_uri(&payload.logo_uri)?;
     let service_account_permissions =
         service_accounts::normalize_permissions(payload.service_account_permissions)?;
     let backchannel_logout_uri = backchannel_logout::validate_backchannel_logout_config(
@@ -3915,6 +5495,7 @@ fn client_input_to_new(
         client_id: payload.client_id,
         client_secret_hash,
         client_name: payload.client_name,
+        logo_uri,
         organization_id,
         redirect_uris,
         post_logout_redirect_uris,
@@ -3951,6 +5532,342 @@ fn client_input_to_new(
 mod tests {
     use super::*;
 
+    #[test]
+    fn user_list_scope_accepts_authorization_code_accounts() {
+        assert!(matches!(
+            user_list_scope(Some("authorization_code")),
+            Ok(UserListScope::AuthorizationCode)
+        ));
+    }
+
+    #[test]
+    fn bulk_csv_parser_normalizes_fields_and_rejects_duplicate_identities() {
+        let batch = parse_bulk_import_csv(
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             Alice@Example.com,alice,\"Alice, Example\",Corp,ADMIN,true\n\
+             bob@example.com,bob,,,,0\n",
+        )
+        .unwrap();
+
+        assert_eq!(batch.rows.len(), 2);
+        assert_eq!(batch.rows[0].email.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            batch.candidates[0].organization_slug.as_deref(),
+            Some("corp")
+        );
+        assert_eq!(
+            batch.candidates[0].organization_role.as_deref(),
+            Some("admin")
+        );
+        assert!(!batch.candidates[1].is_active);
+
+        let mut duplicate_batch = parse_bulk_import_csv(
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             first@example.com,duplicate,,,,true\n\
+             second@example.com,duplicate,,,,false\n",
+        )
+        .unwrap();
+        validate_bulk_import_duplicates(&mut duplicate_batch);
+        assert_eq!(duplicate_batch.rows[0].outcome, "invalid");
+        assert_eq!(duplicate_batch.rows[1].outcome, "invalid");
+        assert!(
+            duplicate_batch.rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("username duplicates CSV row"))
+        );
+    }
+
+    #[test]
+    fn bulk_csv_parser_requires_exact_headers_and_boolean_status() {
+        assert!(
+            parse_bulk_import_csv(
+                "email,username,display_name,organization_slug,organization_role\n\
+             alice@example.com,alice,,,,true\n"
+            )
+            .is_err()
+        );
+
+        let batch = parse_bulk_import_csv(
+            "\u{feff}email,username,display_name,organization_slug,organization_role,is_active\n\
+             alice@example.com,alice,,,,sometimes\n",
+        )
+        .unwrap();
+        assert_eq!(batch.rows[0].outcome, "invalid");
+        assert_eq!(
+            batch.rows[0].error.as_deref(),
+            Some("is_active must be true or false")
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn bulk_import_test_state(
+        permissions: &[Permission],
+    ) -> (AppState, std::path::PathBuf, CookieJar) {
+        let mut settings: crate::Settings =
+            toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gpt-sso-admin-bulk-import-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        settings.database.kind = crate::config::DatabaseKind::Sqlite;
+        settings.database.url = path.to_string_lossy().into_owned();
+        settings.database.run_migrations = true;
+        settings.bootstrap.admin.create_on_startup = false;
+        settings.bootstrap.clients.clear();
+        let db = crate::db::Db::connect(&settings).unwrap();
+        db.migrate().await.unwrap();
+        db.seed(&settings).await.unwrap();
+        let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+        let state = AppState { settings, db, jwt };
+        let user = state
+            .db
+            .insert_user(NewUser {
+                email: "bulk-manager@example.com".to_string(),
+                username: "bulk-manager".to_string(),
+                display_name: None,
+                phone: None,
+                password_hash: "test-hash".to_string(),
+                email_verified_at: Some(util::now_ts()),
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: true,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        if !permissions.is_empty() {
+            let role = state
+                .db
+                .insert_role(NewRole {
+                    name: format!("bulk-import-manager-{}", uuid::Uuid::new_v4()),
+                    description: None,
+                    is_system: false,
+                    permissions: permissions
+                        .iter()
+                        .map(|permission| permission.as_str().to_string())
+                        .collect(),
+                })
+                .await
+                .unwrap();
+            state
+                .db
+                .replace_user_roles(&user.id, vec![role.id])
+                .await
+                .unwrap();
+        }
+        let (_session, cookie_value) = state
+            .db
+            .insert_session(
+                &user.id,
+                state.settings.security.session_ttl_seconds,
+                crate::db::SessionMetadata::default(),
+            )
+            .await
+            .unwrap();
+        let jar = CookieJar::new().add(axum_extra::extract::cookie::Cookie::new(
+            state.settings.security.cookie_name.clone(),
+            cookie_value,
+        ));
+        (state, path, jar)
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn bulk_import_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bulk_import_dry_run_is_insert_only_and_records_row_results() {
+        let (state, path, jar) =
+            bulk_import_test_state(&[Permission::UsersManage, Permission::OrganizationsManage])
+                .await;
+        let organization = state
+            .db
+            .insert_organization(NewOrganization {
+                slug: "corp".to_string(),
+                name: "Corp".to_string(),
+                description: None,
+                allowed_email_domains: vec!["example.com".to_string()],
+                is_active: true,
+            })
+            .await
+            .unwrap();
+
+        let response = import_users_csv(
+            State(state.clone()),
+            jar,
+            Query(BulkImportQuery { dry_run: true }),
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             alice@example.com,alice,Alice,corp,member,true\n"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = bulk_import_body(response).await;
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["committed"], false);
+        assert_eq!(body["summary"]["would_create"], 1);
+        assert_eq!(body["rows"][0]["outcome"], "would_create");
+        assert!(
+            state
+                .db
+                .find_user_by_email("alice@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .db
+                .list_organization_members(&organization.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .db
+                .list_audit_events(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.action == "user.bulk_import.dry_run")
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bulk_import_requires_organization_manage_for_organization_roles() {
+        let (state, path, jar) = bulk_import_test_state(&[Permission::UsersManage]).await;
+        let result = import_users_csv(
+            State(state.clone()),
+            jar,
+            Query(BulkImportQuery { dry_run: true }),
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             alice@example.com,alice,Alice,corp,owner,true\n"
+                .to_string(),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden)));
+        assert!(
+            state
+                .db
+                .find_user_by_email("alice@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bulk_import_commits_roles_atomically_and_rejects_existing_identities() {
+        let (state, path, jar) =
+            bulk_import_test_state(&[Permission::UsersManage, Permission::OrganizationsManage])
+                .await;
+        let organization = state
+            .db
+            .insert_organization(NewOrganization {
+                slug: "corp".to_string(),
+                name: "Corp".to_string(),
+                description: None,
+                allowed_email_domains: Vec::new(),
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let existing = state
+            .db
+            .insert_user(NewUser {
+                email: "existing@example.com".to_string(),
+                username: "existing".to_string(),
+                display_name: None,
+                phone: None,
+                password_hash: "test-hash".to_string(),
+                email_verified_at: Some(util::now_ts()),
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: true,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        let invalid_response = import_users_csv(
+            State(state.clone()),
+            jar.clone(),
+            Query(BulkImportQuery { dry_run: false }),
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             new@example.com,new,New,corp,member,true\n\
+             existing@example.com,different,Existing,corp,admin,true\n"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid_body = bulk_import_body(invalid_response).await;
+        assert_eq!(invalid_body["summary"]["invalid"], 1);
+        assert_eq!(invalid_body["summary"]["not_committed"], 1);
+        assert!(
+            state
+                .db
+                .find_user_by_email("new@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let success_response = import_users_csv(
+            State(state.clone()),
+            jar,
+            Query(BulkImportQuery { dry_run: false }),
+            "email,username,display_name,organization_slug,organization_role,is_active\n\
+             owner@example.com,owner,Owner,corp,owner,true\n\
+             member@example.com,member,Member,corp,member,false\n"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(success_response.status(), StatusCode::OK);
+        let success_body = bulk_import_body(success_response).await;
+        assert_eq!(success_body["committed"], true);
+        assert_eq!(success_body["summary"]["created"], 2);
+        let memberships = state
+            .db
+            .list_organization_members(&organization.id)
+            .await
+            .unwrap();
+        assert!(memberships.iter().any(|membership| {
+            membership.email == "owner@example.com" && membership.role == organizations::ROLE_OWNER
+        }));
+        assert!(memberships.iter().any(|membership| {
+            membership.email == "member@example.com"
+                && membership.role == organizations::ROLE_MEMBER
+                && membership.is_active == 0
+        }));
+        let existing_after = state
+            .db
+            .find_user_by_email("existing@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing_after.id, existing.id);
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn user(archived_at: Option<i64>) -> crate::db::UserRecord {
         crate::db::UserRecord {
             id: "user-id".to_string(),
@@ -3964,6 +5881,7 @@ mod tests {
             is_admin: 0,
             is_active: 1,
             archived_at,
+            registration_source: "local".to_string(),
             last_login_at: None,
             last_login_ip: None,
             last_oidc_client_id: None,
@@ -4027,6 +5945,182 @@ mod tests {
         assert_eq!(input.password, None);
     }
 
+    #[test]
+    fn admin_universal_code_creation_and_updates_require_a_true_administrator() {
+        let delegated_manager = user(None);
+        assert!(matches!(
+            ensure_admin_universal_manager(
+                &delegated_manager,
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AdminUniversal,
+            ),
+            Err(AppError::Forbidden)
+        ));
+        assert!(
+            ensure_admin_universal_manager(
+                &delegated_manager,
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+            )
+            .is_ok()
+        );
+
+        let mut administrator = delegated_manager;
+        administrator.is_admin = 1;
+        assert!(
+            ensure_admin_universal_manager(
+                &administrator,
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AdminUniversal,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn account_recovery_target_must_be_an_exact_active_existing_user() {
+        assert!(matches!(
+            recovery_target_user_id("user", None),
+            Err(AppError::BadRequest(message))
+                if message.contains("existing account")
+        ));
+
+        let mut case_mismatch = user(None);
+        case_mismatch.username = "User".to_string();
+        assert!(matches!(
+            recovery_target_user_id("user", Some(case_mismatch)),
+            Err(AppError::BadRequest(message))
+                if message.contains("exactly match")
+        ));
+
+        let mut disabled = user(None);
+        disabled.is_active = 0;
+        assert!(matches!(
+            recovery_target_user_id("user", Some(disabled)),
+            Err(AppError::BadRequest(message))
+                if message.contains("active account")
+        ));
+        assert!(matches!(
+            recovery_target_user_id("user", Some(user(Some(1)))),
+            Err(AppError::BadRequest(message))
+                if message.contains("active account")
+        ));
+        assert_eq!(
+            recovery_target_user_id("user", Some(user(None))).unwrap(),
+            "user-id"
+        );
+    }
+
+    #[test]
+    fn admin_universal_codes_reject_account_binding_metadata() {
+        assert!(matches!(
+            validate_login_code_binding_metadata(
+                LoginCodeLevel::AdminUniversal,
+                None,
+                Some("user"),
+                None,
+            ),
+            Err(AppError::BadRequest(message))
+                if message.contains("cannot set account binding metadata")
+        ));
+        assert!(
+            validate_login_code_binding_metadata(LoginCodeLevel::AdminUniversal, None, None, None,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn all_login_codes_reject_unused_email_and_display_name_metadata() {
+        for level in [
+            LoginCodeLevel::AccountRecovery,
+            LoginCodeLevel::AdminUniversal,
+            LoginCodeLevel::TrialEnrollment,
+        ] {
+            for (email, display_name) in [(Some("user@example.com"), None), (None, Some("User"))] {
+                assert!(matches!(
+                    validate_login_code_binding_metadata(
+                        level,
+                        email,
+                        (level == LoginCodeLevel::AccountRecovery).then_some("user"),
+                        display_name,
+                    ),
+                    Err(AppError::BadRequest(message))
+                        if message.contains("cannot set email or display-name metadata")
+                ));
+            }
+        }
+        assert!(
+            validate_login_code_binding_metadata(
+                LoginCodeLevel::AccountRecovery,
+                None,
+                Some("user"),
+                None,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_login_code_binding_metadata(
+                LoginCodeLevel::TrialEnrollment,
+                None,
+                Some("user"),
+                None,
+            ),
+            Err(AppError::BadRequest(message)) if message.contains("cannot set account binding metadata")
+        ));
+    }
+
+    #[test]
+    fn authorization_code_client_allowlist_is_immutable() {
+        let existing = vec!["client-b".to_string(), "client-a".to_string()];
+        assert_eq!(
+            immutable_allowed_client_ids(existing.clone(), None).unwrap(),
+            vec!["client-a".to_string(), "client-b".to_string()]
+        );
+        assert!(
+            immutable_allowed_client_ids(
+                existing.clone(),
+                Some(vec![
+                    " client-a ".to_string(),
+                    "client-b".to_string(),
+                    "client-a".to_string(),
+                ]),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            immutable_allowed_client_ids(existing, Some(vec!["client-c".to_string()])),
+            Err(AppError::BadRequest(message))
+                if message == "allowed_client_ids cannot be changed after creation"
+        ));
+    }
+
+    #[test]
+    fn account_recovery_username_is_immutable_and_missing_put_field_is_preserved() {
+        assert_eq!(
+            immutable_recovery_username(Some("recovery-user"), None).unwrap(),
+            Some("recovery-user".to_string())
+        );
+        assert_eq!(
+            immutable_recovery_username(
+                Some("recovery-user"),
+                Some(" recovery-user ".to_string()),
+            )
+            .unwrap(),
+            Some("recovery-user".to_string())
+        );
+        assert!(matches!(
+            immutable_recovery_username(
+                Some("recovery-user"),
+                Some("different-user".to_string()),
+            ),
+            Err(AppError::BadRequest(message)) if message.contains("cannot be changed")
+        ));
+        assert!(matches!(
+            immutable_recovery_username(Some("recovery-user"), Some(" ".to_string())),
+            Err(AppError::BadRequest(message)) if message.contains("cannot be cleared")
+        ));
+    }
+
     fn external_provider_input() -> ExternalOidcProviderInput {
         ExternalOidcProviderInput {
             slug: "Corp_OIDC".to_string(),
@@ -4035,6 +6129,7 @@ mod tests {
             issuer: "https://idp.example.com/".to_string(),
             client_id: " client ".to_string(),
             client_secret: " secret ".to_string(),
+            clear_client_secret: false,
             authorization_endpoint: "https://idp.example.com/oauth2/authorize/".to_string(),
             token_endpoint: "https://idp.example.com/oauth2/token/".to_string(),
             userinfo_endpoint: "https://idp.example.com/oauth2/userinfo/".to_string(),
@@ -4121,6 +6216,36 @@ mod tests {
     }
 
     #[test]
+    fn external_provider_update_preserves_or_explicitly_clears_secret() {
+        let mut payload = external_provider_input();
+        payload.client_secret = " ".to_string();
+        let mut provider = normalize_external_provider_input(payload, None).unwrap();
+        apply_external_provider_secret_update(&mut provider, "stored-secret", false);
+        assert_eq!(provider.client_secret, "stored-secret");
+
+        apply_external_provider_secret_update(&mut provider, "stored-secret", true);
+        assert!(provider.client_secret.is_empty());
+
+        let mut provider =
+            normalize_external_provider_input(external_provider_input(), None).unwrap();
+        apply_external_provider_secret_update(&mut provider, "stored-secret", false);
+        assert_eq!(provider.client_secret, "secret");
+    }
+
+    #[test]
+    fn organization_options_do_not_grant_full_member_read_access() {
+        for permission in [
+            Permission::ClientsManage,
+            Permission::IapRead,
+            Permission::IapManage,
+            Permission::ProvidersManage,
+        ] {
+            assert!(ORGANIZATION_OPTION_PERMISSIONS.contains(&permission));
+            assert!(!ORGANIZATION_READ_PERMISSIONS.contains(&permission));
+        }
+    }
+
+    #[test]
     fn active_external_provider_requires_runtime_fields() {
         let mut provider = external_provider_input();
         provider.client_id = " ".to_string();
@@ -4191,6 +6316,7 @@ mod tests {
         ClientInput {
             client_id: "demo-web".to_string(),
             client_name: "Demo Web".to_string(),
+            logo_uri: String::new(),
             organization_id: None,
             client_secret: None,
             redirect_uris: vec![
@@ -4249,6 +6375,28 @@ mod tests {
             client.frontchannel_logout_uri,
             "https://app.example.com/front-logout"
         );
+    }
+
+    #[test]
+    fn client_logo_uri_is_normalized_and_rejects_unsafe_urls() {
+        let mut input = client_input();
+        input.logo_uri = " https://assets.example.com/signet.svg ".to_string();
+        validate_client_input(&input).unwrap();
+        let client = client_input_to_new(input, None, None).unwrap();
+        assert_eq!(client.logo_uri, "https://assets.example.com/signet.svg");
+
+        for logo_uri in [
+            "javascript:alert(1)",
+            "https://user:secret@assets.example.com/logo.svg",
+            "https://assets.example.com/logo.svg#fragment",
+        ] {
+            let mut input = client_input();
+            input.logo_uri = logo_uri.to_string();
+            assert!(matches!(
+                validate_client_input(&input),
+                Err(AppError::BadRequest(_))
+            ));
+        }
     }
 
     #[test]
@@ -4384,5 +6532,37 @@ mod tests {
             ]),
             Err(AppError::BadRequest(message)) if message == "quick link id must be unique"
         ));
+    }
+
+    #[test]
+    fn brand_logo_url_allows_blank_and_rejects_unsafe_urls() {
+        assert_eq!(normalize_brand_logo_url("  ".to_string()).unwrap(), "");
+        assert_eq!(
+            normalize_brand_logo_url(" https://cdn.example.com/signet.svg ".to_string()).unwrap(),
+            "https://cdn.example.com/signet.svg"
+        );
+        assert!(matches!(
+            normalize_brand_logo_url("javascript:alert(1)".to_string()),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_brand_logo_url("/signet.svg".to_string()),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            normalize_brand_logo_url(format!("https://cdn.example.com/{}", "a".repeat(2048))),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn login_settings_input_preserves_compatibility_with_clients_without_brand_logo_url() {
+        let input: LoginSettingsInput = serde_json::from_value(serde_json::json!({
+            "email_domains": [],
+            "quick_links": []
+        }))
+        .unwrap();
+
+        assert!(input.brand_logo_url.is_none());
     }
 }

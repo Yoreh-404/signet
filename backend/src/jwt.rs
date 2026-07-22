@@ -73,6 +73,8 @@ pub struct TokenClaims {
     pub cnf: Option<ConfirmationClaim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_sso_login_code_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +400,7 @@ impl JwtManager {
             sid: None,
             cnf: None,
             authorization_details: None,
+            gpt_sso_login_code_level: None,
         };
         let mut claims_value = serde_json::to_value(claims)
             .map_err(|err| AppError::Internal(format!("failed to encode claims: {err}")))?;
@@ -521,6 +524,7 @@ impl JwtManager {
             sid: None,
             cnf: None,
             authorization_details: None,
+            gpt_sso_login_code_level: None,
         };
         let mut claims_value = serde_json::to_value(claims)
             .map_err(|err| AppError::Internal(format!("failed to encode claims: {err}")))?;
@@ -532,5 +536,33 @@ impl JwtManager {
         header.kid = Some(key_set.active_key.kid.clone());
         encode(&header, &claims_value, &key_set.active_key.encoding_key)
             .map_err(|err| AppError::Internal(format!("failed to sign token: {err}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenClaims;
+
+    #[test]
+    fn legacy_token_claims_without_login_code_level_still_decode() {
+        let claims: TokenClaims = serde_json::from_value(serde_json::json!({
+            "iss": "https://sso.example",
+            "sub": "user-id",
+            "aud": "client-id",
+            "exp": 2,
+            "iat": 1,
+            "token_use": "access_token",
+            "client_id": "client-id",
+            "scope": "openid",
+            "email": "user@example.com",
+            "email_verified": true,
+            "name": "User",
+            "preferred_username": "user",
+            "nonce": null,
+            "auth_time": null
+        }))
+        .expect("legacy claims should remain compatible");
+
+        assert_eq!(claims.gpt_sso_login_code_level, None);
     }
 }

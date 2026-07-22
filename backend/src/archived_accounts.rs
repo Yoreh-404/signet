@@ -114,6 +114,7 @@ mod tests {
             is_admin: 0,
             is_active: 1,
             archived_at,
+            registration_source: "local".to_string(),
             last_login_at: None,
             last_login_ip: None,
             last_oidc_client_id: None,

@@ -311,6 +311,7 @@ mod tests {
             client_id: "demo-web".to_string(),
             client_secret_hash: None,
             client_name: "Demo".to_string(),
+            logo_uri: String::new(),
             organization_id: None,
             redirect_uris: "[]".to_string(),
             post_logout_redirect_uris: "[]".to_string(),

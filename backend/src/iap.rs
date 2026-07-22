@@ -68,17 +68,12 @@ pub trait IapApplicationRepository {
 }
 
 impl IapApplicationRepository for crate::db::Db {
-    fn active_iap_applications(
-        &self,
-    ) -> impl Future<Output = AppResult<Vec<IapApplicationRecord>>> + Send {
-        async move { self.list_active_iap_applications().await }
+    async fn active_iap_applications(&self) -> AppResult<Vec<IapApplicationRecord>> {
+        self.list_active_iap_applications().await
     }
 
-    fn user_organizations(
-        &self,
-        user_id: &str,
-    ) -> impl Future<Output = AppResult<Vec<UserOrganizationRecord>>> + Send {
-        async move { self.list_user_organizations(user_id).await }
+    async fn user_organizations(&self, user_id: &str) -> AppResult<Vec<UserOrganizationRecord>> {
+        self.list_user_organizations(user_id).await
     }
 }
 
@@ -168,7 +163,7 @@ async fn forward_auth(
         ));
     };
     ensure_user_allowed(&state, application, &current.user).await?;
-    Ok(allow_response(application, &current.user, &target)?)
+    allow_response(application, &current.user, &target)
 }
 
 async fn start_login(
@@ -179,13 +174,13 @@ async fn start_login(
     let target = target_from_url("GET", &query.return_to)?;
     let application = ensure_target_is_configured(&state, &target).await?;
     let current = auth::current_user_from_cookie(&state, &jar).await?;
-    if let Some(current) = current.as_ref() {
-        if iap_session_can_access(current) {
-            match ensure_user_allowed(&state, &application, &current.user).await {
-                Ok(()) => return Ok(Redirect::to(&target.url).into_response()),
-                Err(AppError::Unauthorized | AppError::Forbidden) => {}
-                Err(err) => return Err(err),
-            }
+    if let Some(current) = current.as_ref()
+        && iap_session_can_access(current)
+    {
+        match ensure_user_allowed(&state, &application, &current.user).await {
+            Ok(()) => return Ok(Redirect::to(&target.url).into_response()),
+            Err(AppError::Unauthorized | AppError::Forbidden) => {}
+            Err(err) => return Err(err),
         }
     }
     let finish = format!(
@@ -213,15 +208,11 @@ async fn finish_login(
             "{LOGIN_FINISH_PATH}?return_to={}",
             util::url_encode(&target.url)
         );
-        state.db.delete_session(&current.session_id).await?;
-        return Ok((
-            jar.add(auth::expired_session_cookie(&state)),
-            Redirect::to(&redirects::frontend_auth_error_url(
-                Some(&finish),
-                "temporary archived accounts cannot access protected applications",
-            )),
-        )
-            .into_response());
+        return Ok(Redirect::to(&redirects::frontend_auth_error_url(
+            Some(&finish),
+            "temporary archived accounts cannot access protected applications",
+        ))
+        .into_response());
     }
     ensure_user_allowed(&state, &application, &current.user).await?;
     Ok(Redirect::to(&target.url).into_response())
@@ -438,10 +429,10 @@ fn target_from_request(target: Option<&str>, headers: &HeaderMap) -> AppResult<I
         return target_from_url(&method, target);
     }
     for header_name in ["x-original-url", "x-forwarded-url"] {
-        if let Some(value) = first_header(headers, header_name) {
-            if value.starts_with("http://") || value.starts_with("https://") {
-                return target_from_url(&method, &value);
-            }
+        if let Some(value) = first_header(headers, header_name)
+            && (value.starts_with("http://") || value.starts_with("https://"))
+        {
+            return target_from_url(&method, &value);
         }
     }
     let host = first_header(headers, "x-forwarded-host")
@@ -608,9 +599,9 @@ mod tests {
     }
 
     #[test]
-    fn temporary_archived_sessions_cannot_access_iap() {
+    fn temporary_authorization_code_sessions_cannot_access_iap() {
         let standard = current(auth::AccountSessionKind::Standard);
-        let temporary = current(auth::AccountSessionKind::TemporaryArchived);
+        let temporary = current(auth::AccountSessionKind::TemporaryAuthorizationCode);
 
         assert!(iap_session_can_access(&standard));
         assert!(!iap_session_can_access(&temporary));
@@ -629,8 +620,9 @@ mod tests {
                 phone_verified_at: None,
                 is_admin: 0,
                 is_active: 1,
-                archived_at: (session_kind == auth::AccountSessionKind::TemporaryArchived)
+                archived_at: (session_kind == auth::AccountSessionKind::TemporaryAuthorizationCode)
                     .then_some(1),
+                registration_source: "local".to_string(),
                 last_login_at: None,
                 last_login_ip: None,
                 last_oidc_client_id: None,

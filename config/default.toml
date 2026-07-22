@@ -25,7 +25,7 @@ access_token_ttl_seconds = 900
 id_token_ttl_seconds = 900
 authorization_code_ttl_seconds = 300
 refresh_token_ttl_seconds = 2592000
-supported_scopes = ["openid", "profile", "email", "offline_access"]
+supported_scopes = ["openid", "profile", "email", "offline_access", "scim.read", "scim.write"]
 # If false, users see a consent page before a new client/scope set is authorized.
 skip_consent = true
 allow_dynamic_client_registration = false
@@ -37,7 +37,7 @@ cookie_secure = false
 cookie_same_site = "Lax"
 session_ttl_seconds = 28800
 password_min_length = 10
-# Optional RS256 private key. If empty, the server generates an in-memory dev key on startup.
+# Optional RS256 private key. If empty, the server generates a key and persists it in the database.
 rsa_private_key_pem = ""
 key_id = "dev-key-1"
 admin_api_prefix = "/api/admin"
@@ -113,7 +113,7 @@ allow_registration = true
 [cors]
 allowed_origins = ["http://localhost:5173", "http://localhost:8080"]
 allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-allowed_headers = ["authorization", "content-type"]
+allowed_headers = ["authorization", "content-type", "x-csrf-token"]
 allow_credentials = true
 
 [bootstrap.admin]
@@ -126,6 +126,7 @@ password = "ChangeMe123!"
 [[bootstrap.clients]]
 client_id = "demo-web"
 client_name = "Demo Web App"
+logo_uri = ""
 client_secret = "demo-secret-change-me"
 redirect_uris = ["http://localhost:3000/callback", "http://localhost:5173/callback"]
 post_logout_redirect_uris = ["http://localhost:3000/"]

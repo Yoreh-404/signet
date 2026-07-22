@@ -234,6 +234,7 @@ fn amr_values(login_method: Option<&str>) -> Vec<String> {
         "oidc_ldap" | "ldap" => values(&["pwd", "federated"]),
         "external_oidc" | "oidc_external" => values(&["federated"]),
         "authorization_code" => values(&["temporary"]),
+        "trial_enrollment" => values(&["trial_enrollment"]),
         "" => values(&["pwd"]),
         _ => values(&["pwd"]),
     }

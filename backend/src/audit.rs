@@ -38,8 +38,8 @@ pub trait AuditSink {
 }
 
 impl AuditSink for Db {
-    fn record_audit_event(&self, event: AuditEvent) -> impl Future<Output = AppResult<()>> + Send {
-        async move { self.insert_audit_event(event).await }
+    async fn record_audit_event(&self, event: AuditEvent) -> AppResult<()> {
+        self.insert_audit_event(event).await
     }
 }
 

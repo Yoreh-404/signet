@@ -412,6 +412,10 @@ mod tests {
             code_challenge_method: None,
             response_mode: None,
             account_selection_prompted: false,
+            account_selection_required: false,
+            reauthentication_required: false,
+            selected_session_id: None,
+            selected_user_id: None,
         }
     }
 }

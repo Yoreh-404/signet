@@ -27,6 +27,7 @@ pub struct ClientMetadata {
     pub redirect_uris: Option<Vec<String>>,
     pub post_logout_redirect_uris: Option<Vec<String>>,
     pub client_name: Option<String>,
+    pub logo_uri: Option<String>,
     pub scope: Option<String>,
     pub grant_types: Option<Vec<String>>,
     pub response_types: Option<Vec<String>>,
@@ -66,6 +67,8 @@ pub struct ClientRegistrationResponse {
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
     pub client_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
     pub scope: String,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
@@ -145,6 +148,7 @@ impl DynamicClientRegistrar {
         });
         let redirect_uris = metadata.redirect_uris.unwrap_or_default();
         let post_logout_redirect_uris = metadata.post_logout_redirect_uris.unwrap_or_default();
+        let logo_uri = normalize_logo_uri(metadata.logo_uri.as_deref())?;
         let response_types = metadata
             .response_types
             .unwrap_or_else(|| default_response_types(&grant_types));
@@ -223,6 +227,7 @@ impl DynamicClientRegistrar {
                     .client_name
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "Dynamic client".to_string()),
+                logo_uri,
                 organization_id: None,
                 redirect_uris,
                 post_logout_redirect_uris,
@@ -270,6 +275,7 @@ impl DynamicClientRegistrar {
 
 impl ClientMetadataValidator for DynamicClientRegistrar {
     fn validate_metadata(&self, metadata: &ClientMetadata) -> AppResult<()> {
+        normalize_logo_uri(metadata.logo_uri.as_deref())?;
         let grant_types = metadata.grant_types.clone().unwrap_or_else(|| {
             DEFAULT_GRANT_TYPES
                 .iter()
@@ -544,6 +550,7 @@ async fn client_response(
         redirect_uris: public.redirect_uris,
         post_logout_redirect_uris: public.post_logout_redirect_uris,
         client_name: public.client_name,
+        logo_uri: (!public.logo_uri.is_empty()).then_some(public.logo_uri),
         scope: public.scopes.join(" "),
         grant_types: public.grant_types,
         response_types: public.response_types,
@@ -642,6 +649,36 @@ fn validate_uri(value: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn normalize_logo_uri(value: Option<&str>) -> AppResult<String> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > 2048 {
+        return Err(AppError::BadRequest(
+            "logo_uri must not exceed 2048 characters".to_string(),
+        ));
+    }
+    let parsed = Url::parse(value)
+        .map_err(|err| AppError::BadRequest(format!("logo_uri is invalid: {err}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(AppError::BadRequest(
+            "logo_uri must be an absolute http(s) URL".to_string(),
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(AppError::BadRequest(
+            "logo_uri cannot contain a fragment".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::BadRequest(
+            "logo_uri cannot include user info".to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +687,20 @@ mod tests {
     fn redirect_uri_rejects_fragments() {
         assert!(validate_uri("https://app.example/callback").is_ok());
         assert!(validate_uri("https://app.example/callback#fragment").is_err());
+    }
+
+    #[test]
+    fn logo_uri_is_normalized_and_requires_a_safe_http_url() {
+        assert_eq!(
+            normalize_logo_uri(Some(" https://assets.example.com/signet.svg ")).unwrap(),
+            "https://assets.example.com/signet.svg"
+        );
+        for logo_uri in [
+            "javascript:alert(1)",
+            "https://user:secret@assets.example.com/logo.svg",
+            "https://assets.example.com/logo.svg#fragment",
+        ] {
+            assert!(normalize_logo_uri(Some(logo_uri)).is_err());
+        }
     }
 }

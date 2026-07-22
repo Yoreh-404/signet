@@ -309,10 +309,10 @@ fn validate_claims(client_id: &str, claims: &ClientAssertionClaims) -> AppResult
         return Err(AppError::Unauthorized);
     }
     let now = util::now_ts();
-    if let Some(iat) = claims.iat {
-        if iat > now + 60 {
-            return Err(AppError::Unauthorized);
-        }
+    if let Some(iat) = claims.iat
+        && iat > now + 60
+    {
+        return Err(AppError::Unauthorized);
     }
     if claims.exp > now + MAX_ASSERTION_TTL_SECONDS {
         return Err(AppError::Unauthorized);

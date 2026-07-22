@@ -4,11 +4,14 @@ use crate::{
     auth,
     config::VerificationChannelSettings,
     db::{
-        ExternalOidcProviderRecord, NewUser, PublicExternalOidcProvider, PublicLoginSettings,
-        PublicRegistrationSettings, VerificationCodeClaim,
+        AdminLoginCodeRedemptionInput, AuthorizationCodeType, ExternalOidcProviderRecord,
+        InvitationRecord, LoginCodeLevel, NewTrialEnrollmentUser, NewUser, NewVerificationCode,
+        PublicExternalOidcProvider, PublicLoginSettings, PublicRegistrationSettings,
+        VerificationCodeClaim,
     },
     domain_discovery::EmailDomainRoutable,
     error::{AppError, AppResult},
+    network_policy::TrustedNetworkPolicy,
     redirects,
     security_policy::{PasswordPolicy, PasswordSubject},
     util, verification,
@@ -31,7 +34,15 @@ const PASSWORD_RESET_VERIFICATION_PURPOSE: &str = "password_reset";
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/public/bootstrap", get(bootstrap))
+        .route(
+            "/api/public/authorization-code/inspect",
+            post(inspect_authorization_code),
+        )
         .route("/api/register", post(register))
+        .route(
+            "/api/login/authorization-code",
+            post(login_with_authorization_code),
+        )
         .route("/api/register/verification/start", post(start_verification))
         .route("/api/password-reset/start", post(start_password_reset))
         .route(
@@ -48,6 +59,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct BootstrapResponse {
     has_users: bool,
+    issuer: String,
     registration: PublicRegistrationSettings,
     login: PublicLoginSettings,
     default_locale: String,
@@ -74,6 +86,7 @@ struct PublicDirectorySummary {
 
 async fn bootstrap(State(state): State<AppState>) -> AppResult<Json<BootstrapResponse>> {
     let has_users = state.db.user_count().await? > 0;
+    let issuer = state.db.runtime_settings().await?.issuer;
     let settings = state.db.registration_settings().await?.public();
     let mut login = state.db.login_settings().await?.public()?;
     login.quick_links.retain(|link| link.is_active);
@@ -117,6 +130,7 @@ async fn bootstrap(State(state): State<AppState>) -> AppResult<Json<BootstrapRes
         .collect();
     Ok(Json(BootstrapResponse {
         has_users,
+        issuer,
         registration: settings,
         login,
         default_locale: state.settings.i18n.default_locale.clone(),
@@ -175,15 +189,15 @@ async fn issue_verification_code(
     let code = util::verification_code();
     let record = state
         .db
-        .insert_verification_code(
+        .insert_verification_code(NewVerificationCode {
             channel,
             target,
             purpose,
-            util::token_hash(&code),
-            settings.code_ttl_seconds,
-            settings.resend_interval_seconds,
-            settings.max_attempts,
-        )
+            code_hash: util::token_hash(&code),
+            ttl_seconds: settings.code_ttl_seconds,
+            resend_interval_seconds: settings.resend_interval_seconds,
+            max_attempts: settings.max_attempts,
+        })
         .await?;
     let delivery = match verification::deliver_verification_code(
         settings,
@@ -259,6 +273,21 @@ async fn complete_password_reset(
     Json(payload): Json<PasswordResetCompleteRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let email = normalize_email(&payload.email)?;
+    let user = state
+        .db
+        .find_user_by_email(&email)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("password reset request is invalid".to_string()))?;
+    if state
+        .db
+        .find_trial_enrollment_for_user(&user.id)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "password reset is not available for trial enrollment accounts".to_string(),
+        ));
+    }
     state
         .db
         .consume_verification_code(
@@ -268,11 +297,6 @@ async fn complete_password_reset(
             payload.code.trim(),
         )
         .await?;
-    let user = state
-        .db
-        .find_user_by_email(&email)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("password reset request is invalid".to_string()))?;
     if user.is_active != 1 || user.archived_at.is_some() {
         return Err(AppError::BadRequest(
             "password reset is not available for this account".to_string(),
@@ -318,12 +342,140 @@ struct RegisterRequest {
     phone_code: Option<String>,
     invitation_code: Option<String>,
     authorization_code: Option<String>,
+    return_to: Option<String>,
+    account_flow: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct RegisterResponse {
     user: crate::db::PublicUser,
     first_admin: bool,
+}
+
+struct RegistrationAuthorizationContext {
+    state: AppState,
+    jar: CookieJar,
+    headers: HeaderMap,
+    request_ip: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorizationCodeLoginRequest {
+    /// Authorization-code sign-in is deliberately email-address based.  Do
+    /// not accept a username here: recovery codes are bound to a user record,
+    /// and resolving the currently active record from its normalized email
+    /// keeps renamed usernames from becoming an alternate login identifier.
+    email: String,
+    authorization_code: String,
+    return_to: Option<String>,
+    account_flow: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorizationCodeLoginResponse {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continue_to: Option<String>,
+    user: Option<auth::CurrentUserResponse>,
+    mfa_required: bool,
+    mfa_challenge_id: Option<String>,
+    recovery_available: bool,
+    captcha_required: bool,
+    captcha_challenge_id: Option<String>,
+    captcha_prompt: Option<String>,
+    captcha_expires_at: Option<i64>,
+}
+
+/// The public enrollment form must not infer a code's purpose from its shape
+/// or from administrator-only list data.  This deliberately exposes only the
+/// minimum UI contract; the code, bound identity, organization and remaining
+/// uses stay server-side and are checked again during redemption.
+#[derive(Debug, Deserialize)]
+struct AuthorizationCodeInspectionRequest {
+    authorization_code: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthorizationCodeInspectionMode {
+    Registration,
+    TrialEnrollment,
+    SignInOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthorizationCodeEmailRequirement {
+    Required,
+    MustMatchCode,
+    NewIdentity,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorizationCodeInspectionResponse {
+    mode: AuthorizationCodeInspectionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_requirement: Option<AuthorizationCodeEmailRequirement>,
+}
+
+async fn inspect_authorization_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<AuthorizationCodeInspectionRequest>,
+) -> AppResult<Json<AuthorizationCodeInspectionResponse>> {
+    let code = payload.authorization_code.trim();
+    if code.is_empty() {
+        return Ok(Json(AuthorizationCodeInspectionResponse {
+            mode: AuthorizationCodeInspectionMode::Unavailable,
+            email_requirement: None,
+        }));
+    }
+    let request_ip = state.request_ip(&headers, Some(remote_addr)).await?;
+    auth::assert_authorization_code_access_allowed(&state, request_ip.as_deref()).await?;
+    let invitation = match state.db.find_invitation_by_code(code).await {
+        Ok(invitation) => invitation,
+        Err(AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)) => {
+            return Err(AppError::Internal(
+                "authorization-code inspection is temporarily unavailable".to_string(),
+            ));
+        }
+        // Do not distinguish a malformed, expired, exhausted or revoked code.
+        Err(_) => {
+            return Ok(Json(AuthorizationCodeInspectionResponse {
+                mode: AuthorizationCodeInspectionMode::Unavailable,
+                email_requirement: None,
+            }));
+        }
+    };
+    let response = match invitation.authorization_code_type()? {
+        AuthorizationCodeType::Registration => AuthorizationCodeInspectionResponse {
+            mode: AuthorizationCodeInspectionMode::Registration,
+            email_requirement: Some(
+                invitation
+                    .authorized_email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|_| AuthorizationCodeEmailRequirement::MustMatchCode)
+                    .unwrap_or(AuthorizationCodeEmailRequirement::Required),
+            ),
+        },
+        AuthorizationCodeType::Login
+            if invitation.login_code_level()? == LoginCodeLevel::TrialEnrollment =>
+        {
+            AuthorizationCodeInspectionResponse {
+                mode: AuthorizationCodeInspectionMode::TrialEnrollment,
+                email_requirement: Some(AuthorizationCodeEmailRequirement::NewIdentity),
+            }
+        }
+        AuthorizationCodeType::Login => AuthorizationCodeInspectionResponse {
+            mode: AuthorizationCodeInspectionMode::SignInOnly,
+            email_requirement: None,
+        },
+    };
+    Ok(Json(response))
 }
 
 async fn register(
@@ -341,10 +493,44 @@ async fn register(
         first_nonempty_code(&payload.authorization_code, &payload.invitation_code);
     if !first_user {
         if let Some(code) = authorization_code.as_deref() {
-            return register_with_authorization_code(
-                state, jar, headers, request_ip, payload, code,
-            )
-            .await;
+            let authorization = state.db.find_invitation_by_code(code).await?;
+            return match authorization.authorization_code_type()? {
+                AuthorizationCodeType::Registration => {
+                    register_with_registration_authorization_code(
+                        RegistrationAuthorizationContext {
+                            state,
+                            jar,
+                            headers,
+                            request_ip,
+                        },
+                        payload,
+                        code,
+                        authorization,
+                        &registration,
+                    )
+                    .await
+                }
+                AuthorizationCodeType::Login => {
+                    // `/api/register` is an enrollment surface.  Recovery and
+                    // administrator-universal codes must stay on the sign-in
+                    // surface; only a trial-enrollment code may create a new
+                    // restricted account here.
+                    if authorization.login_code_level()? != LoginCodeLevel::TrialEnrollment {
+                        return Err(AppError::Unauthorized);
+                    }
+                    register_with_trial_enrollment_authorization_code(
+                        RegistrationAuthorizationContext {
+                            state,
+                            jar,
+                            headers,
+                            request_ip,
+                        },
+                        payload,
+                        code,
+                    )
+                    .await
+                }
+            };
         }
         if registration.require_invitation {
             return Err(AppError::BadRequest(
@@ -424,32 +610,21 @@ async fn register(
             verification_claims,
         )
         .await?;
-    state
-        .db
-        .record_login_event(
-            &user.id,
-            request_ip.clone(),
-            util::user_agent(&headers),
-            "registration",
-            None,
-            None,
-        )
-        .await?;
-    let session = state
-        .db
-        .insert_session(
-            &user.id,
-            state.settings.security.session_ttl_seconds,
-            auth::session_metadata(request_ip, &headers, "registration"),
-        )
-        .await?;
-    let cookie = auth::session_cookie(
+    let jar = auth::issue_session_with_login_event(
         &state,
-        session.id,
-        state.settings.security.session_ttl_seconds,
-    );
+        jar,
+        &headers,
+        request_ip,
+        &user,
+        "registration",
+        auth::LoginEventContext {
+            account_flow: payload.account_flow.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok((
-        jar.add(cookie),
+        jar,
         Json(RegisterResponse {
             user: user.public(),
             first_admin: crate::db::registered_user_is_admin(first_user),
@@ -457,47 +632,115 @@ async fn register(
     ))
 }
 
-async fn register_with_authorization_code(
-    state: AppState,
-    jar: CookieJar,
-    headers: HeaderMap,
-    request_ip: Option<String>,
+async fn register_with_registration_authorization_code(
+    context: RegistrationAuthorizationContext,
     payload: RegisterRequest,
     code: &str,
+    authorization: InvitationRecord,
+    registration: &PublicRegistrationSettings,
 ) -> AppResult<(CookieJar, Json<RegisterResponse>)> {
+    let RegistrationAuthorizationContext {
+        state,
+        jar,
+        headers,
+        request_ip,
+    } = context;
     auth::assert_authorization_code_access_allowed(&state, request_ip.as_deref()).await?;
-    let authorization = state.db.find_invitation_by_code(code).await?;
+    let payload_email = optional_register_email(&payload.email)?;
     let email = match authorization
         .authorized_email
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(value) => normalize_email(value)?,
-        None => optional_register_email(&payload.email)?.unwrap_or_else(temporary_email),
+        Some(value) => {
+            let bound = normalize_email(value)?;
+            if payload_email
+                .as_deref()
+                .is_some_and(|value| value != bound.as_str())
+            {
+                return Err(AppError::BadRequest(
+                    "email does not match the registration authorization code".to_string(),
+                ));
+            }
+            bound
+        }
+        None => {
+            payload_email.ok_or_else(|| AppError::BadRequest("email is required".to_string()))?
+        }
     };
-    if state.db.find_user_by_email(&email).await?.is_some() {
-        return Err(AppError::BadRequest(
-            "authorization code cannot be used for an existing account".to_string(),
-        ));
-    }
-
-    let now = util::now_ts();
-    let username_source = authorization
+    auth::assert_registration_allowed(&state, Some(&email), request_ip.as_deref()).await?;
+    let payload_username = normalize_optional(&payload.username);
+    let username = match authorization
         .authorized_username
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            payload
-                .username
+    {
+        Some(bound) => {
+            if payload_username
                 .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .or_else(|| email.split('@').next())
-        .unwrap_or("external")
-        .to_string();
+                .is_some_and(|value| value != bound)
+            {
+                return Err(AppError::BadRequest(
+                    "username does not match the registration authorization code".to_string(),
+                ));
+            }
+            bound.to_string()
+        }
+        None => register_username_or_email_local(&payload.username, &email),
+    };
+    let password_hash = if let Some(password) = payload
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state.db.security_policy().await?.validate_password(
+            password,
+            PasswordSubject {
+                email: &email,
+                username: &username,
+            },
+        )?;
+        util::hash_password(password)?
+    } else {
+        // A registration code is the enrollment credential.  The password is
+        // intentionally non-recoverable until the person completes the normal
+        // password-reset flow, so a code-only form cannot accidentally create
+        // a known password or weaken the configured password policy.
+        util::hash_password(&util::random_token(32))?
+    };
+    let phone = normalize_optional(&payload.phone);
+    let mut verification_claims = Vec::new();
+    if let Some(verification_code) = normalize_optional(&payload.email_code) {
+        verification_claims.push(VerificationCodeClaim::new(
+            "email",
+            &email,
+            REGISTRATION_VERIFICATION_PURPOSE,
+            &verification_code,
+        ));
+    }
+    if let Some(verification_code) = normalize_optional(&payload.phone_code) {
+        let phone_value = phone.as_deref().ok_or_else(|| {
+            AppError::BadRequest(
+                "phone is required when a phone verification code is supplied".to_string(),
+            )
+        })?;
+        verification_claims.push(VerificationCodeClaim::new(
+            "phone",
+            phone_value,
+            REGISTRATION_VERIFICATION_PURPOSE,
+            &verification_code,
+        ));
+    }
+    let now = util::now_ts();
+    let email_verified = verification_claims
+        .iter()
+        .any(|claim| claim.channel == "email");
+    let phone_verified = verification_claims
+        .iter()
+        .any(|claim| claim.channel == "phone");
     let display_name = authorization
         .authorized_display_name
         .clone()
@@ -506,52 +749,488 @@ async fn register_with_authorization_code(
         .or_else(|| authorization.description.clone());
     let user = state
         .db
-        .redeem_invitation_for_new_user(
-            &authorization.id,
+        .redeem_registration_code_for_new_user(
+            code,
             NewUser {
                 email,
-                username: temporary_username(&username_source),
+                username,
                 display_name,
-                phone: None,
-                password_hash: util::hash_password(&util::random_token(32))?,
-                email_verified_at: Some(now),
-                phone_verified_at: None,
+                phone: phone.clone(),
+                password_hash,
+                email_verified_at: email_verified.then_some(now),
+                phone_verified_at: (phone_verified && phone.is_some()).then_some(now),
                 is_admin: false,
-                is_active: true,
-                archived_at: Some(now),
+                is_active: registration.default_user_active,
+                archived_at: None,
             },
+            verification_claims,
         )
         .await?;
+    let jar = auth::issue_session_with_login_event(
+        &state,
+        jar,
+        &headers,
+        request_ip.clone(),
+        &user,
+        "registration_authorization_code",
+        auth::LoginEventContext {
+            account_flow: payload.account_flow.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     state
         .db
-        .record_login_event(
-            &user.id,
-            request_ip.clone(),
-            util::user_agent(&headers),
-            "authorization_code",
-            None,
-            None,
-        )
+        .record_audit_event(audit::AuditEvent {
+            actor_user_id: Some(user.id.clone()),
+            actor_client_id: None,
+            action: "authorization_code.redeem".to_string(),
+            target_kind: "authorization_code".to_string(),
+            target_id: Some(authorization.id),
+            outcome: AuditOutcome::Success,
+            ip_address: request_ip,
+            user_agent: util::user_agent(&headers),
+            details: serde_json::json!({ "code_type": "registration" }),
+        })
         .await?;
-    let session = state
-        .db
-        .insert_session(
-            &user.id,
-            state.settings.security.session_ttl_seconds,
-            auth::session_metadata(request_ip, &headers, "authorization_code"),
-        )
-        .await?;
-    let cookie = auth::session_cookie(
-        &state,
-        session.id,
-        state.settings.security.session_ttl_seconds,
-    );
     Ok((
-        jar.add(cookie),
+        jar,
         Json(RegisterResponse {
             user: user.public(),
             first_admin: false,
         }),
+    ))
+}
+
+/// Redeem a trial-enrollment code only from the enrollment surface.  This is
+/// intentionally separate from `/api/login/authorization-code`: a trial code
+/// creates a restricted identity, while that endpoint is strictly for signing
+/// in to an identity that already exists.
+async fn register_with_trial_enrollment_authorization_code(
+    context: RegistrationAuthorizationContext,
+    payload: RegisterRequest,
+    code: &str,
+) -> AppResult<(CookieJar, Json<RegisterResponse>)> {
+    let RegistrationAuthorizationContext {
+        state,
+        jar,
+        headers,
+        request_ip,
+    } = context;
+    let email = required_register_email(&payload.email)?;
+    let username = register_username_or_email_local(&payload.username, &email);
+
+    auth::assert_authorization_code_access_allowed(&state, request_ip.as_deref()).await?;
+    // Keep code enrollment protected by the same per-identity lockout as an
+    // authorization-code sign-in.  The subject is now the normalized email,
+    // matching the public login endpoint and the visible form field.
+    auth::assert_login_not_locked(&state, &email).await?;
+    auth::assert_registration_allowed(&state, Some(&email), request_ip.as_deref()).await?;
+
+    let redemption = match state
+        .db
+        .redeem_trial_enrollment_code_for_new_user(
+            code,
+            NewTrialEnrollmentUser {
+                email: email.clone(),
+                username,
+                // The public enrollment form intentionally collects only an
+                // email and a code; do not let an omitted legacy field become
+                // a user-controlled profile attribute.
+                display_name: None,
+                // Trial enrollment is code-only.  This random value prevents
+                // password login and cannot be recovered from the response.
+                password_hash: util::hash_password(&util::random_token(32))?,
+            },
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if !matches!(
+                err,
+                AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+            ) {
+                auth::record_login_failure(
+                    &state,
+                    request_ip,
+                    &headers,
+                    &email,
+                    "invalid_authorization_code",
+                )
+                .await?;
+                return Err(AppError::Unauthorized);
+            }
+            return Err(err);
+        }
+    };
+    let session_ttl_seconds =
+        auth::authorization_code_session_ttl_seconds(&state, redemption.code_expires_at)?;
+    let jar = auth::issue_session_with_login_event(
+        &state,
+        jar,
+        &headers,
+        request_ip.clone(),
+        &redemption.user,
+        "trial_enrollment",
+        auth::LoginEventContext {
+            account_flow: payload.account_flow.clone(),
+            session_ttl_seconds: Some(session_ttl_seconds),
+            ..Default::default()
+        },
+    )
+    .await?;
+    auth::clear_login_failures(&state, &email).await?;
+    state
+        .db
+        .record_audit_event(audit::AuditEvent {
+            actor_user_id: Some(redemption.user.id.clone()),
+            actor_client_id: None,
+            action: "authorization_code.trial_enrollment_redeem".to_string(),
+            target_kind: "authorization_code".to_string(),
+            target_id: Some(redemption.invitation_id),
+            outcome: AuditOutcome::Success,
+            ip_address: request_ip,
+            user_agent: util::user_agent(&headers),
+            details: serde_json::json!({
+                "code_type": "login",
+                "login_code_level": "trial_enrollment",
+                "organization_id": redemption.organization_id,
+                "return_to_present": payload.return_to.is_some(),
+            }),
+        })
+        .await?;
+    Ok((
+        jar,
+        Json(RegisterResponse {
+            user: redemption.user.public(),
+            first_admin: false,
+        }),
+    ))
+}
+
+async fn login_with_authorization_code(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<AuthorizationCodeLoginRequest>,
+) -> AppResult<(CookieJar, Json<AuthorizationCodeLoginResponse>)> {
+    let request_ip = state.request_ip(&headers, Some(remote_addr)).await?;
+    let (jar, response) =
+        perform_authorization_code_login(&state, jar, &headers, request_ip, payload).await?;
+    Ok((jar, Json(response)))
+}
+
+async fn perform_authorization_code_login(
+    state: &AppState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    request_ip: Option<String>,
+    payload: AuthorizationCodeLoginRequest,
+) -> AppResult<(CookieJar, AuthorizationCodeLoginResponse)> {
+    let email = normalize_authorization_code_login_email(&payload.email)?;
+    auth::assert_authorization_code_access_allowed(state, request_ip.as_deref()).await?;
+    auth::assert_login_not_locked(state, &email).await?;
+    let invitation = match state
+        .db
+        .find_invitation_by_code(payload.authorization_code.trim())
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if !matches!(
+                err,
+                AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+            ) {
+                auth::record_login_failure(
+                    state,
+                    request_ip,
+                    headers,
+                    &email,
+                    "invalid_authorization_code",
+                )
+                .await?;
+                return Err(AppError::Unauthorized);
+            }
+            return Err(err);
+        }
+    };
+    if invitation.authorization_code_type()? != AuthorizationCodeType::Login {
+        auth::record_login_failure(
+            state,
+            request_ip,
+            headers,
+            &email,
+            "invalid_authorization_code",
+        )
+        .await?;
+        return Err(AppError::Unauthorized);
+    }
+    match invitation.login_code_level()? {
+        LoginCodeLevel::AdminUniversal => {
+            let user =
+                resolve_active_authorization_code_login_user(state, headers, &request_ip, &email)
+                    .await?;
+            return perform_admin_universal_authorization_code_login(
+                state, jar, headers, request_ip, &payload, &email, &user.id,
+            )
+            .await;
+        }
+        LoginCodeLevel::TrialEnrollment => {
+            // A trial-enrollment code is an account-creation capability, not
+            // a login credential.  It can only be redeemed through
+            // `/api/register`, where the new-identity checks are performed.
+            auth::record_login_failure(
+                state,
+                request_ip,
+                headers,
+                &email,
+                "invalid_authorization_code",
+            )
+            .await?;
+            return Err(AppError::Unauthorized);
+        }
+        LoginCodeLevel::AccountRecovery => {}
+    }
+    let user =
+        resolve_active_authorization_code_login_user(state, headers, &request_ip, &email).await?;
+    let redemption = match state
+        .db
+        .redeem_account_recovery_code(payload.authorization_code.trim(), &user.id, &email)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if !matches!(
+                err,
+                AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+            ) {
+                auth::record_login_failure(
+                    state,
+                    request_ip,
+                    headers,
+                    &email,
+                    "invalid_authorization_code",
+                )
+                .await?;
+                return Err(AppError::Unauthorized);
+            }
+            return Err(err);
+        }
+    };
+    let session_ttl_seconds =
+        auth::authorization_code_session_ttl_seconds(state, redemption.code_expires_at)?;
+    let next_jar = auth::issue_session_with_login_event(
+        state,
+        jar,
+        headers,
+        request_ip.clone(),
+        &redemption.user,
+        "authorization_code",
+        auth::LoginEventContext {
+            account_flow: payload.account_flow.clone(),
+            session_ttl_seconds: Some(session_ttl_seconds),
+            ..Default::default()
+        },
+    )
+    .await?;
+    auth::clear_login_failures(state, &email).await?;
+    state
+        .db
+        .record_audit_event(audit::AuditEvent {
+            actor_user_id: Some(redemption.user.id.clone()),
+            actor_client_id: None,
+            action: "authorization_code.redeem".to_string(),
+            target_kind: "authorization_code".to_string(),
+            target_id: Some(redemption.invitation_id),
+            outcome: AuditOutcome::Success,
+            ip_address: request_ip,
+            user_agent: util::user_agent(headers),
+            details: serde_json::json!({
+                "code_type": "login",
+                "login_code_level": "account_recovery",
+                "return_to_present": payload.return_to.is_some(),
+            }),
+        })
+        .await?;
+    let current = auth::require_current_user(state, &next_jar).await?;
+    Ok((
+        next_jar,
+        AuthorizationCodeLoginResponse {
+            mode: "session",
+            continue_to: None,
+            user: Some(auth::current_user_response_for_session(state, current).await?),
+            mfa_required: false,
+            mfa_challenge_id: None,
+            recovery_available: false,
+            captcha_required: false,
+            captcha_challenge_id: None,
+            captcha_prompt: None,
+            captcha_expires_at: None,
+        },
+    ))
+}
+
+/// Look up the existing authorization-code-login target by the normalized
+/// email supplied to the public endpoint.  The invitation redemption methods
+/// receive this record's immutable id and re-check it transactionally, so a
+/// username rename cannot create a second login path or redirect a code to a
+/// different account.
+async fn resolve_active_authorization_code_login_user(
+    state: &AppState,
+    headers: &HeaderMap,
+    request_ip: &Option<String>,
+    email: &str,
+) -> AppResult<crate::db::UserRecord> {
+    let user = state.db.find_user_by_email(email).await?;
+    match user {
+        Some(user) if user.is_active == 1 && user.archived_at.is_none() => Ok(user),
+        _ => {
+            auth::record_login_failure(
+                state,
+                request_ip.clone(),
+                headers,
+                email,
+                "invalid_authorization_code",
+            )
+            .await?;
+            Err(AppError::Unauthorized)
+        }
+    }
+}
+
+async fn perform_admin_universal_authorization_code_login(
+    state: &AppState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    request_ip: Option<String>,
+    payload: &AuthorizationCodeLoginRequest,
+    email: &str,
+    user_id: &str,
+) -> AppResult<(CookieJar, AuthorizationCodeLoginResponse)> {
+    let interaction = match crate::oidc::verified_oidc_login_interaction_from_return_to(
+        state,
+        payload.return_to.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if matches!(
+                err,
+                AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+            ) {
+                return Err(err);
+            }
+            auth::record_login_failure(
+                state,
+                request_ip,
+                headers,
+                email,
+                "invalid_authorization_code",
+            )
+            .await?;
+            return Err(AppError::Unauthorized);
+        }
+    };
+    let policy_requires_mfa = state
+        .db
+        .security_policy()
+        .await?
+        .requires_mfa_for_ip(request_ip.as_deref())?;
+    if interaction.request_requires_mfa
+        || policy_requires_mfa
+        || interaction.requests_offline_access
+    {
+        auth::record_login_failure(
+            state,
+            request_ip,
+            headers,
+            email,
+            "authorization_code_assurance_not_allowed",
+        )
+        .await?;
+        return Err(AppError::Unauthorized);
+    }
+    let (credential_hash, cookie_value) = crate::oidc::new_oidc_login_grant_credentials();
+    let redemption = match state
+        .db
+        .redeem_admin_login_code_for_oidc_grant(AdminLoginCodeRedemptionInput {
+            code: payload.authorization_code.trim(),
+            user_id,
+            email,
+            trusted_client_id: &interaction.client.client_id,
+            interaction_request_hash: &interaction.interaction_request_hash,
+            credential_hash: &credential_hash,
+            ttl_seconds: crate::oidc::OIDC_LOGIN_GRANT_TTL_SECONDS,
+        })
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            if matches!(
+                err,
+                AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+            ) {
+                return Err(err);
+            }
+            auth::record_login_failure(
+                state,
+                request_ip,
+                headers,
+                email,
+                "invalid_authorization_code",
+            )
+            .await?;
+            return Err(AppError::Unauthorized);
+        }
+    };
+    auth::clear_login_failures(state, email).await?;
+    state
+        .db
+        .record_login_event(
+            &redemption.user.id,
+            request_ip.clone(),
+            util::user_agent(headers),
+            "authorization_code_admin_universal",
+            Some(interaction.client.client_id.clone()),
+            None,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::AuditEvent {
+            actor_user_id: None,
+            actor_client_id: Some(interaction.client.client_id.clone()),
+            action: "authorization_code.admin_universal_redeem".to_string(),
+            target_kind: "user".to_string(),
+            target_id: Some(redemption.user.id),
+            outcome: AuditOutcome::Success,
+            ip_address: request_ip,
+            user_agent: util::user_agent(headers),
+            details: serde_json::json!({
+                "authorization_code_id": redemption.invitation_id,
+                "client_id": interaction.client.client_id,
+                "interaction_request_hash": interaction.interaction_request_hash,
+                "grant_expires_at": redemption.grant.expires_at,
+            }),
+        })
+        .await?;
+    Ok((
+        jar.add(crate::oidc::oidc_login_grant_cookie(state, cookie_value)),
+        AuthorizationCodeLoginResponse {
+            mode: "oidc_continuation",
+            continue_to: Some(interaction.continue_to),
+            user: None,
+            mfa_required: false,
+            mfa_challenge_id: None,
+            recovery_available: false,
+            captcha_required: false,
+            captcha_challenge_id: None,
+            captcha_prompt: None,
+            captcha_expires_at: None,
+        },
     ))
 }
 
@@ -560,6 +1239,42 @@ struct OidcStartQuery {
     return_to: Option<String>,
     login_hint: Option<String>,
     mode: Option<String>,
+    account_flow: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ExternalOidcReturnContext {
+    return_to: Option<String>,
+    account_flow: Option<String>,
+}
+
+fn external_oidc_return_context(
+    return_to: Option<String>,
+    account_flow: Option<String>,
+) -> AppResult<Option<String>> {
+    let context = ExternalOidcReturnContext {
+        return_to: redirects::optional_local_return_to(return_to),
+        account_flow: account_flow
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    if context.return_to.is_none() && context.account_flow.is_none() {
+        Ok(None)
+    } else {
+        serde_json::to_string(&context)
+            .map(Some)
+            .map_err(|err| AppError::Internal(err.to_string()))
+    }
+}
+
+fn parse_external_oidc_return_context(value: Option<String>) -> ExternalOidcReturnContext {
+    let Some(value) = value else {
+        return ExternalOidcReturnContext::default();
+    };
+    serde_json::from_str(&value).unwrap_or_else(|_| ExternalOidcReturnContext {
+        return_to: redirects::optional_local_return_to(Some(value)),
+        account_flow: None,
+    })
 }
 
 async fn external_oidc_start(
@@ -589,7 +1304,7 @@ async fn external_oidc_start(
             state_token.clone(),
             provider.slug.clone(),
             nonce.clone(),
-            redirects::optional_local_return_to(query.return_to),
+            external_oidc_return_context(query.return_to, query.account_flow)?,
             600,
         )
         .await?;
@@ -718,32 +1433,23 @@ async fn external_oidc_callback(
     if user.is_active != 1 || user.archived_at.is_some() {
         return Err(AppError::Unauthorized);
     }
-    state
-        .db
-        .record_login_event(
-            &user.id,
-            request_ip.clone(),
-            util::user_agent(&headers),
-            "external_oidc",
-            None,
-            Some(slug),
-        )
-        .await?;
-    let session = state
-        .db
-        .insert_session(
-            &user.id,
-            state.settings.security.session_ttl_seconds,
-            auth::session_metadata(request_ip, &headers, "external_oidc"),
-        )
-        .await?;
-    let cookie = auth::session_cookie(
+    let return_context = parse_external_oidc_return_context(oidc_state.return_to);
+    let jar = auth::issue_session_with_login_event(
         &state,
-        session.id,
-        state.settings.security.session_ttl_seconds,
-    );
-    let return_to = redirects::local_return_to(oidc_state.return_to.as_deref());
-    Ok((jar.add(cookie), Redirect::to(&return_to)).into_response())
+        jar,
+        &headers,
+        request_ip,
+        &user,
+        "external_oidc",
+        auth::LoginEventContext {
+            external_provider: Some(slug),
+            account_flow: return_context.account_flow,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let return_to = redirects::local_return_to(return_context.return_to.as_deref());
+    Ok((jar, Redirect::to(&return_to)).into_response())
 }
 
 async fn external_oidc_error_return_to(
@@ -751,11 +1457,11 @@ async fn external_oidc_error_return_to(
     slug: &str,
     state_value: Option<&str>,
 ) -> Option<String> {
-    let Some(state_value) = state_value else {
-        return None;
-    };
+    let state_value = state_value?;
     match state.db.consume_external_oidc_state(state_value).await {
-        Ok(oidc_state) if oidc_state.provider_slug == slug => oidc_state.return_to,
+        Ok(oidc_state) if oidc_state.provider_slug == slug => {
+            parse_external_oidc_return_context(oidc_state.return_to).return_to
+        }
         Ok(_) => None,
         Err(err) => {
             tracing::warn!(error = %err, "failed to consume external OIDC error state");
@@ -905,22 +1611,12 @@ fn required_register_password(value: &Option<String>) -> AppResult<&str> {
         .ok_or_else(|| AppError::BadRequest("password is required".to_string()))
 }
 
-fn temporary_username(value: &str) -> String {
-    let base = value
-        .trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-        .collect::<String>();
-    let base = if base.is_empty() {
-        "external".to_string()
-    } else {
-        base.chars().take(32).collect()
-    };
-    format!("{base}-{}", util::random_token(12))
-}
-
-fn temporary_email() -> String {
-    format!("auth-{}@temporary.local", util::random_token(8))
+fn normalize_authorization_code_login_email(value: &str) -> AppResult<String> {
+    let email = value.trim();
+    if email.is_empty() || email.len() > 320 || email.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::Unauthorized);
+    }
+    normalize_email(email).map_err(|_| AppError::Unauthorized)
 }
 
 fn normalize_optional(value: &Option<String>) -> Option<String> {
@@ -1099,20 +1795,30 @@ mod tests {
     }
 
     #[test]
-    fn authorization_code_flow_can_generate_temporary_email() {
-        assert!(optional_register_email(&None).unwrap().is_none());
-        let email = temporary_email();
-        assert!(email.starts_with("auth-"));
-        assert!(email.ends_with("@temporary.local"));
+    fn authorization_code_login_normalizes_and_requires_an_email() {
+        assert_eq!(
+            normalize_authorization_code_login_email(" User@Example.COM ").unwrap(),
+            "user@example.com"
+        );
+        assert!(normalize_authorization_code_login_email(" ").is_err());
+        assert!(normalize_authorization_code_login_email("not-an-email").is_err());
     }
 
     #[test]
-    fn temporary_username_keeps_prefix_and_uses_high_entropy_suffix() {
-        let username = temporary_username(" External User! ");
-        let Some(suffix) = username.strip_prefix("ExternalUser-") else {
-            panic!("temporary username should preserve sanitized prefix: {username}");
-        };
-        assert!(suffix.len() >= 16);
+    fn authorization_code_login_request_accepts_email_not_username() {
+        let request: AuthorizationCodeLoginRequest = serde_json::from_value(serde_json::json!({
+            "email": "person@example.com",
+            "authorization_code": "AUTH-123"
+        }))
+        .unwrap();
+        assert_eq!(request.email, "person@example.com");
+        assert!(
+            serde_json::from_value::<AuthorizationCodeLoginRequest>(serde_json::json!({
+                "username": "person",
+                "authorization_code": "AUTH-123"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

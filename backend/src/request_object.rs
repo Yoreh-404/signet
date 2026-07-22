@@ -125,6 +125,10 @@ fn request_from_claims(
         code_challenge_method: optional_claim(claims.code_challenge_method),
         response_mode: optional_claim(claims.response_mode),
         account_selection_prompted: false,
+        account_selection_required: false,
+        reauthentication_required: false,
+        selected_session_id: None,
+        selected_user_id: None,
     })
 }
 
@@ -361,6 +365,7 @@ mod tests {
                 client_id: "jar-client".to_string(),
                 client_secret_hash: None,
                 client_name: "JAR Client".to_string(),
+                logo_uri: String::new(),
                 organization_id: None,
                 redirect_uris: serde_json::json!(["https://app.example/callback"]).to_string(),
                 post_logout_redirect_uris: "[]".to_string(),

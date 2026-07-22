@@ -2,7 +2,7 @@ use crate::{
     AppState,
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization_details,
+    auth_flow, authorization_details, csrf,
     db::{ClientRecord, DeviceAuthorizationRecord, NewDeviceAuthorization},
     error::{AppError, AppResult},
     mfa,
@@ -105,6 +105,15 @@ pub struct DevicePageQuery {
 pub struct DeviceForm {
     user_code: String,
     action: Option<String>,
+    #[serde(rename = "_csrf")]
+    csrf_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceFormAction {
+    Lookup,
+    Approve,
+    Deny,
 }
 
 pub async fn device_authorization(
@@ -221,7 +230,8 @@ pub async fn device_page(
     {
         return Ok(response);
     }
-    Ok(device_confirm_page(&record, &client, &current.user.email).into_response())
+    let csrf_token = csrf::token_for_current_session(&state, &jar).await?;
+    Ok(device_confirm_page(&record, &client, &current.user.email, &csrf_token).into_response())
 }
 
 pub async fn device_form(
@@ -231,6 +241,10 @@ pub async fn device_form(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Form(payload): Form<DeviceForm>,
 ) -> AppResult<Response> {
+    let action = parse_device_form_action(payload.action.as_deref())?;
+    if action == DeviceFormAction::Lookup {
+        return Ok(Redirect::to(&device_return_to(&payload.user_code)).into_response());
+    }
     let user_code_hash = user_code_hash(&payload.user_code)?;
     let Some(record) = state
         .db
@@ -249,9 +263,9 @@ pub async fn device_form(
             Redirect::to(&device_login_url(&record.user_code_display, false)).into_response(),
         );
     };
-    auth::ensure_account_mutable(&current.user)?;
-    let action = payload.action.as_deref().unwrap_or("approve");
-    if action != "deny" {
+    auth::ensure_current_account_mutable(&current)?;
+    csrf::validate_form_token(&state, &jar, payload.csrf_token.as_deref()).await?;
+    if action == DeviceFormAction::Approve {
         let client = state
             .db
             .find_client_by_client_id(&record.client_id)
@@ -270,7 +284,7 @@ pub async fn device_form(
             return Ok(response);
         }
     }
-    let record = if action == "deny" {
+    let record = if action == DeviceFormAction::Deny {
         state.db.deny_device_authorization(&user_code_hash).await?
     } else {
         state
@@ -284,7 +298,7 @@ pub async fn device_form(
             &current.user.id,
             state.request_ip(&headers, Some(remote_addr)).await?,
             util::user_agent(&headers),
-            if action == "deny" {
+            if action == DeviceFormAction::Deny {
                 "device_deny"
             } else {
                 "device_authorize"
@@ -293,7 +307,21 @@ pub async fn device_form(
             None,
         )
         .await?;
-    Ok(device_done_page(action != "deny").into_response())
+    Ok(device_done_page(action == DeviceFormAction::Approve).into_response())
+}
+
+fn parse_device_form_action(value: Option<&str>) -> AppResult<DeviceFormAction> {
+    match value {
+        Some("lookup") => Ok(DeviceFormAction::Lookup),
+        Some("approve") => Ok(DeviceFormAction::Approve),
+        Some("deny") => Ok(DeviceFormAction::Deny),
+        Some(_) => Err(AppError::BadRequest(
+            "invalid device authorization action".to_string(),
+        )),
+        None => Err(AppError::BadRequest(
+            "device authorization action is required".to_string(),
+        )),
+    }
 }
 
 async fn enforce_device_mfa(
@@ -382,10 +410,10 @@ pub async fn consume_authorized_device_code(
         ));
     }
     if record.authorized_user_id.is_none() {
-        if let Some(last_poll_at) = record.last_poll_at {
-            if now - last_poll_at < i64::from(record.interval_seconds) {
-                return Err(oauth_error("slow_down", "polling interval is too short"));
-            }
+        if let Some(last_poll_at) = record.last_poll_at
+            && now - last_poll_at < i64::from(record.interval_seconds)
+        {
+            return Err(oauth_error("slow_down", "polling interval is too short"));
         }
         state
             .db
@@ -509,6 +537,7 @@ fn device_code_entry_page(user_code: Option<&str>, error: Option<&str>) -> Html<
       {error}
       <label>授权码</label>
       <input name="user_code" value="{value}" autocomplete="one-time-code" required />
+      <input type="hidden" name="action" value="lookup" />
       <button type="submit">继续</button>
     </form>
   </main>
@@ -522,11 +551,13 @@ fn device_confirm_page(
     record: &DeviceAuthorizationRecord,
     client: &ClientRecord,
     email: &str,
+    csrf_token: &str,
 ) -> Html<String> {
     let user_code = html_escape(&record.user_code_display);
     let client_name = html_escape(&client.client_name);
     let scope = html_escape(&record.scope);
     let email = html_escape(email);
+    let csrf_token = html_escape(csrf_token);
     let resource = record
         .resource
         .as_deref()
@@ -563,8 +594,9 @@ fn device_confirm_page(
 	        <dt>权限范围</dt><dd>{scope}</dd>
 	        {resource}
 	        {authorization_details}
-	      </dl>
+      </dl>
       <input type="hidden" name="user_code" value="{user_code}" />
+      <input type="hidden" name="_csrf" value="{csrf_token}" />
       <button type="submit" name="action" value="approve">允许</button>
       <button class="secondary" type="submit" name="action" value="deny">拒绝</button>
     </form>
@@ -659,5 +691,21 @@ mod tests {
             url,
             "/?auth=login&return_to=%2Foauth2%2Fdevice%3Fuser_code%3DABCD-2345"
         );
+    }
+
+    #[test]
+    fn device_code_entry_requires_lookup_before_approval() {
+        let page = device_code_entry_page(Some("ABCD-2345"), None).0;
+        assert!(page.contains("name=\"action\" value=\"lookup\""));
+        assert!(parse_device_form_action(None).is_err());
+        assert_eq!(
+            parse_device_form_action(Some("lookup")).unwrap(),
+            DeviceFormAction::Lookup
+        );
+        assert_eq!(
+            parse_device_form_action(Some("approve")).unwrap(),
+            DeviceFormAction::Approve
+        );
+        assert!(parse_device_form_action(Some("unexpected")).is_err());
     }
 }

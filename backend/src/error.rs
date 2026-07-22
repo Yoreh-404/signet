@@ -79,13 +79,24 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let is_internal = matches!(
+            &self,
+            AppError::Database(_) | AppError::Configuration(_) | AppError::Internal(_)
+        );
+        if is_internal {
+            tracing::error!(error = %self, "request failed with an internal error");
+        }
         let error_description = match &self {
             AppError::OAuth { description, .. } => Some(description.clone()),
             _ => None,
         };
-        let message = match &self {
-            AppError::OAuth { description, .. } => description.clone(),
-            _ => self.to_string(),
+        let message = if is_internal {
+            "internal server error".to_string()
+        } else {
+            match &self {
+                AppError::OAuth { description, .. } => description.clone(),
+                _ => self.to_string(),
+            }
         };
         let body = ErrorBody {
             error: self.oauth_error(),

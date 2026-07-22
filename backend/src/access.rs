@@ -208,21 +208,15 @@ pub trait Authorizer {
 }
 
 impl Authorizer for Db {
-    fn has_permission(
-        &self,
-        user: &UserRecord,
-        permission: Permission,
-    ) -> impl Future<Output = AppResult<bool>> + Send {
-        async move {
-            if !user_can_hold_permissions(user) {
-                return Ok(false);
-            }
-            if user.is_admin == 1 {
-                return Ok(true);
-            }
-            let permissions = self.list_effective_permissions(&user.id).await?;
-            Ok(permissions.iter().any(|item| item == permission.as_str()))
+    async fn has_permission(&self, user: &UserRecord, permission: Permission) -> AppResult<bool> {
+        if !user_can_hold_permissions(user) {
+            return Ok(false);
         }
+        if user.is_admin == 1 {
+            return Ok(true);
+        }
+        let permissions = self.list_effective_permissions(&user.id).await?;
+        Ok(permissions.iter().any(|item| item == permission.as_str()))
     }
 }
 
@@ -243,6 +237,7 @@ mod tests {
             is_admin: 1,
             is_active,
             archived_at,
+            registration_source: "local".to_string(),
             last_login_at: None,
             last_login_ip: None,
             last_oidc_client_id: None,

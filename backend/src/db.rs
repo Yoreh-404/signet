@@ -32,6 +32,20 @@ type PgPool = Pool<ConnectionManager<PgConnection>>;
 #[cfg(feature = "mysql")]
 type MysqlPool = Pool<ConnectionManager<MysqlConnection>>;
 
+#[cfg(feature = "sqlite")]
+#[derive(Debug)]
+struct SqliteConnectionCustomizer;
+
+#[cfg(feature = "sqlite")]
+impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
+    for SqliteConnectionCustomizer
+{
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        conn.batch_execute("PRAGMA busy_timeout = 5000;")
+            .map_err(Into::into)
+    }
+}
+
 #[derive(Clone)]
 pub enum Db {
     #[cfg(feature = "sqlite")]
@@ -145,6 +159,7 @@ macro_rules! mark_verification_code_consumed {
 const USER_AUTH_STATE_TABLES: &[(&str, &str)] = &[
     ("sessions", "user_id"),
     ("authorization_codes", "user_id"),
+    ("oidc_login_grants", "user_id"),
     ("refresh_tokens", "user_id"),
     ("device_authorizations", "authorized_user_id"),
     ("webauthn_challenges", "user_id"),
@@ -152,6 +167,16 @@ const USER_AUTH_STATE_TABLES: &[(&str, &str)] = &[
 
 macro_rules! clear_user_auth_state_for_conn {
     ($conn:expr, $kind:expr, $user_id:expr) => {{
+        for table in ["session_credentials", "browser_context_accounts"] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE session_id IN (SELECT id FROM sessions WHERE user_id = {})",
+                ph($kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>($user_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
         for (table, column) in USER_AUTH_STATE_TABLES {
             let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph($kind, 1));
             sql_query(sql)
@@ -160,6 +185,82 @@ macro_rules! clear_user_auth_state_for_conn {
                 .map_err(AppError::from)?;
         }
         Ok::<(), AppError>(())
+    }};
+}
+
+macro_rules! revoke_trial_enrollment_auth_state_for_invitation {
+    ($conn:expr, $kind:expr, $invitation_id:expr) => {{
+        for table in ["session_credentials", "browser_context_accounts"] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE session_id IN (SELECT id FROM sessions WHERE user_id IN (SELECT user_id FROM trial_enrollments WHERE invitation_id = {}))",
+                ph($kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>($invitation_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        for (table, column) in [
+            ("authorization_codes", "user_id"),
+            ("oidc_login_grants", "user_id"),
+            ("refresh_tokens", "user_id"),
+            ("device_authorizations", "authorized_user_id"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE {column} IN (SELECT user_id FROM trial_enrollments WHERE invitation_id = {})",
+                ph($kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>($invitation_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        let sql = format!(
+            "DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM trial_enrollments WHERE invitation_id = {})",
+            ph($kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>($invitation_id)
+            .execute($conn)
+            .map_err(AppError::from)?;
+    }};
+}
+
+macro_rules! revoke_trial_enrollment_auth_state_for_organization {
+    ($conn:expr, $kind:expr, $organization_id:expr) => {{
+        for table in ["session_credentials", "browser_context_accounts"] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE session_id IN (SELECT id FROM sessions WHERE user_id IN (SELECT user_id FROM trial_enrollments WHERE organization_id = {}))",
+                ph($kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>($organization_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        for (table, column) in [
+            ("authorization_codes", "user_id"),
+            ("oidc_login_grants", "user_id"),
+            ("refresh_tokens", "user_id"),
+            ("device_authorizations", "authorized_user_id"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE {column} IN (SELECT user_id FROM trial_enrollments WHERE organization_id = {})",
+                ph($kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>($organization_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        let sql = format!(
+            "DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM trial_enrollments WHERE organization_id = {})",
+            ph($kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>($organization_id)
+            .execute($conn)
+            .map_err(AppError::from)?;
     }};
 }
 
@@ -187,6 +288,8 @@ pub struct UserRecord {
     pub is_active: i32,
     #[diesel(sql_type = Nullable<BigInt>)]
     pub archived_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    pub registration_source: String,
     #[diesel(sql_type = Nullable<BigInt>)]
     pub last_login_at: Option<i64>,
     #[diesel(sql_type = Nullable<Text>)]
@@ -213,6 +316,7 @@ pub struct PublicUser {
     pub is_admin: bool,
     pub is_active: bool,
     pub archived_at: Option<i64>,
+    pub registration_source: String,
     pub last_login_at: Option<i64>,
     pub last_login_ip: Option<String>,
     pub last_oidc_client_id: Option<String>,
@@ -234,6 +338,7 @@ impl UserRecord {
             is_admin: self.is_admin == 1,
             is_active: self.is_active == 1,
             archived_at: self.archived_at,
+            registration_source: self.registration_source,
             last_login_at: self.last_login_at,
             last_login_ip: self.last_login_ip,
             last_oidc_client_id: self.last_oidc_client_id,
@@ -244,12 +349,31 @@ impl UserRecord {
     }
 }
 
+/// How an account was first created.  The value is intentionally immutable:
+/// redeeming a login-only authorization code must never change an existing
+/// account into an authorization-code-created account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserRegistrationSource {
+    Local,
+    AuthorizationCode,
+}
+
+impl UserRegistrationSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::AuthorizationCode => "authorization_code",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum UserListScope {
     Live,
     Active,
     Disabled,
     Archived,
+    AuthorizationCode,
     All,
 }
 
@@ -260,6 +384,7 @@ impl UserListScope {
             UserListScope::Active => "WHERE archived_at IS NULL AND is_active = 1",
             UserListScope::Disabled => "WHERE archived_at IS NULL AND is_active = 0",
             UserListScope::Archived => "WHERE archived_at IS NOT NULL",
+            UserListScope::AuthorizationCode => "WHERE registration_source = 'authorization_code'",
             UserListScope::All => "",
         }
     }
@@ -267,7 +392,9 @@ impl UserListScope {
     fn order_sql(self) -> &'static str {
         match self {
             UserListScope::Archived => "archived_at DESC, created_at DESC",
-            UserListScope::All => "archived_at IS NOT NULL ASC, is_active DESC, created_at DESC",
+            UserListScope::AuthorizationCode | UserListScope::All => {
+                "archived_at IS NOT NULL ASC, is_active DESC, created_at DESC"
+            }
             UserListScope::Live | UserListScope::Active | UserListScope::Disabled => {
                 "is_active DESC, created_at DESC"
             }
@@ -287,6 +414,28 @@ pub struct NewUser {
     pub is_admin: bool,
     pub is_active: bool,
     pub archived_at: Option<i64>,
+}
+
+/// A new local account and, optionally, its first organization membership.
+///
+/// This is deliberately an insert-only shape.  Enterprise provisioning must
+/// never turn a CSV upload into an implicit update of an existing identity.
+#[derive(Debug, Clone)]
+pub struct NewBulkProvisionedUser {
+    pub user: NewUser,
+    pub organization_id: Option<String>,
+    pub organization_role: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserUpdate<'a> {
+    pub id: &'a str,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub phone: Option<String>,
+    pub is_admin: bool,
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +476,8 @@ pub struct ClientRecord {
     pub client_secret_hash: Option<String>,
     #[diesel(sql_type = Text)]
     pub client_name: String,
+    #[diesel(sql_type = Text)]
+    pub logo_uri: String,
     #[diesel(sql_type = Nullable<Text>)]
     pub organization_id: Option<String>,
     #[diesel(sql_type = Text)]
@@ -459,6 +610,7 @@ pub struct PublicClient {
     pub id: String,
     pub client_id: String,
     pub client_name: String,
+    pub logo_uri: String,
     pub organization_id: Option<String>,
     pub organization_slug: Option<String>,
     pub organization_name: Option<String>,
@@ -515,6 +667,7 @@ impl ClientRecord {
             id: self.id,
             client_id: self.client_id,
             client_name: self.client_name,
+            logo_uri: self.logo_uri,
             organization_id: self.organization_id,
             organization_slug: None,
             organization_name: None,
@@ -599,6 +752,7 @@ pub struct NewClient {
     pub client_id: String,
     pub client_secret_hash: Option<String>,
     pub client_name: String,
+    pub logo_uri: String,
     pub organization_id: Option<String>,
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
@@ -752,6 +906,54 @@ pub struct SessionMetadata {
     pub login_method: Option<String>,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct BrowserContextRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub csrf_token: String,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct BrowserContextAccountRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub browser_context_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub session_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub added_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_selected_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct AccountLoginFlowRecord {
+    #[diesel(sql_type = Text)]
+    pub id_hash: String,
+    #[diesel(sql_type = Text)]
+    pub browser_context_id: String,
+    #[diesel(sql_type = Text)]
+    pub return_to: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub expected_user_id: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub consumed_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
 pub struct MfaTotpMethodRecord {
     #[diesel(sql_type = Text)]
@@ -807,6 +1009,7 @@ pub struct MfaRecoveryCodeRecord {
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Text)]
+    #[serde(skip)]
     pub code_hash: String,
     #[diesel(sql_type = Nullable<BigInt>)]
     pub used_at: Option<i64>,
@@ -933,6 +1136,45 @@ pub struct NewAuthorizationCode {
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct OidcLoginGrantRecord {
+    #[diesel(sql_type = Text)]
+    pub credential_hash: String,
+    #[diesel(sql_type = Text)]
+    pub invitation_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub client_id: String,
+    #[diesel(sql_type = Text)]
+    pub interaction_request_hash: String,
+    #[diesel(sql_type = BigInt)]
+    pub auth_time: i64,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub consumed_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcLoginGrantRedemption {
+    pub invitation_id: String,
+    pub user: UserRecord,
+    pub grant: OidcLoginGrantRecord,
+}
+
+pub(crate) struct AdminLoginCodeRedemptionInput<'a> {
+    pub code: &'a str,
+    pub user_id: &'a str,
+    pub email: &'a str,
+    pub trusted_client_id: &'a str,
+    pub interaction_request_hash: &'a str,
+    pub credential_hash: &'a str,
+    pub ttl_seconds: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
 pub struct PushedAuthorizationRequestRecord {
     #[diesel(sql_type = Text)]
     pub request_uri_hash: String,
@@ -1025,6 +1267,17 @@ pub struct RefreshTokenRecord {
     pub revoked_at: Option<i64>,
     #[diesel(sql_type = BigInt)]
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshTokenInput {
+    pub token_hash: String,
+    pub user_id: String,
+    pub scope: String,
+    pub resource: Option<String>,
+    pub authorization_details: Option<String>,
+    pub dpop_jkt: Option<String>,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -1325,6 +1578,8 @@ pub struct LoginSettingsRecord {
     #[diesel(sql_type = Text)]
     pub id: String,
     #[diesel(sql_type = Text)]
+    pub brand_logo_url: String,
+    #[diesel(sql_type = Text)]
     pub email_domains: String,
     #[diesel(sql_type = Text)]
     pub quick_links: String,
@@ -1334,6 +1589,7 @@ pub struct LoginSettingsRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicLoginSettings {
+    pub brand_logo_url: String,
     pub email_domains: Vec<String>,
     pub quick_links: Vec<QuickLink>,
     pub updated_at: i64,
@@ -1342,6 +1598,7 @@ pub struct PublicLoginSettings {
 impl LoginSettingsRecord {
     pub fn public(&self) -> AppResult<PublicLoginSettings> {
         Ok(PublicLoginSettings {
+            brand_logo_url: self.brand_logo_url.clone(),
             email_domains: util::from_json(&self.email_domains)?,
             quick_links: util::from_json(&self.quick_links)?,
             updated_at: self.updated_at,
@@ -1351,6 +1608,7 @@ impl LoginSettingsRecord {
 
 #[derive(Debug, Clone)]
 pub struct NewLoginSettings {
+    pub brand_logo_url: String,
     pub email_domains: Vec<String>,
     pub quick_links: Vec<QuickLink>,
 }
@@ -1408,6 +1666,17 @@ pub struct VerificationCodeRecord {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewVerificationCode<'a> {
+    pub channel: &'a str,
+    pub target: &'a str,
+    pub purpose: &'a str,
+    pub code_hash: String,
+    pub ttl_seconds: i64,
+    pub resend_interval_seconds: i64,
+    pub max_attempts: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VerificationCodeDecision {
     Accepted(String),
@@ -1461,15 +1730,35 @@ pub struct InvitationRecord {
     #[diesel(sql_type = Text)]
     pub id: String,
     #[diesel(sql_type = Text)]
+    #[serde(skip)]
     pub code_hash: String,
     #[diesel(sql_type = Text)]
     pub code_prefix: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    #[serde(skip)]
+    pub code_reveal_key_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    #[serde(skip)]
+    pub code_reveal_ciphertext: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub code_type: String,
+    #[diesel(sql_type = Text)]
+    pub login_code_level: String,
+    #[diesel(sql_type = Text)]
+    pub allowed_client_ids: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub organization_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub organization_role: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub description: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub authorized_email: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub authorized_username: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    #[serde(skip)]
+    pub authorized_user_id: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub authorized_display_name: Option<String>,
     #[diesel(sql_type = Nullable<BigInt>)]
@@ -1529,6 +1818,15 @@ impl InvitationRedemptionRecord {
 pub struct PublicInvitation {
     pub id: String,
     pub code_prefix: String,
+    /// Whether this code was created with protected reveal material.  The
+    /// management client uses this server-authoritative flag instead of trying
+    /// to infer recoverability from a prefix or creation date.
+    pub can_reveal: bool,
+    pub code_type: AuthorizationCodeType,
+    pub login_code_level: LoginCodeLevel,
+    pub allowed_client_ids: Vec<String>,
+    pub organization_id: Option<String>,
+    pub organization_role: Option<String>,
     pub description: Option<String>,
     pub authorized_email: Option<String>,
     pub authorized_username: Option<String>,
@@ -1540,21 +1838,39 @@ pub struct PublicInvitation {
     pub created_by: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub redemptions: Vec<PublicInvitationRedemption>,
 }
 
 impl InvitationRecord {
-    pub fn public(self) -> PublicInvitation {
-        self.public_with_redemptions(Vec::new())
+    pub fn authorization_code_type(&self) -> AppResult<AuthorizationCodeType> {
+        AuthorizationCodeType::parse(&self.code_type)
     }
 
-    pub fn public_with_redemptions(
-        self,
-        redemptions: Vec<PublicInvitationRedemption>,
-    ) -> PublicInvitation {
-        PublicInvitation {
+    pub fn login_code_level(&self) -> AppResult<LoginCodeLevel> {
+        LoginCodeLevel::parse(&self.login_code_level)
+    }
+
+    pub fn allowed_client_ids(&self) -> AppResult<Vec<String>> {
+        util::from_json(&self.allowed_client_ids).map_err(|err| {
+            AppError::Configuration(format!(
+                "authorization code client allowlist is invalid: {err}"
+            ))
+        })
+    }
+
+    pub fn public(self) -> AppResult<PublicInvitation> {
+        let code_type = self.authorization_code_type()?;
+        let login_code_level = self.login_code_level()?;
+        let allowed_client_ids = self.allowed_client_ids()?;
+        let can_reveal = self.code_reveal_key_id.is_some() && self.code_reveal_ciphertext.is_some();
+        Ok(PublicInvitation {
             id: self.id,
             code_prefix: self.code_prefix,
+            can_reveal,
+            code_type,
+            login_code_level,
+            allowed_client_ids,
+            organization_id: self.organization_id,
+            organization_role: self.organization_role,
             description: self.description,
             authorized_email: self.authorized_email,
             authorized_username: self.authorized_username,
@@ -1566,13 +1882,86 @@ impl InvitationRecord {
             created_by: self.created_by,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            redemptions,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationCodeType {
+    Registration,
+    Login,
+}
+
+impl AuthorizationCodeType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registration => "registration",
+            Self::Login => "login",
+        }
+    }
+
+    pub fn parse(value: &str) -> AppResult<Self> {
+        match value {
+            "registration" => Ok(Self::Registration),
+            "login" => Ok(Self::Login),
+            _ => Err(AppError::Configuration(format!(
+                "unknown authorization code type: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginCodeLevel {
+    AccountRecovery,
+    AdminUniversal,
+    TrialEnrollment,
+}
+
+impl LoginCodeLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountRecovery => "account_recovery",
+            Self::AdminUniversal => "admin_universal",
+            Self::TrialEnrollment => "trial_enrollment",
+        }
+    }
+
+    pub fn parse(value: &str) -> AppResult<Self> {
+        match value {
+            "account_recovery" => Ok(Self::AccountRecovery),
+            "admin_universal" => Ok(Self::AdminUniversal),
+            "trial_enrollment" => Ok(Self::TrialEnrollment),
+            _ => Err(AppError::Configuration(format!(
+                "unknown login authorization code type: {value}"
+            ))),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct NewInvitation {
+    pub code_type: AuthorizationCodeType,
+    pub login_code_level: LoginCodeLevel,
+    pub allowed_client_ids: Vec<String>,
+    pub organization_id: Option<String>,
+    pub organization_role: Option<String>,
+    pub description: Option<String>,
+    pub authorized_email: Option<String>,
+    pub authorized_username: Option<String>,
+    pub authorized_user_id: Option<String>,
+    pub authorized_display_name: Option<String>,
+    pub expires_at: Option<i64>,
+    pub max_uses: Option<i32>,
+    pub is_active: bool,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvitationUpdate<'a> {
+    pub id: &'a str,
     pub description: Option<String>,
     pub authorized_email: Option<String>,
     pub authorized_username: Option<String>,
@@ -1580,7 +1969,74 @@ pub struct NewInvitation {
     pub expires_at: Option<i64>,
     pub max_uses: Option<i32>,
     pub is_active: bool,
-    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountRecoveryCodeRedemption {
+    pub invitation_id: String,
+    pub user: UserRecord,
+    pub code_expires_at: Option<i64>,
+}
+
+/// The immutable enrollment provenance for a trial account. It deliberately
+/// snapshots the client allowlist at redemption time: disabling or deleting a
+/// code revokes these records, while an administrator can never accidentally
+/// turn a former trial session into a normal SSO session by editing a code.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct TrialEnrollmentRecord {
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub invitation_id: String,
+    #[diesel(sql_type = Text)]
+    pub organization_id: String,
+    #[diesel(sql_type = Text)]
+    pub organization_role: String,
+    #[diesel(sql_type = Text)]
+    pub allowed_client_ids: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub expires_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub revoked_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+}
+
+impl TrialEnrollmentRecord {
+    pub fn allowed_client_ids(&self) -> AppResult<Vec<String>> {
+        util::from_json(&self.allowed_client_ids).map_err(|err| {
+            AppError::Configuration(format!(
+                "trial enrollment client allowlist is invalid: {err}"
+            ))
+        })
+    }
+
+    pub fn allows_client(&self, client_id: &str) -> AppResult<bool> {
+        Ok(self
+            .allowed_client_ids()?
+            .iter()
+            .any(|allowed| allowed == client_id))
+    }
+
+    pub fn is_active_at(&self, now: i64) -> bool {
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|expires_at| expires_at >= now)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTrialEnrollmentUser {
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub password_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrialEnrollmentCodeRedemption {
+    pub invitation_id: String,
+    pub user: UserRecord,
+    pub code_expires_at: Option<i64>,
+    pub organization_id: String,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -1801,6 +2257,14 @@ pub struct OrganizationMemberRecord {
     pub created_at: i64,
     #[diesel(sql_type = BigInt)]
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct OrganizationMemberCountRecord {
+    #[diesel(sql_type = Text)]
+    pub organization_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub member_count: i64,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -2149,7 +2613,18 @@ fn ph(kind: DatabaseKind, index: usize) -> String {
 }
 
 fn select_user_sql() -> &'static str {
-    "SELECT id, email, username, display_name, phone, password_hash, email_verified_at, phone_verified_at, is_admin, is_active, archived_at, last_login_at, last_login_ip, last_oidc_client_id, last_login_method, created_at, updated_at FROM users"
+    "SELECT id, email, username, display_name, phone, password_hash, email_verified_at, phone_verified_at, is_admin, is_active, archived_at, registration_source, last_login_at, last_login_ip, last_oidc_client_id, last_login_method, created_at, updated_at FROM users"
+}
+
+fn authorization_code_registration_source_backfill_sql(kind: DatabaseKind) -> String {
+    format!(
+        "UPDATE users SET registration_source = {} WHERE registration_source = {} AND id IN (SELECT invitation_redemptions.user_id FROM invitation_redemptions INNER JOIN invitations ON invitations.id = invitation_redemptions.invitation_id WHERE invitations.code_type = {} OR (invitations.code_type = {} AND invitations.login_code_level = {}))",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5),
+    )
 }
 
 fn select_ldap_provider_sql() -> &'static str {
@@ -2193,9 +2668,10 @@ fn count_linked_identity_sql(kind: DatabaseKind) -> String {
     )
 }
 
-fn insert_user_sql(kind: DatabaseKind) -> String {
+fn insert_user_sql(kind: DatabaseKind, registration_source: UserRegistrationSource) -> String {
+    let source = registration_source.as_str();
     format!(
-        "INSERT INTO users (id, email, username, display_name, phone, password_hash, email_verified_at, phone_verified_at, is_admin, is_active, archived_at, last_login_at, last_login_ip, last_oidc_client_id, last_login_method, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO users (id, email, username, display_name, phone, password_hash, email_verified_at, phone_verified_at, is_admin, is_active, archived_at, registration_source, last_login_at, last_login_ip, last_oidc_client_id, last_login_method, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{source}', {}, {}, {}, {}, {}, {})",
         ph(kind, 1),
         ph(kind, 2),
         ph(kind, 3),
@@ -2212,12 +2688,12 @@ fn insert_user_sql(kind: DatabaseKind) -> String {
         ph(kind, 14),
         ph(kind, 15),
         ph(kind, 16),
-        ph(kind, 17)
+        ph(kind, 17),
     )
 }
 
 fn select_client_sql() -> &'static str {
-    "SELECT id, client_id, client_secret_hash, client_name, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, COALESCE(require_mfa, 0) AS require_mfa, COALESCE(require_pushed_authorization_requests, 0) AS require_pushed_authorization_requests, COALESCE(require_s256_pkce, 0) AS require_s256_pkce, COALESCE(require_confidential_client, 0) AS require_confidential_client, COALESCE(require_dpop, 0) AS require_dpop, COALESCE(require_account_selection, 0) AS require_account_selection, COALESCE(trust_email_verified, 0) AS trust_email_verified, COALESCE(authorization_details_types, '[]') AS authorization_details_types, subject_type, sector_identifier_uri, COALESCE(jwks_uri, '') AS jwks_uri, COALESCE(jwks, '') AS jwks, COALESCE(backchannel_logout_uri, '') AS backchannel_logout_uri, COALESCE(backchannel_logout_session_required, 0) AS backchannel_logout_session_required, COALESCE(frontchannel_logout_uri, '') AS frontchannel_logout_uri, COALESCE(frontchannel_logout_session_required, 0) AS frontchannel_logout_session_required, COALESCE(service_account_enabled, 0) AS service_account_enabled, COALESCE(service_account_permissions, '[]') AS service_account_permissions, is_active, created_at, updated_at FROM clients"
+    "SELECT id, client_id, client_secret_hash, client_name, COALESCE(logo_uri, '') AS logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, COALESCE(require_mfa, 0) AS require_mfa, COALESCE(require_pushed_authorization_requests, 0) AS require_pushed_authorization_requests, COALESCE(require_s256_pkce, 0) AS require_s256_pkce, COALESCE(require_confidential_client, 0) AS require_confidential_client, COALESCE(require_dpop, 0) AS require_dpop, COALESCE(require_account_selection, 0) AS require_account_selection, COALESCE(trust_email_verified, 0) AS trust_email_verified, COALESCE(authorization_details_types, '[]') AS authorization_details_types, subject_type, sector_identifier_uri, COALESCE(jwks_uri, '') AS jwks_uri, COALESCE(jwks, '') AS jwks, COALESCE(backchannel_logout_uri, '') AS backchannel_logout_uri, COALESCE(backchannel_logout_session_required, 0) AS backchannel_logout_session_required, COALESCE(frontchannel_logout_uri, '') AS frontchannel_logout_uri, COALESCE(frontchannel_logout_session_required, 0) AS frontchannel_logout_session_required, COALESCE(service_account_enabled, 0) AS service_account_enabled, COALESCE(service_account_permissions, '[]') AS service_account_permissions, is_active, created_at, updated_at FROM clients"
 }
 
 fn select_client_claim_mapper_sql() -> &'static str {
@@ -2240,8 +2716,16 @@ fn select_pushed_authorization_request_sql() -> &'static str {
     "SELECT request_uri_hash, client_id, request_json, expires_at, consumed_at, created_at FROM pushed_authorization_requests"
 }
 
+fn select_oidc_login_grant_sql() -> &'static str {
+    "SELECT credential_hash, invitation_id, user_id, client_id, interaction_request_hash, auth_time, expires_at, consumed_at, created_at FROM oidc_login_grants"
+}
+
 fn select_invitation_sql() -> &'static str {
-    "SELECT id, code_hash, code_prefix, description, authorized_email, authorized_username, authorized_display_name, expires_at, max_uses, uses_count, is_active, created_by, created_at, updated_at FROM invitations"
+    "SELECT id, code_hash, code_prefix, code_reveal_key_id, code_reveal_ciphertext, code_type, login_code_level, COALESCE(allowed_client_ids, '[]') AS allowed_client_ids, organization_id, organization_role, description, authorized_email, authorized_username, authorized_user_id, authorized_display_name, expires_at, max_uses, uses_count, is_active, created_by, created_at, updated_at FROM invitations"
+}
+
+fn select_trial_enrollment_sql() -> &'static str {
+    "SELECT user_id, invitation_id, organization_id, organization_role, allowed_client_ids, expires_at, revoked_at, created_at FROM trial_enrollments"
 }
 
 fn select_verification_code_sql() -> &'static str {
@@ -2319,11 +2803,61 @@ fn consume_verification_code_sql(kind: DatabaseKind) -> String {
 
 fn redeem_invitation_update_sql(kind: DatabaseKind) -> String {
     format!(
-        "UPDATE invitations SET uses_count = uses_count + 1, updated_at = {} WHERE id = {} AND is_active = 1 AND (expires_at IS NULL OR expires_at >= {}) AND (max_uses IS NULL OR uses_count < max_uses)",
+        "UPDATE invitations SET uses_count = uses_count + 1, updated_at = {} WHERE id = {} AND code_type = {} AND is_active = 1 AND (expires_at IS NULL OR expires_at >= {}) AND (max_uses IS NULL OR uses_count < max_uses)",
         ph(kind, 1),
         ph(kind, 2),
-        ph(kind, 3)
+        ph(kind, 3),
+        ph(kind, 4)
     )
+}
+
+fn redeem_account_recovery_invitation_update_sql(kind: DatabaseKind) -> String {
+    format!(
+        "UPDATE invitations SET uses_count = uses_count + 1, authorized_user_id = COALESCE(authorized_user_id, {}), updated_at = {} WHERE id = {} AND code_type = {} AND login_code_level = {} AND (authorized_user_id IS NULL OR authorized_user_id = {}) AND is_active = 1 AND (expires_at IS NULL OR expires_at >= {}) AND (max_uses IS NULL OR uses_count < max_uses)",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5),
+        ph(kind, 6),
+        ph(kind, 7)
+    )
+}
+
+fn redeem_trial_enrollment_invitation_update_sql(kind: DatabaseKind) -> String {
+    format!(
+        "UPDATE invitations SET uses_count = uses_count + 1, updated_at = {} WHERE id = {} AND code_type = {} AND login_code_level = {} AND is_active = 1 AND (expires_at IS NULL OR expires_at >= {}) AND (max_uses IS NULL OR uses_count < max_uses)",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5)
+    )
+}
+
+fn ensure_invitation_redeemable(invitation: &InvitationRecord, now: i64) -> AppResult<()> {
+    if invitation.is_active != 1 {
+        return Err(AppError::BadRequest(
+            "authorization code is disabled".to_string(),
+        ));
+    }
+    if invitation
+        .expires_at
+        .is_some_and(|expires_at| expires_at < now)
+    {
+        return Err(AppError::BadRequest(
+            "authorization code expired".to_string(),
+        ));
+    }
+    if invitation
+        .max_uses
+        .is_some_and(|max_uses| invitation.uses_count >= max_uses)
+    {
+        return Err(AppError::BadRequest(
+            "authorization code is exhausted".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn select_organization_sql() -> &'static str {
@@ -2381,6 +2915,13 @@ impl Db {
         }
     }
 
+    pub async fn ping(&self) -> AppResult<()> {
+        with_conn!(self, |conn, _kind| {
+            conn.batch_execute("SELECT 1")
+                .map_err(|err| AppError::Database(err.to_string()))
+        })
+    }
+
     pub async fn migrate(&self) -> AppResult<()> {
         with_conn!(self, |conn, kind| {
             for statement in migration_sql(kind) {
@@ -2391,6 +2932,18 @@ impl Db {
                     }
                 }
             }
+            // This data repair is deliberately outside the static migration
+            // arrays: those arrays run on every startup and MySQL keeps them
+            // schema-only. The statement is idempotent and only touches
+            // legacy rows which still carry the default source.
+            sql_query(authorization_code_registration_source_backfill_sql(kind))
+                .bind::<Text, _>(UserRegistrationSource::AuthorizationCode.as_str())
+                .bind::<Text, _>(UserRegistrationSource::Local.as_str())
+                .bind::<Text, _>(AuthorizationCodeType::Registration.as_str())
+                .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                .bind::<Text, _>(LoginCodeLevel::TrialEnrollment.as_str())
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
             Ok(())
         })
     }
@@ -2458,6 +3011,7 @@ impl Db {
         .await?;
 
         self.ensure_login_settings(NewLoginSettings {
+            brand_logo_url: String::new(),
             email_domains: Vec::new(),
             quick_links: vec![default_openai_quick_link()],
         })
@@ -2516,6 +3070,7 @@ impl Db {
                     client_id: client.client_id.clone(),
                     client_secret_hash,
                     client_name: client.client_name.clone(),
+                    logo_uri: client.logo_uri.clone(),
                     organization_id: None,
                     redirect_uris: client.redirect_uris.clone(),
                     post_logout_redirect_uris: client.post_logout_redirect_uris.clone(),
@@ -2556,6 +3111,18 @@ impl Db {
             let sql = format!("{} WHERE email = {}", select_user_sql(), ph(kind, 1));
             sql_query(sql)
                 .bind::<Text, _>(email)
+                .get_result::<UserRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_user_by_username(&self, username: &str) -> AppResult<Option<UserRecord>> {
+        let username = username.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!("{} WHERE username = {}", select_user_sql(), ph(kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>(username)
                 .get_result::<UserRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
@@ -2624,7 +3191,7 @@ impl Db {
                     identity,
                     "user email, username, or phone already exists"
                 )?;
-                sql_query(insert_user_sql(kind))
+                sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
                     .bind::<Text, _>(&id)
                     .bind::<Text, _>(user.email)
                     .bind::<Text, _>(user.username)
@@ -2650,6 +3217,156 @@ impl Db {
                     .bind::<Text, _>(id)
                     .get_result::<UserRecord>(conn)
                     .map_err(AppError::from)
+            })
+        })
+    }
+
+    /// Inserts a complete enterprise-provisioning batch in one transaction.
+    ///
+    /// The method validates the identity availability and the optional
+    /// organization membership inside the transaction as well as at the API
+    /// preflight layer.  The second check makes a concurrent account creation
+    /// fail closed: no partial users or memberships can remain from a batch.
+    pub async fn insert_bulk_provisioned_users(
+        &self,
+        users: Vec<NewBulkProvisionedUser>,
+    ) -> AppResult<Vec<UserRecord>> {
+        if users.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let entries = users
+            .into_iter()
+            .map(|entry| (uuid::Uuid::new_v4().to_string(), entry))
+            .collect::<Vec<_>>();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<Vec<UserRecord>, AppError, _>(|conn| {
+                let mut inserted = Vec::with_capacity(entries.len());
+                for (id, entry) in &entries {
+                    if entry.user.is_admin {
+                        return Err(AppError::BadRequest(
+                            "bulk provisioning cannot create administrators".to_string(),
+                        ));
+                    }
+                    if entry.user.archived_at.is_some() {
+                        return Err(AppError::BadRequest(
+                            "bulk provisioning cannot create archived accounts".to_string(),
+                        ));
+                    }
+
+                    let identity = UserIdentityCandidate::insert(&entry.user);
+                    ensure_user_identity_available!(
+                        conn,
+                        kind,
+                        identity,
+                        "user email, username, or phone already exists"
+                    )?;
+
+                    let membership = match (
+                        entry.organization_id.as_deref(),
+                        entry.organization_role.as_deref(),
+                    ) {
+                        (None, None) => None,
+                        (Some(_), None) => {
+                            return Err(AppError::BadRequest(
+                                "organization membership role is required".to_string(),
+                            ));
+                        }
+                        (None, Some(_)) => {
+                            return Err(AppError::BadRequest(
+                                "organization membership requires an organization".to_string(),
+                            ));
+                        }
+                        (Some(organization_id), Some(role)) => {
+                            let role = crate::organizations::normalize_role(role)?;
+                            let sql = format!(
+                                "{} WHERE id = {}",
+                                select_organization_sql(),
+                                ph(kind, 1)
+                            );
+                            let organization = sql_query(sql)
+                                .bind::<Text, _>(organization_id)
+                                .get_result::<OrganizationRecord>(conn)
+                                .optional()
+                                .map_err(AppError::from)?
+                                .ok_or_else(|| {
+                                    AppError::BadRequest(
+                                        "organization does not reference an existing organization"
+                                            .to_string(),
+                                    )
+                                })?;
+                            if organization.is_active != 1 {
+                                return Err(AppError::BadRequest(
+                                    "organization is inactive".to_string(),
+                                ));
+                            }
+                            if !organization.allows_email(&entry.user.email)? {
+                                return Err(AppError::BadRequest(
+                                    "email is not allowed by the organization policy".to_string(),
+                                ));
+                            }
+                            Some((organization.id, role))
+                        }
+                    };
+
+                    sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
+                        .bind::<Text, _>(id)
+                        .bind::<Text, _>(&entry.user.email)
+                        .bind::<Text, _>(&entry.user.username)
+                        .bind::<Nullable<Text>, _>(entry.user.display_name.clone())
+                        .bind::<Nullable<Text>, _>(entry.user.phone.clone())
+                        .bind::<Text, _>(&entry.user.password_hash)
+                        .bind::<Nullable<BigInt>, _>(entry.user.email_verified_at)
+                        .bind::<Nullable<BigInt>, _>(entry.user.phone_verified_at)
+                        .bind::<Integer, _>(i32::from(entry.user.is_admin))
+                        .bind::<Integer, _>(i32::from(entry.user.is_active))
+                        .bind::<Nullable<BigInt>, _>(entry.user.archived_at)
+                        .bind::<Nullable<BigInt>, _>(None::<i64>)
+                        .bind::<Nullable<Text>, _>(None::<String>)
+                        .bind::<Nullable<Text>, _>(None::<String>)
+                        .bind::<Nullable<Text>, _>(None::<String>)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(|error| match error {
+                            diesel::result::Error::DatabaseError(
+                                diesel::result::DatabaseErrorKind::UniqueViolation,
+                                _,
+                            ) => AppError::BadRequest(
+                                "user email, username, or phone already exists".to_string(),
+                            ),
+                            other => AppError::from(other),
+                        })?;
+
+                    if let Some((organization_id, role)) = membership {
+                        let sql = format!(
+                            "INSERT INTO organization_members (organization_id, user_id, role, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
+                            ph(kind, 1),
+                            ph(kind, 2),
+                            ph(kind, 3),
+                            ph(kind, 4),
+                            ph(kind, 5)
+                        );
+                        sql_query(sql)
+                            .bind::<Text, _>(organization_id)
+                            .bind::<Text, _>(id)
+                            .bind::<Text, _>(role)
+                            .bind::<BigInt, _>(now)
+                            .bind::<BigInt, _>(now)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+
+                    let sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
+                    inserted.push(
+                        sql_query(sql)
+                            .bind::<Text, _>(id)
+                            .get_result::<UserRecord>(conn)
+                            .map_err(AppError::from)?,
+                    );
+                }
+                Ok(inserted)
             })
         })
     }
@@ -2694,7 +3411,7 @@ impl Db {
                     }
                 }
 
-                sql_query(insert_user_sql(kind))
+                sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
                     .bind::<Text, _>(&id)
                     .bind::<Text, _>(user.email)
                     .bind::<Text, _>(user.username)
@@ -2734,16 +3451,16 @@ impl Db {
         })
     }
 
-    pub async fn update_user(
-        &self,
-        id: &str,
-        email: String,
-        username: String,
-        display_name: Option<String>,
-        phone: Option<String>,
-        is_admin: bool,
-        is_active: bool,
-    ) -> AppResult<UserRecord> {
+    pub async fn update_user(&self, update: UserUpdate<'_>) -> AppResult<UserRecord> {
+        let UserUpdate {
+            id,
+            email,
+            username,
+            display_name,
+            phone,
+            is_admin,
+            is_active,
+        } = update;
         let id = id.to_string();
         let now = util::now_ts();
         let identity =
@@ -2886,12 +3603,11 @@ impl Db {
 
     pub async fn permanently_delete_user(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
+        let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<(), AppError, _>(|conn| {
+                clear_user_auth_state_for_conn!(conn, kind, &id)?;
                 for table in [
-                    "sessions",
-                    "authorization_codes",
-                    "refresh_tokens",
                     "user_consents",
                     "user_roles",
                     "group_members",
@@ -2901,23 +3617,31 @@ impl Db {
                     "mfa_recovery_codes",
                     "mfa_challenges",
                     "passkeys",
-                    "webauthn_challenges",
                     "linked_identities",
                     "login_events",
                     "invitation_redemptions",
-                    "device_authorizations",
+                    "trial_enrollments",
                 ] {
-                    let column = if table == "device_authorizations" {
-                        "authorized_user_id"
-                    } else {
-                        "user_id"
-                    };
-                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
+                    let sql = format!("DELETE FROM {table} WHERE user_id = {}", ph(kind, 1));
                     sql_query(sql)
                         .bind::<Text, _>(&id)
                         .execute(conn)
                         .map_err(AppError::from)?;
                 }
+                let invalidate_recovery_codes_sql = format!(
+                    "UPDATE invitations SET is_active = 0, updated_at = {} WHERE authorized_user_id = {} AND code_type = {} AND login_code_level = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                sql_query(invalidate_recovery_codes_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<Text, _>(LoginCodeLevel::AccountRecovery.as_str())
+                    .execute(conn)
+                    .map_err(AppError::from)?;
                 let sql = format!("DELETE FROM users WHERE id = {}", ph(kind, 1));
                 let affected = sql_query(sql)
                     .bind::<Text, _>(&id)
@@ -3015,7 +3739,7 @@ impl Db {
         let service_account_permissions = util::to_json(&client.service_account_permissions)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO clients (id, client_id, client_secret_hash, client_name, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO clients (id, client_id, client_secret_hash, client_name, logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -3048,13 +3772,15 @@ impl Db {
                 ph(kind, 30),
                 ph(kind, 31),
                 ph(kind, 32),
-                ph(kind, 33)
+                ph(kind, 33),
+                ph(kind, 34)
             );
             sql_query(sql)
                 .bind::<Text, _>(&id)
                 .bind::<Text, _>(client.client_id)
                 .bind::<Nullable<Text>, _>(client.client_secret_hash)
                 .bind::<Text, _>(client.client_name)
+                .bind::<Text, _>(client.logo_uri)
                 .bind::<Nullable<Text>, _>(client.organization_id)
                 .bind::<Text, _>(redirect_uris)
                 .bind::<Text, _>(post_logout_redirect_uris)
@@ -3107,7 +3833,7 @@ impl Db {
         let service_account_permissions = util::to_json(&client.service_account_permissions)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
+                "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, logo_uri = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -3139,12 +3865,14 @@ impl Db {
                 ph(kind, 29),
                 ph(kind, 30),
                 ph(kind, 31),
-                ph(kind, 32)
+                ph(kind, 32),
+                ph(kind, 33)
             );
             sql_query(sql)
                 .bind::<Text, _>(client.client_id)
                 .bind::<Nullable<Text>, _>(client.client_secret_hash)
                 .bind::<Text, _>(client.client_name)
+                .bind::<Text, _>(client.logo_uri)
                 .bind::<Nullable<Text>, _>(client.organization_id)
                 .bind::<Text, _>(redirect_uris)
                 .bind::<Text, _>(post_logout_redirect_uris)
@@ -3424,8 +4152,8 @@ impl Db {
         user_id: &str,
         ttl_seconds: i64,
         metadata: SessionMetadata,
-    ) -> AppResult<SessionRecord> {
-        let id = util::random_token(32);
+    ) -> AppResult<(SessionRecord, String)> {
+        let (id, cookie_value) = util::new_session_credentials();
         let csrf_token = util::random_token(32);
         let now = util::now_ts();
         let expires_at = now + ttl_seconds;
@@ -3453,16 +4181,19 @@ impl Db {
                 .bind::<BigInt, _>(now)
                 .execute(&mut conn)
                 .map_err(AppError::from)?;
-            Ok(SessionRecord {
-                id,
-                user_id,
-                csrf_token,
-                ip_address: metadata.ip_address,
-                user_agent: metadata.user_agent,
-                login_method: metadata.login_method,
-                expires_at,
-                created_at: now,
-            })
+            Ok((
+                SessionRecord {
+                    id,
+                    user_id,
+                    csrf_token,
+                    ip_address: metadata.ip_address,
+                    user_agent: metadata.user_agent,
+                    login_method: metadata.login_method,
+                    expires_at,
+                    created_at: now,
+                },
+                cookie_value,
+            ))
         })
     }
 
@@ -3475,6 +4206,29 @@ impl Db {
             );
             sql_query(sql)
                 .bind::<Text, _>(id)
+                .get_result::<SessionRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_session_by_credential(
+        &self,
+        credential_id: &str,
+    ) -> AppResult<Option<SessionRecord>> {
+        let credential_id = credential_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT sessions.id, sessions.user_id, sessions.csrf_token, sessions.ip_address, sessions.user_agent, sessions.login_method, sessions.expires_at, sessions.created_at FROM session_credentials INNER JOIN sessions ON sessions.id = session_credentials.session_id WHERE session_credentials.credential_id = {} AND session_credentials.expires_at >= {} AND sessions.expires_at >= {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(credential_id)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
                 .get_result::<SessionRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
@@ -3501,12 +4255,24 @@ impl Db {
     pub async fn delete_session(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!("DELETE FROM sessions WHERE id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            conn.transaction::<(), AppError, _>(|conn| {
+                for (table, column) in [
+                    ("session_credentials", "session_id"),
+                    ("browser_context_accounts", "session_id"),
+                ] {
+                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!("DELETE FROM sessions WHERE id = {}", ph(kind, 1));
+                sql_query(sql)
+                    .bind::<Text, _>(id)
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
         })
     }
 
@@ -3514,17 +4280,555 @@ impl Db {
         let user_id = user_id.to_string();
         let session_id = session_id.to_string();
         with_conn!(self, |conn, kind| {
+            conn.transaction::<bool, AppError, _>(|conn| {
+                let exists_sql = format!(
+                    "SELECT COUNT(*) AS count FROM sessions WHERE user_id = {} AND id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let exists = sql_query(exists_sql)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&session_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    > 0;
+                if !exists {
+                    return Ok(false);
+                }
+                for (table, column) in [
+                    ("session_credentials", "session_id"),
+                    ("browser_context_accounts", "session_id"),
+                ] {
+                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
+                    sql_query(sql)
+                        .bind::<Text, _>(&session_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!(
+                    "DELETE FROM sessions WHERE user_id = {} AND id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<Text, _>(session_id)
+                    .execute(conn)
+                    .map(|affected| affected > 0)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn insert_browser_context(
+        &self,
+        id: &str,
+        csrf_token: &str,
+        ttl_seconds: i64,
+    ) -> AppResult<BrowserContextRecord> {
+        let id = id.to_string();
+        let csrf_token = csrf_token.to_string();
+        let now = util::now_ts();
+        let expires_at = now + ttl_seconds;
+        with_conn!(self, |conn, kind| {
             let sql = format!(
-                "DELETE FROM sessions WHERE user_id = {} AND id = {}",
+                "INSERT INTO browser_contexts (id, csrf_token, expires_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&id)
+                .bind::<Text, _>(&csrf_token)
+                .bind::<BigInt, _>(expires_at)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(BrowserContextRecord {
+                id,
+                csrf_token,
+                expires_at,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+    }
+
+    pub async fn find_browser_context(&self, id: &str) -> AppResult<Option<BrowserContextRecord>> {
+        let id = id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, csrf_token, expires_at, created_at, updated_at FROM browser_contexts WHERE id = {} AND expires_at >= {}",
                 ph(kind, 1),
                 ph(kind, 2)
             );
             sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .bind::<Text, _>(session_id)
-                .execute(&mut conn)
-                .map(|affected| affected > 0)
+                .bind::<Text, _>(id)
+                .bind::<BigInt, _>(now)
+                .get_result::<BrowserContextRecord>(&mut conn)
+                .optional()
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_browser_context_accounts(
+        &self,
+        browser_context_id: &str,
+    ) -> AppResult<Vec<BrowserContextAccountRecord>> {
+        let browser_context_id = browser_context_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT browser_context_accounts.id, browser_context_accounts.browser_context_id, browser_context_accounts.user_id, browser_context_accounts.session_id, browser_context_accounts.added_at, browser_context_accounts.last_selected_at FROM browser_context_accounts INNER JOIN sessions ON sessions.id = browser_context_accounts.session_id WHERE browser_context_accounts.browser_context_id = {} AND sessions.expires_at >= {} ORDER BY sessions.created_at DESC, browser_context_accounts.added_at DESC, browser_context_accounts.id ASC",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(browser_context_id)
+                .bind::<BigInt, _>(now)
+                .load::<BrowserContextAccountRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_browser_context_account(
+        &self,
+        browser_context_id: &str,
+        account_ref: &str,
+    ) -> AppResult<Option<BrowserContextAccountRecord>> {
+        let browser_context_id = browser_context_id.to_string();
+        let account_ref = account_ref.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(browser_context_id)
+                .bind::<Text, _>(account_ref)
+                .get_result::<BrowserContextAccountRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_browser_context_account_by_session(
+        &self,
+        browser_context_id: &str,
+        session_id: &str,
+    ) -> AppResult<Option<BrowserContextAccountRecord>> {
+        let browser_context_id = browser_context_id.to_string();
+        let session_id = session_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND session_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(browser_context_id)
+                .bind::<Text, _>(session_id)
+                .get_result::<BrowserContextAccountRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn attach_browser_context_account(
+        &self,
+        browser_context_id: &str,
+        user_id: &str,
+        session_id: &str,
+    ) -> AppResult<BrowserContextAccountRecord> {
+        let browser_context_id = browser_context_id.to_string();
+        let user_id = user_id.to_string();
+        let session_id = session_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<BrowserContextAccountRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND user_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&user_id)
+                    .get_result::<BrowserContextAccountRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?;
+
+                let remove_other_mapping_sql = format!(
+                    "DELETE FROM browser_context_accounts WHERE session_id = {} AND browser_context_id <> {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(remove_other_mapping_sql)
+                    .bind::<Text, _>(&session_id)
+                    .bind::<Text, _>(&browser_context_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let remove_other_credentials_sql = format!(
+                    "DELETE FROM session_credentials WHERE session_id = {} AND browser_context_id <> {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(remove_other_credentials_sql)
+                    .bind::<Text, _>(&session_id)
+                    .bind::<Text, _>(&browser_context_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                if let Some(existing) = existing {
+                    if existing.session_id != session_id {
+                        let delete_credentials_sql = format!(
+                            "DELETE FROM session_credentials WHERE session_id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(delete_credentials_sql)
+                            .bind::<Text, _>(&existing.session_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                        let delete_session_sql = format!(
+                            "DELETE FROM sessions WHERE id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(delete_session_sql)
+                            .bind::<Text, _>(&existing.session_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    let update_sql = format!(
+                        "UPDATE browser_context_accounts SET session_id = {}, last_selected_at = {} WHERE id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3)
+                    );
+                    sql_query(update_sql)
+                        .bind::<Text, _>(&session_id)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&existing.id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    return Ok(BrowserContextAccountRecord {
+                        session_id,
+                        last_selected_at: Some(now),
+                        ..existing
+                    });
+                }
+
+                let id = uuid::Uuid::new_v4().to_string();
+                let insert_sql = format!(
+                    "INSERT INTO browser_context_accounts (id, browser_context_id, user_id, session_id, added_at, last_selected_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&session_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Nullable<BigInt>, _>(Some(now))
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(BrowserContextAccountRecord {
+                    id,
+                    browser_context_id,
+                    user_id,
+                    session_id,
+                    added_at: now,
+                    last_selected_at: Some(now),
+                })
+            })
+        })
+    }
+
+    pub async fn mint_browser_account_session_credential(
+        &self,
+        browser_context_id: &str,
+        account_ref: &str,
+    ) -> AppResult<(SessionRecord, String)> {
+        let browser_context_id = browser_context_id.to_string();
+        let account_ref = account_ref.to_string();
+        let (credential_id, cookie_value) = util::new_session_credentials();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<SessionRecord, AppError, _>(|conn| {
+                let account_sql = format!(
+                    "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let account = sql_query(account_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&account_ref)
+                    .get_result::<BrowserContextAccountRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                let session_sql = format!(
+                    "SELECT id, user_id, csrf_token, ip_address, user_agent, login_method, expires_at, created_at FROM sessions WHERE id = {} AND user_id = {} AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let session = sql_query(session_sql)
+                    .bind::<Text, _>(&account.session_id)
+                    .bind::<Text, _>(&account.user_id)
+                    .bind::<BigInt, _>(now)
+                    .get_result::<SessionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                let delete_sql = format!(
+                    "DELETE FROM session_credentials WHERE browser_context_id = {} AND session_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(delete_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&session.id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let insert_sql = format!(
+                    "INSERT INTO session_credentials (credential_id, session_id, browser_context_id, expires_at, created_at) VALUES ({}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(credential_id)
+                    .bind::<Text, _>(&session.id)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<BigInt, _>(session.expires_at)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let update_sql = format!(
+                    "UPDATE browser_context_accounts SET last_selected_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(account.id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(session)
+            })
+        })
+        .map(|session| (session, cookie_value))
+    }
+
+    pub async fn remove_browser_context_account(
+        &self,
+        browser_context_id: &str,
+        account_ref: &str,
+    ) -> AppResult<BrowserContextAccountRecord> {
+        let browser_context_id = browser_context_id.to_string();
+        let account_ref = account_ref.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<BrowserContextAccountRecord, AppError, _>(|conn| {
+                let select_sql = format!(
+                    "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let account = sql_query(select_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&account_ref)
+                    .get_result::<BrowserContextAccountRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                for (table, column) in [
+                    ("session_credentials", "session_id"),
+                    ("browser_context_accounts", "session_id"),
+                ] {
+                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
+                    sql_query(sql)
+                        .bind::<Text, _>(&account.session_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let delete_session_sql =
+                    format!("DELETE FROM sessions WHERE id = {}", ph(kind, 1));
+                sql_query(delete_session_sql)
+                    .bind::<Text, _>(&account.session_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(account)
+            })
+        })
+    }
+
+    pub async fn delete_browser_context(&self, browser_context_id: &str) -> AppResult<()> {
+        let browser_context_id = browser_context_id.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let delete_credentials_sql = format!(
+                    "DELETE FROM session_credentials WHERE browser_context_id = {} OR session_id IN (SELECT session_id FROM browser_context_accounts WHERE browser_context_id = {})",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(delete_credentials_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<Text, _>(&browser_context_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let delete_sessions_sql = format!(
+                    "DELETE FROM sessions WHERE id IN (SELECT session_id FROM browser_context_accounts WHERE browser_context_id = {})",
+                    ph(kind, 1)
+                );
+                sql_query(delete_sessions_sql)
+                    .bind::<Text, _>(&browser_context_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                for table in ["browser_context_accounts", "account_login_flows"] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE browser_context_id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&browser_context_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let delete_context_sql =
+                    format!("DELETE FROM browser_contexts WHERE id = {}", ph(kind, 1));
+                sql_query(delete_context_sql)
+                    .bind::<Text, _>(browser_context_id)
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn insert_account_login_flow(
+        &self,
+        id_hash: &str,
+        browser_context_id: &str,
+        return_to: &str,
+        expected_user_id: Option<&str>,
+        ttl_seconds: i64,
+    ) -> AppResult<AccountLoginFlowRecord> {
+        let id_hash = id_hash.to_string();
+        let browser_context_id = browser_context_id.to_string();
+        let return_to = return_to.to_string();
+        let expected_user_id = expected_user_id.map(ToOwned::to_owned);
+        let now = util::now_ts();
+        let expires_at = now + ttl_seconds;
+        with_conn!(self, |conn, kind| {
+            let cleanup_sql = format!(
+                "DELETE FROM account_login_flows WHERE expires_at < {} OR consumed_at IS NOT NULL",
+                ph(kind, 1)
+            );
+            sql_query(cleanup_sql)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            let insert_sql = format!(
+                "INSERT INTO account_login_flows (id_hash, browser_context_id, return_to, expected_user_id, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7)
+            );
+            sql_query(insert_sql)
+                .bind::<Text, _>(&id_hash)
+                .bind::<Text, _>(&browser_context_id)
+                .bind::<Text, _>(&return_to)
+                .bind::<Nullable<Text>, _>(expected_user_id.as_deref())
+                .bind::<BigInt, _>(expires_at)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(AccountLoginFlowRecord {
+                id_hash,
+                browser_context_id,
+                return_to,
+                expected_user_id,
+                expires_at,
+                consumed_at: None,
+                created_at: now,
+            })
+        })
+    }
+
+    pub async fn consume_account_login_flow(
+        &self,
+        id_hash: &str,
+        browser_context_id: &str,
+        authenticated_user_id: &str,
+    ) -> AppResult<AccountLoginFlowRecord> {
+        let id_hash = id_hash.to_string();
+        let browser_context_id = browser_context_id.to_string();
+        let authenticated_user_id = authenticated_user_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<AccountLoginFlowRecord, AppError, _>(|conn| {
+                let select_sql = format!(
+                    "SELECT id_hash, browser_context_id, return_to, expected_user_id, expires_at, consumed_at, created_at FROM account_login_flows WHERE id_hash = {} AND browser_context_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let flow = sql_query(select_sql)
+                    .bind::<Text, _>(&id_hash)
+                    .bind::<Text, _>(&browser_context_id)
+                    .get_result::<AccountLoginFlowRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                if flow.consumed_at.is_some() || flow.expires_at < now {
+                    return Err(AppError::Unauthorized);
+                }
+                if flow
+                    .expected_user_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != authenticated_user_id)
+                {
+                    return Err(AppError::Unauthorized);
+                }
+                let update_sql = format!(
+                    "UPDATE account_login_flows SET consumed_at = {} WHERE id_hash = {} AND browser_context_id = {} AND consumed_at IS NULL AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id_hash)
+                    .bind::<Text, _>(&browser_context_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Unauthorized);
+                }
+                Ok(AccountLoginFlowRecord {
+                    consumed_at: Some(now),
+                    ..flow
+                })
+            })
         })
     }
 
@@ -3613,44 +4917,49 @@ impl Db {
     pub async fn delete_client(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
-            for (table, column) in [
-                ("authorization_codes", "client_id"),
-                ("refresh_tokens", "client_id"),
-                ("user_consents", "client_id"),
-                ("device_authorizations", "client_id"),
-                ("pushed_authorization_requests", "client_id"),
-            ] {
-                let sql = format!(
-                    "DELETE FROM {table} WHERE {column} IN (SELECT client_id FROM clients WHERE id = {})",
-                    ph(kind, 1)
-                );
-                sql_query(sql)
+            conn.transaction::<(), AppError, _>(|conn| {
+                // These tables refer to the public OIDC client_id rather than
+                // the internal clients.id. Clear them before the client record
+                // disappears so no live credential or authorization state can
+                // outlast a deleted client.
+                for (table, column) in [
+                    ("authorization_codes", "client_id"),
+                    ("refresh_tokens", "client_id"),
+                    ("user_consents", "client_id"),
+                    ("device_authorizations", "client_id"),
+                    ("pushed_authorization_requests", "client_id"),
+                    ("oidc_login_grants", "client_id"),
+                    ("client_assertion_jtis", "client_id"),
+                ] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE {column} IN (SELECT client_id FROM clients WHERE id = {})",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                for table in ["client_registrations", "client_claim_mappers"] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE client_db_id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!("DELETE FROM clients WHERE id = {}", ph(kind, 1));
+                let affected = sql_query(sql)
                     .bind::<Text, _>(&id)
-                    .execute(&mut conn)
+                    .execute(conn)
                     .map_err(AppError::from)?;
-            }
-            let sql = format!(
-                "DELETE FROM client_registrations WHERE client_db_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!(
-                "DELETE FROM client_claim_mappers WHERE client_db_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!("DELETE FROM clients WHERE id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+                if affected == 0 {
+                    return Err(AppError::NotFound);
+                }
+                Ok(())
+            })
         })
     }
 
@@ -4476,6 +5785,117 @@ impl Db {
         })
     }
 
+    pub async fn find_oidc_login_grant(
+        &self,
+        credential_hash: &str,
+        interaction_request_hash: &str,
+    ) -> AppResult<Option<OidcLoginGrantRecord>> {
+        let credential_hash = credential_hash.to_string();
+        let interaction_request_hash = interaction_request_hash.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE credential_hash = {} AND interaction_request_hash = {} AND consumed_at IS NULL AND expires_at >= {}",
+                select_oidc_login_grant_sql(),
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(credential_hash)
+                .bind::<Text, _>(interaction_request_hash)
+                .bind::<BigInt, _>(now)
+                .get_result::<OidcLoginGrantRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn consume_oidc_login_grant_and_insert_authorization_code(
+        &self,
+        credential_hash: &str,
+        interaction_request_hash: &str,
+        code: NewAuthorizationCode,
+    ) -> AppResult<()> {
+        if code.session_id.is_some() {
+            return Err(AppError::Configuration(
+                "OIDC login grant authorization code cannot have a session id".to_string(),
+            ));
+        }
+        let credential_hash = credential_hash.to_string();
+        let interaction_request_hash = interaction_request_hash.to_string();
+        let expected_client_id = code.client_id.clone();
+        let expected_user_id = code.user_id.clone();
+        let amr = util::to_json(&code.amr)?;
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE oidc_login_grants SET consumed_at = {} WHERE credential_hash = {} AND interaction_request_hash = {} AND client_id = {} AND user_id = {} AND consumed_at IS NULL AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&credential_hash)
+                    .bind::<Text, _>(&interaction_request_hash)
+                    .bind::<Text, _>(&expected_client_id)
+                    .bind::<Text, _>(&expected_user_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Unauthorized);
+                }
+                let sql = format!(
+                    "INSERT INTO authorization_codes (code, client_id, user_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16),
+                    ph(kind, 17)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(code.code)
+                    .bind::<Text, _>(code.client_id)
+                    .bind::<Text, _>(code.user_id)
+                    .bind::<Nullable<Text>, _>(code.session_id)
+                    .bind::<Text, _>(code.redirect_uri)
+                    .bind::<Text, _>(code.scope)
+                    .bind::<Nullable<Text>, _>(code.resource)
+                    .bind::<Nullable<Text>, _>(code.authorization_details)
+                    .bind::<Nullable<Text>, _>(code.nonce)
+                    .bind::<Nullable<Text>, _>(code.code_challenge)
+                    .bind::<Nullable<Text>, _>(code.code_challenge_method)
+                    .bind::<BigInt, _>(code.auth_time)
+                    .bind::<Text, _>(code.acr)
+                    .bind::<Text, _>(amr)
+                    .bind::<BigInt, _>(code.expires_at)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
     pub async fn insert_authorization_code(&self, code: NewAuthorizationCode) -> AppResult<()> {
         let now = util::now_ts();
         let amr = util::to_json(&code.amr)?;
@@ -4618,6 +6038,52 @@ impl Db {
         })
     }
 
+    pub async fn update_unconsumed_pushed_authorization_request(
+        &self,
+        request_uri_hash: &str,
+        client_id: &str,
+        expected_request_json: &str,
+        request_json: &str,
+    ) -> AppResult<PushedAuthorizationRequestRecord> {
+        let request_uri_hash = request_uri_hash.to_string();
+        let client_id = client_id.to_string();
+        let expected_request_json = expected_request_json.to_string();
+        let request_json = request_json.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<PushedAuthorizationRequestRecord, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE pushed_authorization_requests SET request_json = {} WHERE request_uri_hash = {} AND client_id = {} AND request_json = {} AND consumed_at IS NULL AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<Text, _>(&request_json)
+                    .bind::<Text, _>(&request_uri_hash)
+                    .bind::<Text, _>(&client_id)
+                    .bind::<Text, _>(&expected_request_json)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Unauthorized);
+                }
+                let select_sql = format!(
+                    "{} WHERE request_uri_hash = {}",
+                    select_pushed_authorization_request_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(request_uri_hash)
+                    .get_result::<PushedAuthorizationRequestRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
     pub async fn consume_pushed_authorization_request(
         &self,
         request_uri_hash: &str,
@@ -4625,34 +6091,34 @@ impl Db {
         let request_uri_hash = request_uri_hash.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let select_sql = format!(
-                "{} WHERE request_uri_hash = {}",
-                select_pushed_authorization_request_sql(),
-                ph(kind, 1)
-            );
-            let record = sql_query(select_sql)
-                .bind::<Text, _>(&request_uri_hash)
-                .get_result::<PushedAuthorizationRequestRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)?
-                .ok_or_else(|| AppError::Oidc("invalid request_uri".to_string()))?;
-            if record.expires_at < now {
-                return Err(AppError::Oidc("request_uri expired".to_string()));
-            }
-            if record.consumed_at.is_some() {
-                return Err(AppError::Oidc("request_uri already consumed".to_string()));
-            }
-            let update_sql = format!(
-                "UPDATE pushed_authorization_requests SET consumed_at = {} WHERE request_uri_hash = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(update_sql)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(request_uri_hash)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            Ok(record)
+            conn.transaction::<PushedAuthorizationRequestRecord, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE pushed_authorization_requests SET consumed_at = {} WHERE request_uri_hash = {} AND consumed_at IS NULL AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&request_uri_hash)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Oidc(
+                        "request_uri is invalid, expired, or already consumed".to_string(),
+                    ));
+                }
+                let select_sql = format!(
+                    "{} WHERE request_uri_hash = {}",
+                    select_pushed_authorization_request_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(request_uri_hash)
+                    .get_result::<PushedAuthorizationRequestRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
 
@@ -4868,15 +6334,18 @@ impl Db {
 
     pub async fn insert_refresh_token(
         &self,
-        token_hash: String,
         client_id: String,
-        user_id: String,
-        scope: String,
-        resource: Option<String>,
-        authorization_details: Option<String>,
-        dpop_jkt: Option<String>,
-        expires_at: i64,
+        token: RefreshTokenInput,
     ) -> AppResult<()> {
+        let RefreshTokenInput {
+            token_hash,
+            user_id,
+            scope,
+            resource,
+            authorization_details,
+            dpop_jkt,
+            expires_at,
+        } = token;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
@@ -4942,6 +6411,66 @@ impl Db {
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn rotate_refresh_token(
+        &self,
+        token_hash: &str,
+        client_id: &str,
+        replacement: RefreshTokenInput,
+    ) -> AppResult<bool> {
+        let token_hash = token_hash.to_string();
+        let client_id = client_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<bool, AppError, _>(|conn| {
+                let revoke_sql = format!(
+                    "UPDATE refresh_tokens SET revoked_at = {} WHERE token_hash = {} AND client_id = {} AND revoked_at IS NULL AND expires_at >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let changed = sql_query(revoke_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&token_hash)
+                    .bind::<Text, _>(&client_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if changed != 1 {
+                    return Ok(false);
+                }
+
+                let insert_sql = format!(
+                    "INSERT INTO refresh_tokens (token_hash, client_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(replacement.token_hash)
+                    .bind::<Text, _>(client_id)
+                    .bind::<Text, _>(replacement.user_id)
+                    .bind::<Text, _>(replacement.scope)
+                    .bind::<Nullable<Text>, _>(replacement.resource)
+                    .bind::<Nullable<Text>, _>(replacement.authorization_details)
+                    .bind::<Nullable<Text>, _>(replacement.dpop_jkt)
+                    .bind::<BigInt, _>(replacement.expires_at)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(true)
+            })
         })
     }
 
@@ -5616,7 +7145,7 @@ impl Db {
 
     pub async fn login_settings(&self) -> AppResult<LoginSettingsRecord> {
         with_conn!(self, |conn, _kind| {
-            sql_query("SELECT id, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
+            sql_query("SELECT id, brand_logo_url, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
                 .get_result::<LoginSettingsRecord>(&mut conn)
                 .map_err(AppError::from)
         })
@@ -5626,18 +7155,21 @@ impl Db {
         &self,
         settings: NewLoginSettings,
     ) -> AppResult<LoginSettingsRecord> {
-        let email_domains = util::to_json(&settings.email_domains)?;
-        let quick_links = util::to_json(&settings.quick_links)?;
+        let NewLoginSettings {
+            brand_logo_url,
+            email_domains,
+            quick_links,
+        } = settings;
+        let email_domains = util::to_json(&email_domains)?;
+        let quick_links_json = util::to_json(&quick_links)?;
         with_conn!(self, |conn, kind| {
             let existing =
-                sql_query("SELECT id, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
+                sql_query("SELECT id, brand_logo_url, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
                     .get_result::<LoginSettingsRecord>(&mut conn)
                     .optional()
                     .map_err(AppError::from)?;
             if let Some(existing) = existing {
-                if let Some(quick_links) =
-                    merge_missing_quick_links(&existing, &settings.quick_links)?
-                {
+                if let Some(quick_links) = merge_missing_quick_links(&existing, &quick_links)? {
                     let now = util::now_ts();
                     let update_sql = format!(
                         "UPDATE login_settings SET quick_links = {}, updated_at = {} WHERE id = {}",
@@ -5651,7 +7183,7 @@ impl Db {
                         .bind::<Text, _>("default")
                         .execute(&mut conn)
                         .map_err(AppError::from)?;
-                    return sql_query("SELECT id, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
+                    return sql_query("SELECT id, brand_logo_url, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
                         .get_result::<LoginSettingsRecord>(&mut conn)
                         .map_err(AppError::from);
                 }
@@ -5659,20 +7191,22 @@ impl Db {
             }
             let now = util::now_ts();
             let insert_sql = format!(
-                "INSERT INTO login_settings (id, email_domains, quick_links, updated_at) VALUES ({}, {}, {}, {})",
+                "INSERT INTO login_settings (id, brand_logo_url, email_domains, quick_links, updated_at) VALUES ({}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
-                ph(kind, 4)
+                ph(kind, 4),
+                ph(kind, 5)
             );
             sql_query(insert_sql)
                 .bind::<Text, _>("default")
+                .bind::<Text, _>(brand_logo_url)
                 .bind::<Text, _>(email_domains)
-                .bind::<Text, _>(quick_links)
+                .bind::<Text, _>(quick_links_json)
                 .bind::<BigInt, _>(now)
                 .execute(&mut conn)
                 .map_err(AppError::from)?;
-            sql_query("SELECT id, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
+            sql_query("SELECT id, brand_logo_url, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
                 .get_result::<LoginSettingsRecord>(&mut conn)
                 .map_err(AppError::from)
         })
@@ -5683,17 +7217,24 @@ impl Db {
         settings: NewLoginSettings,
     ) -> AppResult<LoginSettingsRecord> {
         let now = util::now_ts();
-        let email_domains = util::to_json(&settings.email_domains)?;
-        let quick_links = util::to_json(&settings.quick_links)?;
+        let NewLoginSettings {
+            brand_logo_url,
+            email_domains,
+            quick_links,
+        } = settings;
+        let email_domains = util::to_json(&email_domains)?;
+        let quick_links = util::to_json(&quick_links)?;
         with_conn!(self, |conn, kind| {
             let update_sql = format!(
-                "UPDATE login_settings SET email_domains = {}, quick_links = {}, updated_at = {} WHERE id = {}",
+                "UPDATE login_settings SET brand_logo_url = {}, email_domains = {}, quick_links = {}, updated_at = {} WHERE id = {}",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
-                ph(kind, 4)
+                ph(kind, 4),
+                ph(kind, 5)
             );
             let changed = sql_query(update_sql)
+                .bind::<Text, _>(&brand_logo_url)
                 .bind::<Text, _>(&email_domains)
                 .bind::<Text, _>(&quick_links)
                 .bind::<BigInt, _>(now)
@@ -5702,21 +7243,23 @@ impl Db {
                 .map_err(AppError::from)?;
             if changed == 0 {
                 let insert_sql = format!(
-                    "INSERT INTO login_settings (id, email_domains, quick_links, updated_at) VALUES ({}, {}, {}, {})",
+                    "INSERT INTO login_settings (id, brand_logo_url, email_domains, quick_links, updated_at) VALUES ({}, {}, {}, {}, {})",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
-                    ph(kind, 4)
+                    ph(kind, 4),
+                    ph(kind, 5)
                 );
                 sql_query(insert_sql)
                     .bind::<Text, _>("default")
+                    .bind::<Text, _>(&brand_logo_url)
                     .bind::<Text, _>(email_domains)
                     .bind::<Text, _>(quick_links)
                     .bind::<BigInt, _>(now)
                     .execute(&mut conn)
                     .map_err(AppError::from)?;
             }
-            sql_query("SELECT id, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
+            sql_query("SELECT id, brand_logo_url, email_domains, quick_links, updated_at FROM login_settings WHERE id = 'default'")
                 .get_result::<LoginSettingsRecord>(&mut conn)
                 .map_err(AppError::from)
         })
@@ -5724,14 +7267,17 @@ impl Db {
 
     pub async fn insert_verification_code(
         &self,
-        channel: &str,
-        target: &str,
-        purpose: &str,
-        code_hash: String,
-        ttl_seconds: i64,
-        resend_interval_seconds: i64,
-        max_attempts: i32,
+        code: NewVerificationCode<'_>,
     ) -> AppResult<VerificationCodeRecord> {
+        let NewVerificationCode {
+            channel,
+            target,
+            purpose,
+            code_hash,
+            ttl_seconds,
+            resend_interval_seconds,
+            max_attempts,
+        } = code;
         let id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
         let expires_at = now + ttl_seconds;
@@ -5879,6 +7425,18 @@ impl Db {
         })
     }
 
+    pub async fn find_invitation_by_id(&self, id: &str) -> AppResult<Option<InvitationRecord>> {
+        let id = id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!("{} WHERE id = {}", select_invitation_sql(), ph(kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>(id)
+                .get_result::<InvitationRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn list_invitation_redemptions(&self) -> AppResult<Vec<InvitationRedemptionRecord>> {
         with_conn!(self, |conn, _kind| {
             sql_query(
@@ -5889,18 +7447,101 @@ impl Db {
         })
     }
 
+    /// Lists one bounded, keyset-paginated page of redemptions for a single
+    /// authorization code.  Keeping this separate from `list_invitations`
+    /// prevents a frequently-used code from making the management list grow
+    /// without bound.
+    pub async fn list_invitation_redemptions_for_invitation(
+        &self,
+        invitation_id: &str,
+        before: Option<(i64, String)>,
+        limit: i32,
+    ) -> AppResult<Vec<InvitationRedemptionRecord>> {
+        let invitation_id = invitation_id.to_string();
+        with_conn!(self, |conn, kind| {
+            if let Some((redeemed_at, redemption_id)) = before {
+                let sql = format!(
+                    "SELECT invitation_redemptions.id, invitation_redemptions.invitation_id, invitation_redemptions.user_id, users.email AS user_email, users.username AS user_username, invitation_redemptions.redeemed_at FROM invitation_redemptions LEFT JOIN users ON users.id = invitation_redemptions.user_id WHERE invitation_redemptions.invitation_id = {} AND (invitation_redemptions.redeemed_at < {} OR (invitation_redemptions.redeemed_at = {} AND invitation_redemptions.id < {})) ORDER BY invitation_redemptions.redeemed_at DESC, invitation_redemptions.id DESC LIMIT {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(invitation_id)
+                    .bind::<BigInt, _>(redeemed_at)
+                    .bind::<BigInt, _>(redeemed_at)
+                    .bind::<Text, _>(redemption_id)
+                    .bind::<Integer, _>(limit)
+                    .load::<InvitationRedemptionRecord>(&mut conn)
+                    .map_err(AppError::from)
+            } else {
+                let sql = format!(
+                    "SELECT invitation_redemptions.id, invitation_redemptions.invitation_id, invitation_redemptions.user_id, users.email AS user_email, users.username AS user_username, invitation_redemptions.redeemed_at FROM invitation_redemptions LEFT JOIN users ON users.id = invitation_redemptions.user_id WHERE invitation_redemptions.invitation_id = {} ORDER BY invitation_redemptions.redeemed_at DESC, invitation_redemptions.id DESC LIMIT {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(invitation_id)
+                    .bind::<Integer, _>(limit)
+                    .load::<InvitationRedemptionRecord>(&mut conn)
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
     pub async fn insert_invitation(
         &self,
         invitation: NewInvitation,
     ) -> AppResult<(InvitationRecord, String)> {
+        let code = format!(
+            "{}-{}",
+            match invitation.code_type {
+                AuthorizationCodeType::Registration => "REG",
+                AuthorizationCodeType::Login => "LOGIN",
+            },
+            util::random_token(18)
+        );
+        self.insert_invitation_with_secret(invitation, code, None, None)
+            .await
+    }
+
+    /// Inserts a code whose complete value can later be revealed to an
+    /// authorized manager.  The caller supplies an encrypted form produced by
+    /// the server; neither the plaintext code nor its ciphertext is included
+    /// in public invitation responses.
+    pub async fn insert_invitation_with_reveal_secret(
+        &self,
+        invitation: NewInvitation,
+        code: String,
+        code_reveal_key_id: String,
+        code_reveal_ciphertext: String,
+    ) -> AppResult<(InvitationRecord, String)> {
+        self.insert_invitation_with_secret(
+            invitation,
+            code,
+            Some(code_reveal_key_id),
+            Some(code_reveal_ciphertext),
+        )
+        .await
+    }
+
+    async fn insert_invitation_with_secret(
+        &self,
+        invitation: NewInvitation,
+        code: String,
+        code_reveal_key_id: Option<String>,
+        code_reveal_ciphertext: Option<String>,
+    ) -> AppResult<(InvitationRecord, String)> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
-        let code = format!("AUTH-{}", util::random_token(18));
         let code_hash = util::token_hash(&code);
         let code_prefix = code.chars().take(12).collect::<String>();
+        let allowed_client_ids = util::to_json(&invitation.allowed_client_ids)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO invitations (id, code_hash, code_prefix, description, authorized_email, authorized_username, authorized_display_name, expires_at, max_uses, uses_count, is_active, created_by, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO invitations (id, code_hash, code_prefix, code_reveal_key_id, code_reveal_ciphertext, code_type, login_code_level, allowed_client_ids, organization_id, organization_role, description, authorized_email, authorized_username, authorized_user_id, authorized_display_name, expires_at, max_uses, uses_count, is_active, created_by, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -5914,15 +7555,31 @@ impl Db {
                 ph(kind, 11),
                 ph(kind, 12),
                 ph(kind, 13),
-                ph(kind, 14)
+                ph(kind, 14),
+                ph(kind, 15),
+                ph(kind, 16),
+                ph(kind, 17),
+                ph(kind, 18),
+                ph(kind, 19),
+                ph(kind, 20),
+                ph(kind, 21),
+                ph(kind, 22)
             );
             sql_query(sql)
                 .bind::<Text, _>(&id)
                 .bind::<Text, _>(code_hash)
                 .bind::<Text, _>(code_prefix)
+                .bind::<Nullable<Text>, _>(code_reveal_key_id)
+                .bind::<Nullable<Text>, _>(code_reveal_ciphertext)
+                .bind::<Text, _>(invitation.code_type.as_str())
+                .bind::<Text, _>(invitation.login_code_level.as_str())
+                .bind::<Nullable<Text>, _>(Some(allowed_client_ids))
+                .bind::<Nullable<Text>, _>(invitation.organization_id)
+                .bind::<Nullable<Text>, _>(invitation.organization_role)
                 .bind::<Nullable<Text>, _>(invitation.description)
                 .bind::<Nullable<Text>, _>(invitation.authorized_email)
                 .bind::<Nullable<Text>, _>(invitation.authorized_username)
+                .bind::<Nullable<Text>, _>(invitation.authorized_user_id)
                 .bind::<Nullable<Text>, _>(invitation.authorized_display_name)
                 .bind::<Nullable<BigInt>, _>(invitation.expires_at)
                 .bind::<Nullable<Integer>, _>(invitation.max_uses)
@@ -5944,59 +7601,106 @@ impl Db {
 
     pub async fn update_invitation(
         &self,
-        id: &str,
-        description: Option<String>,
-        authorized_email: Option<String>,
-        authorized_username: Option<String>,
-        authorized_display_name: Option<String>,
-        expires_at: Option<i64>,
-        max_uses: Option<i32>,
-        is_active: bool,
+        update: InvitationUpdate<'_>,
     ) -> AppResult<InvitationRecord> {
+        let InvitationUpdate {
+            id,
+            description,
+            authorized_email,
+            authorized_username,
+            authorized_display_name,
+            expires_at,
+            max_uses,
+            is_active,
+        } = update;
         let id = id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE invitations SET description = {}, authorized_email = {}, authorized_username = {}, authorized_display_name = {}, expires_at = {}, max_uses = {}, is_active = {}, updated_at = {} WHERE id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9)
-            );
-            sql_query(sql)
-                .bind::<Nullable<Text>, _>(description)
-                .bind::<Nullable<Text>, _>(authorized_email)
-                .bind::<Nullable<Text>, _>(authorized_username)
-                .bind::<Nullable<Text>, _>(authorized_display_name)
-                .bind::<Nullable<BigInt>, _>(expires_at)
-                .bind::<Nullable<Integer>, _>(max_uses)
-                .bind::<Integer, _>(i32::from(is_active))
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!("{} WHERE id = {}", select_invitation_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<InvitationRecord>(&mut conn)
-                .map_err(AppError::from)
+            conn.transaction::<InvitationRecord, AppError, _>(|conn| {
+                let sql = format!(
+                    "UPDATE invitations SET description = {}, authorized_email = {}, authorized_username = {}, authorized_display_name = {}, expires_at = {}, max_uses = {}, is_active = {}, updated_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9)
+                );
+                sql_query(sql)
+                    .bind::<Nullable<Text>, _>(description)
+                    .bind::<Nullable<Text>, _>(authorized_email)
+                    .bind::<Nullable<Text>, _>(authorized_username)
+                    .bind::<Nullable<Text>, _>(authorized_display_name)
+                    .bind::<Nullable<BigInt>, _>(expires_at)
+                    .bind::<Nullable<Integer>, _>(max_uses)
+                    .bind::<Integer, _>(i32::from(is_active))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if !is_active {
+                    let revoke_sql = format!(
+                        "DELETE FROM oidc_login_grants WHERE invitation_id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(revoke_sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    revoke_trial_enrollment_auth_state_for_invitation!(conn, kind, &id);
+                    let revoke_trial_sql = format!(
+                        "UPDATE trial_enrollments SET revoked_at = {} WHERE invitation_id = {} AND revoked_at IS NULL",
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    );
+                    sql_query(revoke_trial_sql)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!("{} WHERE id = {}", select_invitation_sql(), ph(kind, 1));
+                sql_query(sql)
+                    .bind::<Text, _>(id)
+                    .get_result::<InvitationRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
 
     pub async fn delete_invitation(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!("DELETE FROM invitations WHERE id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            conn.transaction::<(), AppError, _>(|conn| {
+                let sql = format!(
+                    "DELETE FROM oidc_login_grants WHERE invitation_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                revoke_trial_enrollment_auth_state_for_invitation!(conn, kind, &id);
+                let revoke_trial_sql = format!(
+                    "UPDATE trial_enrollments SET revoked_at = {} WHERE invitation_id = {} AND revoked_at IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(revoke_trial_sql)
+                    .bind::<BigInt, _>(util::now_ts())
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let sql = format!("DELETE FROM invitations WHERE id = {}", ph(kind, 1));
+                sql_query(sql)
+                    .bind::<Text, _>(id)
+                    .execute(conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
         })
     }
 
@@ -6015,62 +7719,105 @@ impl Db {
                 .optional()
                 .map_err(AppError::from)?
                 .ok_or_else(|| AppError::BadRequest("authorization code is invalid".to_string()))?;
-            if record.is_active != 1 {
-                return Err(AppError::BadRequest(
-                    "authorization code is disabled".to_string(),
-                ));
-            }
-            if let Some(expires_at) = record.expires_at {
-                if expires_at < now {
-                    return Err(AppError::BadRequest(
-                        "authorization code expired".to_string(),
-                    ));
-                }
-            }
-            if let Some(max_uses) = record.max_uses {
-                if record.uses_count >= max_uses {
-                    return Err(AppError::BadRequest(
-                        "authorization code is exhausted".to_string(),
-                    ));
-                }
-            }
+            ensure_invitation_redeemable(&record, now)?;
             Ok(record)
         })
     }
 
-    pub async fn redeem_invitation_for_new_user(
+    pub async fn redeem_registration_code_for_new_user(
         &self,
-        invitation_id: &str,
+        code: &str,
         user: NewUser,
+        verification_claims: Vec<VerificationCodeClaim>,
     ) -> AppResult<UserRecord> {
+        if !verification_claims.is_empty() {
+            self.verify_verification_claims(verification_claims.clone())
+                .await?;
+        }
+
         let user_id = uuid::Uuid::new_v4().to_string();
         let redemption_id = uuid::Uuid::new_v4().to_string();
-        let invitation_id = invitation_id.to_string();
+        let code_hash = util::token_hash(code);
         let now = util::now_ts();
         let identity = UserIdentityCandidate::insert(&user);
         with_conn!(self, |conn, kind| {
             conn.transaction::<UserRecord, AppError, _>(|conn| {
+                let invitation_sql = format!(
+                    "{} WHERE code_hash = {}",
+                    select_invitation_sql(),
+                    ph(kind, 1)
+                );
+                let invitation = sql_query(invitation_sql)
+                    .bind::<Text, _>(&code_hash)
+                    .get_result::<InvitationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("registration authorization code is invalid".to_string())
+                    })?;
+                if invitation.authorization_code_type()?
+                    != AuthorizationCodeType::Registration
+                {
+                    return Err(AppError::BadRequest(
+                        "authorization code cannot be used for registration".to_string(),
+                    ));
+                }
+                ensure_invitation_redeemable(&invitation, now)?;
+                if invitation
+                    .authorized_email
+                    .as_deref()
+                    .is_some_and(|value| value != user.email.as_str())
+                    || invitation
+                        .authorized_username
+                        .as_deref()
+                        .is_some_and(|value| value != user.username.as_str())
+                {
+                    return Err(AppError::BadRequest(
+                        "registration details do not match the authorization code".to_string(),
+                    ));
+                }
                 ensure_user_identity_available!(
                     conn,
                     kind,
                     identity,
-                    "authorization code cannot be used for an existing account"
+                    "registration authorization code cannot be used for an existing account"
                 )?;
+
+                let mut verification_code_ids = Vec::with_capacity(verification_claims.len());
+                for claim in &verification_claims {
+                    let verification_hash = util::token_hash(&claim.code);
+                    let record = latest_verification_code!(conn, kind, claim).ok_or_else(|| {
+                        AppError::BadRequest("verification code is missing".to_string())
+                    })?;
+                    match record.verify_hash(&verification_hash, now)? {
+                        VerificationCodeDecision::Accepted(id) => verification_code_ids.push(id),
+                        VerificationCodeDecision::RejectedAttempt(_) => {
+                            return Err(AppError::BadRequest(
+                                "verification code is invalid".to_string(),
+                            ));
+                        }
+                    }
+                }
 
                 let update_sql = redeem_invitation_update_sql(kind);
                 let affected = sql_query(update_sql)
                     .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&invitation_id)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(AuthorizationCodeType::Registration.as_str())
                     .bind::<BigInt, _>(now)
                     .execute(conn)
                     .map_err(AppError::from)?;
                 if affected == 0 {
                     return Err(AppError::BadRequest(
-                        "authorization code is exhausted or no longer valid".to_string(),
+                        "registration authorization code is exhausted or no longer valid"
+                            .to_string(),
                     ));
                 }
 
-                sql_query(insert_user_sql(kind))
+                sql_query(insert_user_sql(
+                    kind,
+                    UserRegistrationSource::AuthorizationCode,
+                ))
                     .bind::<Text, _>(&user_id)
                     .bind::<Text, _>(&user.email)
                     .bind::<Text, _>(&user.username)
@@ -6091,6 +7838,16 @@ impl Db {
                     .execute(conn)
                     .map_err(AppError::from)?;
 
+                for verification_code_id in &verification_code_ids {
+                    let affected =
+                        mark_verification_code_consumed!(conn, kind, now, verification_code_id);
+                    if affected == 0 {
+                        return Err(AppError::BadRequest(
+                            "verification code is missing".to_string(),
+                        ));
+                    }
+                }
+
                 let select_user_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
                 let user = sql_query(select_user_sql)
                     .bind::<Text, _>(&user_id)
@@ -6106,7 +7863,7 @@ impl Db {
                 );
                 sql_query(insert_redemption_sql)
                     .bind::<Text, _>(redemption_id)
-                    .bind::<Text, _>(invitation_id)
+                    .bind::<Text, _>(invitation.id)
                     .bind::<Text, _>(&user_id)
                     .bind::<BigInt, _>(now)
                     .execute(conn)
@@ -6117,15 +7874,477 @@ impl Db {
         })
     }
 
-    pub async fn user_has_invitation_redemption(&self, user_id: &str) -> AppResult<bool> {
+    /// Atomically turns an active trial-enrollment code into one brand-new,
+    /// restricted account.  Existing identities are never selected or reused:
+    /// the code is an enrollment capability, not proof of ownership of an
+    /// account name or email address.
+    pub async fn redeem_trial_enrollment_code_for_new_user(
+        &self,
+        code: &str,
+        user: NewTrialEnrollmentUser,
+    ) -> AppResult<TrialEnrollmentCodeRedemption> {
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let redemption_id = uuid::Uuid::new_v4().to_string();
+        let code_hash = util::token_hash(code);
+        let now = util::now_ts();
+        let identity = UserIdentityCandidate {
+            email: user.email.clone(),
+            username: user.username.clone(),
+            phone: None,
+            exclude_user_id: None,
+        };
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<TrialEnrollmentCodeRedemption, AppError, _>(|conn| {
+                let invitation_sql = format!(
+                    "{} WHERE code_hash = {}",
+                    select_invitation_sql(),
+                    ph(kind, 1)
+                );
+                let invitation = sql_query(invitation_sql)
+                    .bind::<Text, _>(&code_hash)
+                    .get_result::<InvitationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                if invitation.authorization_code_type()? != AuthorizationCodeType::Login
+                    || invitation.login_code_level()? != LoginCodeLevel::TrialEnrollment
+                    || ensure_invitation_redeemable(&invitation, now).is_err()
+                    || invitation.expires_at.is_some_and(|expires_at| expires_at <= now)
+                {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let organization_id = invitation
+                    .organization_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(AppError::Unauthorized)?
+                    .to_string();
+                let organization_role = invitation
+                    .organization_role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(AppError::Unauthorized)?;
+                let organization_role = crate::organizations::normalize_role(organization_role)
+                    .map_err(|_| AppError::Unauthorized)?;
+                let allowed_client_ids = invitation.allowed_client_ids()?;
+                if allowed_client_ids.is_empty() {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let organization_sql = format!(
+                    "{} WHERE id = {}",
+                    select_organization_sql(),
+                    ph(kind, 1)
+                );
+                let organization = sql_query(organization_sql)
+                    .bind::<Text, _>(&organization_id)
+                    .get_result::<OrganizationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .filter(|organization| organization.is_active == 1)
+                    .ok_or(AppError::Unauthorized)?;
+                if !organization.allows_email(&user.email)? {
+                    return Err(AppError::Unauthorized);
+                }
+
+                ensure_user_identity_available!(
+                    conn,
+                    kind,
+                    identity,
+                    "trial enrollment authorization code cannot be used for an existing account"
+                )?;
+
+                let affected = sql_query(redeem_trial_enrollment_invitation_update_sql(kind))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<Text, _>(LoginCodeLevel::TrialEnrollment.as_str())
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Unauthorized);
+                }
+
+                sql_query(insert_user_sql(
+                    kind,
+                    UserRegistrationSource::AuthorizationCode,
+                ))
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&user.email)
+                    .bind::<Text, _>(&user.username)
+                    .bind::<Nullable<Text>, _>(user.display_name.clone())
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&user.password_hash)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<Integer, _>(0)
+                    .bind::<Integer, _>(1)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let membership_sql = format!(
+                    "INSERT INTO organization_members (organization_id, user_id, role, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                sql_query(membership_sql)
+                    .bind::<Text, _>(&organization_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&organization_role)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let enrollment_sql = format!(
+                    "INSERT INTO trial_enrollments (user_id, invitation_id, organization_id, organization_role, allowed_client_ids, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8)
+                );
+                sql_query(enrollment_sql)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(&organization_id)
+                    .bind::<Text, _>(&organization_role)
+                    .bind::<Text, _>(util::to_json(&allowed_client_ids)?)
+                    .bind::<Nullable<BigInt>, _>(invitation.expires_at)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let redemption_sql = format!(
+                    "INSERT INTO invitation_redemptions (id, invitation_id, user_id, redeemed_at) VALUES ({}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                sql_query(redemption_sql)
+                    .bind::<Text, _>(redemption_id)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let user_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
+                let user = sql_query(user_sql)
+                    .bind::<Text, _>(&user_id)
+                    .get_result::<UserRecord>(conn)
+                    .map_err(AppError::from)?;
+                Ok(TrialEnrollmentCodeRedemption {
+                    invitation_id: invitation.id,
+                    user,
+                    code_expires_at: invitation.expires_at,
+                    organization_id,
+                })
+            })
+        })
+    }
+
+    pub async fn find_trial_enrollment_for_user(
+        &self,
+        user_id: &str,
+    ) -> AppResult<Option<TrialEnrollmentRecord>> {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT COUNT(*) AS count FROM invitation_redemptions WHERE user_id = {}",
+                "{} WHERE user_id = {}",
+                select_trial_enrollment_sql(),
                 ph(kind, 1)
             );
             sql_query(sql)
                 .bind::<Text, _>(user_id)
+                .get_result::<TrialEnrollmentRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_active_trial_enrollment_for_user(
+        &self,
+        user_id: &str,
+    ) -> AppResult<Option<TrialEnrollmentRecord>> {
+        Ok(self
+            .find_trial_enrollment_for_user(user_id)
+            .await?
+            .filter(|enrollment| enrollment.is_active_at(util::now_ts())))
+    }
+
+    pub async fn redeem_account_recovery_code(
+        &self,
+        code: &str,
+        user_id: &str,
+        email: &str,
+    ) -> AppResult<AccountRecoveryCodeRedemption> {
+        let code_hash = util::token_hash(code);
+        let user_id = user_id.to_string();
+        let email = email.to_string();
+        let redemption_id = uuid::Uuid::new_v4().to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<AccountRecoveryCodeRedemption, AppError, _>(|conn| {
+                let invitation_sql = format!(
+                    "{} WHERE code_hash = {}",
+                    select_invitation_sql(),
+                    ph(kind, 1)
+                );
+                let invitation = sql_query(invitation_sql)
+                    .bind::<Text, _>(&code_hash)
+                    .get_result::<InvitationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                if invitation.authorization_code_type()?
+                    != AuthorizationCodeType::Login
+                    || invitation.login_code_level()? != LoginCodeLevel::AccountRecovery
+                    || ensure_invitation_redeemable(&invitation, now).is_err()
+                {
+                    return Err(AppError::Unauthorized);
+                }
+                let _bound_username = invitation
+                    .authorized_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(AppError::Unauthorized)?;
+                let authorized_user_id = invitation
+                    .authorized_user_id
+                    .as_deref()
+                    .ok_or(AppError::Unauthorized)?;
+                let user_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
+                let user = sql_query(user_sql)
+                    .bind::<Text, _>(authorized_user_id)
+                    .get_result::<UserRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                if user.id != user_id
+                    || user.email != email
+                    || user.is_active != 1
+                    || user.archived_at.is_some()
+                {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let affected = sql_query(redeem_account_recovery_invitation_update_sql(kind))
+                    .bind::<Text, _>(&user.id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<Text, _>(LoginCodeLevel::AccountRecovery.as_str())
+                    .bind::<Text, _>(&user.id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let insert_redemption_sql = format!(
+                    "INSERT INTO invitation_redemptions (id, invitation_id, user_id, redeemed_at) VALUES ({}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                sql_query(insert_redemption_sql)
+                    .bind::<Text, _>(redemption_id)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(&user.id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                Ok(AccountRecoveryCodeRedemption {
+                    invitation_id: invitation.id,
+                    user,
+                    code_expires_at: invitation.expires_at,
+                })
+            })
+        })
+    }
+
+    pub(crate) async fn redeem_admin_login_code_for_oidc_grant(
+        &self,
+        input: AdminLoginCodeRedemptionInput<'_>,
+    ) -> AppResult<OidcLoginGrantRedemption> {
+        if input.ttl_seconds <= 0
+            || input.trusted_client_id.trim().is_empty()
+            || input.interaction_request_hash.trim().is_empty()
+            || input.credential_hash.trim().is_empty()
+        {
+            return Err(AppError::Unauthorized);
+        }
+        let code_hash = util::token_hash(input.code);
+        let user_id = input.user_id.to_string();
+        let email = input.email.to_string();
+        let trusted_client_id = input.trusted_client_id.to_string();
+        let interaction_request_hash = input.interaction_request_hash.to_string();
+        let credential_hash = input.credential_hash.to_string();
+        let redemption_id = uuid::Uuid::new_v4().to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<OidcLoginGrantRedemption, AppError, _>(|conn| {
+                let invitation_sql = format!(
+                    "{} WHERE code_hash = {}",
+                    select_invitation_sql(),
+                    ph(kind, 1)
+                );
+                let invitation = sql_query(invitation_sql)
+                    .bind::<Text, _>(&code_hash)
+                    .get_result::<InvitationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::Unauthorized)?;
+                if invitation.authorization_code_type()? != AuthorizationCodeType::Login
+                    || invitation.login_code_level()? != LoginCodeLevel::AdminUniversal
+                    || ensure_invitation_redeemable(&invitation, now).is_err()
+                    || !invitation
+                        .allowed_client_ids()?
+                        .iter()
+                        .any(|value| value == &trusted_client_id)
+                {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let user_sql = format!(
+                    "{} WHERE id = {}",
+                    select_user_sql(),
+                    ph(kind, 1)
+                );
+                let user = sql_query(user_sql)
+                    .bind::<Text, _>(&user_id)
+                    .get_result::<UserRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .filter(|user| {
+                        user.id == user_id
+                            && user.email == email
+                            && user.is_active == 1
+                            && user.archived_at.is_none()
+                    })
+                    .ok_or(AppError::Unauthorized)?;
+
+                let affected = sql_query(redeem_invitation_update_sql(kind))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected != 1 {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let insert_redemption_sql = format!(
+                    "INSERT INTO invitation_redemptions (id, invitation_id, user_id, redeemed_at) VALUES ({}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                sql_query(insert_redemption_sql)
+                    .bind::<Text, _>(redemption_id)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(&user.id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let cleanup_sql = format!(
+                    "DELETE FROM oidc_login_grants WHERE expires_at < {} OR consumed_at IS NOT NULL",
+                    ph(kind, 1)
+                );
+                sql_query(cleanup_sql)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let expires_at = invitation
+                    .expires_at
+                    .unwrap_or(i64::MAX)
+                    .min(now.saturating_add(input.ttl_seconds));
+                if expires_at <= now {
+                    return Err(AppError::Unauthorized);
+                }
+                let insert_grant_sql = format!(
+                    "INSERT INTO oidc_login_grants (credential_hash, invitation_id, user_id, client_id, interaction_request_hash, auth_time, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9)
+                );
+                sql_query(insert_grant_sql)
+                    .bind::<Text, _>(&credential_hash)
+                    .bind::<Text, _>(&invitation.id)
+                    .bind::<Text, _>(&user.id)
+                    .bind::<Text, _>(&trusted_client_id)
+                    .bind::<Text, _>(&interaction_request_hash)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(expires_at)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(|_| AppError::Unauthorized)?;
+                let grant = OidcLoginGrantRecord {
+                    credential_hash,
+                    invitation_id: invitation.id.clone(),
+                    user_id: user.id.clone(),
+                    client_id: trusted_client_id,
+                    interaction_request_hash,
+                    auth_time: now,
+                    expires_at,
+                    consumed_at: None,
+                    created_at: now,
+                };
+                Ok(OidcLoginGrantRedemption {
+                    invitation_id: invitation.id,
+                    user,
+                    grant,
+                })
+            })
+        })
+    }
+
+    pub async fn user_has_invitation_redemption(&self, user_id: &str) -> AppResult<bool> {
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT COUNT(*) AS count FROM invitation_redemptions INNER JOIN invitations ON invitations.id = invitation_redemptions.invitation_id WHERE invitation_redemptions.user_id = {} AND invitations.code_type = {} AND invitations.login_code_level = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                .bind::<Text, _>(LoginCodeLevel::AccountRecovery.as_str())
                 .get_result::<CountRow>(&mut conn)
                 .map(|row| row.count > 0)
                 .map_err(AppError::from)
@@ -7019,7 +9238,7 @@ impl Db {
         let group_id = group_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT users.id, users.email, users.username, users.display_name, users.phone, users.password_hash, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM users INNER JOIN group_members ON users.id = group_members.user_id WHERE group_members.group_id = {} ORDER BY users.email ASC",
+                "SELECT users.id, users.email, users.username, users.display_name, users.phone, users.password_hash, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.registration_source, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM users INNER JOIN group_members ON users.id = group_members.user_id WHERE group_members.group_id = {} ORDER BY users.email ASC",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -7095,6 +9314,37 @@ impl Db {
             );
             sql_query(sql)
                 .load::<OrganizationRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_organization_member_counts(&self) -> AppResult<BTreeMap<String, i64>> {
+        with_conn!(self, |conn, _kind| {
+            sql_query(
+                "SELECT organization_id, COUNT(*) AS member_count FROM organization_members GROUP BY organization_id",
+            )
+            .load::<OrganizationMemberCountRecord>(&mut conn)
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|count| (count.organization_id, count.member_count))
+                    .collect()
+            })
+            .map_err(AppError::from)
+        })
+    }
+
+    pub async fn count_organization_members(&self, organization_id: &str) -> AppResult<i64> {
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT COUNT(*) AS count FROM organization_members WHERE organization_id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(organization_id)
+                .get_result::<CountRow>(&mut conn)
+                .map(|row| row.count)
                 .map_err(AppError::from)
         })
     }
@@ -7206,6 +9456,59 @@ impl Db {
                     .map_err(AppError::from)?;
                 let sql = format!(
                     "UPDATE external_oidc_providers SET organization_id = NULL, updated_at = {} WHERE organization_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                // Trial-enrollment authorization codes cannot survive without
+                // their one required organization.  Remove their outstanding
+                // grants before deleting the codes, then revoke every trial
+                // account that was created for this organization below.
+                let sql = format!(
+                    "DELETE FROM oidc_login_grants WHERE invitation_id IN (SELECT id FROM invitations WHERE organization_id = {} AND code_type = {} AND login_code_level = {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<Text, _>(LoginCodeLevel::TrialEnrollment.as_str())
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let sql = format!(
+                    "DELETE FROM invitations WHERE organization_id = {} AND code_type = {} AND login_code_level = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                    .bind::<Text, _>(LoginCodeLevel::TrialEnrollment.as_str())
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                revoke_trial_enrollment_auth_state_for_organization!(conn, kind, &id);
+                let sql = format!(
+                    "UPDATE trial_enrollments SET revoked_at = {} WHERE organization_id = {} AND revoked_at IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                // The public API only permits an organization on trial
+                // enrollment codes.  Clear it from any pre-existing legacy
+                // or malformed records instead of deleting an otherwise
+                // independent authorization code.
+                let sql = format!(
+                    "UPDATE invitations SET organization_id = NULL, organization_role = NULL, updated_at = {} WHERE organization_id = {}",
                     ph(kind, 1),
                     ph(kind, 2)
                 );
@@ -7373,6 +9676,21 @@ impl Db {
         })
     }
 
+    pub async fn list_user_ids_with_linked_identities(&self) -> AppResult<Vec<String>> {
+        #[derive(diesel::QueryableByName)]
+        struct UserIdRow {
+            #[diesel(sql_type = Text)]
+            user_id: String,
+        }
+
+        with_conn!(self, |conn, _kind| {
+            sql_query("SELECT DISTINCT user_id FROM linked_identities")
+                .load::<UserIdRow>(&mut conn)
+                .map(|rows| rows.into_iter().map(|row| row.user_id).collect())
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_linked_identity(
         &self,
         provider_slug: &str,
@@ -7457,6 +9775,25 @@ impl Db {
             );
             sql_query(sql)
                 .bind::<Text, _>(slug)
+                .get_result::<ExternalOidcProviderRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_external_oidc_provider_by_id(
+        &self,
+        id: &str,
+    ) -> AppResult<Option<ExternalOidcProviderRecord>> {
+        let id = id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE id = {}",
+                select_external_oidc_provider_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(id)
                 .get_result::<ExternalOidcProviderRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
@@ -7803,7 +10140,7 @@ impl Db {
                     ));
                 }
 
-                sql_query(insert_user_sql(kind))
+                sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
                     .bind::<Text, _>(&user_id)
                     .bind::<Text, _>(&user.email)
                     .bind::<Text, _>(&user.username)
@@ -7959,15 +10296,16 @@ impl Db {
 
 #[cfg(feature = "sqlite")]
 fn connect_sqlite(settings: &DatabaseSettings) -> AppResult<Db> {
-    if let Some(parent) = Path::new(&settings.url).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| AppError::Database(format!("failed to create sqlite dir: {err}")))?;
-        }
+    if let Some(parent) = Path::new(&settings.url).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| AppError::Database(format!("failed to create sqlite dir: {err}")))?;
     }
     let manager = ConnectionManager::<SqliteConnection>::new(settings.url.clone());
     let pool = Pool::builder()
         .max_size(settings.pool_size)
+        .connection_customizer(Box::new(SqliteConnectionCustomizer))
         .build(manager)
         .map_err(|err| AppError::Database(err.to_string()))?;
     Ok(Db::Sqlite(pool))
@@ -8014,6 +10352,9 @@ fn connect_mysql(_settings: &DatabaseSettings) -> AppResult<Db> {
     ))
 }
 
+// Keep the large backend-neutral test suite before the per-database migration
+// tables so the production SQL remains grouped by engine at the end of file.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8029,6 +10370,7 @@ mod tests {
         };
         let record = LoginSettingsRecord {
             id: "default".to_string(),
+            brand_logo_url: String::new(),
             email_domains: "[]".to_string(),
             quick_links: util::to_json(&vec![existing_link.clone()]).unwrap(),
             updated_at: 1,
@@ -8049,6 +10391,7 @@ mod tests {
         let openai = default_openai_quick_link();
         let record = LoginSettingsRecord {
             id: "default".to_string(),
+            brand_logo_url: String::new(),
             email_domains: "[]".to_string(),
             quick_links: util::to_json(&vec![openai.clone()]).unwrap(),
             updated_at: 1,
@@ -8062,14 +10405,22 @@ mod tests {
     }
 
     #[test]
-    fn invitation_public_response_keeps_redemptions() {
+    fn invitation_public_response_excludes_reveal_material() {
         let invitation = InvitationRecord {
             id: "invitation-id".to_string(),
             code_hash: "hash".to_string(),
             code_prefix: "AUTH-abc".to_string(),
+            code_reveal_key_id: Some("signing-key-1".to_string()),
+            code_reveal_ciphertext: Some("ciphertext".to_string()),
+            code_type: "login".to_string(),
+            login_code_level: "account_recovery".to_string(),
+            allowed_client_ids: "[]".to_string(),
+            organization_id: None,
+            organization_role: None,
             description: Some("temporary access".to_string()),
             authorized_email: Some("visitor@example.com".to_string()),
             authorized_username: Some("visitor".to_string()),
+            authorized_user_id: Some("user-id".to_string()),
             authorized_display_name: Some("Visitor".to_string()),
             expires_at: Some(1000),
             max_uses: Some(1),
@@ -8079,23 +10430,13 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        let redemption = InvitationRedemptionRecord {
-            id: "redemption-id".to_string(),
-            invitation_id: invitation.id.clone(),
-            user_id: "user-id".to_string(),
-            user_email: Some("visitor@example.com".to_string()),
-            user_username: Some("visitor".to_string()),
-            redeemed_at: 900,
-        };
+        let public = invitation.public().unwrap();
+        let serialized = serde_json::to_string(&public).unwrap();
 
-        let public = invitation.public_with_redemptions(vec![redemption.public()]);
-
-        assert_eq!(public.redemptions.len(), 1);
-        assert_eq!(
-            public.redemptions[0].user_email.as_deref(),
-            Some("visitor@example.com")
-        );
-        assert_eq!(public.redemptions[0].redeemed_at, 900);
+        assert!(public.can_reveal);
+        assert!(!serialized.contains("hash"));
+        assert!(!serialized.contains("ciphertext"));
+        assert!(!serialized.contains("signing-key-1"));
     }
 
     #[test]
@@ -8178,6 +10519,19 @@ mod tests {
                 "missing nullable legacy JSON migration: {statement}"
             );
         }
+    }
+
+    #[test]
+    fn login_settings_brand_logo_url_migrations_cover_all_database_engines() {
+        assert!(SQLITE_MIGRATIONS.contains(
+            &"ALTER TABLE login_settings ADD COLUMN brand_logo_url TEXT NOT NULL DEFAULT ''"
+        ));
+        assert!(POSTGRES_MIGRATIONS.contains(
+            &"ALTER TABLE login_settings ADD COLUMN IF NOT EXISTS brand_logo_url TEXT NOT NULL DEFAULT ''"
+        ));
+        assert!(MYSQL_MIGRATIONS.contains(
+            &"ALTER TABLE login_settings ADD COLUMN brand_logo_url VARCHAR(2048) NOT NULL DEFAULT ''"
+        ));
     }
 
     #[test]
@@ -8335,18 +10689,887 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    fn test_bulk_user(
+        email: &str,
+        username: &str,
+        organization_id: Option<&str>,
+        organization_role: Option<&str>,
+    ) -> NewBulkProvisionedUser {
+        NewBulkProvisionedUser {
+            user: test_user(email, username),
+            organization_id: organization_id.map(ToOwned::to_owned),
+            organization_role: organization_role.map(ToOwned::to_owned),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn test_invitation(
+        code_type: AuthorizationCodeType,
+        login_code_level: LoginCodeLevel,
+        authorized_username: Option<&str>,
+        authorized_user_id: Option<&str>,
+        allowed_client_ids: Vec<String>,
+    ) -> NewInvitation {
+        NewInvitation {
+            code_type,
+            login_code_level,
+            allowed_client_ids,
+            organization_id: None,
+            organization_role: None,
+            description: None,
+            authorized_email: None,
+            authorized_username: authorized_username.map(ToOwned::to_owned),
+            authorized_user_id: authorized_user_id.map(ToOwned::to_owned),
+            authorized_display_name: None,
+            expires_at: None,
+            max_uses: None,
+            is_active: true,
+            created_by: None,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
     async fn sqlite_test_db() -> (Db, std::path::PathBuf) {
+        sqlite_test_db_with_pool_size(1).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn sqlite_test_db_with_pool_size(pool_size: u32) -> (Db, std::path::PathBuf) {
         let path =
             std::env::temp_dir().join(format!("gpt-sso-test-{}.sqlite3", uuid::Uuid::new_v4()));
         let db = connect_sqlite(&DatabaseSettings {
             kind: DatabaseKind::Sqlite,
             url: path.to_string_lossy().into_owned(),
-            pool_size: 1,
+            pool_size,
             run_migrations: true,
         })
         .unwrap();
         db.migrate().await.unwrap();
         (db, path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn browser_context_accounts_are_ordered_by_session_login_time() {
+        let (db, path) = sqlite_test_db().await;
+        let older_user = db
+            .insert_user(test_user("older-session@example.com", "older-session"))
+            .await
+            .unwrap();
+        let newer_user = db
+            .insert_user(test_user("newer-session@example.com", "newer-session"))
+            .await
+            .unwrap();
+        let context_id = "browser-context-login-time";
+        db.insert_browser_context(context_id, "csrf", 600)
+            .await
+            .unwrap();
+        let (older_session, _) = db
+            .insert_session(&older_user.id, 600, SessionMetadata::default())
+            .await
+            .unwrap();
+        let (newer_session, _) = db
+            .insert_session(&newer_user.id, 600, SessionMetadata::default())
+            .await
+            .unwrap();
+        let older_account = db
+            .attach_browser_context_account(context_id, &older_user.id, &older_session.id)
+            .await
+            .unwrap();
+        let newer_account = db
+            .attach_browser_context_account(context_id, &newer_user.id, &newer_session.id)
+            .await
+            .unwrap();
+
+        // Make selection recency deliberately disagree with login recency.
+        // The list must follow the session's successful-login timestamp.
+        let older_session_id = older_session.id.clone();
+        let newer_session_id = newer_session.id.clone();
+        let older_account_id = older_account.id.clone();
+        let newer_account_id = newer_account.id.clone();
+        with_conn!(db, |conn, kind| {
+            let update_session = format!(
+                "UPDATE sessions SET created_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(&update_session)
+                .bind::<BigInt, _>(10)
+                .bind::<Text, _>(older_session_id)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            sql_query(update_session)
+                .bind::<BigInt, _>(20)
+                .bind::<Text, _>(newer_session_id)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+
+            let update_selection = format!(
+                "UPDATE browser_context_accounts SET last_selected_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(&update_selection)
+                .bind::<BigInt, _>(30)
+                .bind::<Text, _>(older_account_id)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            sql_query(update_selection)
+                .bind::<BigInt, _>(5)
+                .bind::<Text, _>(newer_account_id)
+                .execute(&mut conn)
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let accounts = db.list_browser_context_accounts(context_id).await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].id, newer_account.id);
+        assert_eq!(accounts[1].id, older_account.id);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bulk_provisioning_creates_memberships_and_rolls_back_the_entire_batch() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(NewOrganization {
+                slug: "corp".to_string(),
+                name: "Corp".to_string(),
+                description: None,
+                allowed_email_domains: vec!["example.com".to_string()],
+                is_active: true,
+            })
+            .await
+            .unwrap();
+
+        let rejected = db
+            .insert_bulk_provisioned_users(vec![
+                test_bulk_user(
+                    "first@example.com",
+                    "first",
+                    Some(&organization.id),
+                    Some(crate::organizations::ROLE_MEMBER),
+                ),
+                test_bulk_user(
+                    "blocked@other.test",
+                    "blocked",
+                    Some(&organization.id),
+                    Some(crate::organizations::ROLE_ADMIN),
+                ),
+            ])
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(AppError::BadRequest(message))
+                if message == "email is not allowed by the organization policy"
+        ));
+        assert!(
+            db.find_user_by_email("first@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_organization_members(&organization.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let created = db
+            .insert_bulk_provisioned_users(vec![
+                test_bulk_user(
+                    "owner@example.com",
+                    "owner",
+                    Some(&organization.id),
+                    Some(crate::organizations::ROLE_OWNER),
+                ),
+                test_bulk_user(
+                    "member@example.com",
+                    "member",
+                    Some(&organization.id),
+                    Some(crate::organizations::ROLE_MEMBER),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        let memberships = db
+            .list_organization_members(&organization.id)
+            .await
+            .unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.iter().any(|membership| {
+            membership.user_id == created[0].id
+                && membership.role == crate::organizations::ROLE_OWNER
+        }));
+        assert!(memberships.iter().any(|membership| {
+            membership.user_id == created[1].id
+                && membership.role == crate::organizations::ROLE_MEMBER
+        }));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bulk_provisioning_never_overwrites_an_existing_identity() {
+        let (db, path) = sqlite_test_db().await;
+        let existing = db
+            .insert_user(test_user("existing@example.com", "existing"))
+            .await
+            .unwrap();
+
+        let result = db
+            .insert_bulk_provisioned_users(vec![test_bulk_user(
+                "existing@example.com",
+                "different",
+                None,
+                None,
+            )])
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(message))
+                if message == "user email, username, or phone already exists"
+        ));
+        let after = db
+            .find_user_by_email("existing@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, existing.id);
+        assert_eq!(after.username, "existing");
+        assert!(
+            db.find_user_by_username("different")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn trial_enrollment_code_creates_only_new_restricted_organization_members() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(NewOrganization {
+                slug: "trial-team".to_string(),
+                name: "Trial Team".to_string(),
+                description: None,
+                allowed_email_domains: vec!["example.com".to_string()],
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        db.insert_user(test_user("taken@example.com", "taken"))
+            .await
+            .unwrap();
+        let mut invitation = test_invitation(
+            AuthorizationCodeType::Login,
+            LoginCodeLevel::TrialEnrollment,
+            None,
+            None,
+            vec!["trial-client".to_string()],
+        );
+        invitation.organization_id = Some(organization.id.clone());
+        invitation.organization_role = Some(crate::organizations::ROLE_MEMBER.to_string());
+        invitation.expires_at = Some(util::now_ts() + 300);
+        invitation.max_uses = Some(2);
+        let (stored, code) = db.insert_invitation(invitation).await.unwrap();
+
+        let collision = db
+            .redeem_trial_enrollment_code_for_new_user(
+                &code,
+                NewTrialEnrollmentUser {
+                    email: "taken@example.com".to_string(),
+                    username: "new-name".to_string(),
+                    display_name: None,
+                    password_hash: "hash".to_string(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(collision, Err(AppError::BadRequest(message)) if message.contains("existing account"))
+        );
+        assert_eq!(
+            db.find_invitation_by_id(&stored.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .uses_count,
+            0
+        );
+
+        let redemption = db
+            .redeem_trial_enrollment_code_for_new_user(
+                &code,
+                NewTrialEnrollmentUser {
+                    email: "visitor@example.com".to_string(),
+                    username: "visitor".to_string(),
+                    display_name: Some("Visitor".to_string()),
+                    password_hash: "hash".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(redemption.organization_id, organization.id);
+        assert_eq!(redemption.user.is_admin, 0);
+        assert_eq!(
+            redemption.user.registration_source,
+            UserRegistrationSource::AuthorizationCode.as_str()
+        );
+        let enrollment = db
+            .find_trial_enrollment_for_user(&redemption.user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(enrollment.invitation_id, stored.id);
+        assert!(enrollment.allows_client("trial-client").unwrap());
+        assert!(!enrollment.allows_client("other-client").unwrap());
+        let members = db
+            .list_organization_members(&organization.id)
+            .await
+            .unwrap();
+        assert!(members.iter().any(|member| {
+            member.user_id == redemption.user.id && member.role == crate::organizations::ROLE_MEMBER
+        }));
+        let authorization_code_users = db
+            .list_users(UserListScope::AuthorizationCode)
+            .await
+            .unwrap();
+        assert_eq!(authorization_code_users.len(), 1);
+        assert_eq!(authorization_code_users[0].id, redemption.user.id);
+
+        db.update_invitation(InvitationUpdate {
+            id: &stored.id,
+            description: None,
+            authorized_email: None,
+            authorized_username: None,
+            authorized_display_name: None,
+            expires_at: Some(util::now_ts() + 300),
+            max_uses: Some(2),
+            is_active: false,
+        })
+        .await
+        .unwrap();
+        let revoked = db
+            .find_trial_enrollment_for_user(&redemption.user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(revoked.revoked_at.is_some());
+        assert!(
+            db.find_active_trial_enrollment_for_user(&redemption.user.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn deleting_an_organization_removes_members_and_cleans_authorization_codes() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(NewOrganization {
+                slug: "deleted-team".to_string(),
+                name: "Deleted Team".to_string(),
+                description: None,
+                allowed_email_domains: vec!["example.com".to_string()],
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let member = db
+            .insert_user(test_user("member@example.com", "member"))
+            .await
+            .unwrap();
+        db.replace_organization_members(
+            &organization.id,
+            vec![OrganizationMemberInput {
+                user_id: member.id.clone(),
+                role: crate::organizations::ROLE_MEMBER.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut trial_code = test_invitation(
+            AuthorizationCodeType::Login,
+            LoginCodeLevel::TrialEnrollment,
+            None,
+            None,
+            vec!["trial-client".to_string()],
+        );
+        trial_code.organization_id = Some(organization.id.clone());
+        trial_code.organization_role = Some(crate::organizations::ROLE_MEMBER.to_string());
+        trial_code.expires_at = Some(util::now_ts() + 300);
+        trial_code.max_uses = Some(2);
+        let (trial_invitation, trial_secret) = db.insert_invitation(trial_code).await.unwrap();
+        let trial_user = db
+            .redeem_trial_enrollment_code_for_new_user(
+                &trial_secret,
+                NewTrialEnrollmentUser {
+                    email: "trial-user@example.com".to_string(),
+                    username: "trial-user".to_string(),
+                    display_name: None,
+                    password_hash: "hash".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .user;
+
+        // The API rejects this shape, but old/manual data can contain it.
+        // It has an independent allowed-client scope, so deletion removes only
+        // the stale organization metadata instead of destroying the code.
+        let mut legacy_code = test_invitation(
+            AuthorizationCodeType::Login,
+            LoginCodeLevel::AdminUniversal,
+            None,
+            None,
+            vec!["other-client".to_string()],
+        );
+        legacy_code.organization_id = Some(organization.id.clone());
+        legacy_code.organization_role = Some(crate::organizations::ROLE_ADMIN.to_string());
+        let (legacy_invitation, _) = db.insert_invitation(legacy_code).await.unwrap();
+
+        assert_eq!(
+            db.list_organization_member_counts()
+                .await
+                .unwrap()
+                .get(&organization.id),
+            Some(&2)
+        );
+
+        db.delete_organization(&organization.id).await.unwrap();
+
+        assert!(
+            db.find_organization_by_id(&organization.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_organization_members(&organization.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_user_organizations(&member.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_user_organizations(&trial_user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.find_invitation_by_id(&trial_invitation.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let enrollment = db
+            .find_trial_enrollment_for_user(&trial_user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(enrollment.revoked_at.is_some());
+        assert!(
+            db.find_active_trial_enrollment_for_user(&trial_user.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let legacy_after = db
+            .find_invitation_by_id(&legacy_invitation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(legacy_after.organization_id.is_none());
+        assert!(legacy_after.organization_role.is_none());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn account_recovery_code_stays_bound_to_the_user_id_after_a_username_rename() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user("rename-target@example.com", "rename-target"))
+            .await
+            .unwrap();
+        let (invitation, code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+                Some("rename-target"),
+                Some(&user.id),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        db.update_user(UserUpdate {
+            id: &user.id,
+            email: user.email.clone(),
+            username: "renamed-target".to_string(),
+            display_name: user.display_name.clone(),
+            phone: user.phone.clone(),
+            is_admin: false,
+            is_active: true,
+        })
+        .await
+        .unwrap();
+
+        let original_name = db
+            .redeem_account_recovery_code(&code, &user.id, &user.email)
+            .await
+            .unwrap();
+        let current_name = db
+            .redeem_account_recovery_code(&code, &user.id, &user.email)
+            .await
+            .unwrap();
+
+        assert!(
+            db.redeem_account_recovery_code(&code, &user.id, "different@example.com")
+                .await
+                .is_err()
+        );
+
+        assert_eq!(original_name.user.id, user.id);
+        assert_eq!(current_name.user.id, user.id);
+        let stored = db
+            .find_invitation_by_id(&invitation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.authorized_user_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(stored.uses_count, 2);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn account_recovery_code_never_falls_back_after_bound_user_deletion() {
+        let (db, path) = sqlite_test_db().await;
+        let original = db
+            .insert_user(test_user("deleted-target@example.com", "reused-name"))
+            .await
+            .unwrap();
+        let (invitation, code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+                Some("reused-name"),
+                Some(&original.id),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        db.permanently_delete_user(&original.id).await.unwrap();
+        let replacement = db
+            .insert_user(test_user("replacement@example.com", "reused-name"))
+            .await
+            .unwrap();
+
+        assert!(
+            db.redeem_account_recovery_code(&code, &replacement.id, &replacement.email)
+                .await
+                .is_err()
+        );
+        let stored = db
+            .find_invitation_by_id(&invitation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.authorized_user_id.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_eq!(stored.is_active, 0);
+        assert_eq!(stored.uses_count, 0);
+        assert_ne!(replacement.id, original.id);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn account_recovery_code_rejects_an_unbound_or_missing_account() {
+        let (db, path) = sqlite_test_db().await;
+        let (invitation, code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+                Some("new-temporary-user"),
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            db.redeem_account_recovery_code(&code, "missing-user-id", "missing@example.com")
+                .await
+                .is_err()
+        );
+        assert!(
+            db.find_user_by_username("new-temporary-user")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stored = db
+            .find_invitation_by_id(&invitation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.authorized_user_id, None);
+        assert_eq!(stored.uses_count, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn temporary_account_detection_ignores_registration_and_universal_redemptions() {
+        let (db, path) = sqlite_test_db().await;
+        let (registration, registration_code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Registration,
+                LoginCodeLevel::AccountRecovery,
+                None,
+                None,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let registered = db
+            .redeem_registration_code_for_new_user(
+                &registration_code,
+                test_user("registered-only@example.com", "registered-only"),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registered.registration_source,
+            UserRegistrationSource::AuthorizationCode.as_str()
+        );
+        assert!(
+            !db.user_has_invitation_redemption(&registered.id)
+                .await
+                .unwrap()
+        );
+
+        let universal_user = db
+            .insert_user(test_user("universal-only@example.com", "universal-only"))
+            .await
+            .unwrap();
+        assert_eq!(
+            universal_user.registration_source,
+            UserRegistrationSource::Local.as_str()
+        );
+        let (_universal, universal_code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AdminUniversal,
+                None,
+                None,
+                vec!["client-a".to_string()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            db.redeem_account_recovery_code(
+                &universal_code,
+                &universal_user.id,
+                &universal_user.email,
+            )
+            .await
+            .is_err()
+        );
+        db.redeem_admin_login_code_for_oidc_grant(AdminLoginCodeRedemptionInput {
+            code: &universal_code,
+            user_id: &universal_user.id,
+            email: &universal_user.email,
+            trusted_client_id: "client-a",
+            interaction_request_hash: "universal-interaction-hash",
+            credential_hash: "universal-credential-hash",
+            ttl_seconds: 60,
+        })
+        .await
+        .unwrap();
+        assert!(
+            !db.user_has_invitation_redemption(&universal_user.id)
+                .await
+                .unwrap()
+        );
+
+        let recovery_user = db
+            .insert_user(test_user("recovery-only@example.com", "recovery-only"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery_user.registration_source,
+            UserRegistrationSource::Local.as_str()
+        );
+        let (_recovery, recovery_code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+                Some("recovery-only"),
+                Some(&recovery_user.id),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        db.redeem_account_recovery_code(&recovery_code, &recovery_user.id, &recovery_user.email)
+            .await
+            .unwrap();
+        assert!(
+            db.user_has_invitation_redemption(&recovery_user.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.find_invitation_by_id(&registration.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Simulate an installation that existed before registration_source
+        // was introduced. A repeated migration must restore only the account
+        // that was actually created by a registration code, not an ordinary
+        // user who later redeemed a login-only recovery code.
+        let db_for_update = db.clone();
+        let registered_id = registered.id.clone();
+        with_conn!(db_for_update, |conn, kind| {
+            let sql = format!(
+                "UPDATE users SET registration_source = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(UserRegistrationSource::Local.as_str())
+                .bind::<Text, _>(registered_id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        db.migrate().await.unwrap();
+
+        let backfilled_registered = db.find_user_by_id(&registered.id).await.unwrap().unwrap();
+        let backfilled_recovery = db
+            .find_user_by_id(&recovery_user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            backfilled_registered.registration_source,
+            UserRegistrationSource::AuthorizationCode.as_str()
+        );
+        assert_eq!(
+            backfilled_recovery.registration_source,
+            UserRegistrationSource::Local.as_str()
+        );
+        let authorization_code_users = db
+            .list_users(UserListScope::AuthorizationCode)
+            .await
+            .unwrap();
+        assert_eq!(authorization_code_users.len(), 1);
+        assert_eq!(authorization_code_users[0].id, registered.id);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn disabling_an_invitation_revokes_outstanding_oidc_login_grants() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user("grant-revoke@example.com", "grant-revoke"))
+            .await
+            .unwrap();
+        let (invitation, code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AdminUniversal,
+                None,
+                None,
+                vec!["client-a".to_string()],
+            ))
+            .await
+            .unwrap();
+        db.redeem_admin_login_code_for_oidc_grant(AdminLoginCodeRedemptionInput {
+            code: &code,
+            user_id: &user.id,
+            email: &user.email,
+            trusted_client_id: "client-a",
+            interaction_request_hash: "revoke-interaction-hash",
+            credential_hash: "revoke-credential-hash",
+            ttl_seconds: 60,
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.find_oidc_login_grant("revoke-credential-hash", "revoke-interaction-hash")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let disabled = db
+            .update_invitation(InvitationUpdate {
+                id: &invitation.id,
+                description: invitation.description.clone(),
+                authorized_email: invitation.authorized_email.clone(),
+                authorized_username: invitation.authorized_username.clone(),
+                authorized_display_name: invitation.authorized_display_name.clone(),
+                expires_at: invitation.expires_at,
+                max_uses: invitation.max_uses,
+                is_active: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled.is_active, 0);
+        assert!(
+            db.find_oidc_login_grant("revoke-credential-hash", "revoke-interaction-hash")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -8380,9 +11603,21 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    async fn insert_user_auth_state(db: &Db, user_id: &str, suffix: &str) {
+    async fn insert_user_auth_state(db: &Db, user_id: &str, suffix: &str) -> String {
         let now = util::now_ts();
-        db.insert_session(user_id, 600, SessionMetadata::default())
+        let (session, _cookie_value) = db
+            .insert_session(user_id, 600, SessionMetadata::default())
+            .await
+            .unwrap();
+        let browser_context_id = format!("browser-context-{suffix}");
+        db.insert_browser_context(&browser_context_id, "csrf", 600)
+            .await
+            .unwrap();
+        let account = db
+            .attach_browser_context_account(&browser_context_id, user_id, &session.id)
+            .await
+            .unwrap();
+        db.mint_browser_account_session_credential(&browser_context_id, &account.id)
             .await
             .unwrap();
         db.insert_authorization_code(NewAuthorizationCode {
@@ -8405,14 +11640,16 @@ mod tests {
         .await
         .unwrap();
         db.insert_refresh_token(
-            format!("refresh-token-{suffix}"),
             "client".to_string(),
-            user_id.to_string(),
-            "openid".to_string(),
-            None,
-            None,
-            None,
-            now + 600,
+            RefreshTokenInput {
+                token_hash: format!("refresh-token-{suffix}"),
+                user_id: user_id.to_string(),
+                scope: "openid".to_string(),
+                resource: None,
+                authorization_details: None,
+                dpop_jkt: None,
+                expires_at: now + 600,
+            },
         )
         .await
         .unwrap();
@@ -8436,6 +11673,55 @@ mod tests {
         db.create_webauthn_challenge(Some(user_id), "login", "{}".to_string(), 600)
             .await
             .unwrap();
+        let user_id = user_id.to_string();
+        let suffix = suffix.to_string();
+        with_conn!(db, |conn, kind| {
+            let sql = format!(
+                "INSERT INTO oidc_login_grants (credential_hash, invitation_id, user_id, client_id, interaction_request_hash, auth_time, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7),
+                ph(kind, 8),
+                ph(kind, 9)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(format!("credential-{suffix}"))
+                .bind::<Text, _>(format!("invitation-{suffix}"))
+                .bind::<Text, _>(user_id)
+                .bind::<Text, _>("client")
+                .bind::<Text, _>(format!("interaction-{suffix}"))
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now + 600)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        session.id
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn session_link_count(db: &Db, table: &str, session_id: &str) -> i64 {
+        let table = table.to_string();
+        let session_id = session_id.to_string();
+        with_conn!(db, |conn, kind| {
+            let sql = format!(
+                "SELECT COUNT(*) AS count FROM {table} WHERE session_id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(session_id)
+                .get_result::<CountRow>(&mut conn)
+                .map(|row| row.count)
+                .map_err(AppError::from)
+        })
+        .unwrap()
     }
 
     #[cfg(feature = "sqlite")]
@@ -8448,6 +11734,278 @@ mod tests {
                 .map_err(AppError::from)
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn refresh_token_replacement(token_hash: &str, user_id: &str) -> RefreshTokenInput {
+        RefreshTokenInput {
+            token_hash: token_hash.to_string(),
+            user_id: user_id.to_string(),
+            scope: "openid profile".to_string(),
+            resource: Some("https://api.example/".to_string()),
+            authorization_details: None,
+            dpop_jkt: None,
+            expires_at: util::now_ts() + 600,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn concurrent_refresh_token_rotation_has_one_winner() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        let now = util::now_ts();
+        db.insert_refresh_token(
+            "client".to_string(),
+            RefreshTokenInput {
+                token_hash: "old-refresh-hash".to_string(),
+                user_id: "user".to_string(),
+                scope: "openid profile".to_string(),
+                resource: Some("https://api.example/".to_string()),
+                authorization_details: None,
+                dpop_jkt: None,
+                expires_at: now + 600,
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first, second) = tokio::join!(
+            first_db.rotate_refresh_token(
+                "old-refresh-hash",
+                "client",
+                refresh_token_replacement("new-refresh-hash-1", "user"),
+            ),
+            second_db.rotate_refresh_token(
+                "old-refresh-hash",
+                "client",
+                refresh_token_replacement("new-refresh-hash-2", "user"),
+            )
+        );
+
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(outcomes.iter().filter(|&&rotated| rotated).count(), 1);
+        let inserted = [
+            db.find_refresh_token("new-refresh-hash-1")
+                .await
+                .unwrap()
+                .is_some(),
+            db.find_refresh_token("new-refresh-hash-2")
+                .await
+                .unwrap()
+                .is_some(),
+        ];
+        assert_eq!(inserted.iter().filter(|&&exists| exists).count(), 1);
+        assert!(
+            db.find_refresh_token("old-refresh-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn interaction_request_update_requires_live_unconsumed_client_binding() {
+        let (db, path) = sqlite_test_db().await;
+        db.insert_pushed_authorization_request(NewPushedAuthorizationRequest {
+            request_uri_hash: "reauth-interaction-hash".to_string(),
+            client_id: "client".to_string(),
+            request_json: "{\"state\":\"pending\"}".to_string(),
+            expires_at: util::now_ts() + 600,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.update_unconsumed_pushed_authorization_request(
+                "reauth-interaction-hash",
+                "other-client",
+                "{\"state\":\"pending\"}",
+                "{\"state\":\"forged\"}",
+            )
+            .await
+            .is_err()
+        );
+        let updated = db
+            .update_unconsumed_pushed_authorization_request(
+                "reauth-interaction-hash",
+                "client",
+                "{\"state\":\"pending\"}",
+                "{\"state\":\"complete\"}",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.request_json, "{\"state\":\"complete\"}");
+        db.consume_pushed_authorization_request("reauth-interaction-hash")
+            .await
+            .unwrap();
+        assert!(
+            db.update_unconsumed_pushed_authorization_request(
+                "reauth-interaction-hash",
+                "client",
+                "{\"state\":\"complete\"}",
+                "{\"state\":\"replayed\"}",
+            )
+            .await
+            .is_err()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn concurrent_interaction_request_compare_and_swap_has_one_winner() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        db.insert_pushed_authorization_request(NewPushedAuthorizationRequest {
+            request_uri_hash: "concurrent-reauth-interaction".to_string(),
+            client_id: "client".to_string(),
+            request_json: "{\"state\":\"pending\"}".to_string(),
+            expires_at: util::now_ts() + 600,
+        })
+        .await
+        .unwrap();
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first, second) = tokio::join!(
+            first_db.update_unconsumed_pushed_authorization_request(
+                "concurrent-reauth-interaction",
+                "client",
+                "{\"state\":\"pending\"}",
+                "{\"state\":\"first\"}",
+            ),
+            second_db.update_unconsumed_pushed_authorization_request(
+                "concurrent-reauth-interaction",
+                "client",
+                "{\"state\":\"pending\"}",
+                "{\"state\":\"second\"}",
+            )
+        );
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+        let stored = db
+            .find_pushed_authorization_request("concurrent-reauth-interaction")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored.request_json.as_str(),
+            "{\"state\":\"first\"}" | "{\"state\":\"second\"}"
+        ));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn pushed_authorization_request_consumption_has_one_concurrent_winner() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        db.insert_pushed_authorization_request(NewPushedAuthorizationRequest {
+            request_uri_hash: "concurrent-request-uri-hash".to_string(),
+            client_id: "client".to_string(),
+            request_json: "{}".to_string(),
+            expires_at: util::now_ts() + 600,
+        })
+        .await
+        .unwrap();
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first, second) = tokio::join!(
+            first_db.consume_pushed_authorization_request("concurrent-request-uri-hash"),
+            second_db.consume_pushed_authorization_request("concurrent-request-uri-hash")
+        );
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+        assert!(
+            db.consume_pushed_authorization_request("concurrent-request-uri-hash")
+                .await
+                .is_err()
+        );
+        assert!(
+            db.find_pushed_authorization_request("concurrent-request-uri-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .consumed_at
+                .is_some()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn refresh_token_rotation_rolls_back_revoke_when_insert_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let now = util::now_ts();
+        for token_hash in ["old-refresh-hash", "duplicate-refresh-hash"] {
+            db.insert_refresh_token(
+                "client".to_string(),
+                RefreshTokenInput {
+                    token_hash: token_hash.to_string(),
+                    user_id: "user".to_string(),
+                    scope: "openid".to_string(),
+                    resource: None,
+                    authorization_details: None,
+                    dpop_jkt: None,
+                    expires_at: now + 600,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            db.rotate_refresh_token(
+                "old-refresh-hash",
+                "client",
+                refresh_token_replacement("duplicate-refresh-hash", "user"),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.find_refresh_token("old-refresh-hash")
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at,
+            None
+        );
+        assert!(
+            db.rotate_refresh_token(
+                "old-refresh-hash",
+                "client",
+                refresh_token_replacement("unique-refresh-hash", "user"),
+            )
+            .await
+            .unwrap()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -8493,19 +12051,19 @@ mod tests {
             .insert_user(test_user("deactivate@example.com", "deactivate"))
             .await
             .unwrap();
-        insert_user_auth_state(&db, &user.id, "deactivate").await;
+        let _session_id = insert_user_auth_state(&db, &user.id, "deactivate").await;
         assert_user_auth_state_count(&db, &user.id, 1).await;
 
         let updated = db
-            .update_user(
-                &user.id,
-                user.email.clone(),
-                user.username.clone(),
-                user.display_name.clone(),
-                user.phone.clone(),
-                user.is_admin == 1,
-                false,
-            )
+            .update_user(UserUpdate {
+                id: &user.id,
+                email: user.email.clone(),
+                username: user.username.clone(),
+                display_name: user.display_name.clone(),
+                phone: user.phone.clone(),
+                is_admin: user.is_admin == 1,
+                is_active: false,
+            })
             .await
             .unwrap();
 
@@ -8524,7 +12082,7 @@ mod tests {
             .insert_user(test_user("archive@example.com", "archive"))
             .await
             .unwrap();
-        insert_user_auth_state(&db, &user.id, "archive").await;
+        let _session_id = insert_user_auth_state(&db, &user.id, "archive").await;
         assert_user_auth_state_count(&db, &user.id, 1).await;
 
         db.archive_user(&user.id).await.unwrap();
@@ -8546,7 +12104,17 @@ mod tests {
             .insert_user(test_user("deleted@example.com", "deleted"))
             .await
             .unwrap();
-        insert_user_auth_state(&db, &user.id, "deleted").await;
+        let session_id = insert_user_auth_state(&db, &user.id, "deleted").await;
+        let (recovery_invitation, _recovery_code) = db
+            .insert_invitation(test_invitation(
+                AuthorizationCodeType::Login,
+                LoginCodeLevel::AccountRecovery,
+                Some(&user.username),
+                Some(&user.id),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
         db.insert_audit_event(crate::audit::management_event(
             user.id.clone(),
             "user.test_event",
@@ -8561,6 +12129,19 @@ mod tests {
 
         assert!(db.find_user_by_id(&user.id).await.unwrap().is_none());
         assert_user_auth_state_count(&db, &user.id, 0).await;
+        for table in ["session_credentials", "browser_context_accounts"] {
+            assert_eq!(session_link_count(&db, table, &session_id).await, 0);
+        }
+        let invalidated = db
+            .find_invitation_by_id(&recovery_invitation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalidated.is_active, 0);
+        assert_eq!(
+            invalidated.authorized_user_id.as_deref(),
+            Some(user.id.as_str())
+        );
         let audit_events = db.list_audit_events(10).await.unwrap();
         assert!(audit_events.iter().any(|event| {
             event.action == "user.test_event"
@@ -8683,28 +12264,28 @@ mod tests {
     async fn verification_code_issue_respects_resend_interval() {
         let (db, path) = sqlite_test_db().await;
         let first = db
-            .insert_verification_code(
-                "email",
-                "resend@example.com",
-                "registration",
-                util::token_hash("123456"),
-                600,
-                60,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: "resend@example.com",
+                purpose: "registration",
+                code_hash: util::token_hash("123456"),
+                ttl_seconds: 600,
+                resend_interval_seconds: 60,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
 
         let second = db
-            .insert_verification_code(
-                "email",
-                "resend@example.com",
-                "registration",
-                util::token_hash("654321"),
-                600,
-                60,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: "resend@example.com",
+                purpose: "registration",
+                code_hash: util::token_hash("654321"),
+                ttl_seconds: 600,
+                resend_interval_seconds: 60,
+                max_attempts: 5,
+            })
             .await;
 
         assert!(matches!(
@@ -8726,15 +12307,15 @@ mod tests {
     async fn verification_delivery_cleanup_allows_retry_without_resend_delay() {
         let (db, path) = sqlite_test_db().await;
         let first = db
-            .insert_verification_code(
-                "email",
-                "cleanup@example.com",
-                "registration",
-                util::token_hash("123456"),
-                600,
-                60,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: "cleanup@example.com",
+                purpose: "registration",
+                code_hash: util::token_hash("123456"),
+                ttl_seconds: 600,
+                resend_interval_seconds: 60,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
 
@@ -8745,15 +12326,15 @@ mod tests {
         );
 
         let second = db
-            .insert_verification_code(
-                "email",
-                "cleanup@example.com",
-                "registration",
-                util::token_hash("654321"),
-                600,
-                60,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: "cleanup@example.com",
+                purpose: "registration",
+                code_hash: util::token_hash("654321"),
+                ttl_seconds: 600,
+                resend_interval_seconds: 60,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
         assert_eq!(second.target, "cleanup@example.com");
@@ -8778,15 +12359,15 @@ mod tests {
         let (db, path) = sqlite_test_db().await;
         let code = "123456";
         let record = db
-            .insert_verification_code(
-                "email",
-                "consumed-cleanup@example.com",
-                "registration",
-                util::token_hash(code),
-                600,
-                1,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: "consumed-cleanup@example.com",
+                purpose: "registration",
+                code_hash: util::token_hash(code),
+                ttl_seconds: 600,
+                resend_interval_seconds: 1,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
 
@@ -8821,15 +12402,15 @@ mod tests {
         let email = "verified@example.com";
         let code = "123456";
         let verification_code = db
-            .insert_verification_code(
-                "email",
-                email,
-                "registration",
-                util::token_hash(code),
-                600,
-                1,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: email,
+                purpose: "registration",
+                code_hash: util::token_hash(code),
+                ttl_seconds: 600,
+                resend_interval_seconds: 1,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
         db.insert_user(test_user(email, "existing")).await.unwrap();
@@ -9007,15 +12588,15 @@ mod tests {
         let (db, path) = sqlite_test_db().await;
         let email = "wrong-code@example.com";
         let verification_code = db
-            .insert_verification_code(
-                "email",
-                email,
-                "registration",
-                util::token_hash("123456"),
-                600,
-                1,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: email,
+                purpose: "registration",
+                code_hash: util::token_hash("123456"),
+                ttl_seconds: 600,
+                resend_interval_seconds: 1,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
 
@@ -9051,15 +12632,15 @@ mod tests {
         let email = "new-verified@example.com";
         let code = "123456";
         let verification_code = db
-            .insert_verification_code(
-                "email",
-                email,
-                "registration",
-                util::token_hash(code),
-                600,
-                1,
-                5,
-            )
+            .insert_verification_code(NewVerificationCode {
+                channel: "email",
+                target: email,
+                purpose: "registration",
+                code_hash: util::token_hash(code),
+                ttl_seconds: 600,
+                resend_interval_seconds: 1,
+                max_attempts: 5,
+            })
             .await
             .unwrap();
 
@@ -9127,6 +12708,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         is_admin INTEGER NOT NULL,
         is_active INTEGER NOT NULL,
         archived_at INTEGER,
+        registration_source TEXT NOT NULL DEFAULT 'local',
         last_login_at INTEGER,
         last_login_ip TEXT,
         last_oidc_client_id TEXT,
@@ -9135,12 +12717,15 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     )",
     "ALTER TABLE users ADD COLUMN archived_at INTEGER",
+    "ALTER TABLE users ADD COLUMN registration_source TEXT NOT NULL DEFAULT 'local'",
     "CREATE INDEX IF NOT EXISTS idx_users_archive_active_created ON users(archived_at, is_active, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_users_registration_source_lifecycle ON users(registration_source, archived_at, is_active, created_at)",
     "CREATE TABLE IF NOT EXISTS clients (
         id TEXT PRIMARY KEY,
         client_id TEXT NOT NULL UNIQUE,
         client_secret_hash TEXT,
         client_name TEXT NOT NULL,
+        logo_uri TEXT NOT NULL DEFAULT '',
         organization_id TEXT,
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
@@ -9189,6 +12774,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN frontchannel_logout_session_required INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_permissions TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE clients ADD COLUMN logo_uri TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN organization_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization_id, is_active)",
     "CREATE TABLE IF NOT EXISTS client_registrations (
@@ -9246,6 +12832,44 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN login_method TEXT",
     "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_user_expires ON sessions(user_id, expires_at)",
+    "CREATE TABLE IF NOT EXISTS browser_contexts (
+        id TEXT PRIMARY KEY,
+        csrf_token TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_browser_contexts_expires ON browser_contexts(expires_at)",
+    "CREATE TABLE IF NOT EXISTS browser_context_accounts (
+        id TEXT PRIMARY KEY,
+        browser_context_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        session_id TEXT NOT NULL UNIQUE,
+        added_at INTEGER NOT NULL,
+        last_selected_at INTEGER,
+        UNIQUE(browser_context_id, user_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_browser_context_accounts_context ON browser_context_accounts(browser_context_id, last_selected_at)",
+    "CREATE TABLE IF NOT EXISTS session_credentials (
+        credential_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        browser_context_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_session_credentials_session ON session_credentials(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_session_credentials_context ON session_credentials(browser_context_id, expires_at)",
+    "CREATE TABLE IF NOT EXISTS account_login_flows (
+        id_hash TEXT PRIMARY KEY,
+        browser_context_id TEXT NOT NULL,
+        return_to TEXT NOT NULL,
+        expected_user_id TEXT,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        created_at INTEGER NOT NULL
+    )",
+    "ALTER TABLE account_login_flows ADD COLUMN expected_user_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_account_login_flows_context_expires ON account_login_flows(browser_context_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS mfa_totp_methods (
         user_id TEXT PRIMARY KEY,
         secret TEXT NOT NULL,
@@ -9326,6 +12950,19 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN auth_time INTEGER",
     "ALTER TABLE authorization_codes ADD COLUMN acr TEXT NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN amr TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE IF NOT EXISTS oidc_login_grants (
+        credential_hash TEXT PRIMARY KEY,
+        invitation_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        interaction_request_hash TEXT NOT NULL UNIQUE,
+        auth_time INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_client_expires ON oidc_login_grants(client_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_user_expires ON oidc_login_grants(user_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS pushed_authorization_requests (
         request_uri_hash TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
@@ -9455,9 +13092,17 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         id TEXT PRIMARY KEY,
         code_hash TEXT NOT NULL UNIQUE,
         code_prefix TEXT NOT NULL,
+        code_reveal_key_id TEXT,
+        code_reveal_ciphertext TEXT,
+        code_type TEXT NOT NULL DEFAULT 'login',
+        login_code_level TEXT NOT NULL DEFAULT 'account_recovery',
+        allowed_client_ids TEXT,
+        organization_id TEXT,
+        organization_role TEXT,
         description TEXT,
         authorized_email TEXT,
         authorized_username TEXT,
+        authorized_user_id TEXT,
         authorized_display_name TEXT,
         expires_at INTEGER,
         max_uses INTEGER,
@@ -9467,8 +13112,16 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )",
+    "ALTER TABLE invitations ADD COLUMN code_type TEXT NOT NULL DEFAULT 'login'",
+    "ALTER TABLE invitations ADD COLUMN code_reveal_key_id TEXT",
+    "ALTER TABLE invitations ADD COLUMN code_reveal_ciphertext TEXT",
+    "ALTER TABLE invitations ADD COLUMN login_code_level TEXT NOT NULL DEFAULT 'account_recovery'",
+    "ALTER TABLE invitations ADD COLUMN allowed_client_ids TEXT",
+    "ALTER TABLE invitations ADD COLUMN organization_id TEXT",
+    "ALTER TABLE invitations ADD COLUMN organization_role TEXT",
     "ALTER TABLE invitations ADD COLUMN authorized_email TEXT",
     "ALTER TABLE invitations ADD COLUMN authorized_username TEXT",
+    "ALTER TABLE invitations ADD COLUMN authorized_user_id TEXT",
     "ALTER TABLE invitations ADD COLUMN authorized_display_name TEXT",
     "CREATE TABLE IF NOT EXISTS invitation_redemptions (
         id TEXT PRIMARY KEY,
@@ -9476,6 +13129,17 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         user_id TEXT NOT NULL,
         redeemed_at INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS trial_enrollments (
+        user_id TEXT PRIMARY KEY,
+        invitation_id TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        organization_role TEXT NOT NULL,
+        allowed_client_ids TEXT NOT NULL,
+        expires_at INTEGER,
+        revoked_at INTEGER,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_trial_enrollments_invitation ON trial_enrollments(invitation_id, revoked_at)",
     "CREATE TABLE IF NOT EXISTS login_events (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -9672,10 +13336,12 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS login_settings (
         id TEXT PRIMARY KEY,
+        brand_logo_url TEXT NOT NULL DEFAULT '',
         email_domains TEXT NOT NULL,
         quick_links TEXT NOT NULL,
         updated_at INTEGER NOT NULL
     )",
+    "ALTER TABLE login_settings ADD COLUMN brand_logo_url TEXT NOT NULL DEFAULT ''",
 ];
 
 const POSTGRES_MIGRATIONS: &[&str] = &[
@@ -9691,6 +13357,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         is_admin INTEGER NOT NULL,
         is_active INTEGER NOT NULL,
         archived_at BIGINT,
+        registration_source TEXT NOT NULL DEFAULT 'local',
         last_login_at BIGINT,
         last_login_ip TEXT,
         last_oidc_client_id TEXT,
@@ -9699,12 +13366,15 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL
     )",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS archived_at BIGINT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS registration_source TEXT NOT NULL DEFAULT 'local'",
     "CREATE INDEX IF NOT EXISTS idx_users_archive_active_created ON users(archived_at, is_active, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_users_registration_source_lifecycle ON users(registration_source, archived_at, is_active, created_at)",
     "CREATE TABLE IF NOT EXISTS clients (
         id TEXT PRIMARY KEY,
         client_id TEXT NOT NULL UNIQUE,
         client_secret_hash TEXT,
         client_name TEXT NOT NULL,
+        logo_uri TEXT NOT NULL DEFAULT '',
         organization_id TEXT,
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
@@ -9753,6 +13423,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS frontchannel_logout_session_required INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS service_account_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS service_account_permissions TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE clients ADD COLUMN IF NOT EXISTS logo_uri TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS organization_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization_id, is_active)",
     "CREATE TABLE IF NOT EXISTS client_registrations (
@@ -9810,6 +13481,44 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS login_method TEXT",
     "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_user_expires ON sessions(user_id, expires_at)",
+    "CREATE TABLE IF NOT EXISTS browser_contexts (
+        id TEXT PRIMARY KEY,
+        csrf_token TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_browser_contexts_expires ON browser_contexts(expires_at)",
+    "CREATE TABLE IF NOT EXISTS browser_context_accounts (
+        id TEXT PRIMARY KEY,
+        browser_context_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        session_id TEXT NOT NULL UNIQUE,
+        added_at BIGINT NOT NULL,
+        last_selected_at BIGINT,
+        UNIQUE(browser_context_id, user_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_browser_context_accounts_context ON browser_context_accounts(browser_context_id, last_selected_at)",
+    "CREATE TABLE IF NOT EXISTS session_credentials (
+        credential_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        browser_context_id TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_session_credentials_session ON session_credentials(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_session_credentials_context ON session_credentials(browser_context_id, expires_at)",
+    "CREATE TABLE IF NOT EXISTS account_login_flows (
+        id_hash TEXT PRIMARY KEY,
+        browser_context_id TEXT NOT NULL,
+        return_to TEXT NOT NULL,
+        expected_user_id TEXT,
+        expires_at BIGINT NOT NULL,
+        consumed_at BIGINT,
+        created_at BIGINT NOT NULL
+    )",
+    "ALTER TABLE account_login_flows ADD COLUMN IF NOT EXISTS expected_user_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_account_login_flows_context_expires ON account_login_flows(browser_context_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS mfa_totp_methods (
         user_id TEXT PRIMARY KEY,
         secret TEXT NOT NULL,
@@ -9890,6 +13599,19 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS auth_time BIGINT",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS acr TEXT NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS amr TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE IF NOT EXISTS oidc_login_grants (
+        credential_hash TEXT PRIMARY KEY,
+        invitation_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        interaction_request_hash TEXT NOT NULL UNIQUE,
+        auth_time BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        consumed_at BIGINT,
+        created_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_client_expires ON oidc_login_grants(client_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_user_expires ON oidc_login_grants(user_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS pushed_authorization_requests (
         request_uri_hash TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
@@ -10019,9 +13741,17 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         id TEXT PRIMARY KEY,
         code_hash TEXT NOT NULL UNIQUE,
         code_prefix TEXT NOT NULL,
+        code_reveal_key_id TEXT,
+        code_reveal_ciphertext TEXT,
+        code_type TEXT NOT NULL DEFAULT 'login',
+        login_code_level TEXT NOT NULL DEFAULT 'account_recovery',
+        allowed_client_ids TEXT,
+        organization_id TEXT,
+        organization_role TEXT,
         description TEXT,
         authorized_email TEXT,
         authorized_username TEXT,
+        authorized_user_id TEXT,
         authorized_display_name TEXT,
         expires_at BIGINT,
         max_uses INTEGER,
@@ -10031,8 +13761,16 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL
     )",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS code_type TEXT NOT NULL DEFAULT 'login'",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS code_reveal_key_id TEXT",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS code_reveal_ciphertext TEXT",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS login_code_level TEXT NOT NULL DEFAULT 'account_recovery'",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS allowed_client_ids TEXT",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS organization_id TEXT",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS organization_role TEXT",
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS authorized_email TEXT",
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS authorized_username TEXT",
+    "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS authorized_user_id TEXT",
     "ALTER TABLE invitations ADD COLUMN IF NOT EXISTS authorized_display_name TEXT",
     "CREATE TABLE IF NOT EXISTS invitation_redemptions (
         id TEXT PRIMARY KEY,
@@ -10040,6 +13778,17 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         user_id TEXT NOT NULL,
         redeemed_at BIGINT NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS trial_enrollments (
+        user_id TEXT PRIMARY KEY,
+        invitation_id TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        organization_role TEXT NOT NULL,
+        allowed_client_ids TEXT NOT NULL,
+        expires_at BIGINT,
+        revoked_at BIGINT,
+        created_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_trial_enrollments_invitation ON trial_enrollments(invitation_id, revoked_at)",
     "CREATE TABLE IF NOT EXISTS login_events (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -10236,10 +13985,12 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS login_settings (
         id TEXT PRIMARY KEY,
+        brand_logo_url TEXT NOT NULL DEFAULT '',
         email_domains TEXT NOT NULL,
         quick_links TEXT NOT NULL,
         updated_at BIGINT NOT NULL
     )",
+    "ALTER TABLE login_settings ADD COLUMN IF NOT EXISTS brand_logo_url TEXT NOT NULL DEFAULT ''",
 ];
 
 const MYSQL_MIGRATIONS: &[&str] = &[
@@ -10255,6 +14006,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         is_admin INT NOT NULL,
         is_active INT NOT NULL,
         archived_at BIGINT NULL,
+        registration_source VARCHAR(32) NOT NULL DEFAULT 'local',
         last_login_at BIGINT NULL,
         last_login_ip VARCHAR(128) NULL,
         last_oidc_client_id VARCHAR(255) NULL,
@@ -10263,12 +14015,15 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL
     )",
     "ALTER TABLE users ADD COLUMN archived_at BIGINT NULL",
+    "ALTER TABLE users ADD COLUMN registration_source VARCHAR(32) NOT NULL DEFAULT 'local'",
     "CREATE INDEX idx_users_archive_active_created ON users(archived_at, is_active, created_at)",
+    "CREATE INDEX idx_users_registration_source_lifecycle ON users(registration_source, archived_at, is_active, created_at)",
     "CREATE TABLE IF NOT EXISTS clients (
         id VARCHAR(64) PRIMARY KEY,
         client_id VARCHAR(255) NOT NULL UNIQUE,
         client_secret_hash TEXT NULL,
         client_name TEXT NOT NULL,
+        logo_uri VARCHAR(2048) NOT NULL DEFAULT '',
         organization_id VARCHAR(64) NULL,
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
@@ -10317,6 +14072,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN frontchannel_logout_session_required INT NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_enabled INT NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_permissions TEXT NULL",
+    "ALTER TABLE clients ADD COLUMN logo_uri VARCHAR(2048) NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN organization_id VARCHAR(64) NULL",
     "CREATE INDEX idx_clients_organization ON clients(organization_id, is_active)",
     "CREATE TABLE IF NOT EXISTS client_registrations (
@@ -10375,6 +14131,44 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN user_agent TEXT NULL",
     "ALTER TABLE sessions ADD COLUMN login_method VARCHAR(64) NULL",
     "CREATE INDEX idx_sessions_user_expires ON sessions(user_id, expires_at)",
+    "CREATE TABLE IF NOT EXISTS browser_contexts (
+        id VARCHAR(128) PRIMARY KEY,
+        csrf_token VARCHAR(128) NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_browser_contexts_expires (expires_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS browser_context_accounts (
+        id VARCHAR(64) PRIMARY KEY,
+        browser_context_id VARCHAR(128) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        session_id VARCHAR(128) NOT NULL UNIQUE,
+        added_at BIGINT NOT NULL,
+        last_selected_at BIGINT NULL,
+        UNIQUE KEY idx_browser_context_accounts_user (browser_context_id, user_id),
+        INDEX idx_browser_context_accounts_context (browser_context_id, last_selected_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS session_credentials (
+        credential_id VARCHAR(128) PRIMARY KEY,
+        session_id VARCHAR(128) NOT NULL,
+        browser_context_id VARCHAR(128) NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_session_credentials_session (session_id),
+        INDEX idx_session_credentials_context (browser_context_id, expires_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS account_login_flows (
+        id_hash VARCHAR(128) PRIMARY KEY,
+        browser_context_id VARCHAR(128) NOT NULL,
+        return_to TEXT NOT NULL,
+        expected_user_id VARCHAR(64) NULL,
+        expires_at BIGINT NOT NULL,
+        consumed_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_account_login_flows_context_expires (browser_context_id, expires_at)
+    )",
+    "ALTER TABLE account_login_flows ADD COLUMN expected_user_id VARCHAR(64) NULL",
     "CREATE TABLE IF NOT EXISTS mfa_totp_methods (
         user_id VARCHAR(64) PRIMARY KEY,
         secret TEXT NOT NULL,
@@ -10455,6 +14249,19 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN auth_time BIGINT NULL",
     "ALTER TABLE authorization_codes ADD COLUMN acr VARCHAR(255) NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN amr TEXT NULL",
+    "CREATE TABLE IF NOT EXISTS oidc_login_grants (
+        credential_hash VARCHAR(128) PRIMARY KEY,
+        invitation_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        client_id VARCHAR(255) NOT NULL,
+        interaction_request_hash VARCHAR(128) NOT NULL UNIQUE,
+        auth_time BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        consumed_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_oidc_login_grants_client_expires (client_id, expires_at),
+        INDEX idx_oidc_login_grants_user_expires (user_id, expires_at)
+    )",
     "CREATE TABLE IF NOT EXISTS pushed_authorization_requests (
         request_uri_hash VARCHAR(128) PRIMARY KEY,
         client_id VARCHAR(255) NOT NULL,
@@ -10584,9 +14391,17 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         id VARCHAR(64) PRIMARY KEY,
         code_hash VARCHAR(128) NOT NULL UNIQUE,
         code_prefix VARCHAR(32) NOT NULL,
+        code_reveal_key_id VARCHAR(128) NULL,
+        code_reveal_ciphertext TEXT NULL,
+        code_type VARCHAR(32) NOT NULL DEFAULT 'login',
+        login_code_level VARCHAR(32) NOT NULL DEFAULT 'account_recovery',
+        allowed_client_ids TEXT NULL,
+        organization_id VARCHAR(64) NULL,
+        organization_role VARCHAR(32) NULL,
         description TEXT NULL,
         authorized_email VARCHAR(255) NULL,
         authorized_username VARCHAR(255) NULL,
+        authorized_user_id VARCHAR(64) NULL,
         authorized_display_name TEXT NULL,
         expires_at BIGINT NULL,
         max_uses INT NULL,
@@ -10596,14 +14411,33 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL
     )",
+    "ALTER TABLE invitations ADD COLUMN code_type VARCHAR(32) NOT NULL DEFAULT 'login'",
+    "ALTER TABLE invitations ADD COLUMN code_reveal_key_id VARCHAR(128) NULL",
+    "ALTER TABLE invitations ADD COLUMN code_reveal_ciphertext TEXT NULL",
+    "ALTER TABLE invitations ADD COLUMN login_code_level VARCHAR(32) NOT NULL DEFAULT 'account_recovery'",
+    "ALTER TABLE invitations ADD COLUMN allowed_client_ids TEXT NULL",
+    "ALTER TABLE invitations ADD COLUMN organization_id VARCHAR(64) NULL",
+    "ALTER TABLE invitations ADD COLUMN organization_role VARCHAR(32) NULL",
     "ALTER TABLE invitations ADD COLUMN authorized_email VARCHAR(255) NULL",
     "ALTER TABLE invitations ADD COLUMN authorized_username VARCHAR(255) NULL",
+    "ALTER TABLE invitations ADD COLUMN authorized_user_id VARCHAR(64) NULL",
     "ALTER TABLE invitations ADD COLUMN authorized_display_name TEXT NULL",
     "CREATE TABLE IF NOT EXISTS invitation_redemptions (
         id VARCHAR(64) PRIMARY KEY,
         invitation_id VARCHAR(64) NOT NULL,
         user_id VARCHAR(64) NOT NULL,
         redeemed_at BIGINT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS trial_enrollments (
+        user_id VARCHAR(64) PRIMARY KEY,
+        invitation_id VARCHAR(64) NOT NULL,
+        organization_id VARCHAR(64) NOT NULL,
+        organization_role VARCHAR(32) NOT NULL,
+        allowed_client_ids TEXT NOT NULL,
+        expires_at BIGINT NULL,
+        revoked_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_trial_enrollments_invitation (invitation_id, revoked_at)
     )",
     "CREATE TABLE IF NOT EXISTS login_events (
         id VARCHAR(64) PRIMARY KEY,
@@ -10801,8 +14635,10 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS login_settings (
         id VARCHAR(32) PRIMARY KEY,
+        brand_logo_url VARCHAR(2048) NOT NULL,
         email_domains TEXT NOT NULL,
         quick_links TEXT NOT NULL,
         updated_at BIGINT NOT NULL
     )",
+    "ALTER TABLE login_settings ADD COLUMN brand_logo_url VARCHAR(2048) NOT NULL DEFAULT ''",
 ];

@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::RngCore;
 use rsa::{
-    RsaPrivateKey,
-    pkcs8::{EncodePrivateKey, LineEnding},
+    Oaep, RsaPrivateKey, RsaPublicKey,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,6 +61,110 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 
 pub fn token_hash(token: &str) -> String {
     sha256_base64url(token)
+}
+
+/// Domain-separates the short-lived authorization-code display secret from
+/// every other use of the instance signing key.  The encrypted value is never
+/// sent in a list response; it is only decrypted for an authorized, audited
+/// management request.
+const AUTHORIZATION_CODE_REVEAL_LABEL: &str = "gpt-sso:authorization-code-reveal:v1";
+
+/// Encrypts an administrator-visible authorization code at rest with RSA-OAEP
+/// (SHA-256).  The signing-key record is used as protected server key material:
+/// a signing-key database compromise already permits token forgery, so it is a
+/// suitable trust boundary without adding a second plaintext secret to the
+/// database.
+pub fn encrypt_authorization_code_for_reveal(
+    private_key_pem: &str,
+    authorization_code: &str,
+) -> AppResult<String> {
+    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(|err| {
+        AppError::Configuration(format!(
+            "invalid RSA private key for authorization-code reveal encryption: {err}"
+        ))
+    })?;
+    let public_key = RsaPublicKey::from(&private_key);
+    let mut rng = OsRng;
+    let ciphertext = public_key
+        .encrypt(
+            &mut rng,
+            Oaep::new_with_label::<Sha256, _>(AUTHORIZATION_CODE_REVEAL_LABEL),
+            authorization_code.as_bytes(),
+        )
+        .map_err(|err| {
+            AppError::Internal(format!(
+                "failed to encrypt authorization code for reveal: {err}"
+            ))
+        })?;
+    Ok(URL_SAFE_NO_PAD.encode(ciphertext))
+}
+
+/// Decrypts a code previously encrypted by
+/// [`encrypt_authorization_code_for_reveal`].  This deliberately has no
+/// fallback to `code_hash`: hashes remain one-way and legacy hash-only codes
+/// cannot be revealed.
+pub fn decrypt_authorization_code_for_reveal(
+    private_key_pem: &str,
+    encrypted_authorization_code: &str,
+) -> AppResult<String> {
+    let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(|err| {
+        AppError::Configuration(format!(
+            "invalid RSA private key for authorization-code reveal decryption: {err}"
+        ))
+    })?;
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(encrypted_authorization_code)
+        .map_err(|err| {
+            AppError::Internal(format!("invalid encrypted authorization code: {err}"))
+        })?;
+    let plaintext = private_key
+        .decrypt(
+            Oaep::new_with_label::<Sha256, _>(AUTHORIZATION_CODE_REVEAL_LABEL),
+            &ciphertext,
+        )
+        .map_err(|err| {
+            AppError::Internal(format!("failed to decrypt authorization code: {err}"))
+        })?;
+    String::from_utf8(plaintext)
+        .map_err(|err| AppError::Internal(format!("invalid decrypted authorization code: {err}")))
+}
+
+const SESSION_COOKIE_PREFIX: &str = "v2.";
+const SESSION_ID_PREFIX: &str = "v2id.";
+
+/// Generates a browser bearer and a separate non-bearer database identifier.
+/// The database identifier stays internal, is separately derived again for an
+/// OIDC `sid`, and must never be accepted as a session cookie.
+pub fn new_session_credentials() -> (String, String) {
+    let secret = random_token(32);
+    let cookie_value = format!("{SESSION_COOKIE_PREFIX}{secret}");
+    let id = format!(
+        "{SESSION_ID_PREFIX}{}",
+        sha256_base64url(&format!("gpt-sso:session-cookie:{secret}"))
+    );
+    (id, cookie_value)
+}
+
+/// Resolves current v2 cookies. Legacy database session identifiers are
+/// intentionally rejected because older releases exposed them as OIDC `sid`
+/// values; upgrading therefore invalidates existing browser sessions once.
+pub fn session_id_from_cookie(cookie_value: &str) -> Option<String> {
+    let secret = cookie_value.strip_prefix(SESSION_COOKIE_PREFIX)?;
+    if secret.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{SESSION_ID_PREFIX}{}",
+        sha256_base64url(&format!("gpt-sso:session-cookie:{secret}"))
+    ))
+}
+
+/// Stable opaque handle for session management and OIDC logout correlation.
+pub fn session_public_id(session_id: &str) -> String {
+    format!(
+        "sid.{}",
+        sha256_base64url(&format!("gpt-sso:session-public:{session_id}"))
+    )
 }
 
 pub fn verification_code() -> String {
@@ -266,6 +370,28 @@ pub fn normalize_scopes(requested: Option<&str>, supported: &[String]) -> AppRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_cookie_secret_is_separate_from_database_and_public_ids() {
+        let (session_id, cookie_value) = new_session_credentials();
+        assert!(session_id.starts_with("v2id."));
+        assert!(cookie_value.starts_with("v2."));
+        assert_ne!(session_id, cookie_value);
+        assert_eq!(
+            session_id_from_cookie(&cookie_value).as_deref(),
+            Some(session_id.as_str())
+        );
+        assert!(session_id_from_cookie(&session_id).is_none());
+        assert_ne!(session_public_id(&session_id), session_id);
+    }
+
+    #[test]
+    fn legacy_session_cookie_is_rejected_after_security_upgrade() {
+        let legacy = "legacy-session-bearer";
+        assert!(session_id_from_cookie(legacy).is_none());
+        assert!(session_id_from_cookie("v2.").is_none());
+        assert_ne!(session_public_id(legacy), legacy);
+    }
 
     #[test]
     fn forwarded_header_builds_external_base_url() {

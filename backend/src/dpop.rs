@@ -157,15 +157,12 @@ async fn validate_claims(
             "DPoP proof htu does not match request URI",
         ));
     }
-    match access_token {
-        Some(token) => {
-            if claims.ath.as_deref() != Some(access_token_hash(token).as_str()) {
-                return Err(invalid_dpop_proof(
-                    "DPoP proof ath does not match access token",
-                ));
-            }
-        }
-        None => {}
+    if let Some(token) = access_token
+        && claims.ath.as_deref() != Some(access_token_hash(token).as_str())
+    {
+        return Err(invalid_dpop_proof(
+            "DPoP proof ath does not match access token",
+        ));
     }
     let _ = &claims.nonce;
     Ok(())
