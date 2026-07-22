@@ -95,8 +95,6 @@ macro_rules! ensure_user_identity_available {
         let count = sql_query(count_user_identity_conflicts_sql($kind))
             .bind::<Text, _>(&candidate.email)
             .bind::<Text, _>(&candidate.username)
-            .bind::<Nullable<Text>, _>(candidate.phone.clone())
-            .bind::<Nullable<Text>, _>(candidate.phone.clone())
             .bind::<Nullable<Text>, _>(candidate.exclude_user_id.clone())
             .bind::<Nullable<Text>, _>(candidate.exclude_user_id.clone())
             .get_result::<CountRow>($conn)
@@ -442,7 +440,6 @@ pub struct UserUpdate<'a> {
 struct UserIdentityCandidate {
     email: String,
     username: String,
-    phone: Option<String>,
     exclude_user_id: Option<String>,
 }
 
@@ -451,16 +448,14 @@ impl UserIdentityCandidate {
         Self {
             email: user.email.clone(),
             username: user.username.clone(),
-            phone: user.phone.clone(),
             exclude_user_id: None,
         }
     }
 
-    fn update(id: &str, email: String, username: String, phone: Option<String>) -> Self {
+    fn update(id: &str, email: String, username: String) -> Self {
         Self {
             email,
             username,
-            phone,
             exclude_user_id: Some(id.to_string()),
         }
     }
@@ -2650,13 +2645,11 @@ fn ensure_first_user_registration_state(
 
 fn count_user_identity_conflicts_sql(kind: DatabaseKind) -> String {
     format!(
-        "SELECT COUNT(*) AS count FROM users WHERE (email = {} OR username = {} OR ({} IS NOT NULL AND phone = {})) AND ({} IS NULL OR id <> {})",
+        "SELECT COUNT(*) AS count FROM users WHERE (email = {} OR username = {}) AND ({} IS NULL OR id <> {})",
         ph(kind, 1),
         ph(kind, 2),
         ph(kind, 3),
-        ph(kind, 4),
-        ph(kind, 5),
-        ph(kind, 6)
+        ph(kind, 4)
     )
 }
 
@@ -2932,6 +2925,10 @@ impl Db {
                     }
                 }
             }
+            Ok(())
+        })?;
+        self.remove_legacy_phone_uniqueness().await?;
+        with_conn!(self, |conn, kind| {
             // This data repair is deliberately outside the static migration
             // arrays: those arrays run on every startup and MySQL keeps them
             // schema-only. The statement is idempotent and only touches
@@ -2946,6 +2943,46 @@ impl Db {
                 .map_err(AppError::from)?;
             Ok(())
         })
+    }
+
+    /// Older installations treated phone as an identity key. Phone is now a
+    /// verification contact and may legitimately be shared across accounts.
+    async fn remove_legacy_phone_uniqueness(&self) -> AppResult<()> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(pool) => {
+                let pool = pool.clone();
+                blocking(move || {
+                    let mut conn = pool
+                        .get()
+                        .map_err(|err| AppError::Database(err.to_string()))?;
+                    migrate_sqlite_phone_uniqueness(&mut conn)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(pool) => {
+                let pool = pool.clone();
+                blocking(move || {
+                    let mut conn = pool
+                        .get()
+                        .map_err(|err| AppError::Database(err.to_string()))?;
+                    migrate_postgres_phone_uniqueness(&mut conn)
+                })
+                .await
+            }
+            #[cfg(feature = "mysql")]
+            Self::Mysql(pool) => {
+                let pool = pool.clone();
+                blocking(move || {
+                    let mut conn = pool
+                        .get()
+                        .map_err(|err| AppError::Database(err.to_string()))?;
+                    migrate_mysql_phone_uniqueness(&mut conn)
+                })
+                .await
+            }
+        }
     }
 
     pub async fn seed(&self, settings: &Settings) -> AppResult<()> {
@@ -3189,7 +3226,7 @@ impl Db {
                     conn,
                     kind,
                     identity,
-                    "user email, username, or phone already exists"
+                    "user email or username already exists"
                 )?;
                 sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
                     .bind::<Text, _>(&id)
@@ -3260,7 +3297,7 @@ impl Db {
                         conn,
                         kind,
                         identity,
-                        "user email, username, or phone already exists"
+                        "user email or username already exists"
                     )?;
 
                     let membership = match (
@@ -3334,7 +3371,7 @@ impl Db {
                                 diesel::result::DatabaseErrorKind::UniqueViolation,
                                 _,
                             ) => AppError::BadRequest(
-                                "user email, username, or phone already exists".to_string(),
+                                "user email or username already exists".to_string(),
                             ),
                             other => AppError::from(other),
                         })?;
@@ -3392,7 +3429,7 @@ impl Db {
                     conn,
                     kind,
                     identity,
-                    "user email, username, or phone already exists"
+                    "user email or username already exists"
                 )?;
 
                 let mut verification_code_ids = Vec::with_capacity(verification_claims.len());
@@ -3463,15 +3500,14 @@ impl Db {
         } = update;
         let id = id.to_string();
         let now = util::now_ts();
-        let identity =
-            UserIdentityCandidate::update(&id, email.clone(), username.clone(), phone.clone());
+        let identity = UserIdentityCandidate::update(&id, email.clone(), username.clone());
         with_conn!(self, |conn, kind| {
             conn.transaction::<UserRecord, AppError, _>(|conn| {
                 ensure_user_identity_available!(
                     conn,
                     kind,
                     identity,
-                    "user email, username, or phone already exists"
+                    "user email or username already exists"
                 )?;
                 if !is_active {
                     clear_user_auth_state_for_conn!(conn, kind, &id)?;
@@ -10125,7 +10161,7 @@ impl Db {
                     conn,
                     kind,
                     identity,
-                    "external OIDC email, username, or phone already belongs to an existing account"
+                    "external OIDC email or username already belongs to an existing account"
                 )?;
 
                 let existing_identity_count = sql_query(count_linked_identity_sql(kind))
@@ -10292,6 +10328,210 @@ impl Db {
             Ok(record)
         })
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn migrate_sqlite_phone_uniqueness(conn: &mut SqliteConnection) -> AppResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct SchemaRow {
+        #[diesel(sql_type = Text)]
+        sql: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct IndexRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        sql: Option<String>,
+    }
+
+    let schema = sql_query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+        .get_result::<SchemaRow>(conn)
+        .optional()
+        .map_err(AppError::from)?;
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+
+    // A column/table UNIQUE constraint requires a table rebuild in SQLite,
+    // while a deployment-created index can be removed in place. Inspect both:
+    // the former has no SQL entry in sqlite_master, the latter does.
+    let indexes = sql_query(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' AND sql IS NOT NULL",
+    )
+    .load::<IndexRow>(conn)
+    .map_err(AppError::from)?;
+    let explicit_phone_unique_indexes = indexes
+        .iter()
+        .filter(|index| index.sql.as_deref().is_some_and(sqlite_phone_unique_index))
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    let has_inline_phone_unique = sqlite_table_has_phone_unique_constraint(&schema.sql);
+
+    if !has_inline_phone_unique {
+        if explicit_phone_unique_indexes.is_empty() {
+            return Ok(());
+        }
+        return conn.transaction::<(), AppError, _>(|conn| {
+            for index in &explicit_phone_unique_indexes {
+                let escaped = index.replace('"', "\"\"");
+                conn.batch_execute(&format!("DROP INDEX \"{escaped}\""))
+                    .map_err(|err| AppError::Database(err.to_string()))?;
+            }
+            Ok(())
+        });
+    }
+
+    // Explicit deployment indexes survive the table rebuild. Recreate every
+    // one except the single-column phone UNIQUE indexes being retired.
+    let indexes = indexes
+        .into_iter()
+        .filter_map(|index| index.sql.filter(|sql| !sqlite_phone_unique_index(sql)))
+        .collect::<Vec<_>>();
+
+    conn.transaction::<(), AppError, _>(|conn| {
+        conn.batch_execute(
+            "CREATE TABLE users__shared_phone_migration (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT,
+                phone TEXT,
+                password_hash TEXT NOT NULL,
+                email_verified_at INTEGER,
+                phone_verified_at INTEGER,
+                is_admin INTEGER NOT NULL,
+                is_active INTEGER NOT NULL,
+                archived_at INTEGER,
+                registration_source TEXT NOT NULL DEFAULT 'local',
+                last_login_at INTEGER,
+                last_login_ip TEXT,
+                last_oidc_client_id TEXT,
+                last_login_method TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO users__shared_phone_migration (
+                id, email, username, display_name, phone, password_hash,
+                email_verified_at, phone_verified_at, is_admin, is_active,
+                archived_at, registration_source, last_login_at, last_login_ip,
+                last_oidc_client_id, last_login_method, created_at, updated_at
+            )
+            SELECT
+                id, email, username, display_name, phone, password_hash,
+                email_verified_at, phone_verified_at, is_admin, is_active,
+                archived_at, registration_source, last_login_at, last_login_ip,
+                last_oidc_client_id, last_login_method, created_at, updated_at
+            FROM users;
+            DROP TABLE users;
+            ALTER TABLE users__shared_phone_migration RENAME TO users;",
+        )
+        .map_err(|err| AppError::Database(err.to_string()))?;
+        for index in &indexes {
+            conn.batch_execute(index)
+                .map_err(|err| AppError::Database(err.to_string()))?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_table_has_phone_unique_constraint(sql: &str) -> bool {
+    let normalized = sqlite_normalized_sql(sql);
+    normalized.contains("unique(phone)")
+        || normalized.split(',').any(|definition| {
+            definition.starts_with("phone")
+                && !definition.starts_with("phone_")
+                && definition.contains("unique")
+        })
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_phone_unique_index(sql: &str) -> bool {
+    let normalized = sqlite_normalized_sql(sql);
+    let Some(after_create) = normalized.strip_prefix("createuniqueindex") else {
+        return false;
+    };
+    let after_create = after_create
+        .strip_prefix("ifnotexists")
+        .unwrap_or(after_create);
+    let Some((_, indexed_columns)) = after_create.split_once("onusers(") else {
+        return false;
+    };
+    let Some((column, _)) = indexed_columns.split_once(')') else {
+        return false;
+    };
+
+    matches!(column, "phone" | "phoneasc" | "phonedesc") || column.starts_with("phonecollate")
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_normalized_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| {
+            !character.is_ascii_whitespace() && !matches!(character, '`' | '"' | '[' | ']')
+        })
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+#[cfg(feature = "postgres")]
+fn migrate_postgres_phone_uniqueness(conn: &mut PgConnection) -> AppResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct ConstraintRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+    }
+
+    let constraints = sql_query(
+        "SELECT key_column_usage.constraint_name AS name
+         FROM information_schema.key_column_usage
+         INNER JOIN information_schema.table_constraints
+           ON table_constraints.constraint_schema = key_column_usage.constraint_schema
+          AND table_constraints.constraint_name = key_column_usage.constraint_name
+          AND table_constraints.table_name = key_column_usage.table_name
+         WHERE key_column_usage.table_schema = current_schema()
+           AND key_column_usage.table_name = 'users'
+           AND table_constraints.constraint_type = 'UNIQUE'
+         GROUP BY key_column_usage.constraint_name
+         HAVING COUNT(*) = 1 AND MAX(key_column_usage.column_name) = 'phone'",
+    )
+    .load::<ConstraintRow>(conn)
+    .map_err(AppError::from)?;
+    for constraint in constraints {
+        let escaped = constraint.name.replace('"', "\"\"");
+        conn.batch_execute(&format!("ALTER TABLE users DROP CONSTRAINT \"{escaped}\""))
+            .map_err(|err| AppError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mysql")]
+fn migrate_mysql_phone_uniqueness(conn: &mut MysqlConnection) -> AppResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct IndexRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+    }
+
+    let indexes = sql_query(
+        "SELECT index_name AS name
+         FROM information_schema.statistics
+         WHERE table_schema = DATABASE()
+           AND table_name = 'users'
+           AND non_unique = 0
+         GROUP BY index_name
+         HAVING COUNT(*) = 1 AND MAX(column_name) = 'phone'",
+    )
+    .load::<IndexRow>(conn)
+    .map_err(AppError::from)?;
+    for index in indexes {
+        let escaped = index.name.replace('`', "``");
+        conn.batch_execute(&format!("ALTER TABLE users DROP INDEX `{escaped}`"))
+            .map_err(|err| AppError::Database(err.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "sqlite")]
@@ -10535,7 +10775,7 @@ mod tests {
     }
 
     #[test]
-    fn user_identity_conflicts_cover_email_username_phone_and_current_user_exclusion() {
+    fn user_identity_conflicts_cover_email_username_and_current_user_exclusion() {
         for kind in [
             DatabaseKind::Sqlite,
             DatabaseKind::Postgres,
@@ -10544,8 +10784,77 @@ mod tests {
             let sql = count_user_identity_conflicts_sql(kind);
             assert!(sql.contains("email ="));
             assert!(sql.contains("username ="));
-            assert!(sql.contains("phone ="));
+            assert!(!sql.contains("phone"));
             assert!(sql.contains("id <>"));
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_phone_uniqueness_migration_allows_shared_phone_insert_and_update() {
+        for (case_name, phone_definition, explicit_phone_index) in [
+            ("inline unique constraint", "phone TEXT UNIQUE", false),
+            ("explicit unique index", "phone TEXT", true),
+        ] {
+            let mut conn = SqliteConnection::establish(":memory:").unwrap();
+            let explicit_index_sql = explicit_phone_index.then_some(
+                "CREATE UNIQUE INDEX IF NOT EXISTS \"legacy_users_phone_unique\" ON \"users\" (\"phone\" DESC);",
+            );
+            conn.batch_execute(&format!(
+                "CREATE TABLE users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    username TEXT NOT NULL UNIQUE,
+                    display_name TEXT,
+                    {phone_definition},
+                    password_hash TEXT NOT NULL,
+                    email_verified_at INTEGER,
+                    phone_verified_at INTEGER,
+                    is_admin INTEGER NOT NULL,
+                    is_active INTEGER NOT NULL,
+                    archived_at INTEGER,
+                    registration_source TEXT NOT NULL DEFAULT 'local',
+                    last_login_at INTEGER,
+                    last_login_ip TEXT,
+                    last_oidc_client_id TEXT,
+                    last_login_method TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                {}
+                INSERT INTO users (id, email, username, phone, password_hash, is_admin, is_active, registration_source, created_at, updated_at)
+                VALUES ('first', 'first@example.com', 'first', '+15550000000', 'hash', 0, 1, 'local', 1, 1);",
+                explicit_index_sql.unwrap_or_default(),
+            ))
+            .unwrap();
+
+            migrate_sqlite_phone_uniqueness(&mut conn).unwrap();
+            migrate_sqlite_phone_uniqueness(&mut conn).unwrap();
+
+            if explicit_phone_index {
+                let index_count = sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name = 'legacy_users_phone_unique'",
+                )
+                .get_result::<CountRow>(&mut conn)
+                .unwrap()
+                .count;
+                assert_eq!(index_count, 0, "{case_name}");
+            }
+
+            conn.batch_execute(
+                "INSERT INTO users (id, email, username, phone, password_hash, is_admin, is_active, registration_source, created_at, updated_at)
+                 VALUES ('second', 'second@example.com', 'second', '+15550000000', 'hash', 0, 1, 'local', 1, 1);
+                 INSERT INTO users (id, email, username, phone, password_hash, is_admin, is_active, registration_source, created_at, updated_at)
+                 VALUES ('third', 'third@example.com', 'third', '+15551111111', 'hash', 0, 1, 'local', 1, 1);
+                 UPDATE users SET phone = '+15550000000' WHERE id = 'third';",
+            )
+            .unwrap();
+            let shared_phone_count =
+                sql_query("SELECT COUNT(*) AS count FROM users WHERE phone = '+15550000000'")
+                    .get_result::<CountRow>(&mut conn)
+                    .unwrap()
+                    .count;
+            assert_eq!(shared_phone_count, 3, "{case_name}");
         }
     }
 
@@ -10936,7 +11245,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppError::BadRequest(message))
-                if message == "user email, username, or phone already exists"
+                if message == "user email or username already exists"
         ));
         let after = db
             .find_user_by_email("existing@example.com")
@@ -12430,7 +12739,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(AppError::BadRequest(message)) if message == "user email, username, or phone already exists"
+            Err(AppError::BadRequest(message)) if message == "user email or username already exists"
         ));
         assert_eq!(
             load_verification_code(&db, &verification_code.id)
@@ -12701,7 +13010,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         email TEXT NOT NULL UNIQUE,
         username TEXT NOT NULL UNIQUE,
         display_name TEXT,
-        phone TEXT UNIQUE,
+        phone TEXT,
         password_hash TEXT NOT NULL,
         email_verified_at INTEGER,
         phone_verified_at INTEGER,
@@ -13350,7 +13659,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         email TEXT NOT NULL UNIQUE,
         username TEXT NOT NULL UNIQUE,
         display_name TEXT,
-        phone TEXT UNIQUE,
+        phone TEXT,
         password_hash TEXT NOT NULL,
         email_verified_at BIGINT,
         phone_verified_at BIGINT,
@@ -13998,7 +14307,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         id VARCHAR(64) PRIMARY KEY,
         email VARCHAR(255) NOT NULL UNIQUE,
         username VARCHAR(255) NOT NULL UNIQUE,
-        phone VARCHAR(64) UNIQUE,
+        phone VARCHAR(64),
         display_name TEXT NULL,
         password_hash TEXT NOT NULL,
         email_verified_at BIGINT NULL,
