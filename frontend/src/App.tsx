@@ -1,16 +1,27 @@
 import {
+  Activity,
   Archive,
+  ArrowLeftRight,
   AtSign,
   Ban,
   Bot,
   Building2,
+  ChevronDown,
+  ChevronUp,
+  Clock3,
   Copy,
+  Eye,
   ExternalLink,
+  FileUp,
+  Filter,
   Globe2,
   KeyRound,
   Link2,
   LogOut,
   Mail,
+  Menu,
+  Monitor,
+  Moon,
   Phone,
   Plus,
   RefreshCw,
@@ -19,1744 +30,260 @@ import {
   Settings,
   Shield,
   Shuffle,
+  Sun,
   Trash2,
   Ticket,
   UserRound,
   Users
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
-
-type Locale = "zh-CN" | "en-US";
-type AuthMode = "login" | "register" | "reset";
-
-type User = {
-  id: string;
-  email: string;
-  username: string;
-  display_name: string | null;
-  phone: string | null;
-  email_verified_at: number | null;
-  phone_verified_at: number | null;
-  is_admin: boolean;
-  is_active: boolean;
-  archived_at: number | null;
-  last_login_at: number | null;
-  last_login_ip: string | null;
-  last_oidc_client_id: string | null;
-  last_login_method: string | null;
-  created_at: number;
-  updated_at: number;
-  permissions?: string[];
-};
-
-type LoginEvent = {
-  id: string;
-  user_id: string;
-  login_at: number;
-  ip_address: string | null;
-  user_agent: string | null;
-  method: string;
-  oidc_client_id: string | null;
-  external_provider: string | null;
-};
-
-type AuditEvent = {
-  id: string;
-  actor_user_id: string | null;
-  actor_client_id: string | null;
-  action: string;
-  target_kind: string;
-  target_id: string | null;
-  outcome: string;
-  ip_address: string | null;
-  user_agent: string | null;
-  details: string;
-  created_at: number;
-};
-
-type AuditWebhook = {
-  id: string;
-  name: string;
-  url: string;
-  has_secret: boolean;
-  actions: string[];
-  is_active: boolean;
-  timeout_seconds: number;
-  last_delivered_at: number | null;
-  last_status_code: number | null;
-  last_error: string | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type Role = {
-  id: string;
-  name: string;
-  description: string | null;
-  is_system: number;
-  permissions: string[];
-  created_at: number;
-  updated_at: number;
-};
-
-type AccessGroup = {
-  id: string;
-  name: string;
-  description: string | null;
-  roles?: Role[];
-  members?: User[];
-  created_at: number;
-  updated_at: number;
-};
-
-type OrganizationMember = {
-  organization_id: string;
-  user_id: string;
-  role: string;
-  email: string;
-  username: string;
-  display_name: string | null;
-  is_active: boolean;
-  archived_at: number | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type Organization = {
-  id: string;
-  slug: string;
-  name: string;
-  description: string | null;
-  allowed_email_domains: string[];
-  is_active: boolean;
-  members: OrganizationMember[];
-  created_at: number;
-  updated_at: number;
-};
-
-type UserOrganization = {
-  id: string;
-  slug: string;
-  name: string;
-  description: string | null;
-  is_active: number;
-  role: string;
-  membership_created_at: number;
-  membership_updated_at: number;
-};
-
-type PermissionInfo = {
-  key: string;
-  category: string;
-  label: string;
-};
-
-type UserAccess = {
-  direct_roles: Role[];
-  groups: AccessGroup[];
-  effective_permissions: string[];
-};
-
-type LoginResponse = {
-  user: User | null;
-  mfa_required: boolean;
-  mfa_challenge_id: string | null;
-  recovery_available: boolean;
-  captcha_required: boolean;
-  captcha_challenge_id: string | null;
-  captcha_prompt: string | null;
-  captcha_expires_at: number | null;
-};
-
-type MfaStatus = {
-  enabled: boolean;
-  totp_enabled: boolean;
-  recovery_codes_remaining: number;
-  recovery_codes_total: number;
-};
-
-type TotpSetup = {
-  setup_id: string;
-  secret: string;
-  otpauth_uri: string;
-  expires_at: number;
-};
-
-type MfaConfirmResponse = {
-  status: MfaStatus;
-  recovery_codes: string[];
-};
-
-type Passkey = {
-  id: string;
-  name: string;
-  credential_id: string;
-  last_used_at: number | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type WebauthnCreationPublicKeyJson = Omit<PublicKeyCredentialCreationOptions, "challenge" | "excludeCredentials" | "user"> & {
-  challenge: string;
-  excludeCredentials?: Array<Omit<PublicKeyCredentialDescriptor, "id"> & { id: string }>;
-  user: Omit<PublicKeyCredentialUserEntity, "id"> & { id: string };
-};
-
-type WebauthnCreationResponseJson = {
-  publicKey: WebauthnCreationPublicKeyJson;
-};
-
-type WebauthnRequestPublicKeyJson = Omit<PublicKeyCredentialRequestOptions, "allowCredentials" | "challenge"> & {
-  allowCredentials?: Array<Omit<PublicKeyCredentialDescriptor, "id"> & { id: string }>;
-  challenge: string;
-};
-
-type WebauthnRequestResponseJson = {
-  publicKey: WebauthnRequestPublicKeyJson;
-  mediation?: CredentialMediationRequirement;
-};
-
-type PasskeyRegistrationStart = {
-  challenge_id: string;
-  public_key: WebauthnCreationResponseJson;
-  expires_at: number;
-};
-
-type PasskeyAuthenticationStart = {
-  challenge_id: string;
-  public_key: WebauthnRequestResponseJson;
-  expires_at: number;
-};
-
-type SecurityPolicy = {
-  id: string;
-  password_min_length: number;
-  password_require_uppercase: number;
-  password_require_lowercase: number;
-  password_require_digit: number;
-  password_require_symbol: number;
-  password_reject_user_info: number;
-  login_lockout_enabled: number;
-  max_failed_login_attempts: number;
-  failure_window_seconds: number;
-  lockout_seconds: number;
-  trusted_ip_cidrs: string[];
-  require_mfa_outside_trusted_networks: boolean;
-  allowed_ip_cidrs: string[];
-  blocked_ip_cidrs: string[];
-  allowed_email_domains: string[];
-  blocked_email_domains: string[];
-  captcha_enabled: boolean;
-  captcha_after_failed_attempts: number;
-  captcha_ttl_seconds: number;
-  updated_at: number;
-};
-
-type SigningKey = {
-  id: string;
-  kid: string;
-  is_active: boolean;
-  created_at: number;
-  activated_at: number | null;
-  retired_at: number | null;
-};
-
-type MyConsent = {
-  client_id: string;
-  client_name: string | null;
-  granted_scopes: string[];
-  granted_at: number;
-  updated_at: number;
-};
-
-type MySession = {
-  id: string;
-  current: boolean;
-  ip_address: string | null;
-  user_agent: string | null;
-  login_method: string | null;
-  expires_at: number;
-  created_at: number;
-};
-
-type LinkedIdentity = {
-  id: string;
-  user_id: string;
-  provider_slug: string;
-  external_subject: string;
-  external_email: string | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type UserDetail = {
-  user: User;
-  login_events: LoginEvent[];
-  linked_identities: LinkedIdentity[];
-  organizations: UserOrganization[];
-};
-
-type Client = {
-  id: string;
-  client_id: string;
-  client_name: string;
-  organization_id: string | null;
-  organization_slug: string | null;
-  organization_name: string | null;
-  redirect_uris: string[];
-  post_logout_redirect_uris: string[];
-  scopes: string[];
-  grant_types: string[];
-  response_types: string[];
-  token_endpoint_auth_method: string;
-  require_pkce: boolean;
-  require_mfa: boolean;
-  require_pushed_authorization_requests: boolean;
-  require_s256_pkce: boolean;
-  require_confidential_client: boolean;
-  require_dpop: boolean;
-  require_account_selection: boolean;
-  trust_email_verified: boolean;
-  authorization_details_types: string[];
-  subject_type: string;
-  sector_identifier_uri: string;
-  jwks_uri: string;
-  jwks: string;
-  backchannel_logout_uri: string;
-  backchannel_logout_session_required: boolean;
-  frontchannel_logout_uri: string;
-  frontchannel_logout_session_required: boolean;
-  service_account_enabled: boolean;
-  service_account_permissions: string[];
-  is_active: boolean;
-  claim_mappers: ClientClaimMapper[];
-  created_at: number;
-  updated_at: number;
-};
-
-type LogoutFrame = {
-  client_id: string;
-  uri: string;
-};
-
-type LogoutResponse = {
-  ok: boolean;
-  frontchannel_logout_frames?: LogoutFrame[];
-};
-
-type ClientClaimMapper = {
-  id: string;
-  claim_name: string;
-  source: string;
-  source_value: string;
-  value_type: string;
-  include_in_id_token: boolean;
-  include_in_access_token: boolean;
-  include_in_userinfo: boolean;
-  is_active: boolean;
-  sort_order: number;
-  created_at: number;
-  updated_at: number;
-};
-
-type IapApplication = {
-  id: string;
-  slug: string;
-  name: string;
-  description: string | null;
-  external_host: string;
-  path_prefix: string;
-  required_organization_id: string | null;
-  required_organization_roles: string[];
-  required_permissions: string[];
-  is_active: boolean;
-  created_at: number;
-  updated_at: number;
-};
-
-type ClientClaimMapperForm = {
-  claim_name: string;
-  source: string;
-  source_value: string;
-  value_type: string;
-  include_in_id_token: boolean;
-  include_in_access_token: boolean;
-  include_in_userinfo: boolean;
-  is_active: boolean;
-  sort_order: number;
-};
-
-type Invitation = {
-  id: string;
-  code_prefix: string;
-  description: string | null;
-  authorized_email: string | null;
-  authorized_username: string | null;
-  authorized_display_name: string | null;
-  expires_at: number | null;
-  max_uses: number | null;
-  uses_count: number;
-  is_active: boolean;
-  created_by: string | null;
-  created_at: number;
-  updated_at: number;
-  redemptions: InvitationRedemption[];
-};
-
-type InvitationRedemption = {
-  id: string;
-  user_id: string;
-  user_email: string | null;
-  user_username: string | null;
-  redeemed_at: number;
-};
-
-type QuickLink = {
-  id: string;
-  label: string;
-  url: string;
-  icon: string;
-  is_active: boolean;
-};
-
-type LoginSettings = {
-  email_domains: string[];
-  quick_links: QuickLink[];
-  updated_at: number;
-};
-
-type LoginSettingsDraft = {
-  email_domains: string;
-  quick_links: QuickLink[];
-};
-
-type RegistrationSettings = {
-  allow_password_registration: boolean;
-  require_email_verification: boolean;
-  require_phone_verification: boolean;
-  allow_external_oidc_registration: boolean;
-  require_invitation: boolean;
-  first_user_direct_admin: boolean;
-  default_user_active: boolean;
-};
-
-type ExternalProvider = {
-  id: string;
-  slug: string;
-  display_name: string;
-  organization_id: string | null;
-  issuer: string;
-  client_id: string;
-  authorization_endpoint: string;
-  token_endpoint: string;
-  userinfo_endpoint: string;
-  redirect_path: string;
-  scopes: string[];
-  email_domains: string[];
-  is_active: boolean;
-  allow_login: boolean;
-  allow_registration: boolean;
-  created_at: number;
-  updated_at: number;
-};
-
-type ExternalProviderSummary = {
-  slug: string;
-  display_name: string;
-  start_url: string;
-  email_domains: string[];
-  allow_login: boolean;
-  allow_registration: boolean;
-};
-
-type ExternalProviderTemplate = {
-  id: string;
-  slug: string;
-  display_name: string;
-  issuer: string;
-  scopes: string[];
-};
-
-type ExternalProviderDiscovery = {
-  issuer: string;
-  authorization_endpoint: string;
-  token_endpoint: string;
-  userinfo_endpoint: string;
-  scopes: string[];
-};
-
-type LdapProvider = {
-  id: string;
-  slug: string;
-  display_name: string;
-  url: string;
-  starttls: boolean;
-  bind_dn: string;
-  has_bind_password: boolean;
-  base_dn: string;
-  user_filter: string;
-  user_id_attribute: string;
-  email_attribute: string;
-  username_attribute: string;
-  display_name_attribute: string;
-  phone_attribute: string;
-  is_active: boolean;
-  allow_login: boolean;
-  allow_registration: boolean;
-  created_at: number;
-  updated_at: number;
-};
-
-type Bootstrap = {
-  has_users: boolean;
-  registration: RegistrationSettings;
-  login: LoginSettings;
-  default_locale: string;
-  supported_locales: string[];
-  external_oidc_providers: ExternalProviderSummary[];
-  ldap_providers: Array<{ slug: string; display_name: string }>;
-};
-
-type Overview = {
-  users: number;
-  active_users: number;
-  clients: number;
-  active_clients: number;
-  issuer: string;
-  database_kind: string;
-};
-
-type SettingsSummary = Record<string, string | number | boolean | string[]>;
-
-type RuntimeSettings = {
-  public_base_url: string;
-  issuer: string;
-  trust_proxy_headers: boolean;
-  effective_public_base_url: string;
-  effective_issuer: string;
-  updated_at: number;
-};
-
-type Tab = "account" | "overview" | "users" | "clients" | "iap" | "organizations" | "invitations" | "registration" | "providers" | "portal" | "security" | "settings";
-type UserFilter = "live" | "active" | "disabled" | "archived" | "all";
-
-const translations = {
-  "zh-CN": {
-    loading: "加载中",
-    signIn: "登录",
-    register: "注册",
-    firstAdmin: "首次启动：注册第一个管理员",
-    adminConsole: "管理控制台",
-    email: "邮箱",
-    phone: "手机号",
-    password: "密码",
-    newPassword: "新密码",
-    username: "用户名",
-    displayName: "显示名",
-    invitationCode: "授权码",
-    authorizationCodePrefix: "授权码",
-    authAccountSwitch: "当前浏览器已登录其他账号，请使用授权方指定的邮箱继续。",
-    emailCode: "邮箱验证码",
-    phoneCode: "手机验证码",
-    sendEmailCode: "发送邮箱验证码",
-    sendPhoneCode: "发送手机验证码",
-    forgotPassword: "忘记密码",
-    resetPassword: "重置密码",
-    resetPasswordCode: "重置验证码",
-    sendResetCode: "发送重置验证码",
-    completePasswordReset: "确认重置密码",
-    passwordResetComplete: "密码已重置，请重新登录。",
-    passwordRegistrationUnavailable: "密码注册已关闭，请使用授权码或第三方身份源。",
-    temporaryAccountReady: "授权码临时账户已登录，可查阅信息。",
-    createdInvitation: "新授权码",
-    overview: "概览",
-    users: "用户",
-    clients: "OIDC 客户端",
-    iap: "IAP 应用",
-    invitations: "授权码",
-    registration: "注册设置",
-    providers: "身份源",
-    portal: "登录入口",
-    account: "账号",
-    security: "安全",
-    settings: "运行配置",
-    logout: "退出",
-    refresh: "刷新",
-    create: "创建",
-    save: "保存",
-    edit: "编辑",
-    enable: "启用",
-    disable: "禁用",
-    archive: "归档",
-    delete: "删除",
-    details: "详情",
-    active: "启用",
-    disabled: "禁用",
-    archived: "归档",
-    allUsers: "全部账户",
-    liveUsers: "正常/禁用",
-    activeUsers: "正常账户",
-    disabledUsers: "禁用账户",
-    archivedUsers: "归档账户",
-    userFilter: "账户筛选",
-    archivedAt: "归档时间",
-    archivedReadOnly: "归档账户不可编辑，请先启用。",
-    admin: "管理员",
-    normalUser: "普通用户",
-    role: "角色",
-    status: "状态",
-    registeredAt: "注册时间",
-    lastLogin: "最近登录",
-    lastIp: "最近 IP",
-    lastClient: "最近 OIDC 客户端",
-    loginMethod: "登录方式",
-    verified: "已验证",
-    unverified: "未验证",
-    noUserAdminOnly: "当前账号不是管理员。",
-    createUser: "创建用户",
-    updateUser: "更新用户",
-    userDetails: "用户详情",
-    loginEvents: "登录事件",
-    linkedIdentities: "绑定身份",
-    createClient: "创建 OIDC 客户端",
-    createIapApplication: "创建 IAP 应用",
-    updateIapApplication: "更新 IAP 应用",
-    iapApplication: "IAP 应用",
-    externalHost: "外部 Host",
-    pathPrefix: "路径前缀",
-    requiredOrganization: "要求组织",
-    requiredOrganizationRoles: "要求组织角色",
-    requiredPermissions: "要求权限",
-    forwardAuthEndpoint: "ForwardAuth 端点",
-    clientId: "客户端 ID",
-    clientName: "客户端名称",
-    clientSecret: "客户端密钥",
-    redirectUris: "回调地址",
-    postLogoutUris: "退出回调地址",
-    scopes: "Scopes",
-    grantTypes: "Grant Types",
-    responseTypes: "Response Types",
-    tokenAuthMethod: "Token 认证方式",
-    requirePkce: "要求 PKCE",
-    requireClientMfa: "强制 MFA",
-    requirePar: "强制 PAR",
-    requireS256Pkce: "强制 S256 PKCE",
-    requireConfidentialClient: "禁止 Public Client",
-    requireDpop: "强制 DPoP",
-    requireAccountSelection: "强制账号选择",
-    trustEmailVerified: "信任邮箱已验证",
-    authorizationDetailsTypes: "RAR 授权类型",
-    serviceAccount: "机器身份",
-    serviceAccountPermissions: "机器身份权限",
-    subjectType: "Subject Type",
-    sectorIdentifierUri: "Sector Identifier URI",
-    jwksUri: "JWKS URI",
-    jwks: "JWKS JSON",
-    backchannelLogoutUri: "Back-Channel Logout URI",
-    backchannelLogoutSessionRequired: "Logout Token 要求 sid",
-    frontchannelLogoutUri: "Front-Channel Logout URI",
-    frontchannelLogoutSessionRequired: "Iframe 通知要求 sid",
-    claimMappers: "Claim 映射",
-    claimName: "Claim 名称",
-    claimSource: "来源",
-    sourceValue: "来源值",
-    valueType: "值类型",
-    includeIdToken: "ID Token",
-    includeAccessToken: "Access Token",
-    includeUserInfo: "UserInfo",
-    addClaimMapper: "添加 Claim",
-    userField: "用户字段",
-    staticValue: "固定值",
-    scopeFlag: "Scope 标记",
-    clientField: "客户端字段",
-    createInvitation: "创建授权码",
-    updateInvitation: "更新授权码",
-    authorizedEmail: "授权邮箱",
-    authorizedUsername: "授权用户名",
-    authorizedDisplayName: "授权显示名",
-    description: "描述",
-    expiresAt: "过期时间",
-    maxUses: "最大使用次数",
-    used: "已使用",
-    redemptions: "兑换记录",
-    redeemedAt: "兑换时间",
-    permanent: "永久",
-    unlimited: "不限次数",
-    registrationSettings: "注册策略",
-    passwordRegistration: "允许密码注册",
-    requireEmailVerification: "要求邮箱验证",
-    requirePhoneVerification: "要求手机号验证",
-    allowExternalOidc: "允许第三方 OIDC 注册",
-    requireInvitation: "要求授权码",
-    firstUserAdmin: "首个用户自动成为管理员",
-    defaultUserActive: "注册后默认启用",
-    createProvider: "创建第三方 OIDC",
-    updateProvider: "更新第三方 OIDC",
-    providerTemplate: "Provider 模板",
-    applyTemplate: "套用模板",
-    discoverProvider: "发现端点",
-    ldapProviders: "LDAP/AD 目录",
-    createLdapProvider: "创建 LDAP/AD",
-    updateLdapProvider: "更新 LDAP/AD",
-    slug: "标识",
-    issuer: "Issuer",
-    authorizationEndpoint: "授权端点",
-    tokenEndpoint: "Token 端点",
-    userinfoEndpoint: "Userinfo 端点",
-    redirectPath: "回调路径",
-    providerEmailDomains: "企业邮箱域名",
-    allowRegistration: "允许注册",
-    allowLogin: "允许登录",
-    ldapUrl: "LDAP URL",
-    startTls: "StartTLS",
-    bindDn: "Bind DN",
-    bindPassword: "Bind 密码",
-    clearBindPassword: "清空 Bind 密码",
-    baseDn: "Base DN",
-    ldapUserFilter: "用户过滤器",
-    userIdAttribute: "用户 ID 属性",
-    emailAttribute: "邮箱属性",
-    usernameAttribute: "用户名属性",
-    displayNameAttribute: "显示名属性",
-    phoneAttribute: "手机号属性",
-    directoryLogin: "目录登录",
-    externalLogin: "第三方登录/注册",
-    domainSsoLogin: "使用公司 SSO 登录",
-    domainSsoRegister: "使用公司 SSO 注册/登录",
-    language: "语言",
-    database: "数据库",
-    issuerLabel: "Issuer",
-    runtimeSettings: "外部访问设置",
-    loginSettings: "登录入口设置",
-    companyEmailDomains: "公司邮箱后缀",
-    quickLinks: "快捷跳转",
-    createQuickLink: "添加快捷跳转",
-    updateQuickLink: "更新快捷跳转",
-    linkLabel: "链接名称",
-    linkUrl: "跳转链接",
-    linkIcon: "图标",
-    customDomain: "自定义后缀",
-    applySuffix: "使用",
-    randomEmail: "随机邮箱",
-    copyEmail: "复制邮箱",
-    copiedEmail: "邮箱已复制",
-    copyEmailUnavailable: "浏览器不支持自动复制，请手动复制",
-    copyAuthorizationCode: "复制授权码",
-    authorizationCodeCopied: "授权码已复制",
-    copyAuthorizationCodeUnavailable: "浏览器不支持自动复制，请手动复制授权码",
-    companyEmailRequired: "请使用已配置的公司邮箱登录此应用",
-    mfaCode: "二次验证码",
-    mfaRequired: "需要二次验证",
-    captcha: "安全验证",
-    captchaAnswer: "验证答案",
-    captchaRequired: "需要完成安全验证",
-    mfaSettings: "二次验证",
-    totpSetup: "TOTP 设置",
-    startTotpSetup: "开始设置 TOTP",
-    confirmTotp: "确认 TOTP",
-    totpSecret: "TOTP Secret",
-    otpauthUri: "Authenticator URI",
-    recoveryCodes: "恢复码",
-    recoveryCodesRemaining: "剩余恢复码",
-    rotateRecoveryCodes: "重新生成恢复码",
-    disableMfa: "关闭二次验证",
-    resetMfa: "重置 MFA",
-    recoveryCodesOnce: "恢复码只显示一次，请妥善保存。",
-    passkeys: "Passkey",
-    passkeyLogin: "使用 Passkey 登录",
-    passkeyName: "Passkey 名称",
-    registerPasskey: "注册 Passkey",
-    noPasskeys: "暂无 Passkey",
-    credentialId: "凭据 ID",
-    lastUsed: "最近使用",
-    securityPolicy: "安全策略",
-    passwordPolicy: "密码策略",
-    loginLockout: "登录锁定",
-    minPasswordLength: "密码最小长度",
-    requireUppercase: "要求大写字母",
-    requireLowercase: "要求小写字母",
-    requireDigit: "要求数字",
-    requireSymbol: "要求符号",
-    rejectUserInfo: "拒绝包含账号信息",
-    maxFailedAttempts: "最大失败次数",
-    failureWindowSeconds: "失败统计窗口（秒）",
-    lockoutSeconds: "锁定时长（秒）",
-    trustedNetworks: "可信网络",
-    trustedIpCidrs: "可信 IP/CIDR",
-    requireMfaOutsideTrustedNetworks: "外部网络强制 MFA",
-    accessRiskRules: "登录/注册风险规则",
-    allowedIpCidrs: "允许 IP/CIDR",
-    blockedIpCidrs: "阻止 IP/CIDR",
-    allowedEmailDomains: "允许邮箱域名",
-    blockedEmailDomains: "阻止邮箱域名",
-    captchaPolicy: "登录安全验证",
-    captchaAfterFailedAttempts: "失败后要求验证次数",
-    captchaTtlSeconds: "验证有效期（秒）",
-    signingKeys: "签名密钥",
-    keyId: "Key ID",
-    activeSigningKey: "当前签名",
-    retiredSigningKey: "已退役",
-    rotateSigningKey: "轮换密钥",
-    activatedAt: "启用时间",
-    retiredAt: "退役时间",
-    auditEvents: "审计事件",
-    auditWebhooks: "审计 Webhook",
-    createAuditWebhook: "创建审计 Webhook",
-    updateAuditWebhook: "更新审计 Webhook",
-    webhookName: "Webhook 名称",
-    webhookUrl: "Webhook URL",
-    webhookSecret: "签名密钥",
-    webhookActions: "Action 过滤",
-    webhookTimeout: "超时（秒）",
-    clearWebhookSecret: "清除签名密钥",
-    hasSecret: "已配置签名",
-    lastDelivery: "最近投递",
-    deliveryStatus: "投递状态",
-    roles: "角色",
-    groups: "用户组",
-    organizations: "组织",
-    clientOrganization: "所属组织",
-    noOrganization: "无组织",
-    permissions: "权限",
-    roleName: "角色名",
-    groupName: "组名",
-    organizationName: "组织名称",
-    organizationSlug: "组织标识",
-    organizationMembers: "组织成员",
-    organizationRole: "组织角色",
-    createOrganization: "创建组织",
-    updateOrganization: "更新组织",
-    rolePermissions: "角色权限",
-    groupRoles: "组角色",
-    groupMembers: "组成员",
-    userAccess: "用户授权",
-    directRoles: "直接角色",
-    effectivePermissions: "有效权限",
-    selectUser: "选择用户",
-    createRole: "创建角色",
-    updateRole: "更新角色",
-    createGroup: "创建用户组",
-    updateGroup: "更新用户组",
-    systemRole: "系统角色",
-    customRole: "自定义角色",
-    clear: "清空",
-    actor: "操作者",
-    action: "动作",
-    target: "目标",
-    outcome: "结果",
-    detailsJson: "详情",
-    publicBaseUrl: "公网 Base URL",
-    effectivePublicBaseUrl: "当前生效 Base URL",
-    effectiveIssuer: "当前生效 Issuer",
-    trustProxyHeaders: "信任代理/穿透请求头",
-    usersMetric: "用户数",
-    clientsMetric: "客户端数",
-    openRegister: "没有账号？注册",
-    openLogin: "已有账号？登录",
-    codeSent: "验证码已生成",
-    copiedCodeHint: "开发模式验证码已显示，可直接填入。",
-    authorizedApplications: "已授权应用",
-    activeSessions: "登录会话",
-    currentSession: "当前会话",
-    revokeSession: "撤销会话",
-    noActiveSessions: "暂无活跃会话",
-    sessionId: "会话",
-    device: "设备",
-    ipAddress: "IP 地址",
-    userAgent: "User-Agent",
-    authMethod: "认证方式",
-    createdAt: "创建时间",
-    grantedScopes: "授权范围",
-    grantedAt: "授权时间",
-    updatedAt: "更新时间",
-    revoke: "撤销",
-    noAuthorizedApplications: "暂无已记住授权",
-    noData: "暂无数据",
-    loginFailed: "登录失败",
-    registrationFailed: "注册失败",
-    sendVerificationFailed: "发送验证码失败",
-    sendResetCodeFailed: "发送重置验证码失败",
-    resetPasswordFailed: "重置密码失败",
-    saveUserFailed: "保存用户失败",
-    saveClientFailed: "保存客户端失败",
-    saveIapApplicationFailed: "保存 IAP 应用失败",
-    saveInvitationFailed: "保存授权码失败",
-    saveRoleFailed: "保存角色失败",
-    saveGroupFailed: "保存用户组失败",
-    saveOrganizationFailed: "保存组织失败",
-    startMfaSetupFailed: "开始设置二次验证失败",
-    confirmMfaSetupFailed: "确认二次验证失败",
-    rotateRecoveryCodesFailed: "重新生成恢复码失败",
-    disableMfaFailed: "关闭二次验证失败",
-    registerPasskeyFailed: "注册 Passkey 失败",
-    passkeyLoginFailed: "Passkey 登录失败",
-    deletePasskeyFailed: "删除 Passkey 失败",
-    revokeAuthorizationFailed: "撤销授权失败",
-    revokeSessionFailed: "撤销会话失败",
-    saveSecurityPolicyFailed: "保存安全策略失败",
-    rotateSigningKeyFailed: "轮换签名密钥失败",
-    saveRegistrationSettingsFailed: "保存注册策略失败",
-    saveRuntimeSettingsFailed: "保存运行配置失败",
-    saveLoginSettingsFailed: "保存登录入口设置失败",
-    saveProviderFailed: "保存第三方 OIDC 失败",
-    discoverProviderFailed: "发现 OIDC 端点失败",
-    saveLdapProviderFailed: "保存 LDAP/AD 失败",
-    saveAuditWebhookFailed: "保存审计 Webhook 失败",
-    refreshFailed: "刷新失败"
-  },
-  "en-US": {
-    loading: "Loading",
-    signIn: "Sign in",
-    register: "Register",
-    firstAdmin: "First start: register the first administrator",
-    adminConsole: "Admin console",
-    email: "Email",
-    phone: "Phone",
-    password: "Password",
-    newPassword: "New password",
-    username: "Username",
-    displayName: "Display name",
-    invitationCode: "Authorization code",
-    authorizationCodePrefix: "Code",
-    authAccountSwitch: "A different account is signed in. Continue with the email requested by the application.",
-    emailCode: "Email code",
-    phoneCode: "Phone code",
-    sendEmailCode: "Send email code",
-    sendPhoneCode: "Send phone code",
-    forgotPassword: "Forgot password",
-    resetPassword: "Reset password",
-    resetPasswordCode: "Reset code",
-    sendResetCode: "Send reset code",
-    completePasswordReset: "Reset password",
-    passwordResetComplete: "Password reset. Sign in again.",
-    passwordRegistrationUnavailable: "Password registration is disabled. Use an authorization code or an identity source.",
-    temporaryAccountReady: "Temporary authorization-code account signed in for read-only access.",
-    createdInvitation: "New authorization code",
-    overview: "Overview",
-    users: "Users",
-    clients: "OIDC Clients",
-    iap: "IAP apps",
-    invitations: "Authorization codes",
-    registration: "Registration",
-    providers: "Identity sources",
-    portal: "Login entry",
-    account: "Account",
-    security: "Security",
-    settings: "Settings",
-    logout: "Log out",
-    refresh: "Refresh",
-    create: "Create",
-    save: "Save",
-    edit: "Edit",
-    enable: "Enable",
-    disable: "Disable",
-    archive: "Archive",
-    delete: "Delete",
-    details: "Details",
-    active: "Active",
-    disabled: "Disabled",
-    archived: "Archived",
-    allUsers: "All accounts",
-    liveUsers: "Active/disabled",
-    activeUsers: "Active accounts",
-    disabledUsers: "Disabled accounts",
-    archivedUsers: "Archived accounts",
-    userFilter: "Account filter",
-    archivedAt: "Archived at",
-    archivedReadOnly: "Archived accounts are read-only. Enable first to edit.",
-    admin: "Admin",
-    normalUser: "User",
-    role: "Role",
-    status: "Status",
-    registeredAt: "Registered",
-    lastLogin: "Last login",
-    lastIp: "Last IP",
-    lastClient: "Last OIDC client",
-    loginMethod: "Login method",
-    verified: "Verified",
-    unverified: "Unverified",
-    noUserAdminOnly: "This account is not an administrator.",
-    createUser: "Create user",
-    updateUser: "Update user",
-    userDetails: "User details",
-    loginEvents: "Login events",
-    linkedIdentities: "Linked identities",
-    createClient: "Create OIDC client",
-    createIapApplication: "Create IAP app",
-    updateIapApplication: "Update IAP app",
-    iapApplication: "IAP app",
-    externalHost: "External host",
-    pathPrefix: "Path prefix",
-    requiredOrganization: "Required organization",
-    requiredOrganizationRoles: "Required organization roles",
-    requiredPermissions: "Required permissions",
-    forwardAuthEndpoint: "ForwardAuth endpoint",
-    clientId: "Client ID",
-    clientName: "Client name",
-    clientSecret: "Client secret",
-    redirectUris: "Redirect URIs",
-    postLogoutUris: "Post logout URIs",
-    scopes: "Scopes",
-    grantTypes: "Grant types",
-    responseTypes: "Response types",
-    tokenAuthMethod: "Token auth method",
-    requirePkce: "Require PKCE",
-    requireClientMfa: "Require MFA",
-    requirePar: "Require PAR",
-    requireS256Pkce: "Require S256 PKCE",
-    requireConfidentialClient: "Disallow public client",
-    requireDpop: "Require DPoP",
-    requireAccountSelection: "Require account selection",
-    trustEmailVerified: "Trust email as verified",
-    authorizationDetailsTypes: "RAR authorization detail types",
-    serviceAccount: "Service account",
-    serviceAccountPermissions: "Service account permissions",
-    subjectType: "Subject type",
-    sectorIdentifierUri: "Sector identifier URI",
-    jwksUri: "JWKS URI",
-    jwks: "JWKS JSON",
-    backchannelLogoutUri: "Back-Channel logout URI",
-    backchannelLogoutSessionRequired: "Require sid in logout token",
-    frontchannelLogoutUri: "Front-Channel logout URI",
-    frontchannelLogoutSessionRequired: "Require sid in iframe notification",
-    claimMappers: "Claim mappers",
-    claimName: "Claim name",
-    claimSource: "Source",
-    sourceValue: "Source value",
-    valueType: "Value type",
-    includeIdToken: "ID Token",
-    includeAccessToken: "Access Token",
-    includeUserInfo: "UserInfo",
-    addClaimMapper: "Add claim",
-    userField: "User field",
-    staticValue: "Static value",
-    scopeFlag: "Scope flag",
-    clientField: "Client field",
-    createInvitation: "Create authorization code",
-    updateInvitation: "Update authorization code",
-    authorizedEmail: "Authorized email",
-    authorizedUsername: "Authorized username",
-    authorizedDisplayName: "Authorized display name",
-    description: "Description",
-    expiresAt: "Expires at",
-    maxUses: "Max uses",
-    used: "Used",
-    redemptions: "Redemptions",
-    redeemedAt: "Redeemed at",
-    permanent: "Permanent",
-    unlimited: "Unlimited",
-    registrationSettings: "Registration policy",
-    passwordRegistration: "Allow password registration",
-    requireEmailVerification: "Require email verification",
-    requirePhoneVerification: "Require phone verification",
-    allowExternalOidc: "Allow external OIDC registration",
-    requireInvitation: "Require authorization code",
-    firstUserAdmin: "First user becomes admin",
-    defaultUserActive: "Default user active",
-    createProvider: "Create external OIDC",
-    updateProvider: "Update external OIDC",
-    providerTemplate: "Provider template",
-    applyTemplate: "Apply template",
-    discoverProvider: "Discover endpoints",
-    ldapProviders: "LDAP/AD directories",
-    createLdapProvider: "Create LDAP/AD",
-    updateLdapProvider: "Update LDAP/AD",
-    slug: "Slug",
-    issuer: "Issuer",
-    authorizationEndpoint: "Authorization endpoint",
-    tokenEndpoint: "Token endpoint",
-    userinfoEndpoint: "Userinfo endpoint",
-    redirectPath: "Redirect path",
-    providerEmailDomains: "Enterprise email domains",
-    allowRegistration: "Allow registration",
-    allowLogin: "Allow login",
-    ldapUrl: "LDAP URL",
-    startTls: "StartTLS",
-    bindDn: "Bind DN",
-    bindPassword: "Bind password",
-    clearBindPassword: "Clear bind password",
-    baseDn: "Base DN",
-    ldapUserFilter: "User filter",
-    userIdAttribute: "User ID attribute",
-    emailAttribute: "Email attribute",
-    usernameAttribute: "Username attribute",
-    displayNameAttribute: "Display name attribute",
-    phoneAttribute: "Phone attribute",
-    directoryLogin: "Directory login",
-    externalLogin: "External login/register",
-    domainSsoLogin: "Use company SSO",
-    domainSsoRegister: "Use company SSO",
-    language: "Language",
-    database: "Database",
-    issuerLabel: "Issuer",
-    runtimeSettings: "External access settings",
-    loginSettings: "Login entry settings",
-    companyEmailDomains: "Company email suffixes",
-    quickLinks: "Quick links",
-    createQuickLink: "Add quick link",
-    updateQuickLink: "Update quick link",
-    linkLabel: "Link label",
-    linkUrl: "Link URL",
-    linkIcon: "Icon",
-    customDomain: "Custom suffix",
-    applySuffix: "Apply",
-    randomEmail: "Random email",
-    copyEmail: "Copy email",
-    copiedEmail: "Email copied",
-    copyEmailUnavailable: "Clipboard is unavailable. Copy manually",
-    copyAuthorizationCode: "Copy authorization code",
-    authorizationCodeCopied: "Authorization code copied",
-    copyAuthorizationCodeUnavailable: "Clipboard is unavailable. Copy the authorization code manually",
-    companyEmailRequired: "Use a configured company email to sign in to this application",
-    mfaCode: "MFA code",
-    mfaRequired: "MFA required",
-    mfaSettings: "Multi-factor authentication",
-    totpSetup: "TOTP setup",
-    startTotpSetup: "Start TOTP setup",
-    confirmTotp: "Confirm TOTP",
-    totpSecret: "TOTP secret",
-    otpauthUri: "Authenticator URI",
-    recoveryCodes: "Recovery codes",
-    recoveryCodesRemaining: "Recovery codes remaining",
-    rotateRecoveryCodes: "Rotate recovery codes",
-    disableMfa: "Disable MFA",
-    resetMfa: "Reset MFA",
-    captcha: "Security check",
-    captchaAnswer: "Security answer",
-    captchaRequired: "Security check required",
-    recoveryCodesOnce: "Recovery codes are shown only once. Store them now.",
-    passkeys: "Passkeys",
-    passkeyLogin: "Sign in with passkey",
-    passkeyName: "Passkey name",
-    registerPasskey: "Register passkey",
-    noPasskeys: "No passkeys",
-    credentialId: "Credential ID",
-    lastUsed: "Last used",
-    securityPolicy: "Security policy",
-    passwordPolicy: "Password policy",
-    loginLockout: "Login lockout",
-    minPasswordLength: "Minimum password length",
-    requireUppercase: "Require uppercase",
-    requireLowercase: "Require lowercase",
-    requireDigit: "Require digit",
-    requireSymbol: "Require symbol",
-    rejectUserInfo: "Reject account identifiers",
-    maxFailedAttempts: "Max failed attempts",
-    failureWindowSeconds: "Failure window (seconds)",
-    lockoutSeconds: "Lockout duration (seconds)",
-    trustedNetworks: "Trusted networks",
-    trustedIpCidrs: "Trusted IP/CIDR",
-    requireMfaOutsideTrustedNetworks: "Require MFA outside trusted networks",
-    accessRiskRules: "Login/registration risk rules",
-    allowedIpCidrs: "Allowed IP/CIDR",
-    blockedIpCidrs: "Blocked IP/CIDR",
-    allowedEmailDomains: "Allowed email domains",
-    blockedEmailDomains: "Blocked email domains",
-    captchaPolicy: "Login security check",
-    captchaAfterFailedAttempts: "Require after failed attempts",
-    captchaTtlSeconds: "Challenge TTL (seconds)",
-    signingKeys: "Signing keys",
-    keyId: "Key ID",
-    activeSigningKey: "Active signer",
-    retiredSigningKey: "Retired",
-    rotateSigningKey: "Rotate key",
-    activatedAt: "Activated",
-    retiredAt: "Retired",
-    auditEvents: "Audit events",
-    auditWebhooks: "Audit webhooks",
-    createAuditWebhook: "Create audit webhook",
-    updateAuditWebhook: "Update audit webhook",
-    webhookName: "Webhook name",
-    webhookUrl: "Webhook URL",
-    webhookSecret: "Signing secret",
-    webhookActions: "Action filters",
-    webhookTimeout: "Timeout (seconds)",
-    clearWebhookSecret: "Clear signing secret",
-    hasSecret: "Signing enabled",
-    lastDelivery: "Last delivery",
-    deliveryStatus: "Delivery status",
-    roles: "Roles",
-    groups: "Groups",
-    organizations: "Organizations",
-    clientOrganization: "Organization",
-    noOrganization: "No organization",
-    permissions: "Permissions",
-    roleName: "Role name",
-    groupName: "Group name",
-    organizationName: "Organization name",
-    organizationSlug: "Organization slug",
-    organizationMembers: "Organization members",
-    organizationRole: "Organization role",
-    createOrganization: "Create organization",
-    updateOrganization: "Update organization",
-    rolePermissions: "Role permissions",
-    groupRoles: "Group roles",
-    groupMembers: "Group members",
-    userAccess: "User access",
-    directRoles: "Direct roles",
-    effectivePermissions: "Effective permissions",
-    selectUser: "Select user",
-    createRole: "Create role",
-    updateRole: "Update role",
-    createGroup: "Create group",
-    updateGroup: "Update group",
-    systemRole: "System role",
-    customRole: "Custom role",
-    clear: "Clear",
-    actor: "Actor",
-    action: "Action",
-    target: "Target",
-    outcome: "Outcome",
-    detailsJson: "Details",
-    publicBaseUrl: "Public base URL",
-    effectivePublicBaseUrl: "Effective base URL",
-    effectiveIssuer: "Effective issuer",
-    trustProxyHeaders: "Trust proxy/tunnel headers",
-    usersMetric: "Users",
-    clientsMetric: "Clients",
-    openRegister: "Need an account? Register",
-    openLogin: "Already have an account? Sign in",
-    codeSent: "Verification code generated",
-    copiedCodeHint: "Development code is shown and can be entered directly.",
-    authorizedApplications: "Authorized applications",
-    activeSessions: "Login sessions",
-    currentSession: "Current session",
-    revokeSession: "Revoke session",
-    noActiveSessions: "No active sessions",
-    sessionId: "Session",
-    device: "Device",
-    ipAddress: "IP address",
-    userAgent: "User-Agent",
-    authMethod: "Auth method",
-    createdAt: "Created",
-    grantedScopes: "Granted scopes",
-    grantedAt: "Granted",
-    updatedAt: "Updated",
-    revoke: "Revoke",
-    noAuthorizedApplications: "No remembered authorizations",
-    noData: "No data",
-    loginFailed: "Login failed",
-    registrationFailed: "Registration failed",
-    sendVerificationFailed: "Failed to send verification code",
-    sendResetCodeFailed: "Failed to send reset code",
-    resetPasswordFailed: "Failed to reset password",
-    saveUserFailed: "Failed to save user",
-    saveClientFailed: "Failed to save client",
-    saveIapApplicationFailed: "Failed to save IAP app",
-    saveInvitationFailed: "Failed to save authorization code",
-    saveRoleFailed: "Failed to save role",
-    saveGroupFailed: "Failed to save group",
-    saveOrganizationFailed: "Failed to save organization",
-    startMfaSetupFailed: "Failed to start MFA setup",
-    confirmMfaSetupFailed: "Failed to confirm MFA setup",
-    rotateRecoveryCodesFailed: "Failed to rotate recovery codes",
-    disableMfaFailed: "Failed to disable MFA",
-    registerPasskeyFailed: "Failed to register passkey",
-    passkeyLoginFailed: "Passkey login failed",
-    deletePasskeyFailed: "Failed to delete passkey",
-    revokeAuthorizationFailed: "Failed to revoke authorization",
-    revokeSessionFailed: "Failed to revoke session",
-    saveSecurityPolicyFailed: "Failed to save security policy",
-    rotateSigningKeyFailed: "Failed to rotate signing key",
-    saveRegistrationSettingsFailed: "Failed to save registration settings",
-    saveRuntimeSettingsFailed: "Failed to save runtime settings",
-    saveLoginSettingsFailed: "Failed to save login settings",
-    saveProviderFailed: "Failed to save provider",
-    discoverProviderFailed: "Failed to discover OIDC endpoints",
-    saveLdapProviderFailed: "Failed to save LDAP/AD",
-    saveAuditWebhookFailed: "Failed to save audit webhook",
-    refreshFailed: "Failed to refresh"
-  }
-};
-
-type TranslationKey = keyof typeof translations["zh-CN"];
-
-const DEFAULT_LOGIN_EMAIL = "admin@example.com";
-
-const emptyUserForm = {
-  id: "",
-  email: "",
-  username: "",
-  display_name: "",
-  phone: "",
-  password: "",
-  is_admin: false,
-  is_active: true
-};
-
-const emptyRegisterForm = {
-  username: "",
-  display_name: "",
-  phone: "",
-  password: "",
-  email_code: "",
-  phone_code: "",
-  authorization_code: ""
-};
-
-const emptyPasswordResetForm = {
-  code: "",
-  password: ""
-};
-
-const emptyClientForm = {
-  id: "",
-  client_id: "",
-  client_name: "",
-  organization_id: "",
-  client_secret: "",
-  redirect_uris: "http://localhost:3000/callback",
-  post_logout_redirect_uris: "http://localhost:3000/",
-  scopes: "openid profile email offline_access",
-  grant_types: "authorization_code refresh_token",
-  response_types: "code",
-  token_endpoint_auth_method: "client_secret_basic",
-  require_pkce: false,
-  require_mfa: false,
-  require_pushed_authorization_requests: false,
-  require_s256_pkce: false,
-  require_confidential_client: false,
-  require_dpop: false,
-  require_account_selection: false,
-  trust_email_verified: false,
-  authorization_details_types: "",
-  subject_type: "public",
-  sector_identifier_uri: "",
-  jwks_uri: "",
-  jwks: "",
-  backchannel_logout_uri: "",
-  backchannel_logout_session_required: false,
-  frontchannel_logout_uri: "",
-  frontchannel_logout_session_required: false,
-  service_account_enabled: false,
-  service_account_permissions: "",
-  is_active: true,
-  claim_mappers: [] as ClientClaimMapperForm[]
-};
-
-const emptyIapApplicationForm = {
-  id: "",
-  slug: "",
-  name: "",
-  description: "",
-  external_host: "",
-  path_prefix: "/",
-  required_organization_id: "",
-  required_organization_roles: [] as string[],
-  required_permissions: "",
-  is_active: true
-};
-
-function emptyClaimMapperForm(sortOrder: number): ClientClaimMapperForm {
-  return {
-    claim_name: "",
-    source: "user_field",
-    source_value: "username",
-    value_type: "string",
-    include_in_id_token: true,
-    include_in_access_token: false,
-    include_in_userinfo: true,
-    is_active: true,
-    sort_order: sortOrder
-  };
-}
-
-const emptyInvitationForm = {
-  id: "",
-  description: "",
-  authorized_email: "",
-  authorized_username: "",
-  authorized_display_name: "",
-  expires_at: "",
-  max_uses: "",
-  is_active: true
-};
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Card,
+  Check,
+  EmptyState,
+  Field,
+  Modal,
+  SearchField,
+  SelectField,
+  StatusBadge
+} from "./components/ui";
+import {
+  AuthorizationCodeLoginForm,
+  LoginMethodSwitcher
+} from "./components/LoginMethod";
+import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
+import { translations } from "./i18n";
+import type { TranslationKey } from "./i18n";
+import {
+  api,
+  ApiError,
+  cachedApi,
+  cachedApiValue,
+  setApiCacheScope
+} from "./lib/api";
+import {
+  applyEmailDomain,
+  authContextError,
+  deliverFrontchannelLogout,
+  findProviderForEmail,
+  initialAuthContext,
+  loginHintRequiresAccountSwitch,
+  normalizeDomain,
+  oidcStartUrl,
+  randomLocalPart,
+  usableEmailDomain
+} from "./lib/auth-flow";
+import {
+  matchesSearch,
+  sortUsersForDisplay,
+  toggleValue
+} from "./lib/collection-utils";
+import {
+  formatTime,
+  joinList,
+  shortSessionId,
+  splitList,
+  toDatetimeLocalValue,
+  toTimestamp
+} from "./lib/formatters";
+import {
+  DEFAULT_LOGIN_EMAIL,
+  createQuickLinkId,
+  emptyAuditWebhookForm,
+  emptyAuthorizationCodeLoginForm,
+  emptyClaimMapperForm,
+  emptyClientForm,
+  emptyGroupForm,
+  emptyIapApplicationForm,
+  emptyInvitationForm,
+  emptyLdapProviderForm,
+  emptyOrganizationForm,
+  emptyPasswordResetForm,
+  emptyProviderForm,
+  emptyQuickLinkForm,
+  emptyRegisterForm,
+  emptyRoleForm,
+  emptyUserForm
+} from "./lib/form-defaults";
+import { initialTab, initialTheme } from "./lib/navigation";
+import {
+  authenticationCredentialJson,
+  passkeyCreationOptions,
+  passkeyRequestOptions,
+  registrationCredentialJson
+} from "./lib/webauthn";
+import type {
+  AccessGroup,
+  AuditEvent,
+  AuditWebhook,
+  BrowserAccount,
+  BrowserAccountsContext,
+  AuthorizationCodeInspection,
+  AuthorizationCodeType,
+  AuthMode,
+  BulkUserImportResult,
+  BulkUserImportRow,
+  Bootstrap,
+  Client,
+  ClientClaimMapperForm,
+  ExternalProvider,
+  ExternalProviderDiscovery,
+  ExternalProviderTemplate,
+  IapApplication,
+  Invitation,
+  InvitationRedemption,
+  InvitationRedemptionsPage,
+  LdapProvider,
+  Locale,
+  LoginAuthorizationCodeLevel,
+  LoginMethod,
+  LoginResponse,
+  LoginSettings,
+  LoginSettingsDraft,
+  LogoutResponse,
+  MfaConfirmResponse,
+  MfaStatus,
+  MyConsent,
+  MySession,
+  Organization,
+  OrganizationMember,
+  OrganizationMemberRole,
+  OrganizationOption,
+  OidcContinuationLoginResponse,
+  Overview,
+  Passkey,
+  PasskeyAuthenticationStart,
+  PasskeyRegistrationStart,
+  PendingConfirmation,
+  PermissionInfo,
+  QuickLink,
+  RegistrationSettings,
+  Role,
+  RuntimeSettings,
+  SecurityPolicy,
+  SettingsSummary,
+  SigningKey,
+  Tab,
+  Theme,
+  TotpSetup,
+  User,
+  UserAccess,
+  UserDetail,
+  UserFilter
+} from "./types";
 
 const AUTHORIZATION_CODES_API = "/api/admin/authorization-codes";
+const BULK_USER_IMPORT_API = "/api/admin/users/import-csv";
+const BULK_USER_IMPORT_TEMPLATE = [
+  "email,username,display_name,organization_slug,organization_role,is_active",
+  "alex@example.com,alex,Alex Example,example-club,member,true"
+].join("\n");
 
-const emptyQuickLinkForm = {
-  id: "",
-  label: "",
-  url: "",
-  icon: "link",
-  is_active: true
-};
+type UserRoleFilter = "all" | "admin" | "user";
+type UserLoginRegionFilter = "all" | "domestic" | "overseas";
+type UserLinkedIdentityFilter = "all" | "linked" | "unlinked";
+type UserLifecycleState = "active" | "disabled" | "archived";
+type BulkUserAction = "enable" | "disable" | "archive" | "delete" | "reset_mfa";
+type BrowserAccountContinuation = () => Promise<void>;
 
-const emptyRoleForm = {
-  id: "",
-  name: "",
-  description: "",
-  permissions: [] as string[]
-};
-
-const emptyGroupForm = {
-  id: "",
-  name: "",
-  description: "",
-  role_ids: [] as string[],
-  user_ids: [] as string[]
-};
-
-const emptyOrganizationForm = {
-  id: "",
-  slug: "",
-  name: "",
-  description: "",
-  allowed_email_domains: "",
-  is_active: true
-};
-
-const emptyProviderForm = {
-  id: "",
-  slug: "",
-  display_name: "",
-  organization_id: "",
-  issuer: "",
-  client_id: "",
-  client_secret: "",
-  authorization_endpoint: "",
-  token_endpoint: "",
-  userinfo_endpoint: "",
-  redirect_path: "/api/register/oidc/example/callback",
-  scopes: "openid profile email",
-  email_domains: "",
-  is_active: false,
-  allow_login: true,
-  allow_registration: true
-};
-
-const emptyLdapProviderForm = {
-  id: "",
-  slug: "",
-  display_name: "",
-  url: "ldap://ldap.example.com",
-  starttls: true,
-  bind_dn: "",
-  bind_password: "",
-  clear_bind_password: false,
-  base_dn: "dc=example,dc=com",
-  user_filter: "(&(|(mail={login})(uid={login})(sAMAccountName={login}))(objectClass=person))",
-  user_id_attribute: "dn",
-  email_attribute: "mail",
-  username_attribute: "uid",
-  display_name_attribute: "cn",
-  phone_attribute: "telephoneNumber",
-  is_active: false,
-  allow_login: true,
-  allow_registration: true
-};
-
-const emptyAuditWebhookForm = {
-  id: "",
-  name: "",
-  url: "",
-  secret: "",
-  clear_secret: false,
-  actions: "",
-  is_active: true,
-  timeout_seconds: 5
-};
-
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...options,
-    credentials: "include",
-    headers: {
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      ...(options.headers ?? {})
-    }
-  });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ message: response.statusText }));
-    throw new Error(body.message ?? response.statusText);
-  }
-  return response.json() as Promise<T>;
+function timestampAtDayEnd(value: string): number | null {
+  const timestamp = toTimestamp(value);
+  return timestamp === null ? null : timestamp + 86_400;
 }
 
-function base64urlToBuffer(value: string): ArrayBuffer {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes.buffer;
+function isDomesticLoginIp(value: string | null): boolean {
+  if (!value) return false;
+  const ip = value.trim().toLowerCase();
+  // Local/private addresses are common in self-hosted deployments and should
+  // remain visible under the domestic view. Public addresses can be enriched
+  // with a country code by an upstream proxy in the "cn:<ip>" form.
+  return ip.startsWith("cn:")
+    || ip === "localhost"
+    || ip === "::1"
+    || /^127\./.test(ip)
+    || /^10\./.test(ip)
+    || /^192\.168\./.test(ip)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
 }
 
-function bufferSourceToBase64url(value: BufferSource | null): string | null {
-  if (!value) return null;
-  const bytes = value instanceof ArrayBuffer
-    ? new Uint8Array(value)
-    : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  let binary = "";
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+function lifecycleStateForUser(user: Pick<User, "is_active" | "archived_at">): UserLifecycleState {
+  if (user.archived_at !== null) return "archived";
+  return user.is_active ? "active" : "disabled";
 }
 
-function passkeyCreationOptions(value: WebauthnCreationResponseJson): CredentialCreationOptions {
-  const publicKey = value.publicKey;
-  return {
-    publicKey: {
-      ...publicKey,
-      challenge: base64urlToBuffer(publicKey.challenge),
-      excludeCredentials: publicKey.excludeCredentials?.map((credential) => ({
-        ...credential,
-        id: base64urlToBuffer(credential.id)
-      })),
-      user: {
-        ...publicKey.user,
-        id: base64urlToBuffer(publicKey.user.id)
-      }
-    }
-  };
-}
-
-function passkeyRequestOptions(value: WebauthnRequestResponseJson): CredentialRequestOptions {
-  const publicKey = value.publicKey;
-  return {
-    mediation: value.mediation,
-    publicKey: {
-      ...publicKey,
-      allowCredentials: publicKey.allowCredentials?.map((credential) => ({
-        ...credential,
-        id: base64urlToBuffer(credential.id)
-      })),
-      challenge: base64urlToBuffer(publicKey.challenge)
-    }
-  };
-}
-
-function registrationCredentialJson(credential: PublicKeyCredential) {
-  const response = credential.response as AuthenticatorAttestationResponse & {
-    getTransports?: () => AuthenticatorTransport[];
-  };
-  return {
-    id: credential.id,
-    rawId: bufferSourceToBase64url(credential.rawId),
-    response: {
-      attestationObject: bufferSourceToBase64url(response.attestationObject),
-      clientDataJSON: bufferSourceToBase64url(response.clientDataJSON),
-      transports: response.getTransports?.()
-    },
-    type: credential.type,
-    extensions: credential.getClientExtensionResults()
-  };
-}
-
-function authenticationCredentialJson(credential: PublicKeyCredential) {
-  const response = credential.response as AuthenticatorAssertionResponse;
-  return {
-    id: credential.id,
-    rawId: bufferSourceToBase64url(credential.rawId),
-    response: {
-      authenticatorData: bufferSourceToBase64url(response.authenticatorData),
-      clientDataJSON: bufferSourceToBase64url(response.clientDataJSON),
-      signature: bufferSourceToBase64url(response.signature),
-      userHandle: bufferSourceToBase64url(response.userHandle)
-    },
-    type: credential.type,
-    extensions: credential.getClientExtensionResults()
-  };
-}
-
-function splitList(value: string): string[] {
-  return value
-    .split(/[\n, ]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function deliverFrontchannelLogout(frames: LogoutFrame[] = []) {
-  frames.forEach((frame) => {
-    if (!frame.uri) return;
-    const iframe = document.createElement("iframe");
-    iframe.src = frame.uri;
-    iframe.title = frame.client_id || "frontchannel-logout";
-    iframe.style.display = "none";
-    iframe.width = "0";
-    iframe.height = "0";
-    document.body.appendChild(iframe);
-    window.setTimeout(() => iframe.remove(), 2500);
-  });
-}
-
-function joinList(value: string[]): string {
-  return value.join(" ");
-}
-
-function formatTime(value: number | null | undefined, locale: Locale): string {
-  if (!value) return "-";
-  return new Intl.DateTimeFormat(locale, {
-    dateStyle: "medium",
-    timeStyle: "short"
-  }).format(new Date(value * 1000));
-}
-
-function shortSessionId(value: string): string {
-  return value.length > 12 ? `${value.slice(0, 12)}...` : value;
-}
-
-function toTimestamp(value: string): number | null {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : Math.floor(date.getTime() / 1000);
-}
-
-function toDatetimeLocalValue(value: number | null | undefined): string {
-  if (!value) return "";
-  const date = new Date(value * 1000);
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 16);
-}
-
-function sortUsersForDisplay(value: User[]): User[] {
-  const bucket = (item: User) => {
-    if (item.archived_at) return 2;
-    return item.is_active ? 0 : 1;
-  };
-  return [...value].sort((left, right) => {
-    const bucketDiff = bucket(left) - bucket(right);
-    if (bucketDiff !== 0) return bucketDiff;
-    const leftTime = left.archived_at ?? left.created_at;
-    const rightTime = right.archived_at ?? right.created_at;
-    return rightTime - leftTime;
-  });
-}
-
-function toggleValue(values: string[], value: string): string[] {
-  return values.includes(value)
-    ? values.filter((item) => item !== value)
-    : [...values, value];
-}
-
-function normalizeDomain(value: string): string {
-  return value.trim().replace(/^@+/, "").replace(/^\.+/, "").replace(/\.+$/, "").toLowerCase();
-}
-
-function usableEmailDomain(value: string): string {
-  const domain = normalizeDomain(value);
-  if (!domain || domain.includes("@") || domain.includes("/") || domain.includes("\\") || /\s/.test(domain) || domain.split(".").some((part) => !part)) return "";
-  return domain;
-}
-
-function emailDomain(value: string): string {
-  const [, domain = ""] = value.trim().toLowerCase().split("@").slice(-2);
-  return usableEmailDomain(domain);
-}
-
-function domainMatchesRule(domain: string, rule: string): boolean {
-  const normalizedRule = usableEmailDomain(rule);
-  return Boolean(normalizedRule && (domain === normalizedRule || domain.endsWith(`.${normalizedRule}`)));
-}
-
-function findProviderForEmail(providers: ExternalProviderSummary[], email: string): ExternalProviderSummary | null {
-  const domain = emailDomain(email);
-  if (!domain) return null;
-  let matched: { provider: ExternalProviderSummary; rule: string } | null = null;
-  for (const provider of providers) {
-    for (const rule of provider.email_domains) {
-      const normalizedRule = usableEmailDomain(rule);
-      if (!normalizedRule || !domainMatchesRule(domain, normalizedRule)) continue;
-      if (!matched || normalizedRule.length > matched.rule.length) {
-        matched = { provider, rule: normalizedRule };
-      }
+/**
+ * These are the actions a row exposes for its current lifecycle state.
+ * Keeping this source of truth shared with bulk actions prevents a selection
+ * of mixed rows from offering an operation that one of its rows cannot take.
+ */
+function availableUserActions(user: Pick<User, "id" | "is_active" | "archived_at">, currentUserId?: string): BulkUserAction[] {
+  const actions: BulkUserAction[] = [];
+  const canChangeLifecycle = user.id !== currentUserId;
+  const lifecycleState = lifecycleStateForUser(user);
+  if (canChangeLifecycle) {
+    if (lifecycleState === "active") {
+      actions.push("disable");
+    } else if (lifecycleState === "disabled") {
+      actions.push("enable", "archive");
+    } else {
+      actions.push("enable", "delete");
     }
   }
-  return matched?.provider ?? null;
+  if (lifecycleState !== "archived") actions.push("reset_mfa");
+  return actions;
 }
 
-function applyEmailDomain(email: string, domain: string): string {
-  const suffix = usableEmailDomain(domain);
-  if (!suffix) return email;
-  const local = email.split("@")[0]?.trim() || randomLocalPart();
-  return `${local}@${suffix}`;
+function isBulkUserImportResult(value: unknown): value is BulkUserImportResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<BulkUserImportResult>;
+  return typeof candidate.dry_run === "boolean"
+    && typeof candidate.atomic === "boolean"
+    && typeof candidate.committed === "boolean"
+    && Array.isArray(candidate.rows)
+    && Boolean(candidate.summary)
+    && typeof candidate.summary?.total === "number"
+    && typeof candidate.summary?.created === "number"
+    && typeof candidate.summary?.would_create === "number"
+    && typeof candidate.summary?.invalid === "number";
 }
 
-function randomLocalPart(): string {
-  const time = Date.now().toString(36);
-  const random = Math.random().toString(36).slice(2, 8);
-  return `u${time}${random}`;
-}
-
-function currentLocalReturnTo(): string {
-  const target = `${window.location.pathname}${window.location.search}${window.location.hash}` || "/";
-  return localReturnTo(target) ?? "/";
-}
-
-function oidcStartUrl(startUrl: string, email: string, mode: "login" | "register"): string {
-  const separator = startUrl.includes("?") ? "&" : "?";
-  const params = [`return_to=${encodeURIComponent(currentLocalReturnTo())}`, `mode=${mode}`];
-  const loginHint = normalizedAuthEmail(email);
-  if (loginHint.includes("@")) {
-    params.push(`login_hint=${encodeURIComponent(loginHint)}`);
+function bulkImportOutcomeTone(outcome: BulkUserImportRow["outcome"]): "success" | "warning" | "danger" | "info" {
+  switch (outcome) {
+    case "created": return "success";
+    case "would_create": return "info";
+    case "not_committed": return "warning";
+    case "invalid": return "danger";
   }
-  return `${startUrl}${separator}${params.join("&")}`;
 }
 
-function localReturnTo(value: string | null): string | null {
-  const target = value?.trim() ?? "";
-  if (!target || target === "/" || !target.startsWith("/") || target.startsWith("//")) return null;
-  if (target.includes("\\") || /[\r\n]/.test(target)) return null;
-  return target;
+function browserAccountShortName(account: BrowserAccount): string {
+  const email = account.user.email.trim();
+  const separator = email.indexOf("@");
+  return separator > 0 ? email.slice(0, separator) : email || account.user.username;
 }
 
-function normalizedAuthEmail(value: string | null | undefined): string {
-  return value?.trim().toLowerCase() ?? "";
-}
-
-function loginHintRequiresAccountSwitch(user: User | null | undefined, loginHint: string): boolean {
-  const hint = normalizedAuthEmail(loginHint);
-  if (!user || !hint.includes("@")) return false;
-  return normalizedAuthEmail(user.email) !== hint;
-}
-
-function loginHintFromReturnTo(returnTo: string | null): string {
-  if (!returnTo?.startsWith("/oauth2/authorize?")) return "";
-  const query = returnTo.slice("/oauth2/authorize?".length).split("#", 1)[0];
-  return new URLSearchParams(query).get("login_hint")?.trim() ?? "";
-}
-
-type InitialAuthContext = {
-  mode: AuthMode;
-  returnTo: string | null;
-  loginHint: string;
-  forceLogin: boolean;
-  authError: string;
-  authErrorCode: string;
-  authErrorDetail: string;
-};
-
-function initialAuthContext(): InitialAuthContext {
-  const params = new URLSearchParams(window.location.search);
-  const modeParam = params.get("auth");
-  const mode: AuthMode = modeParam === "register" || modeParam === "reset" ? modeParam : "login";
-  const returnTo = localReturnTo(params.get("return_to"));
-  const loginHint = params.get("login_hint")?.trim() || loginHintFromReturnTo(returnTo);
-  const forceLogin = params.get("force_login") === "1";
-  const authError = params.get("auth_error")?.trim() ?? "";
-  const authErrorCode = params.get("auth_error_code")?.trim() ?? "";
-  const authErrorDetail = params.get("auth_error_detail")?.trim() ?? "";
-  return { mode, returnTo, loginHint, forceLogin, authError, authErrorCode, authErrorDetail };
-}
-
-function authContextError(
-  context: InitialAuthContext,
-  t: (key: TranslationKey) => string
-): string {
-  if (context.authError) return context.authError;
-  if (context.authErrorCode === "company_email_required") {
-    return context.authErrorDetail
-      ? `${t("companyEmailRequired")}: ${context.authErrorDetail}`
-      : t("companyEmailRequired");
+/**
+ * `/api/browser-accounts/add/start` is the authority that creates an account
+ * login flow.  The server-issued token stays on this auth URL (without adding
+ * a history entry), so a refresh cannot silently turn an add-account flow
+ * into an unrelated primary-session login.
+ */
+function inlineAccountLoginFlow(loginUrl: string, expectedReturnTo: string): string | null {
+  try {
+    const target = new URL(loginUrl, window.location.origin);
+    if (
+      target.origin !== window.location.origin
+      || target.searchParams.get("auth") !== "login"
+      || target.searchParams.get("force_login") !== "1"
+      || target.searchParams.get("return_to") !== expectedReturnTo
+    ) {
+      return null;
+    }
+    const flow = target.searchParams.get("account_flow")?.trim() ?? "";
+    return /^alf1\.[A-Za-z0-9_-]{20,}$/.test(flow) ? flow : null;
+  } catch {
+    return null;
   }
-  return "";
-}
-
-function randomId(): string {
-  return globalThis.crypto?.randomUUID?.() ?? `link-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function App() {
@@ -1766,12 +293,24 @@ export function App() {
     return saved === "en-US" ? "en-US" : "zh-CN";
   });
   const t = (key: TranslationKey) => translations[locale][key];
-  const messageOr = (err: unknown, fallback: TranslationKey) =>
-    err instanceof Error ? err.message : t(fallback);
+  const messageOr = (err: unknown, fallback: TranslationKey) => {
+    if (err instanceof ApiError && err.code === "network_error") return t("networkError");
+    return err instanceof Error ? err.message : t(fallback);
+  };
 
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [user, setUser] = useState<User | null | undefined>(undefined);
-  const [tab, setTab] = useState<Tab>("account");
+  const [tab, setTab] = useState<Tab>(initialTab);
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [initialLoadError, setInitialLoadError] = useState("");
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
+  const adminLoadId = useRef(0);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
@@ -1787,6 +326,7 @@ export function App() {
   const [roles, setRoles] = useState<Role[]>([]);
   const [groups, setGroups] = useState<AccessGroup[]>([]);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
+  const [organizationOptions, setOrganizationOptions] = useState<OrganizationOption[]>([]);
   const [mfaStatus, setMfaStatus] = useState<MfaStatus | null>(null);
   const [totpSetup, setTotpSetup] = useState<TotpSetup | null>(null);
   const [totpSetupCode, setTotpSetupCode] = useState("");
@@ -1803,28 +343,67 @@ export function App() {
   const [loginSettings, setLoginSettings] = useState<LoginSettings | null>(null);
   const [selectedUser, setSelectedUser] = useState<UserDetail | null>(null);
   const [userFilter, setUserFilter] = useState<UserFilter>("live");
+  const [userOrganizationFilter, setUserOrganizationFilter] = useState("");
+  const [userFiltersExpanded, setUserFiltersExpanded] = useState(false);
+  const [userEmailFilter, setUserEmailFilter] = useState("");
+  const [userRoleFilter, setUserRoleFilter] = useState<UserRoleFilter>("all");
+  const [userRegistrationFrom, setUserRegistrationFrom] = useState("");
+  const [userRegistrationTo, setUserRegistrationTo] = useState("");
+  const [userLastLoginFrom, setUserLastLoginFrom] = useState("");
+  const [userLastLoginTo, setUserLastLoginTo] = useState("");
+  const [userPhoneFilter, setUserPhoneFilter] = useState("");
+  const [userLoginRegionFilter, setUserLoginRegionFilter] = useState<UserLoginRegionFilter>("all");
+  const [userLinkedIdentityFilter, setUserLinkedIdentityFilter] = useState<UserLinkedIdentityFilter>("all");
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [userForm, setUserForm] = useState(emptyUserForm);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
+  const [bulkImportCsv, setBulkImportCsv] = useState("");
+  const [bulkImportFileName, setBulkImportFileName] = useState("");
+  const [bulkImportDryRun, setBulkImportDryRun] = useState(true);
+  const [bulkImportCommitConfirmed, setBulkImportCommitConfirmed] = useState(false);
+  const [bulkImportResult, setBulkImportResult] = useState<BulkUserImportResult | null>(null);
+  const [bulkImportError, setBulkImportError] = useState("");
   const [registerForm, setRegisterForm] = useState(emptyRegisterForm);
+  const [registrationCodeInspection, setRegistrationCodeInspection] = useState<AuthorizationCodeInspection | null>(null);
+  const [registrationCodeInspecting, setRegistrationCodeInspecting] = useState(false);
   const [passwordResetForm, setPasswordResetForm] = useState(emptyPasswordResetForm);
   const [clientForm, setClientForm] = useState(emptyClientForm);
   const [iapApplicationForm, setIapApplicationForm] = useState(emptyIapApplicationForm);
   const [invitationForm, setInvitationForm] = useState(emptyInvitationForm);
+  const [revealedInvitation, setRevealedInvitation] = useState<Invitation | null>(null);
+  const [revealedInvitationCode, setRevealedInvitationCode] = useState("");
+  const [revealingInvitationId, setRevealingInvitationId] = useState("");
+  const [invitationRevealError, setInvitationRevealError] = useState("");
+  const [redemptionsInvitation, setRedemptionsInvitation] = useState<Invitation | null>(null);
+  const [invitationRedemptions, setInvitationRedemptions] = useState<InvitationRedemption[]>([]);
+  const [invitationRedemptionsNextCursor, setInvitationRedemptionsNextCursor] = useState<string | null>(null);
+  const [invitationRedemptionsLoading, setInvitationRedemptionsLoading] = useState(false);
+  const [invitationRedemptionsError, setInvitationRedemptionsError] = useState("");
+  const invitationRedemptionsLoadId = useRef(0);
   const [roleForm, setRoleForm] = useState(emptyRoleForm);
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
   const [organizationForm, setOrganizationForm] = useState(emptyOrganizationForm);
   const [organizationMemberRoles, setOrganizationMemberRoles] = useState<Record<string, string>>({});
+  const [organizationMembersLoading, setOrganizationMembersLoading] = useState(false);
+  const organizationMembersLoadId = useRef(0);
   const [selectedAccessUserId, setSelectedAccessUserId] = useState("");
   const [userAccess, setUserAccess] = useState<UserAccess | null>(null);
   const [providerForm, setProviderForm] = useState(emptyProviderForm);
   const [providerTemplateId, setProviderTemplateId] = useState("");
   const [ldapProviderForm, setLdapProviderForm] = useState(emptyLdapProviderForm);
   const [auditWebhookForm, setAuditWebhookForm] = useState(emptyAuditWebhookForm);
+  const [editor, setEditor] = useState<
+    "user" | "organization" | "client" | "iap" | "invitation" | "provider" | "ldap" | "role" | "group" | null
+  >(null);
   const [loginSettingsDraft, setLoginSettingsDraft] = useState<LoginSettingsDraft>({
+    brand_logo_url: "",
     email_domains: "",
     quick_links: []
   });
   const [quickLinkForm, setQuickLinkForm] = useState(emptyQuickLinkForm);
   const [authEmail, setAuthEmail] = useState(initialAuth.loginHint || DEFAULT_LOGIN_EMAIL);
+  const [loginMethod, setLoginMethod] = useState<LoginMethod>("password");
+  const [authorizationCodeLoginForm, setAuthorizationCodeLoginForm] = useState(emptyAuthorizationCodeLoginForm);
   const [loginPassword, setLoginPassword] = useState("");
   const [loginMfaChallengeId, setLoginMfaChallengeId] = useState("");
   const [loginMfaCode, setLoginMfaCode] = useState("");
@@ -1837,19 +416,42 @@ export function App() {
   const [resetCustomDomain, setResetCustomDomain] = useState("");
   const [authMode, setAuthMode] = useState<AuthMode>(initialAuth.mode);
   const [authReturnTo] = useState(initialAuth.returnTo);
+  const [accountLoginExpanded, setAccountLoginExpanded] = useState(
+    () => Boolean(initialAuth.accountFlow)
+  );
+  const [accountLoginFlow, setAccountLoginFlow] = useState<string | null>(null);
+  const [browserAccountsContext, setBrowserAccountsContext] = useState<BrowserAccountsContext | null>(null);
+  const [selectedBrowserAccount, setSelectedBrowserAccount] = useState<BrowserAccount | null>(null);
+  const [continueWithBrowserAccount, setContinueWithBrowserAccount] = useState<BrowserAccountContinuation | null>(null);
+  const [browserAccountContinuing, setBrowserAccountContinuing] = useState(false);
   const [lastInvitationCode, setLastInvitationCode] = useState("");
   const [verificationMessage, setVerificationMessage] = useState("");
   const [error, setError] = useState(() => authContextError(initialAuth, t));
   const [busy, setBusy] = useState(false);
 
   const userPermissions = user?.permissions ?? [];
+  const isTrialEnrollmentSession = user?.session_kind === "trial_enrollment"
+    || user?.login_code_level === "trial_enrollment";
+  const isAccountRecoverySession = user?.session_kind === "temporary_authorization_code"
+    || user?.login_code_level === "account_recovery";
+  const isRestrictedLoginCodeSession = isTrialEnrollmentSession || isAccountRecoverySession;
+  const canMutateAccount = Boolean(
+    user && !user.archived_at && !isRestrictedLoginCodeSession
+  );
   const authAccountSwitch = Boolean(authReturnTo && loginHintRequiresAccountSwitch(user, initialAuth.loginHint));
   const authCanCompleteWithCurrentUser = Boolean(
-    user && !user.archived_at && authReturnTo && !authAccountSwitch && !initialAuth.forceLogin
+    user
+    && authReturnTo
+    && !authAccountSwitch
+    && !initialAuth.forceLogin
+    && !initialAuth.isAuthPage
+    && !initialAuth.selectAccount
   );
+  const effectiveAccountFlow = accountLoginFlow ?? initialAuth.accountFlow;
+  const authFormsVisible = accountLoginExpanded || !selectedBrowserAccount;
   const hasPermission = (...permissions: string[]) =>
-    Boolean(user?.is_admin || permissions.some((permission) => userPermissions.includes(permission)));
-  const canAdmin = Boolean(user?.is_admin || userPermissions.length > 0);
+    permissions.some((permission) => userPermissions.includes(permission));
+  const canAdmin = !isRestrictedLoginCodeSession && userPermissions.length > 0;
   const canReadUsers = hasPermission("users.read", "users.manage", "organizations.manage", "security.manage");
   const canManageUsers = hasPermission("users.manage");
   const canReadClients = hasPermission("clients.read", "clients.manage");
@@ -1858,10 +460,7 @@ export function App() {
   const canManageIap = hasPermission("iap.manage");
   const canReadOrganizations = hasPermission(
     "organizations.read",
-    "organizations.manage",
-    "clients.manage",
-    "iap.read",
-    "iap.manage"
+    "organizations.manage"
   );
   const canManageOrganizations = hasPermission("organizations.manage");
   const canManageAuthorizationCodes = hasPermission("authorization_codes.manage");
@@ -1874,16 +473,108 @@ export function App() {
     setAuthEmail(value);
   }
 
+  function selectBrowserAccount(
+    account: BrowserAccount,
+    continuation: BrowserAccountContinuation
+  ) {
+    if (accountLoginFlow) {
+      const currentUrl = new URL(window.location.href);
+      currentUrl.searchParams.delete("account_flow");
+      window.history.replaceState(
+        window.history.state,
+        "",
+        `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`
+      );
+      setAccountLoginFlow(null);
+    }
+    setSelectedBrowserAccount(account);
+    setContinueWithBrowserAccount(() => continuation);
+    setAccountLoginExpanded(false);
+    setError("");
+    setVerificationMessage("");
+  }
+
+  function handleBrowserAccountsLoaded(
+    accounts: BrowserAccount[],
+    context: BrowserAccountsContext,
+    continuationForAccount?: (accountRef: string) => Promise<void>
+  ) {
+    setBrowserAccountsContext(context);
+    if (accounts.length === 0) {
+      setSelectedBrowserAccount(null);
+      setContinueWithBrowserAccount(null);
+      return;
+    }
+    if (accountLoginExpanded) return;
+    const next = accounts.find((account) => account.account_ref === selectedBrowserAccount?.account_ref)
+      ?? accounts[0];
+    setSelectedBrowserAccount(next);
+    if (continuationForAccount) {
+      setContinueWithBrowserAccount(() => () => continuationForAccount(next.account_ref));
+    }
+  }
+
+  async function continueSelectedBrowserAccount() {
+    if (!continueWithBrowserAccount) return;
+    setBrowserAccountContinuing(true);
+    setError("");
+    try {
+      await continueWithBrowserAccount();
+    } finally {
+      setBrowserAccountContinuing(false);
+    }
+  }
+
+  function openAnotherAccountLogin(loginUrl: string) {
+    const accountFlow = inlineAccountLoginFlow(loginUrl, authReturnTo ?? "/");
+    if (!accountFlow) {
+      throw new Error(t("browserAccountAddFailed"));
+    }
+    const currentUrl = new URL(window.location.href);
+    currentUrl.searchParams.set("account_flow", accountFlow);
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`
+    );
+    setAccountLoginFlow(accountFlow);
+    setAccountLoginExpanded(true);
+    setSelectedBrowserAccount(null);
+    setContinueWithBrowserAccount(null);
+    setAuthMode("login");
+    setLoginMethod("password");
+    setLoginPassword("");
+    setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
+    setLoginMfaChallengeId("");
+    setLoginMfaCode("");
+    setLoginRecoveryAvailable(false);
+    setLoginCaptchaChallengeId("");
+    setLoginCaptchaPrompt("");
+    setLoginCaptchaAnswer("");
+    setError("");
+    setVerificationMessage("");
+  }
+
   function finishInteractiveAuth(nextUser: User): boolean {
     setUser(nextUser);
-    if (!authReturnTo) return false;
-    if (loginHintRequiresAccountSwitch(nextUser, initialAuth.loginHint)) {
-      setSharedAuthEmail(initialAuth.loginHint);
-      setError(t("authAccountSwitch"));
+    if (!authReturnTo) {
+      // Explicit auth routes deliberately keep the unified chooser visible
+      // for an already authenticated visitor. Once this page itself has just
+      // completed a login or registration, however, retaining `auth=...`
+      // would strand the new session on the form instead of opening the app.
+      if (initialAuth.isAuthPage) {
+        window.location.replace("/");
+        return true;
+      }
       return false;
     }
-    if (nextUser.archived_at) {
-      setVerificationMessage(t("temporaryAccountReady"));
+    // An account-flow is created only after an explicit chooser action.  The
+    // backend consumes it atomically and, for reauthentication, verifies the
+    // expected user.  A login_hint remains a hint here rather than blocking a
+    // deliberate "use another account" sign-in.
+    if (!effectiveAccountFlow && loginHintRequiresAccountSwitch(nextUser, initialAuth.loginHint)) {
+      setSharedAuthEmail(initialAuth.loginHint);
+      setError(t("authAccountSwitch"));
       return false;
     }
     window.location.assign(authReturnTo);
@@ -1911,6 +602,9 @@ export function App() {
   async function loadBootstrap() {
     const next = await api<Bootstrap>("/api/public/bootstrap");
     setBootstrap(next);
+    if (!localStorage.getItem("gpt-sso-locale") && next.default_locale === "en-US") {
+      setLocale("en-US");
+    }
     const defaultDomain = next.login.email_domains[0];
     if (defaultDomain) {
       setAuthEmail((current) => {
@@ -1925,6 +619,7 @@ export function App() {
 
   async function loadMe() {
     const me = await api<User | null>("/api/me");
+    setApiCacheScope(me?.id ?? null);
     setUser(me);
   }
 
@@ -1948,85 +643,206 @@ export function App() {
     setMySessions(nextSessions);
   }
 
-  async function loadAdminData() {
-    if (!canAdmin) return;
-    const [
-      nextOverview,
-      nextUsers,
-      nextClients,
-      nextIapApplications,
-      nextInvitations,
-      nextRegistration,
-      nextProviders,
-      nextProviderTemplates,
-      nextLdapProviders,
-      nextRuntime,
-      nextLoginSettings,
-      nextAuditEvents,
-      nextAuditWebhooks,
-      nextPermissionCatalog,
-      nextRoles,
-      nextGroups,
-      nextOrganizations,
-      nextSecurityPolicy,
-      nextSigningKeys,
-      nextSettings
-    ] =
-      await Promise.all([
-        api<Overview>("/api/admin/overview"),
-        canReadUsers ? api<User[]>(`/api/admin/users?status=${userFilter}`) : Promise.resolve([]),
-        canReadClients ? api<Client[]>("/api/admin/clients") : Promise.resolve([]),
-        canReadIap ? api<IapApplication[]>("/api/admin/iap-applications") : Promise.resolve([]),
-        canManageAuthorizationCodes ? api<Invitation[]>(AUTHORIZATION_CODES_API) : Promise.resolve([]),
-        canManageSettings ? api<RegistrationSettings>("/api/admin/registration-settings") : Promise.resolve(null),
-        canManageProviders ? api<ExternalProvider[]>("/api/admin/external-oidc-providers") : Promise.resolve([]),
-        canManageProviders ? api<ExternalProviderTemplate[]>("/api/admin/external-oidc-provider-templates") : Promise.resolve([]),
-        canManageProviders ? api<LdapProvider[]>("/api/admin/ldap-providers") : Promise.resolve([]),
-        canManageSettings ? api<RuntimeSettings>("/api/admin/runtime-settings") : Promise.resolve(null),
-        canManageSettings ? api<LoginSettings>("/api/admin/login-settings") : Promise.resolve(null),
-        canReadAudit ? api<AuditEvent[]>("/api/admin/audit-events") : Promise.resolve([]),
-        (canReadAudit || canManageSecurity) ? api<AuditWebhook[]>("/api/admin/audit-webhooks") : Promise.resolve([]),
-        canManageSecurity ? api<PermissionInfo[]>("/api/admin/access/permissions") : Promise.resolve([]),
-        canManageSecurity ? api<Role[]>("/api/admin/access/roles") : Promise.resolve([]),
-        canManageSecurity ? api<AccessGroup[]>("/api/admin/access/groups") : Promise.resolve([]),
-        (canReadOrganizations || canManageProviders) ? api<Organization[]>("/api/admin/organizations") : Promise.resolve([]),
-        canManageSecurity ? api<SecurityPolicy>("/api/admin/security-policy") : Promise.resolve(null),
-        canManageSecurity ? api<SigningKey[]>("/api/admin/signing-keys") : Promise.resolve([]),
-        canManageSettings ? api<SettingsSummary>("/api/admin/settings") : Promise.resolve(null)
-      ]);
-    setOverview(nextOverview);
-    setUsers(sortUsersForDisplay(nextUsers));
-    setClients(nextClients);
-    setIapApplications(nextIapApplications);
-    setInvitations(nextInvitations);
-    setRegistrationSettings(nextRegistration);
-    setProviders(nextProviders);
-    setProviderTemplates(nextProviderTemplates);
-    setLdapProviders(nextLdapProviders);
-    setAuditEvents(nextAuditEvents);
-    setAuditWebhooks(nextAuditWebhooks);
-    setPermissionCatalog(nextPermissionCatalog);
-    setRoles(nextRoles);
-    setGroups(nextGroups);
-    setOrganizations(nextOrganizations);
-    setSecurityPolicy(nextSecurityPolicy);
-    setSigningKeys(nextSigningKeys);
-    setRuntimeSettings(nextRuntime);
-    setLoginSettings(nextLoginSettings);
-    if (nextLoginSettings) {
-      setLoginSettingsDraft({
-        email_domains: nextLoginSettings.email_domains.join("\n"),
-        quick_links: nextLoginSettings.quick_links
-      });
-    } else {
-      setLoginSettingsDraft({ email_domains: "", quick_links: [] });
+  function usersListPath() {
+    const params = new URLSearchParams({ status: userFilter });
+    if (userOrganizationFilter) params.set("organization_id", userOrganizationFilter);
+    if (userLinkedIdentityFilter !== "all") params.set("linked_identity", userLinkedIdentityFilter);
+    return `/api/admin/users?${params.toString()}`;
+  }
+
+  function hasCachedAdminTab(targetTab: Tab): boolean {
+    switch (targetTab) {
+      case "overview": return cachedApiValue<Overview>("/api/admin/overview") !== undefined;
+      case "users": return cachedApiValue<User[]>(usersListPath()) !== undefined;
+      case "clients": return cachedApiValue<Client[]>("/api/admin/clients") !== undefined;
+      case "iap": return cachedApiValue<IapApplication[]>("/api/admin/iap-applications") !== undefined;
+      case "organizations": return cachedApiValue<Organization[]>("/api/admin/organizations") !== undefined;
+      case "invitations": return cachedApiValue<Invitation[]>(AUTHORIZATION_CODES_API) !== undefined;
+      case "registration": return cachedApiValue<RegistrationSettings>("/api/admin/registration-settings") !== undefined;
+      case "providers": return cachedApiValue<ExternalProvider[]>("/api/admin/external-oidc-providers") !== undefined;
+      case "portal": return cachedApiValue<LoginSettings>("/api/admin/login-settings") !== undefined;
+      case "security": return (
+        (canManageSecurity && cachedApiValue<SecurityPolicy>("/api/admin/security-policy") !== undefined)
+        || (canReadAudit && cachedApiValue<AuditEvent[]>("/api/admin/audit-events") !== undefined)
+        || cachedApiValue<AuditWebhook[]>("/api/admin/audit-webhooks") !== undefined
+      );
+      case "settings": return cachedApiValue<RuntimeSettings>("/api/admin/runtime-settings") !== undefined;
+      case "account": return false;
     }
-    setSettings(nextSettings);
+  }
+
+  async function loadAdminData(targetTab: Tab = tab, options: { force?: boolean } = {}) {
+    if (!canAdmin || targetTab === "account") return;
+    const loadId = ++adminLoadId.current;
+    const isCurrent = () => adminLoadId.current === loadId;
+    const cacheAvailable = !options.force && hasCachedAdminTab(targetTab);
+    setAdminLoading(!cacheAvailable);
+
+    async function loadCached<T>(path: string, apply: (value: T) => void): Promise<T> {
+      const cached = cachedApiValue<T>(path);
+      if (cached !== undefined && isCurrent()) apply(cached);
+      const result = await cachedApi<T>(path, { force: options.force });
+      if (isCurrent() && (result.changed || cached === undefined)) apply(result.value);
+      return result.value;
+    }
+
+    try {
+      switch (targetTab) {
+        case "overview": {
+          await loadCached<Overview>("/api/admin/overview", setOverview);
+          break;
+        }
+        case "users": {
+          if (!canReadUsers) break;
+          await Promise.all([
+            loadCached<User[]>(usersListPath(), (next) => setUsers(sortUsersForDisplay(next))),
+            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions).catch(() => undefined)
+          ]);
+          break;
+        }
+        case "clients": {
+          if (!canReadClients) break;
+          await Promise.all([
+            loadCached<Client[]>("/api/admin/clients", setClients),
+            canManageClients
+              ? loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
+              : Promise.resolve(undefined)
+          ]);
+          break;
+        }
+        case "iap": {
+          if (!canReadIap) break;
+          await Promise.all([
+            loadCached<IapApplication[]>("/api/admin/iap-applications", setIapApplications),
+            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
+          ]);
+          break;
+        }
+        case "organizations": {
+          if (!canReadOrganizations) break;
+          await Promise.all([
+            loadCached<Organization[]>("/api/admin/organizations", (next) => {
+              setOrganizations(next);
+              setOrganizationOptions(next.map(({ id, slug, name, is_active }) => ({ id, slug, name, is_active })));
+            }),
+            canManageOrganizations
+              ? loadCached<User[]>("/api/admin/users?status=live", (next) => setUsers(sortUsersForDisplay(next)))
+              : Promise.resolve(undefined)
+          ]);
+          break;
+        }
+        case "invitations": {
+          if (!canManageAuthorizationCodes) break;
+          await Promise.all([
+            loadCached<Invitation[]>(AUTHORIZATION_CODES_API, setInvitations),
+            // An authorization-code manager needs only minimal organization
+            // metadata. Older servers may deny these two optional lists.
+            loadCached<Client[]>("/api/admin/clients", setClients).catch(() => undefined),
+            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions).catch(() => undefined)
+          ]);
+          break;
+        }
+        case "registration": {
+          if (!canManageSettings) break;
+          await loadCached<RegistrationSettings>("/api/admin/registration-settings", setRegistrationSettings);
+          break;
+        }
+        case "providers": {
+          if (!canManageProviders) break;
+          await Promise.all([
+            loadCached<ExternalProvider[]>("/api/admin/external-oidc-providers", setProviders),
+            loadCached<ExternalProviderTemplate[]>("/api/admin/external-oidc-provider-templates", setProviderTemplates),
+            loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders),
+            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
+          ]);
+          break;
+        }
+        case "portal": {
+          if (!canManageSettings) break;
+          await loadCached<LoginSettings>("/api/admin/login-settings", (next) => {
+            setLoginSettings(next);
+            setLoginSettingsDraft({
+              brand_logo_url: next.brand_logo_url,
+              email_domains: next.email_domains.join("\n"),
+              quick_links: next.quick_links
+            });
+          });
+          break;
+        }
+        case "security": {
+          if (!canManageSecurity && !canReadAudit) break;
+          await Promise.all([
+            canManageSecurity
+              ? loadCached<SecurityPolicy>("/api/admin/security-policy", setSecurityPolicy)
+              : Promise.resolve(undefined),
+            canManageSecurity
+              ? loadCached<SigningKey[]>("/api/admin/signing-keys", setSigningKeys)
+              : Promise.resolve(undefined),
+            canManageSecurity
+              ? loadCached<PermissionInfo[]>("/api/admin/access/permissions", setPermissionCatalog)
+              : Promise.resolve(undefined),
+            canManageSecurity
+              ? loadCached<Role[]>("/api/admin/access/roles", setRoles)
+              : Promise.resolve(undefined),
+            canManageSecurity
+              ? loadCached<AccessGroup[]>("/api/admin/access/groups", setGroups)
+              : Promise.resolve(undefined),
+            canManageSecurity
+              ? loadCached<User[]>("/api/admin/users?status=live", (next) => setUsers(sortUsersForDisplay(next)))
+              : Promise.resolve(undefined),
+            canReadAudit
+              ? loadCached<AuditEvent[]>("/api/admin/audit-events", setAuditEvents)
+              : Promise.resolve(undefined),
+            loadCached<AuditWebhook[]>("/api/admin/audit-webhooks", setAuditWebhooks)
+          ]);
+          break;
+        }
+        case "settings": {
+          if (!canManageSettings) break;
+          await Promise.all([
+            loadCached<RuntimeSettings>("/api/admin/runtime-settings", setRuntimeSettings),
+            loadCached<SettingsSummary>("/api/admin/settings", setSettings)
+          ]);
+          break;
+        }
+      }
+    } catch (err) {
+      // Preserve a usable stale view when the optional background validation
+      // is temporarily offline. Authorization and validation failures still
+      // surface immediately instead of leaving a now-forbidden view visible.
+      if (
+        cacheAvailable
+        && !options.force
+        && (!(err instanceof ApiError) || err.status === 0 || err.status >= 500)
+      ) return;
+      throw err;
+    } finally {
+      if (isCurrent()) setAdminLoading(false);
+    }
+  }
+
+  async function initialize() {
+    setInitialLoadError("");
+    try {
+      await Promise.all([loadBootstrap(), loadMe()]);
+    } catch (err) {
+      setUser(null);
+      setInitialLoadError(messageOr(err, "loadFailed"));
+    }
   }
 
   useEffect(() => {
-    Promise.all([loadBootstrap(), loadMe()]).catch(() => setUser(null));
+    void initialize();
   }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("gpt-sso-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     if (authCanCompleteWithCurrentUser && authReturnTo) {
@@ -2035,12 +851,143 @@ export function App() {
   }, [authCanCompleteWithCurrentUser, authReturnTo]);
 
   useEffect(() => {
-    loadAccountData().catch((err) => setError(err.message));
-  }, [user?.id]);
+    if (initialAuth.isAuthPage) return;
+    loadAccountData().catch((err) => setError(messageOr(err, "loadFailed")));
+  }, [initialAuth.isAuthPage, user?.id]);
 
   useEffect(() => {
-    loadAdminData().catch((err) => setError(err.message));
-  }, [canAdmin, userFilter]);
+    if (!canAdmin || initialAuth.isAuthPage) return;
+    loadAdminData(tab === "account" ? "overview" : tab).catch((err) =>
+      setError(messageOr(err, "loadFailed"))
+    );
+  }, [canAdmin, initialAuth.isAuthPage, tab, userFilter, userOrganizationFilter, userLinkedIdentityFilter]);
+
+  useEffect(() => {
+    const authorizationCode = registerForm.authorization_code.trim();
+    if (!bootstrap?.has_users || authMode !== "register" || !authorizationCode) {
+      setRegistrationCodeInspection(null);
+      setRegistrationCodeInspecting(false);
+      return;
+    }
+    let current = true;
+    setRegistrationCodeInspection(null);
+    setRegistrationCodeInspecting(true);
+    const timer = window.setTimeout(() => {
+      void api<AuthorizationCodeInspection>("/api/public/authorization-code/inspect", {
+        method: "POST",
+        body: JSON.stringify({ authorization_code: authorizationCode })
+      }).then((inspection) => {
+        if (current) setRegistrationCodeInspection(inspection);
+      }).catch(() => {
+        // The final registration request always re-checks the code.  Keep a
+        // transient inspection failure separate from an unavailable code so a
+        // network hiccup never becomes a client-side authorization decision.
+        if (current) setRegistrationCodeInspection(null);
+      }).finally(() => {
+        if (current) setRegistrationCodeInspecting(false);
+      });
+    }, 350);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
+  }, [authMode, bootstrap?.has_users, registerForm.authorization_code]);
+
+  useEffect(() => {
+    if (userOrganizationFilter) setUserFiltersExpanded(true);
+  }, [userOrganizationFilter]);
+
+  useEffect(() => {
+    setSelectedUserIds([]);
+  }, [
+    searchQuery,
+    userFilter,
+    userOrganizationFilter,
+    userLinkedIdentityFilter,
+    userEmailFilter,
+    userRoleFilter,
+    userRegistrationFrom,
+    userRegistrationTo,
+    userLastLoginFrom,
+    userLastLoginTo,
+    userPhoneFilter,
+    userLoginRegionFilter
+  ]);
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      const next = initialTab();
+      setTab(next);
+      setSidebarOpen(false);
+    };
+    window.addEventListener("hashchange", handleHashChange);
+    window.addEventListener("popstate", handleHashChange);
+    return () => {
+      window.removeEventListener("hashchange", handleHashChange);
+      window.removeEventListener("popstate", handleHashChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!sidebarOpen || !sidebarRef.current) return;
+    const sidebar = sidebarRef.current;
+    const previousOverflow = document.body.style.overflow;
+    const focusableElements = () => [...sidebar.querySelectorAll<HTMLElement>(
+      "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+    )].filter((element) => element.getClientRects().length > 0);
+    const focusFrame = window.requestAnimationFrame(() => focusableElements()[0]?.focus());
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = focusableElements();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      window.requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
+    };
+  }, [sidebarOpen]);
+
+  useEffect(() => {
+    if (!user || !verificationMessage) return;
+    const timer = window.setTimeout(() => setVerificationMessage(""), 4200);
+    return () => window.clearTimeout(timer);
+  }, [user, verificationMessage]);
+
+  useEffect(() => {
+    if (editor) setError("");
+  }, [editor]);
+
+  function changeLoginMethod(next: LoginMethod) {
+    setLoginMethod(next);
+    setError("");
+    setLoginMfaChallengeId("");
+    setLoginMfaCode("");
+    setLoginRecoveryAvailable(false);
+    setLoginCaptchaChallengeId("");
+    setLoginCaptchaPrompt("");
+    setLoginCaptchaAnswer("");
+  }
 
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
@@ -2056,9 +1003,14 @@ export function App() {
           mfa_code: loginMfaCode || null,
           captcha_challenge_id: loginCaptchaChallengeId || null,
           captcha_answer: loginCaptchaAnswer || null,
-          return_to: authReturnTo
+          return_to: authReturnTo,
+          account_flow: effectiveAccountFlow
         })
       });
+      if ("continue_to" in result) {
+        window.location.assign(result.continue_to);
+        return;
+      }
       if (result.captcha_required) {
         setLoginCaptchaChallengeId(result.captcha_challenge_id ?? "");
         setLoginCaptchaPrompt(result.captcha_prompt ?? "");
@@ -2090,6 +1042,36 @@ export function App() {
     }
   }
 
+  async function handleAuthorizationCodeLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<LoginResponse>("/api/login/authorization-code", {
+        method: "POST",
+        body: JSON.stringify({
+          email: authorizationCodeLoginForm.email.trim(),
+          authorization_code: authorizationCodeLoginForm.authorization_code.trim(),
+          return_to: authReturnTo,
+          account_flow: effectiveAccountFlow
+        })
+      });
+      if (result.mode === "oidc_continuation") {
+        setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
+        window.location.assign(result.continue_to);
+        return;
+      }
+      if (!result.user) throw new Error(t("authorizationCodeLoginFailed"));
+      setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
+      if (finishInteractiveAuth(result.user)) return;
+      await loadBootstrap();
+    } catch (err) {
+      setError(messageOr(err, "authorizationCodeLoginFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handlePasskeyLogin() {
     setBusy(true);
     setError("");
@@ -2099,19 +1081,24 @@ export function App() {
       }
       const start = await api<PasskeyAuthenticationStart>("/api/passkeys/authentication/start", {
         method: "POST",
-        body: JSON.stringify({ email: authEmail })
+        body: JSON.stringify({ email: authEmail, account_flow: effectiveAccountFlow })
       });
       const credential = await navigator.credentials.get(passkeyRequestOptions(start.public_key));
       if (!credential || credential.type !== "public-key") {
         throw new Error(t("passkeyLoginFailed"));
       }
-      const result = await api<{ user: User }>("/api/passkeys/authentication/finish", {
+      const result = await api<{ user: User } | OidcContinuationLoginResponse>("/api/passkeys/authentication/finish", {
         method: "POST",
         body: JSON.stringify({
           challenge_id: start.challenge_id,
-          credential: authenticationCredentialJson(credential as PublicKeyCredential)
+          credential: authenticationCredentialJson(credential as PublicKeyCredential),
+          account_flow: effectiveAccountFlow
         })
       });
+      if ("continue_to" in result) {
+        window.location.assign(result.continue_to);
+        return;
+      }
       setLoginMfaChallengeId("");
       setLoginMfaCode("");
       setLoginRecoveryAvailable(false);
@@ -2133,7 +1120,7 @@ export function App() {
       bootstrap?.has_users
       && !bootstrap.registration.allow_password_registration
       && !bootstrap.registration.require_invitation
-      && !registerForm.authorization_code.trim()
+      && !isCodeOnlyRegistration
     ) {
       setError(t("passwordRegistrationUnavailable"));
       return;
@@ -2141,26 +1128,34 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      const body: Record<string, string | null> = {
-        display_name: registerForm.display_name || null,
-        authorization_code: registerForm.authorization_code || null
-      };
-      if (!authorizationCodeRegistration || authEmail.trim()) {
-        body.email = authEmail;
-      }
-      if (!authorizationCodeRegistration || registerForm.username.trim()) {
-        body.username = registerForm.username;
-      }
-      if (!authorizationCodeRegistration) {
-        body.phone = registerForm.phone || null;
-        body.password = registerForm.password;
-        body.email_code = registerForm.email_code || null;
-        body.phone_code = registerForm.phone_code || null;
-      }
-      const result = await api<{ user: User; first_admin: boolean }>("/api/register", {
+      const body: Record<string, string | null> = isCodeOnlyRegistration
+        ? {
+            // The server has classified this as an enrollment code.  Do not
+            // manufacture usernames, passwords or code rules in the browser.
+            email: authEmail,
+            authorization_code: registerForm.authorization_code.trim() || null,
+            account_flow: effectiveAccountFlow
+          }
+        : {
+            email: authEmail,
+            username: registerForm.username,
+            display_name: registerForm.display_name || null,
+            phone: registerForm.phone || null,
+            password: registerForm.password,
+            email_code: registerForm.email_code || null,
+            phone_code: registerForm.phone_code || null,
+            authorization_code: registerForm.authorization_code || null,
+            account_flow: effectiveAccountFlow
+          };
+      const result = await api<{ user: User; first_admin: boolean } | OidcContinuationLoginResponse>("/api/register", {
         method: "POST",
         body: JSON.stringify(body)
       });
+      if ("continue_to" in result) {
+        setRegisterForm(emptyRegisterForm);
+        window.location.assign(result.continue_to);
+        return;
+      }
       if (finishInteractiveAuth(result.user)) return;
       setRegisterForm(emptyRegisterForm);
       await loadBootstrap();
@@ -2172,9 +1167,8 @@ export function App() {
   }
 
   async function sendVerification(channel: "email" | "phone") {
-    setError("");
     const target = channel === "email" ? authEmail : registerForm.phone;
-    try {
+    await runUiAction(async () => {
       const result = await api<{ dev_code: string | null; expires_at: number }>("/api/register/verification/start", {
         method: "POST",
         body: JSON.stringify({ channel, target })
@@ -2188,14 +1182,11 @@ export function App() {
       if (channel === "phone" && result.dev_code) {
         setRegisterForm({ ...registerForm, phone_code: result.dev_code });
       }
-    } catch (err) {
-      setError(messageOr(err, "sendVerificationFailed"));
-    }
+    }, "sendVerificationFailed");
   }
 
   async function sendPasswordResetCode() {
-    setError("");
-    try {
+    await runUiAction(async () => {
       const result = await api<{ dev_code: string | null; expires_at: number }>("/api/password-reset/start", {
         method: "POST",
         body: JSON.stringify({ email: authEmail })
@@ -2206,9 +1197,7 @@ export function App() {
       if (result.dev_code) {
         setPasswordResetForm({ ...passwordResetForm, code: result.dev_code });
       }
-    } catch (err) {
-      setError(messageOr(err, "sendResetCodeFailed"));
-    }
+    }, "sendResetCodeFailed");
   }
 
   async function handlePasswordReset(event: FormEvent) {
@@ -2266,11 +1255,42 @@ export function App() {
     await copyTextToClipboard(email, "copiedEmail", "copyEmailUnavailable");
   }
 
+  async function runUiAction(
+    action: () => Promise<void>,
+    fallback: TranslationKey = "operationFailed"
+  ): Promise<boolean> {
+    setBusy(true);
+    setError("");
+    try {
+      await action();
+      return true;
+    } catch (err) {
+      setError(messageOr(err, fallback));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleLogout() {
-    const result = await api<LogoutResponse>("/api/logout", { method: "POST" });
-    deliverFrontchannelLogout(result.frontchannel_logout_frames);
-    setUser(null);
-    await loadBootstrap();
+    await runUiAction(async () => {
+      const result = await api<LogoutResponse>("/api/logout", { method: "POST" });
+      deliverFrontchannelLogout(result.frontchannel_logout_frames);
+      setUser(null);
+      await loadBootstrap();
+    });
+  }
+
+  async function openAccountSwitcher() {
+    const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}` || "/";
+    setBusy(true);
+    setError("");
+    try {
+      window.location.assign(await startBrowserAccountLogin(returnTo));
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : t("browserAccountAddFailed"));
+      setBusy(false);
+    }
   }
 
   async function saveUser(event: FormEvent) {
@@ -2293,6 +1313,8 @@ export function App() {
         await api<User>("/api/admin/users", { method: "POST", body });
       }
       setUserForm(emptyUserForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveUserFailed"));
@@ -2301,14 +1323,95 @@ export function App() {
     }
   }
 
+  function openBulkUserImport() {
+    setBulkImportOpen(true);
+    setBulkImportError("");
+  }
+
+  function closeBulkUserImport() {
+    if (busy) return;
+    setBulkImportOpen(false);
+    setBulkImportError("");
+  }
+
+  function resetBulkUserImport() {
+    setBulkImportCsv("");
+    setBulkImportFileName("");
+    setBulkImportDryRun(true);
+    setBulkImportCommitConfirmed(false);
+    setBulkImportResult(null);
+    setBulkImportError("");
+  }
+
+  async function readBulkUserImportFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    // Let the same file be selected again after an accidental choice.
+    event.currentTarget.value = "";
+    if (!file) return;
+    try {
+      const csv = await file.text();
+      setBulkImportCsv(csv);
+      setBulkImportFileName(file.name);
+      setBulkImportResult(null);
+      setBulkImportError("");
+    } catch {
+      setBulkImportError(t("bulkImportFileReadFailed"));
+    }
+  }
+
+  async function submitBulkUserImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!bulkImportCsv.trim()) {
+      setBulkImportError(t("bulkImportCsvRequired"));
+      return;
+    }
+    if (!bulkImportDryRun && !bulkImportCommitConfirmed) {
+      setBulkImportError(t("bulkImportCommitConfirmationRequired"));
+      return;
+    }
+    setBusy(true);
+    setBulkImportError("");
+    try {
+      const result = await api<BulkUserImportResult>(
+        `${BULK_USER_IMPORT_API}?dry_run=${bulkImportDryRun ? "true" : "false"}`,
+        {
+          method: "POST",
+          headers: { "content-type": "text/csv" },
+          body: bulkImportCsv
+        }
+      );
+      setBulkImportResult(result);
+      if (result.committed) {
+        setVerificationMessage(t("bulkImportCompleted"));
+        await loadAdminData("users");
+      } else {
+        setVerificationMessage(t("bulkImportDryRunComplete"));
+      }
+    } catch (err) {
+      if (err instanceof ApiError && isBulkUserImportResult(err.body)) {
+        setBulkImportResult(err.body);
+        setBulkImportError(t("bulkImportValidationFailed"));
+      } else {
+        setBulkImportError(messageOr(err, "bulkImportFailed"));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function showUserDetails(id: string) {
-    setSelectedUser(await api<UserDetail>(`/api/admin/users/${id}`));
+    await runUiAction(async () => {
+      setSelectedUser(await api<UserDetail>(`/api/admin/users/${id}`));
+    });
   }
 
   async function enableUser(id: string) {
-    await api(`/api/admin/users/${id}/enable`, { method: "POST" });
-    await loadAdminData();
-    if (selectedUser?.user.id === id) setSelectedUser(null);
+    const completed = await runUiAction(async () => {
+      await api(`/api/admin/users/${id}/enable`, { method: "POST" });
+      await loadAdminData();
+      if (selectedUser?.user.id === id) setSelectedUser(null);
+    });
+    if (completed) setVerificationMessage(t("operationCompleted"));
   }
 
   async function advanceUserLifecycle(id: string) {
@@ -2326,6 +1429,7 @@ export function App() {
       const body = JSON.stringify({
         client_id: clientForm.client_id,
         client_name: clientForm.client_name,
+        logo_uri: clientForm.logo_uri,
         organization_id: clientForm.organization_id || null,
         client_secret: clientForm.client_secret || null,
         redirect_uris: splitList(clientForm.redirect_uris),
@@ -2374,12 +1478,23 @@ export function App() {
         await api<Client>("/api/admin/clients", { method: "POST", body });
       }
       setClientForm(emptyClientForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveClientFailed"));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function deleteClient(id: string) {
+    await api(`/api/admin/clients/${id}`, { method: "DELETE" });
+    if (clientForm.id === id) {
+      setClientForm(emptyClientForm);
+      setEditor(null);
+    }
+    await loadAdminData("clients");
   }
 
   function addClientClaimMapper() {
@@ -2433,6 +1548,8 @@ export function App() {
         await api<IapApplication>("/api/admin/iap-applications", { method: "POST", body });
       }
       setIapApplicationForm(emptyIapApplicationForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveIapApplicationFailed"));
@@ -2464,15 +1581,58 @@ export function App() {
 
   async function saveInvitation(event: FormEvent) {
     event.preventDefault();
+    const editingInvitation = Boolean(invitationForm.id);
+    const isAccountRecoveryCode = invitationForm.code_type === "login"
+      && invitationForm.login_code_level === "account_recovery";
+    const isTrialEnrollmentCode = invitationForm.code_type === "login"
+      && invitationForm.login_code_level === "trial_enrollment";
+    const isAdminUniversalCode = invitationForm.code_type === "login"
+      && invitationForm.login_code_level === "admin_universal";
+    const isApplicationBoundLoginCode = isTrialEnrollmentCode || isAdminUniversalCode;
+    if (isAccountRecoveryCode && !invitationForm.authorized_username.trim()) {
+      setError(t("loginCodeUsernameRequired"));
+      return;
+    }
+    if (isAdminUniversalCode && !user?.is_admin) {
+      setError(t("adminUniversalCodeAdminOnly"));
+      return;
+    }
+    if (isApplicationBoundLoginCode && invitationForm.allowed_client_ids.length === 0) {
+      setError(t(isTrialEnrollmentCode ? "trialEnrollmentApplicationsRequired" : "allowedApplicationsRequired"));
+      return;
+    }
+    if (isTrialEnrollmentCode && !canManageOrganizations) {
+      setError(t("trialEnrollmentOrganizationManageRequired"));
+      return;
+    }
+    if (isTrialEnrollmentCode && !invitationForm.organization_id) {
+      setError(t("trialEnrollmentOrganizationRequired"));
+      return;
+    }
+    if (isTrialEnrollmentCode && !invitationForm.organization_role) {
+      setError(t("trialEnrollmentRoleRequired"));
+      return;
+    }
+    if (isTrialEnrollmentCode && (!invitationForm.expires_at || !invitationForm.max_uses)) {
+      setError(t("trialEnrollmentLimitsRequired"));
+      return;
+    }
     setBusy(true);
     setError("");
     setLastInvitationCode("");
     try {
       const body = JSON.stringify({
+        code_type: invitationForm.code_type,
+        login_code_level: invitationForm.code_type === "login" ? invitationForm.login_code_level : null,
+        allowed_client_ids: isApplicationBoundLoginCode ? invitationForm.allowed_client_ids : [],
+        organization_id: isTrialEnrollmentCode ? invitationForm.organization_id : null,
+        organization_role: isTrialEnrollmentCode ? invitationForm.organization_role : null,
         description: invitationForm.description || null,
-        authorized_email: invitationForm.authorized_email || null,
-        authorized_username: invitationForm.authorized_username || null,
-        authorized_display_name: invitationForm.authorized_display_name || null,
+        authorized_email: invitationForm.code_type === "login" ? null : invitationForm.authorized_email || null,
+        authorized_username: isApplicationBoundLoginCode ? null : invitationForm.authorized_username || null,
+        authorized_display_name: invitationForm.code_type === "registration"
+          ? invitationForm.authorized_display_name || null
+          : null,
         expires_at: toTimestamp(invitationForm.expires_at),
         max_uses: invitationForm.max_uses ? Number(invitationForm.max_uses) : null,
         is_active: invitationForm.is_active
@@ -2487,6 +1647,9 @@ export function App() {
         setLastInvitationCode(result.code);
       }
       setInvitationForm(emptyInvitationForm);
+      // Keep a newly-created code visible so it can be copied once; edits can
+      // return straight to the list.
+      setEditor(editingInvitation ? null : "invitation");
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveInvitationFailed"));
@@ -2508,6 +1671,75 @@ export function App() {
     );
   }
 
+  async function revealInvitationCode(invitation: Invitation) {
+    if (!invitation.can_reveal) return;
+    setRevealedInvitation(invitation);
+    setRevealedInvitationCode("");
+    setInvitationRevealError("");
+    setRevealingInvitationId(invitation.id);
+    try {
+      const result = await api<{ code: string }>(
+        `${AUTHORIZATION_CODES_API}/${encodeURIComponent(invitation.id)}/reveal`,
+        { method: "POST" }
+      );
+      setRevealedInvitationCode(result.code);
+    } catch (err) {
+      setInvitationRevealError(messageOr(err, "revealAuthorizationCodeFailed"));
+    } finally {
+      setRevealingInvitationId("");
+    }
+  }
+
+  function closeInvitationReveal() {
+    setRevealedInvitation(null);
+    setRevealedInvitationCode("");
+    setInvitationRevealError("");
+    setRevealingInvitationId("");
+  }
+
+  async function loadInvitationRedemptions(invitation: Invitation, cursor: string | null = null) {
+    const loadId = ++invitationRedemptionsLoadId.current;
+    setInvitationRedemptionsLoading(true);
+    setInvitationRedemptionsError("");
+    if (!cursor) {
+      setInvitationRedemptions([]);
+      setInvitationRedemptionsNextCursor(null);
+    }
+    try {
+      const query = new URLSearchParams({ limit: "50" });
+      if (cursor) query.set("cursor", cursor);
+      const result = await api<InvitationRedemptionsPage>(
+        `${AUTHORIZATION_CODES_API}/${encodeURIComponent(invitation.id)}/redemptions?${query.toString()}`
+      );
+      if (loadId !== invitationRedemptionsLoadId.current) return;
+      setInvitationRedemptions((existing) => cursor
+        ? [...existing, ...result.redemptions]
+        : result.redemptions
+      );
+      setInvitationRedemptionsNextCursor(result.next_cursor);
+    } catch (err) {
+      if (loadId === invitationRedemptionsLoadId.current) {
+        setInvitationRedemptionsError(messageOr(err, "loadAuthorizationCodeRedemptionsFailed"));
+      }
+    } finally {
+      if (loadId === invitationRedemptionsLoadId.current) setInvitationRedemptionsLoading(false);
+    }
+  }
+
+  function openInvitationRedemptions(invitation: Invitation) {
+    setRedemptionsInvitation(invitation);
+    void loadInvitationRedemptions(invitation);
+  }
+
+  function closeInvitationRedemptions() {
+    invitationRedemptionsLoadId.current += 1;
+    setRedemptionsInvitation(null);
+    setInvitationRedemptions([]);
+    setInvitationRedemptionsNextCursor(null);
+    setInvitationRedemptionsLoading(false);
+    setInvitationRedemptionsError("");
+  }
+
   async function saveRole(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -2524,6 +1756,8 @@ export function App() {
         await api<Role>("/api/admin/access/roles", { method: "POST", body });
       }
       setRoleForm(emptyRoleForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
       if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
     } catch (err) {
@@ -2571,6 +1805,8 @@ export function App() {
         body: JSON.stringify({ user_ids: groupForm.user_ids })
       });
       setGroupForm(emptyGroupForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
       if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
     } catch (err) {
@@ -2599,6 +1835,7 @@ export function App() {
 
   async function saveOrganization(event: FormEvent) {
     event.preventDefault();
+    if (organizationMembersLoading) return;
     setBusy(true);
     setError("");
     try {
@@ -2618,8 +1855,12 @@ export function App() {
           members: Object.entries(organizationMemberRoles).map(([user_id, role]) => ({ user_id, role }))
         })
       });
+      organizationMembersLoadId.current += 1;
       setOrganizationForm(emptyOrganizationForm);
       setOrganizationMemberRoles({});
+      setOrganizationMembersLoading(false);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveOrganizationFailed"));
@@ -2628,7 +1869,8 @@ export function App() {
     }
   }
 
-  function editOrganization(organization: Organization) {
+  async function editOrganization(organization: Organization) {
+    const loadId = ++organizationMembersLoadId.current;
     setOrganizationForm({
       id: organization.id,
       slug: organization.slug,
@@ -2637,9 +1879,24 @@ export function App() {
       allowed_email_domains: organization.allowed_email_domains.join("\n"),
       is_active: organization.is_active
     });
-    setOrganizationMemberRoles(
-      Object.fromEntries(organization.members.map((member) => [member.user_id, member.role]))
-    );
+    setOrganizationMemberRoles({});
+    setOrganizationMembersLoading(true);
+    setEditor("organization");
+    try {
+      const members = await api<OrganizationMember[]>(`/api/admin/organizations/${organization.id}/members`);
+      if (loadId !== organizationMembersLoadId.current) return;
+      setOrganizationMemberRoles(
+        Object.fromEntries(members.map((member) => [member.user_id, member.role]))
+      );
+    } catch (err) {
+      if (loadId === organizationMembersLoadId.current) {
+        setError(messageOr(err, "loadFailed"));
+      }
+    } finally {
+      if (loadId === organizationMembersLoadId.current) {
+        setOrganizationMembersLoading(false);
+      }
+    }
   }
 
   function setOrganizationMemberRole(userId: string, role: string | null) {
@@ -2657,16 +1914,18 @@ export function App() {
   async function deleteOrganization(id: string) {
     await api(`/api/admin/organizations/${id}`, { method: "DELETE" });
     if (organizationForm.id === id) {
+      organizationMembersLoadId.current += 1;
       setOrganizationForm(emptyOrganizationForm);
       setOrganizationMemberRoles({});
+      setOrganizationMembersLoading(false);
     }
     await loadAdminData();
   }
 
   async function loadUserAccess(id: string) {
     setSelectedAccessUserId(id);
+    setUserAccess(null);
     if (!id) {
-      setUserAccess(null);
       return;
     }
     setUserAccess(await api<UserAccess>(`/api/admin/users/${id}/access`));
@@ -2674,29 +1933,28 @@ export function App() {
 
   async function saveUserRoles() {
     if (!selectedAccessUserId || !userAccess) return;
-    const updated = await api<UserAccess>(`/api/admin/users/${selectedAccessUserId}/roles`, {
-      method: "PUT",
-      body: JSON.stringify({ role_ids: userAccess.direct_roles.map((role) => role.id) })
+    const completed = await runUiAction(async () => {
+      const updated = await api<UserAccess>(`/api/admin/users/${selectedAccessUserId}/roles`, {
+        method: "PUT",
+        body: JSON.stringify({ role_ids: userAccess.direct_roles.map((role) => role.id) })
+      });
+      setUserAccess(updated);
+      await loadAdminData();
     });
-    setUserAccess(updated);
-    await loadAdminData();
+    if (completed) setVerificationMessage(t("changesSaved"));
   }
 
   async function startTotpSetup() {
-    setError("");
     setNewRecoveryCodes([]);
     setTotpSetupCode("");
-    try {
+    await runUiAction(async () => {
       setTotpSetup(await api<TotpSetup>("/api/mfa/totp", { method: "POST" }));
-    } catch (err) {
-      setError(messageOr(err, "startMfaSetupFailed"));
-    }
+    }, "startMfaSetupFailed");
   }
 
   async function confirmTotpSetup() {
     if (!totpSetup) return;
-    setError("");
-    try {
+    await runUiAction(async () => {
       const result = await api<MfaConfirmResponse>("/api/mfa/totp/confirm", {
         method: "POST",
         body: JSON.stringify({ setup_id: totpSetup.setup_id, code: totpSetupCode })
@@ -2706,21 +1964,16 @@ export function App() {
       setTotpSetup(null);
       setTotpSetupCode("");
       await loadAccountData();
-    } catch (err) {
-      setError(messageOr(err, "confirmMfaSetupFailed"));
-    }
+    }, "confirmMfaSetupFailed");
   }
 
   async function rotateRecoveryCodes() {
-    setError("");
-    try {
+    await runUiAction(async () => {
       const result = await api<MfaConfirmResponse>("/api/mfa/recovery-codes/rotate", { method: "POST" });
       setMfaStatus(result.status);
       setNewRecoveryCodes(result.recovery_codes);
       await loadAccountData();
-    } catch (err) {
-      setError(messageOr(err, "rotateRecoveryCodesFailed"));
-    }
+    }, "rotateRecoveryCodesFailed");
   }
 
   async function disableMfa() {
@@ -2732,7 +1985,9 @@ export function App() {
       setNewRecoveryCodes([]);
       await loadAccountData();
     } catch (err) {
-      setError(messageOr(err, "disableMfaFailed"));
+      const message = messageOr(err, "disableMfaFailed");
+      setError(message);
+      throw new Error(message);
     }
   }
 
@@ -2775,7 +2030,9 @@ export function App() {
       await api(`/api/passkeys/${encodeURIComponent(id)}`, { method: "DELETE" });
       setPasskeys((current) => current.filter((item) => item.id !== id));
     } catch (err) {
-      setError(messageOr(err, "deletePasskeyFailed"));
+      const message = messageOr(err, "deletePasskeyFailed");
+      setError(message);
+      throw new Error(message);
     } finally {
       setBusy(false);
     }
@@ -2788,7 +2045,9 @@ export function App() {
       await api(`/api/me/consents/${encodeURIComponent(clientId)}`, { method: "DELETE" });
       await loadAccountData();
     } catch (err) {
-      setError(messageOr(err, "revokeAuthorizationFailed"));
+      const message = messageOr(err, "revokeAuthorizationFailed");
+      setError(message);
+      throw new Error(message);
     } finally {
       setBusy(false);
     }
@@ -2801,7 +2060,9 @@ export function App() {
       await api(`/api/me/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
       await loadAccountData();
     } catch (err) {
-      setError(messageOr(err, "revokeSessionFailed"));
+      const message = messageOr(err, "revokeSessionFailed");
+      setError(message);
+      throw new Error(message);
     } finally {
       setBusy(false);
     }
@@ -2843,6 +2104,7 @@ export function App() {
         })
       });
       setSecurityPolicy(updated);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveSecurityPolicyFailed"));
@@ -2862,7 +2124,9 @@ export function App() {
       setSigningKeyKid("");
       await loadAdminData();
     } catch (err) {
-      setError(messageOr(err, "rotateSigningKeyFailed"));
+      const message = messageOr(err, "rotateSigningKeyFailed");
+      setError(message);
+      throw new Error(message);
     } finally {
       setBusy(false);
     }
@@ -2881,6 +2145,7 @@ export function App() {
         })
       });
       setRegistrationSettings(updated);
+      setVerificationMessage(t("changesSaved"));
       await loadBootstrap();
     } catch (err) {
       setError(messageOr(err, "saveRegistrationSettingsFailed"));
@@ -2904,6 +2169,7 @@ export function App() {
         })
       });
       setRuntimeSettings(updated);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveRuntimeSettingsFailed"));
@@ -2919,15 +2185,18 @@ export function App() {
       const updated = await api<LoginSettings>("/api/admin/login-settings", {
         method: "PUT",
         body: JSON.stringify({
+          brand_logo_url: draft.brand_logo_url,
           email_domains: splitList(draft.email_domains).map(normalizeDomain),
           quick_links: draft.quick_links
         })
       });
       setLoginSettings(updated);
       setLoginSettingsDraft({
+        brand_logo_url: updated.brand_logo_url,
         email_domains: updated.email_domains.join("\n"),
         quick_links: updated.quick_links
       });
+      setVerificationMessage(t("changesSaved"));
       await loadBootstrap();
       return true;
     } catch (err) {
@@ -2946,7 +2215,7 @@ export function App() {
   async function saveQuickLinkDraft() {
     if (!quickLinkForm.label.trim() || !quickLinkForm.url.trim()) return;
     const link: QuickLink = {
-      id: quickLinkForm.id || randomId(),
+      id: quickLinkForm.id || createQuickLinkId(),
       label: quickLinkForm.label.trim(),
       url: quickLinkForm.url.trim(),
       icon: quickLinkForm.icon.trim() || "link",
@@ -2974,7 +2243,8 @@ export function App() {
       ...loginSettingsDraft,
       quick_links: loginSettingsDraft.quick_links.filter((item) => item.id !== id)
     });
-    if (saved && quickLinkForm.id === id) setQuickLinkForm(emptyQuickLinkForm);
+    if (!saved) throw new Error(t("saveLoginSettingsFailed"));
+    if (quickLinkForm.id === id) setQuickLinkForm(emptyQuickLinkForm);
   }
 
   function providerRedirectPath(slug: string): string {
@@ -3030,6 +2300,7 @@ export function App() {
         issuer: providerForm.issuer,
         client_id: providerForm.client_id,
         client_secret: providerForm.client_secret,
+        clear_client_secret: providerForm.clear_client_secret,
         authorization_endpoint: providerForm.authorization_endpoint,
         token_endpoint: providerForm.token_endpoint,
         userinfo_endpoint: providerForm.userinfo_endpoint,
@@ -3049,6 +2320,8 @@ export function App() {
         await api<ExternalProvider>("/api/admin/external-oidc-providers", { method: "POST", body });
       }
       setProviderForm(emptyProviderForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
       await loadBootstrap();
     } catch (err) {
@@ -3097,6 +2370,8 @@ export function App() {
         await api<LdapProvider>("/api/admin/ldap-providers", { method: "POST", body });
       }
       setLdapProviderForm(emptyLdapProviderForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
       await loadBootstrap();
     } catch (err) {
@@ -3133,6 +2408,7 @@ export function App() {
       allow_login: provider.allow_login,
       allow_registration: provider.allow_registration
     });
+    setEditor("ldap");
   }
 
   async function saveAuditWebhook(event: FormEvent) {
@@ -3158,6 +2434,7 @@ export function App() {
         await api<AuditWebhook>("/api/admin/audit-webhooks", { method: "POST", body });
       }
       setAuditWebhookForm(emptyAuditWebhookForm);
+      setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
       setError(messageOr(err, "saveAuditWebhookFailed"));
@@ -3187,14 +2464,61 @@ export function App() {
 
   async function refreshCurrentTab() {
     setError("");
+    setRefreshing(true);
     try {
       if (tab === "account") {
         await loadAccountData();
       } else {
-        await loadAdminData();
+        await loadAdminData(tab, { force: true });
       }
+      setVerificationMessage(t("operationCompleted"));
     } catch (err) {
       setError(messageOr(err, "refreshFailed"));
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  function navigateToTab(next: Tab) {
+    setTab(next);
+    setSearchQuery("");
+    setSidebarOpen(false);
+    const nextHash = `#/${next}`;
+    if (window.location.hash !== nextHash) {
+      window.history.pushState(null, "", nextHash);
+    }
+  }
+
+  function closeEditor() {
+    if (editor === "organization") {
+      organizationMembersLoadId.current += 1;
+      setOrganizationMembersLoading(false);
+    }
+    setEditor(null);
+    setError("");
+  }
+
+  function requestConfirmation(
+    action: () => Promise<void> | void,
+    title = t("confirmAction"),
+    description = t("confirmActionDescription")
+  ) {
+    setError("");
+    setPendingConfirmation({ action, title, description });
+  }
+
+  async function runPendingConfirmation() {
+    if (!pendingConfirmation) return;
+    setBusy(true);
+    setError("");
+    try {
+      await pendingConfirmation.action();
+      setPendingConfirmation(null);
+      setVerificationMessage(t("operationCompleted"));
+    } catch (err) {
+      setError(messageOr(err, "operationFailed"));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -3232,29 +2556,286 @@ export function App() {
   );
 
   useEffect(() => {
+    if (!user) return;
     if (!tabs.some((item) => item.id === tab)) {
-      setTab("account");
+      navigateToTab("account");
     }
-  }, [tab, tabs]);
+  }, [tab, tabs, user]);
+
+  useEffect(() => {
+    const authenticated = Boolean(
+      user
+      && !authAccountSwitch
+      && !(authReturnTo && initialAuth.forceLogin)
+      && !initialAuth.isAuthPage
+      && !initialAuth.selectAccount
+    );
+    const label = initialAuth.selectAccount && !accountLoginExpanded
+      ? t("selectAccount")
+      : authenticated
+      ? tabs.find((item) => item.id === tab)?.label
+      : authMode === "register"
+        ? t("register")
+        : authMode === "reset"
+          ? t("resetPassword")
+          : t("signIn");
+    document.title = label ? `${label} · Signet` : "Signet";
+  }, [accountLoginExpanded, authAccountSwitch, authMode, authReturnTo, initialAuth.forceLogin, initialAuth.isAuthPage, initialAuth.selectAccount, locale, tab, tabs, user]);
+
+  const normalizedSearchQuery = searchQuery.trim().toLocaleLowerCase();
+  const normalizedUserEmailFilter = userEmailFilter.trim().toLocaleLowerCase();
+  const normalizedUserPhoneFilter = userPhoneFilter.trim().toLocaleLowerCase();
+  const userRegistrationFromTimestamp = toTimestamp(userRegistrationFrom);
+  const userRegistrationToTimestamp = timestampAtDayEnd(userRegistrationTo);
+  const userLastLoginFromTimestamp = toTimestamp(userLastLoginFrom);
+  const userLastLoginToTimestamp = timestampAtDayEnd(userLastLoginTo);
+  const filteredUsers = users.filter((item) => {
+    if (!matchesSearch(
+      normalizedSearchQuery,
+      item.email,
+      item.username,
+      item.display_name,
+      item.phone
+    )) return false;
+    if (normalizedUserEmailFilter && !item.email.toLocaleLowerCase().includes(normalizedUserEmailFilter)) return false;
+    if (normalizedUserPhoneFilter && !(item.phone ?? "").toLocaleLowerCase().includes(normalizedUserPhoneFilter)) return false;
+    if (userRoleFilter === "admin" && !item.is_admin) return false;
+    if (userRoleFilter === "user" && item.is_admin) return false;
+    if (userRegistrationFromTimestamp !== null && item.created_at < userRegistrationFromTimestamp) return false;
+    if (userRegistrationToTimestamp !== null && item.created_at >= userRegistrationToTimestamp) return false;
+    if (userLastLoginFromTimestamp !== null && (!item.last_login_at || item.last_login_at < userLastLoginFromTimestamp)) return false;
+    if (userLastLoginToTimestamp !== null && (!item.last_login_at || item.last_login_at >= userLastLoginToTimestamp)) return false;
+    if (userLoginRegionFilter === "all") return true;
+    if (!item.last_login_ip) return false;
+    return userLoginRegionFilter === "domestic"
+      ? isDomesticLoginIp(item.last_login_ip)
+      : !isDomesticLoginIp(item.last_login_ip);
+  });
+  const selectedUserIdSet = new Set(selectedUserIds);
+  const allVisibleUsersSelected = filteredUsers.length > 0 && filteredUsers.every((item) => selectedUserIdSet.has(item.id));
+  const filteredClients = clients.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.client_id,
+    item.client_name,
+    item.organization_name,
+    item.scopes.join(" ")
+  ));
+  const filteredIapApplications = iapApplications.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.slug,
+    item.external_host,
+    item.description
+  ));
+  const filteredOrganizations = organizations.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.slug,
+    item.description,
+    item.allowed_email_domains.join(" ")
+  ));
+  const filteredInvitations = invitations.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.code_type,
+    item.login_code_level,
+    item.allowed_client_ids?.join(" "),
+    item.organization_id,
+    item.organization_role,
+    item.code_prefix,
+    item.description,
+    item.authorized_email,
+    item.authorized_username
+  ));
+  const filteredProviders = providers.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.display_name,
+    item.slug,
+    item.issuer,
+    item.email_domains.join(" ")
+  ));
+  const filteredLdapProviders = ldapProviders.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.display_name,
+    item.slug,
+    item.url,
+    item.base_dn
+  ));
+  const filteredRoles = roles.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.description,
+    item.permissions.join(" ")
+  ));
+  const filteredGroups = groups.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.description
+  ));
+  const filteredAuditWebhooks = auditWebhooks.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.url,
+    item.actions.join(" "),
+    item.last_error
+  ));
+  const filteredAuditEvents = auditEvents.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.action,
+    item.target_kind,
+    item.target_id,
+    item.actor_user_id,
+    item.actor_client_id,
+    item.details
+  ));
+  const searchableTabs: Tab[] = [
+    "users",
+    "clients",
+    "iap",
+    "organizations",
+    "invitations",
+    "providers",
+    "security"
+  ];
+  const searchEnabled = searchableTabs.includes(tab);
+  const activeUserCount = overview?.active_users ?? 0;
+  const totalUserCount = overview?.users ?? 0;
+  const activeClientCount = overview?.active_clients ?? 0;
+  const totalClientCount = overview?.clients ?? 0;
+  const activeUserRate = totalUserCount > 0 ? Math.round((activeUserCount / totalUserCount) * 100) : 0;
+  const activeClientRate = totalClientCount > 0 ? Math.round((activeClientCount / totalClientCount) * 100) : 0;
+  const selectedManagedUsers = users.filter((item) => selectedUserIdSet.has(item.id));
+  const selectedUsersAreCurrent = selectedManagedUsers.length === selectedUserIds.length;
+  const selectedLifecycleState = selectedManagedUsers.length > 0
+    ? lifecycleStateForUser(selectedManagedUsers[0])
+    : null;
+  const selectedUsersShareLifecycleState = Boolean(
+    selectedUsersAreCurrent
+    && selectedLifecycleState
+    && selectedManagedUsers.every((item) => lifecycleStateForUser(item) === selectedLifecycleState)
+  );
+  const sharedLifecycleBulkActions: BulkUserAction[] = selectedUsersShareLifecycleState
+    ? selectedManagedUsers.reduce<BulkUserAction[] | null>((shared, item) => {
+      if (!shared) return null;
+      const available = availableUserActions(item, user?.id);
+      return shared.filter((action) => action !== "reset_mfa" && available.includes(action));
+    }, availableUserActions(selectedManagedUsers[0], user?.id).filter((action) => action !== "reset_mfa")) ?? []
+    : [];
+  // MFA reset is not a lifecycle transition. It remains available for any
+  // selection whose individual row actions all expose it (active/disabled),
+  // while lifecycle buttons themselves remain hidden for mixed selections.
+  const canBulkResetMfa = selectedUsersAreCurrent
+    && selectedManagedUsers.length > 0
+    && selectedManagedUsers.every((item) => availableUserActions(item, user?.id).includes("reset_mfa"));
+  const availableBulkUserActions: BulkUserAction[] = [
+    ...sharedLifecycleBulkActions,
+    ...(canBulkResetMfa ? ["reset_mfa" as const] : [])
+  ];
+
+  function resetUserFilters() {
+    setUserFilter("live");
+    setUserOrganizationFilter("");
+    setUserFiltersExpanded(false);
+    setUserEmailFilter("");
+    setUserRoleFilter("all");
+    setUserRegistrationFrom("");
+    setUserRegistrationTo("");
+    setUserLastLoginFrom("");
+    setUserLastLoginTo("");
+    setUserPhoneFilter("");
+    setUserLoginRegionFilter("all");
+    setUserLinkedIdentityFilter("all");
+    setSelectedUserIds([]);
+  }
+
+  function toggleUserSelection(id: string) {
+    setSelectedUserIds((current) => current.includes(id)
+      ? current.filter((item) => item !== id)
+      : [...current, id]);
+  }
+
+  function toggleVisibleUserSelection(selected: boolean) {
+    const visibleIds = filteredUsers.map((item) => item.id);
+    setSelectedUserIds((current) => selected
+      ? [...new Set([...current, ...visibleIds])]
+      : current.filter((id) => !visibleIds.includes(id)));
+  }
+
+  function bulkUserActionTitle(action: BulkUserAction): string {
+    switch (action) {
+      case "enable": return t("bulkEnable");
+      case "disable": return t("bulkDisable");
+      case "archive": return t("bulkArchive");
+      case "delete": return t("bulkDelete");
+      case "reset_mfa": return t("bulkResetMfa");
+    }
+  }
+
+  function requestBulkUserAction(action: BulkUserAction) {
+    if (!availableBulkUserActions.includes(action)) return;
+    const targetIds = selectedManagedUsers.map((item) => item.id);
+    if (targetIds.length === 0 || targetIds.length !== selectedUserIds.length) return;
+    const title = bulkUserActionTitle(action);
+    requestConfirmation(async () => {
+      for (const id of targetIds) {
+        const path = action === "enable"
+          ? `/api/admin/users/${id}/enable`
+          : action === "reset_mfa"
+            ? `/api/admin/users/${id}/mfa/reset`
+            : `/api/admin/users/${id}`;
+        await api(path, { method: action === "enable" || action === "reset_mfa" ? "POST" : "DELETE" });
+      }
+      setSelectedUserIds((current) => current.filter((id) => !targetIds.includes(id)));
+      await loadAdminData("users");
+      setVerificationMessage(t("bulkActionCompleted"));
+    }, title);
+  }
+
+  if (initialLoadError) {
+    return (
+      <main className="load-error" role="alert">
+        <Shield size={34} />
+        <h1>Signet</h1>
+        <p>{initialLoadError}</p>
+        <button type="button" className="primary compact-action" onClick={() => void initialize()}>
+          <RefreshCw size={16} />{t("retry")}
+        </button>
+      </main>
+    );
+  }
 
   if (user === undefined || !bootstrap) {
-    return <div className="loading">{t("loading")}</div>;
+    return <div className="loading" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" />{t("loading")}</div>;
   }
 
   if (authCanCompleteWithCurrentUser) {
-    return <div className="loading">{t("loading")}</div>;
+    return <div className="loading" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" />{t("loading")}</div>;
   }
 
-  const authorizationCodeRegistration =
-    bootstrap.has_users
-    && (
-      Boolean(registerForm.authorization_code.trim())
-      || bootstrap.registration.require_invitation
-    );
+  const hasRegistrationAuthorizationCode = Boolean(registerForm.authorization_code.trim());
+  const registrationCodeMode = registrationCodeInspection?.mode;
+  const isCodeOnlyRegistration = registrationCodeMode === "registration"
+    || registrationCodeMode === "trial_enrollment";
+  const registrationCodeBlocksSubmit = hasRegistrationAuthorizationCode
+    && (registrationCodeInspecting
+      || registrationCodeMode === "unavailable"
+      || registrationCodeMode === "sign_in_only");
+  const registrationCodeHint = registrationCodeInspecting
+    ? t("authorizationCodeChecking")
+    : registrationCodeMode === "trial_enrollment"
+      ? t("authorizationCodeTrialHint")
+      : registrationCodeMode === "registration"
+        ? registrationCodeInspection?.email_requirement === "must_match_code"
+          ? t("authorizationCodeBoundEmailHint")
+          : t("authorizationCodeRegistrationHint")
+        : registrationCodeMode === "sign_in_only"
+          ? t("authorizationCodeSignInHint")
+          : registrationCodeMode === "unavailable"
+            ? t("authorizationCodeUnavailableHint")
+            : "";
   const passwordRegistrationUnavailable =
     bootstrap.has_users
     && authMode === "register"
-    && !authorizationCodeRegistration
+    && !isCodeOnlyRegistration
     && !bootstrap.registration.allow_password_registration;
   const loginExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_login);
   const registerExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_registration);
@@ -3266,83 +2847,218 @@ export function App() {
           : [];
   const loginDomainProvider = findProviderForEmail(loginExternalProviders, authEmail);
   const registerDomainProvider = findProviderForEmail(registerExternalProviders, authEmail);
+  const hasExternalProviderRow = authFormsVisible
+    && authMode !== "reset"
+    && visibleExternalProviders.length > 0;
+  const unifiedAuthTitle = !bootstrap.has_users
+    ? t("firstAdmin")
+    : t("loginOrRegisterAccount");
 
-  if (!user || authAccountSwitch || (authReturnTo && initialAuth.forceLogin)) {
+  if (!user || authAccountSwitch || initialAuth.isAuthPage || initialAuth.selectAccount || (authReturnTo && initialAuth.forceLogin)) {
     return (
-      <main className="login-shell">
-        <section className="login-panel">
-          <TopLanguage locale={locale} switchLocale={switchLocale} label={t("language")} />
-          <div className="brand-row">
-            <Shield size={28} />
-            <div>
-              <h1>GPT SSO</h1>
-              <p>{bootstrap.has_users ? t("adminConsole") : t("firstAdmin")}</p>
-            </div>
-          </div>
-          <div className="segmented">
-            <button type="button" className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>
-              {t("signIn")}
-            </button>
-            <button type="button" className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>
-              {t("register")}
-            </button>
-            {bootstrap.has_users && (
-              <button type="button" className={authMode === "reset" ? "active" : ""} onClick={() => setAuthMode("reset")}>
-                {t("resetPassword")}
-              </button>
+      <main className="unified-auth-page">
+        <header className="unified-auth-header">
+          <div className="unified-auth-header-brand" aria-label="Signet">
+            <span className="auth-logo auth-product-logo" aria-hidden="true">
+              <Shield size={18} />
+              {bootstrap.login.brand_logo_url && (
+                <img
+                  src={bootstrap.login.brand_logo_url}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                  onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
+                  onError={(event) => { event.currentTarget.hidden = true; }}
+                />
+              )}
+            </span>
+            <span>Signet</span>
+            {browserAccountsContext?.client_name && (
+              <>
+                <span className="unified-auth-logo-separator" aria-hidden="true" />
+                <span
+                  className="auth-logo auth-client-logo"
+                  role="img"
+                  aria-label={browserAccountsContext.client_name}
+                  title={browserAccountsContext.client_name}
+                >
+                  <Globe2 size={18} aria-hidden="true" />
+                  {browserAccountsContext.client_logo_uri && (
+                    <img
+                      src={browserAccountsContext.client_logo_uri}
+                      alt=""
+                      referrerPolicy="no-referrer"
+                      onLoad={(event) => { event.currentTarget.dataset.loaded = "true"; }}
+                      onError={(event) => { event.currentTarget.hidden = true; }}
+                    />
+                  )}
+                </span>
+              </>
             )}
           </div>
-          {error && <div className="error">{error}</div>}
+          <div className="auth-toolbar">
+            <TopLanguage locale={locale} supportedLocales={bootstrap.supported_locales} switchLocale={switchLocale} label={t("language")} />
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+              title={theme === "dark" ? t("lightMode") : t("darkMode")}
+              aria-label={theme === "dark" ? t("lightMode") : t("darkMode")}
+            >
+              {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+            </button>
+          </div>
+        </header>
+        <section className={`unified-auth-main${authFormsVisible ? " auth-form-mode" : ""}`}>
+          <div className="unified-auth-content">
+          <section className="unified-auth-title">
+            <h1>{unifiedAuthTitle}</h1>
+          </section>
+          {error && <div className="error" role="alert">{error}</div>}
           {authAccountSwitch && <div className="info">{t("authAccountSwitch")}</div>}
-          {verificationMessage && <div className="info">{verificationMessage}</div>}
-          {authMode === "login" && bootstrap.has_users && (
-            <form onSubmit={handleLogin}>
-              <EmailField
-                label={t("email")}
-                value={authEmail}
-                onChange={setSharedAuthEmail}
-                domains={bootstrap.login.email_domains}
-                customDomain={loginCustomDomain}
-                onCustomDomainChange={setLoginCustomDomain}
-                customLabel={t("customDomain")}
-                applyLabel={t("applySuffix")}
-              />
-              {loginDomainProvider && (
-                <a className="secondary-link" href={oidcStartUrl(loginDomainProvider.start_url, authEmail, "login")}>
-                  <Link2 size={16} />
-                  {t("domainSsoLogin")} · {loginDomainProvider.display_name}
-                </a>
+          {verificationMessage && <div className="info" role="status" aria-live="polite">{verificationMessage}</div>}
+          {!authFormsVisible && selectedBrowserAccount && (
+            <section className="unified-auth-selection" aria-label={`${t("useAccount")}: ${selectedBrowserAccount.user.email}`}>
+              <span className="account-switcher-avatar" aria-hidden="true">
+                {browserAccountShortName(selectedBrowserAccount).slice(0, 1).toLocaleUpperCase()}
+              </span>
+              {browserAccountsContext?.client_name && (
+                <p>{t("selectAccountForApplication")} · {browserAccountsContext.client_name}</p>
               )}
-              <Field label={t("password")} type="password" value={loginPassword} onChange={setLoginPassword} />
-              {loginMfaChallengeId && (
-                <>
-                  <Field label={t("mfaCode")} value={loginMfaCode} onChange={setLoginMfaCode} />
-                  <small>{t("mfaRequired")}{loginRecoveryAvailable ? ` · ${t("recoveryCodes")}` : ""}</small>
-                </>
+              <h2>{browserAccountShortName(selectedBrowserAccount)}</h2>
+              {selectedBrowserAccount.user.display_name && (
+                <p>{selectedBrowserAccount.user.display_name}</p>
               )}
-              {loginCaptchaChallengeId && (
-                <>
-                  <Field label={`${t("captchaAnswer")} · ${loginCaptchaPrompt}`} value={loginCaptchaAnswer} onChange={setLoginCaptchaAnswer} />
-                  <small>{t("captchaRequired")}</small>
-                </>
-              )}
-              <button className="primary" type="submit" disabled={busy}>
-                {t("signIn")}
-              </button>
-              <button className="link-button" type="button" onClick={handlePasskeyLogin} disabled={busy}>
-                <KeyRound size={14} />
-                {t("passkeyLogin")}
-              </button>
-              <button className="link-button" type="button" onClick={() => setAuthMode("register")}>
-                {t("openRegister")}
-              </button>
-              <button className="link-button" type="button" onClick={() => setAuthMode("reset")}>
-                {t("forgotPassword")}
-              </button>
-            </form>
+              <p className="unified-auth-selection-email">{selectedBrowserAccount.user.email}</p>
+              <div className="unified-auth-selection-meta">
+                {selectedBrowserAccount.current && (
+                  <StatusBadge tone="success">{t("currentAccount")}</StatusBadge>
+                )}
+                {(selectedBrowserAccount.session_kind === "trial_enrollment"
+                  || selectedBrowserAccount.user.login_code_level === "trial_enrollment") && (
+                  <StatusBadge tone="warning">{t("trialEnrollmentSessionBadge")}</StatusBadge>
+                )}
+                {(selectedBrowserAccount.session_kind === "temporary_authorization_code"
+                  || selectedBrowserAccount.user.login_code_level === "account_recovery") && (
+                  <StatusBadge tone="warning">{t("temporaryRecoverySessionBadge")}</StatusBadge>
+                )}
+                <small>{t("lastLogin")}: {formatTime(selectedBrowserAccount.last_login_at, locale)}</small>
+              </div>
+              <div className="unified-auth-selection-actions">
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={browserAccountContinuing || !continueWithBrowserAccount}
+                  onClick={() => void continueSelectedBrowserAccount()}
+                >
+                  <KeyRound size={16} />
+                  {browserAccountContinuing ? t("loading") : t("signIn")}
+                </button>
+              </div>
+            </section>
           )}
-          {authMode === "reset" && bootstrap.has_users && (
-            <form onSubmit={handlePasswordReset}>
+          {authFormsVisible && (
+            <div className="unified-auth-forms">
+              {hasExternalProviderRow && (
+                <div className="auth-external-providers" role="group" aria-label={t("externalLogin")}>
+                  {visibleExternalProviders.map((provider) => (
+                    <a
+                      key={provider.slug}
+                      className="auth-provider-button"
+                      href={oidcStartUrl(
+                        provider.start_url,
+                        authEmail,
+                        authMode === "login" ? "login" : "register",
+                        effectiveAccountFlow
+                      )}
+                    >
+                      <Link2 size={16} aria-hidden="true" />
+                      <span>{provider.display_name}</span>
+                    </a>
+                  ))}
+                </div>
+              )}
+              {hasExternalProviderRow && (
+                <div className="auth-method-divider">
+                  <span>{t("orContinueWith")}</span>
+                </div>
+              )}
+          {authFormsVisible && authMode === "login" && bootstrap.has_users && (
+            <>
+              <LoginMethodSwitcher
+                value={loginMethod}
+                onChange={changeLoginMethod}
+                disabled={busy}
+                label={t("loginMethod")}
+                passwordLabel={t("passwordLogin")}
+                authorizationCodeLabel={t("authorizationCodeLogin")}
+              />
+              {loginMethod === "password" ? (
+                <form aria-busy={busy} onSubmit={handleLogin}>
+                  <EmailField
+                    label={t("email")}
+                    value={authEmail}
+                    onChange={setSharedAuthEmail}
+                    domains={bootstrap.login.email_domains}
+                    customDomain={loginCustomDomain}
+                    onCustomDomainChange={setLoginCustomDomain}
+                    customLabel={t("customDomain")}
+                    applyLabel={t("applySuffix")}
+                  />
+                  {loginDomainProvider && (
+                    <a className="secondary-link" href={oidcStartUrl(loginDomainProvider.start_url, authEmail, "login", effectiveAccountFlow)}>
+                      <Link2 size={16} />
+                      {t("domainSsoLogin")} · {loginDomainProvider.display_name}
+                    </a>
+                  )}
+                  <Field label={t("password")} type="password" autoComplete="current-password" value={loginPassword} onChange={setLoginPassword} />
+                  {loginMfaChallengeId && (
+                    <>
+                      <Field label={t("mfaCode")} autoComplete="one-time-code" value={loginMfaCode} onChange={setLoginMfaCode} />
+                      <small>{t("mfaRequired")}{loginRecoveryAvailable ? ` · ${t("recoveryCodes")}` : ""}</small>
+                    </>
+                  )}
+                  {loginCaptchaChallengeId && (
+                    <>
+                      <Field label={`${t("captchaAnswer")} · ${loginCaptchaPrompt}`} value={loginCaptchaAnswer} onChange={setLoginCaptchaAnswer} />
+                      <small>{t("captchaRequired")}</small>
+                    </>
+                  )}
+                  <button className="primary" type="submit" disabled={busy}>
+                    {t("signIn")}
+                  </button>
+                  <button className="link-button" type="button" onClick={handlePasskeyLogin} disabled={busy}>
+                    <KeyRound size={14} />
+                    {t("passkeyLogin")}
+                  </button>
+                </form>
+              ) : (
+                <AuthorizationCodeLoginForm
+                  email={authorizationCodeLoginForm.email}
+                  authorizationCode={authorizationCodeLoginForm.authorization_code}
+                  onAuthorizationCodeChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, authorization_code: value }))}
+                  onEmailChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, email: value }))}
+                  onSubmit={handleAuthorizationCodeLogin}
+                  busy={busy}
+                  emailLabel={t("email")}
+                  authorizationCodeLabel={t("loginAuthorizationCode")}
+                  hint={t("loginAuthorizationCodeHint")}
+                  submitLabel={t("authorizationCodeLogin")}
+                />
+              )}
+              <div className="auth-secondary-actions">
+                <span>
+                  {t("noAccountPrompt")} {" "}
+                  <button type="button" onClick={() => setAuthMode("register")} disabled={busy}>{t("createAccount")}</button>
+                </span>
+                <span>
+                  {t("forgotPasswordPrompt")} {" "}
+                  <button type="button" onClick={() => setAuthMode("reset")} disabled={busy}>{t("resetPasswordAction")}</button>
+                </span>
+              </div>
+            </>
+          )}
+          {authFormsVisible && authMode === "reset" && bootstrap.has_users && (
+            <form aria-busy={busy} onSubmit={handlePasswordReset}>
               <EmailField
                 label={t("email")}
                 value={authEmail}
@@ -3360,18 +3076,16 @@ export function App() {
                 value={passwordResetForm.code}
                 onChange={(value) => setPasswordResetForm({ ...passwordResetForm, code: value })}
                 onSend={sendPasswordResetCode}
+                disabled={busy}
               />
-              <Field label={t("newPassword")} type="password" value={passwordResetForm.password} onChange={(value) => setPasswordResetForm({ ...passwordResetForm, password: value })} />
+              <Field label={t("newPassword")} type="password" autoComplete="new-password" value={passwordResetForm.password} onChange={(value) => setPasswordResetForm({ ...passwordResetForm, password: value })} />
               <button className="primary" type="submit" disabled={busy}>
                 {t("completePasswordReset")}
               </button>
-              <button className="link-button" type="button" onClick={() => setAuthMode("login")}>
-                {t("openLogin")}
-              </button>
             </form>
           )}
-          {(authMode === "register" || !bootstrap.has_users) && (
-            <form onSubmit={handleRegister}>
+          {authFormsVisible && (authMode === "register" || !bootstrap.has_users) && (
+            <form aria-busy={busy} onSubmit={handleRegister}>
               <EmailField
                 label={t("email")}
                 value={authEmail}
@@ -3382,41 +3096,58 @@ export function App() {
                 customLabel={t("customDomain")}
                 applyLabel={t("applySuffix")}
               />
-              {registerDomainProvider && (
-                <a className="secondary-link" href={oidcStartUrl(registerDomainProvider.start_url, authEmail, "register")}>
-                  <Link2 size={16} />
-                  {t("domainSsoRegister")} · {registerDomainProvider.display_name}
-                </a>
-              )}
               {bootstrap.has_users && (
-                <Field label={t("invitationCode")} value={registerForm.authorization_code} onChange={(value) => setRegisterForm({ ...registerForm, authorization_code: value })} />
-              )}
-              <div className="email-actions">
-                <button type="button" onClick={generateRegisterEmail}>
-                  <Shuffle size={14} />
-                  {t("randomEmail")}
-                </button>
-                <button type="button" onClick={copyRegisterEmail}>
-                  <Copy size={14} />
-                  {t("copyEmail")}
-                </button>
-              </div>
-              {passwordRegistrationUnavailable && (
-                <div className="info">{t("passwordRegistrationUnavailable")}</div>
-              )}
-              {bootstrap.registration.require_email_verification && bootstrap.has_users && !authorizationCodeRegistration && (
-                <InlineCode
-                  icon={<Mail size={16} />}
-                  label={t("emailCode")}
-                  button={t("sendEmailCode")}
-                  value={registerForm.email_code}
-                  onChange={(value) => setRegisterForm({ ...registerForm, email_code: value })}
-                  onSend={() => sendVerification("email")}
-                />
-              )}
-              {!authorizationCodeRegistration && (
                 <>
-                  <Field label={t("phone")} value={registerForm.phone} onChange={(value) => setRegisterForm({ ...registerForm, phone: value })} />
+                  <Field
+                    label={t("registrationAuthorizationCode")}
+                    value={registerForm.authorization_code}
+                    onChange={(value) => setRegisterForm({ ...registerForm, authorization_code: value })}
+                    required={bootstrap.registration.require_invitation}
+                  />
+                  {hasRegistrationAuthorizationCode && registrationCodeHint && (
+                    <div
+                      className={`authorization-code-hint ${registrationCodeMode ?? "checking"}`}
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {registrationCodeHint}
+                    </div>
+                  )}
+                </>
+              )}
+              {!isCodeOnlyRegistration && (
+                <>
+                  {registerDomainProvider && (
+                    <a className="secondary-link" href={oidcStartUrl(registerDomainProvider.start_url, authEmail, "register", effectiveAccountFlow)}>
+                      <Link2 size={16} />
+                      {t("domainSsoRegister")} · {registerDomainProvider.display_name}
+                    </a>
+                  )}
+                  <div className="email-actions">
+                    <button type="button" onClick={generateRegisterEmail}>
+                      <Shuffle size={14} />
+                      {t("randomEmail")}
+                    </button>
+                    <button type="button" onClick={copyRegisterEmail}>
+                      <Copy size={14} />
+                      {t("copyEmail")}
+                    </button>
+                  </div>
+                  {passwordRegistrationUnavailable && (
+                    <div className="info">{t("passwordRegistrationUnavailable")}</div>
+                  )}
+                  {bootstrap.registration.require_email_verification && bootstrap.has_users && (
+                    <InlineCode
+                      icon={<Mail size={16} />}
+                      label={t("emailCode")}
+                      button={t("sendEmailCode")}
+                      value={registerForm.email_code}
+                      onChange={(value) => setRegisterForm({ ...registerForm, email_code: value })}
+                      onSend={() => sendVerification("email")}
+                      disabled={busy}
+                    />
+                  )}
+                  <Field label={t("phone")} type="tel" autoComplete="tel" value={registerForm.phone} onChange={(value) => setRegisterForm({ ...registerForm, phone: value })} />
                   {bootstrap.registration.require_phone_verification && bootstrap.has_users && (
                     <InlineCode
                       icon={<Phone size={16} />}
@@ -3425,45 +3156,25 @@ export function App() {
                       value={registerForm.phone_code}
                       onChange={(value) => setRegisterForm({ ...registerForm, phone_code: value })}
                       onSend={() => sendVerification("phone")}
+                      disabled={busy}
                     />
                   )}
+                  <Field label={t("username")} autoComplete="username" value={registerForm.username} onChange={(value) => setRegisterForm({ ...registerForm, username: value })} />
+                  <Field label={t("displayName")} autoComplete="name" value={registerForm.display_name} onChange={(value) => setRegisterForm({ ...registerForm, display_name: value })} />
+                  <Field label={t("password")} type="password" autoComplete="new-password" value={registerForm.password} onChange={(value) => setRegisterForm({ ...registerForm, password: value })} />
                 </>
               )}
-              <Field label={t("username")} value={registerForm.username} onChange={(value) => setRegisterForm({ ...registerForm, username: value })} />
-              <Field label={t("displayName")} value={registerForm.display_name} onChange={(value) => setRegisterForm({ ...registerForm, display_name: value })} />
-              {!authorizationCodeRegistration && (
-                <Field label={t("password")} type="password" value={registerForm.password} onChange={(value) => setRegisterForm({ ...registerForm, password: value })} />
-              )}
-              <button className="primary" type="submit" disabled={busy || passwordRegistrationUnavailable}>
+              <button className="primary" type="submit" disabled={busy || passwordRegistrationUnavailable || registrationCodeBlocksSubmit}>
                 {t("register")}
               </button>
-              {bootstrap.has_users && (
-                <button className="link-button" type="button" onClick={() => setAuthMode("login")}>
-                  {t("openLogin")}
-                </button>
-              )}
             </form>
           )}
-          {visibleExternalProviders.length > 0 && (
-            <div className="external-list">
-              <span>{t("externalLogin")}</span>
-              {visibleExternalProviders.map((provider) => (
-                <a
-                  key={provider.slug}
-                  className="secondary-link"
-                  href={oidcStartUrl(
-                    provider.start_url,
-                    authEmail,
-                    authMode === "login" ? "login" : "register"
-                  )}
-                >
-                  <Link2 size={16} />
-                  {provider.display_name}
-                </a>
-              ))}
+          {authFormsVisible && authMode !== "login" && bootstrap.has_users && (
+            <div className="auth-secondary-actions auth-secondary-actions-single">
+              <button type="button" onClick={() => setAuthMode("login")} disabled={busy}>{t("openLogin")}</button>
             </div>
           )}
-          {bootstrap.ldap_providers.length > 0 && (
+          {authFormsVisible && bootstrap.ldap_providers.length > 0 && (authMode !== "login" || loginMethod === "password") && (
             <div className="external-list">
               <span>{t("directoryLogin")}</span>
               {bootstrap.ldap_providers.map((provider) => (
@@ -3474,50 +3185,154 @@ export function App() {
               ))}
             </div>
           )}
+            </div>
+          )}
           <QuickJump links={bootstrap.login.quick_links} />
+          </div>
         </section>
+        <AccountChooser
+          returnTo={authReturnTo ?? "/"}
+          locale={locale}
+          t={t}
+          selectedAccountRef={selectedBrowserAccount?.account_ref ?? null}
+          selectionMode={initialAuth.selectAccount ? "select" : "activate"}
+          onAccountSelected={selectBrowserAccount}
+          onAccountsLoaded={handleBrowserAccountsLoaded}
+          onLoginAnother={openAnotherAccountLogin}
+        />
       </main>
     );
   }
 
   return (
     <div className="app-shell">
-      <aside>
+      <button
+        type="button"
+        className={`sidebar-scrim ${sidebarOpen ? "visible" : ""}`}
+        aria-label={t("closeNavigation")}
+        aria-hidden={!sidebarOpen}
+        tabIndex={sidebarOpen ? 0 : -1}
+        onClick={() => setSidebarOpen(false)}
+      />
+      <aside
+        id="admin-navigation"
+        ref={sidebarRef}
+        className={sidebarOpen ? "sidebar-open" : ""}
+        aria-label={t("adminConsole")}
+      >
         <div className="brand-row compact">
-          <Shield size={24} />
+          <span className="brand-mark"><Shield size={22} /></span>
           <div>
-            <h1>GPT SSO</h1>
-            <p>{user.email}</p>
+            <h1>Signet</h1>
+            <p>{overview?.issuer ?? bootstrap.issuer}</p>
           </div>
         </div>
-        <TopLanguage locale={locale} switchLocale={switchLocale} label={t("language")} compact />
-        <nav>
-          {tabs.map((item) => {
+        <TopLanguage locale={locale} supportedLocales={bootstrap.supported_locales} switchLocale={switchLocale} label={t("language")} compact />
+        <nav aria-label={t("adminConsole")}>
+          {tabs.filter((item) => item.id !== "account").map((item) => {
             const Icon = item.icon;
             return (
-              <button type="button" key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}>
+              <button
+                type="button"
+                key={item.id}
+                className={tab === item.id ? "active" : ""}
+                onClick={() => navigateToTab(item.id)}
+                aria-current={tab === item.id ? "page" : undefined}
+                aria-label={item.label}
+                title={item.label}
+              >
                 <Icon size={18} />
                 <span>{item.label}</span>
               </button>
             );
           })}
         </nav>
-        <button className="ghost" type="button" onClick={handleLogout} title={t("logout")}>
-          <LogOut size={18} />
-          <span>{t("logout")}</span>
-        </button>
+        <div className="sidebar-footer">
+          <button
+            className={`account-card ${tab === "account" ? "active" : ""}`}
+            type="button"
+            onClick={() => navigateToTab("account")}
+            aria-label={t("account")}
+            aria-current={tab === "account" ? "page" : undefined}
+            aria-describedby="account-tooltip"
+          >
+            <UserRound size={18} />
+            <span className="account-card-copy">
+              <strong>{user.display_name || user.username}</strong>
+              <small>{user.email}</small>
+            </span>
+            <span id="account-tooltip" className="account-tooltip" role="tooltip">
+              <strong>{t("account")}</strong>
+              <span>{t("email")}: {user.email}</span>
+              <span>{t("username")}: {user.username}</span>
+              <span>{t("role")}: {user.is_admin ? t("admin") : t("normalUser")}</span>
+            </span>
+          </button>
+          <button
+            className="ghost account-switch-button"
+            type="button"
+            onClick={openAccountSwitcher}
+            title={t("switchAccount")}
+            aria-label={t("switchAccount")}
+            disabled={busy}
+          >
+            <ArrowLeftRight size={18} />
+          </button>
+          <button className="ghost logout-button" type="button" onClick={handleLogout} title={t("logout")} aria-label={t("logout")} disabled={busy}>
+            <LogOut size={18} />
+          </button>
+        </div>
       </aside>
       <main className="content">
-        <header>
-          <div>
-            <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
-            <p>{tab === "account" ? user.email : overview?.issuer ?? "OIDC provider"}</p>
-          </div>
-          <button className="icon-button" type="button" onClick={refreshCurrentTab} title={t("refresh")}>
-            <RefreshCw size={18} />
+        <header className="page-header">
+          <button
+            ref={mobileMenuButtonRef}
+            className="icon-button mobile-menu-button"
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            title={t("openNavigation")}
+            aria-label={t("openNavigation")}
+            aria-controls="admin-navigation"
+            aria-expanded={sidebarOpen}
+          >
+            <Menu size={19} />
           </button>
+          <div className="page-heading">
+            <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
+            <p>{tab === "account" ? user.email : overview?.issuer ?? bootstrap.issuer}</p>
+          </div>
+          <div className="header-actions">
+            {searchEnabled && (
+              <SearchField
+                value={searchQuery}
+                onChange={setSearchQuery}
+                placeholder={t("searchCurrentPage")}
+                clearLabel={t("clearSearch")}
+              />
+            )}
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+              title={theme === "dark" ? t("lightMode") : t("darkMode")}
+              aria-label={theme === "dark" ? t("lightMode") : t("darkMode")}
+            >
+              {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
+            <button className="icon-button" type="button" onClick={refreshCurrentTab} title={t("refresh")} aria-label={t("refresh")} disabled={refreshing}>
+              <RefreshCw className={refreshing ? "spin" : ""} size={18} />
+            </button>
+          </div>
         </header>
-        {error && <div className="error">{error}</div>}
+        {adminLoading && <div className="loading-bar" role="progressbar" aria-label={t("loading")} />}
+        {error && !editor && !pendingConfirmation && <div className="error" role="alert">{error}</div>}
+        {isRestrictedLoginCodeSession && (
+          <div className="info temporary-session-banner" role="status" aria-live="polite">
+            <Shield size={17} aria-hidden="true" />
+            <span>{t(isTrialEnrollmentSession ? "trialEnrollmentAccountReady" : "temporaryAccountReady")}</span>
+          </div>
+        )}
+        {verificationMessage && <div className="toast" role="status" aria-live="polite">{verificationMessage}</div>}
         {!canAdmin && tab !== "account" ? <div className="empty">{t("noUserAdminOnly")}</div> : null}
         {tab === "account" && (
           <section className="account-layout">
@@ -3573,22 +3388,22 @@ export function App() {
                 <p className="muted">
                   {mfaStatus?.enabled ? t("active") : t("disabled")} · {t("recoveryCodesRemaining")}: {mfaStatus?.recovery_codes_remaining ?? 0}/{mfaStatus?.recovery_codes_total ?? 0}
                 </p>
-                {!user.archived_at && (
+                {canMutateAccount && (
                   <div className="actions">
-                    <button type="button" onClick={startTotpSetup}><KeyRound size={14} />{t("startTotpSetup")}</button>
-                    {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes}>{t("rotateRecoveryCodes")}</button>}
-                    {mfaStatus?.enabled && <button type="button" onClick={disableMfa}>{t("disableMfa")}</button>}
+                    <button type="button" onClick={startTotpSetup} disabled={busy}><KeyRound size={14} />{t("startTotpSetup")}</button>
+                    {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
+                    {mfaStatus?.enabled && <button type="button" onClick={() => requestConfirmation(disableMfa)} disabled={busy}>{t("disableMfa")}</button>}
                   </div>
                 )}
-                {totpSetup && !user.archived_at && (
+                {totpSetup && canMutateAccount && (
                   <div className="mfa-setup">
-                    <label>{t("totpSecret")}</label>
-                    <textarea readOnly value={totpSetup.secret} />
-                    <label>{t("otpauthUri")}</label>
-                    <textarea readOnly value={totpSetup.otpauth_uri} />
+                    <label htmlFor="account-totp-secret">{t("totpSecret")}</label>
+                    <textarea id="account-totp-secret" readOnly value={totpSetup.secret} />
+                    <label htmlFor="account-otpauth-uri">{t("otpauthUri")}</label>
+                    <textarea id="account-otpauth-uri" readOnly value={totpSetup.otpauth_uri} />
                     <Field label={t("mfaCode")} value={totpSetupCode} onChange={setTotpSetupCode} />
                     <div className="actions">
-                      <button type="button" onClick={confirmTotpSetup}><Save size={14} />{t("confirmTotp")}</button>
+                      <button type="button" onClick={confirmTotpSetup} disabled={busy}><Save size={14} />{t("confirmTotp")}</button>
                     </div>
                   </div>
                 )}
@@ -3604,7 +3419,7 @@ export function App() {
               </div>
               <div className="panel">
                 <h3>{t("passkeys")}</h3>
-                {!user.archived_at && (
+                {canMutateAccount && (
                   <div className="inline-code">
                     <Field label={t("passkeyName")} value={passkeyName} onChange={setPasskeyName} />
                     <button type="button" onClick={registerPasskey} disabled={busy}>
@@ -3633,8 +3448,8 @@ export function App() {
                         <td><code>{shortSessionId(passkey.credential_id)}</code></td>
                         <td>{formatTime(passkey.last_used_at, locale)}</td>
                         <td className="actions">
-                          {!user.archived_at && (
-                            <button type="button" onClick={() => deletePasskey(passkey.id)} disabled={busy}>
+                          {canMutateAccount && (
+                            <button type="button" onClick={() => requestConfirmation(() => deletePasskey(passkey.id))} disabled={busy}>
                               <Trash2 size={14} />
                               {t("delete")}
                             </button>
@@ -3683,8 +3498,8 @@ export function App() {
                         <td>{formatTime(session.created_at, locale)}</td>
                         <td>{formatTime(session.expires_at, locale)}</td>
                         <td className="actions">
-                          {!user.archived_at && !session.current && (
-                            <button type="button" onClick={() => revokeMySession(session.id)} disabled={busy}>
+                          {canMutateAccount && !session.current && (
+                            <button type="button" onClick={() => requestConfirmation(() => revokeMySession(session.id))} disabled={busy}>
                               <LogOut size={14} />
                               {t("revokeSession")}
                             </button>
@@ -3724,8 +3539,8 @@ export function App() {
                         <td>{formatTime(consent.granted_at, locale)}</td>
                         <td>{formatTime(consent.updated_at, locale)}</td>
                         <td className="actions">
-                          {!user.archived_at && (
-                            <button type="button" onClick={() => revokeMyConsent(consent.client_id)} disabled={busy}>
+                          {canMutateAccount && (
+                            <button type="button" onClick={() => requestConfirmation(() => revokeMyConsent(consent.client_id))} disabled={busy}>
                               <Ban size={14} />
                               {t("revoke")}
                             </button>
@@ -3741,18 +3556,63 @@ export function App() {
           </section>
         )}
         {canAdmin && tab === "overview" && (
-          <section className="metrics-grid">
-            <Metric label={t("usersMetric")} value={overview?.users ?? 0} detail={`${overview?.active_users ?? 0} ${t("active")}`} />
-            <Metric label={t("clientsMetric")} value={overview?.clients ?? 0} detail={`${overview?.active_clients ?? 0} ${t("active")}`} />
-            <Metric label={t("database")} value={overview?.database_kind ?? "-"} detail={t("settings")} />
-            <Metric label={t("issuerLabel")} value={overview?.issuer ?? "-"} detail="OIDC" />
+          <section className="dashboard">
+            <article className="welcome-card">
+              <div>
+                <StatusBadge tone="success"><Activity size={13} />{t("serviceHealthy")}</StatusBadge>
+                <h3>{t("welcomeBack")}，{user.display_name || user.username}</h3>
+                <p>{t("overviewIntro")}</p>
+              </div>
+              <div className="quick-actions" role="group" aria-label={t("quickActions")}>
+                {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={16} />{t("users")}</button>}
+                {canReadClients && <button type="button" onClick={() => navigateToTab("clients")}><KeyRound size={16} />{t("clients")}</button>}
+                {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={16} />{t("security")}</button>}
+              </div>
+            </article>
+            <div className="metrics-grid">
+              <Metric label={t("usersMetric")} value={totalUserCount} detail={`${activeUserCount} ${t("active")}`} />
+              <Metric label={t("activeRate")} value={`${activeUserRate}%`} detail={`${activeUserCount}/${totalUserCount} ${t("users")}`} />
+              <Metric label={t("clientsMetric")} value={totalClientCount} detail={`${activeClientCount} ${t("active")} · ${activeClientRate}%`} />
+              <Metric label={t("database")} value={overview?.database_kind ?? "-"} detail={t("settings")} />
+            </div>
+            <div className="overview-bottom-grid">
+              <article className="panel overview-status-card">
+                <div className="overview-card-heading">
+                  <div>
+                    <StatusBadge tone="success"><Activity size={13} />{t("serviceHealthy")}</StatusBadge>
+                    <h3>{t("overviewStatus")}</h3>
+                  </div>
+                  <Shield size={22} aria-hidden="true" />
+                </div>
+                <div className="overview-fact-grid">
+                  <Info label={t("issuerLabel")} value={overview?.issuer ?? bootstrap.issuer} />
+                  <Info label={t("database")} value={overview?.database_kind ?? "-"} />
+                  <Info label={t("usersMetric")} value={`${activeUserCount}/${totalUserCount} ${t("active")}`} />
+                  <Info label={t("clientsMetric")} value={`${activeClientCount}/${totalClientCount} ${t("active")}`} />
+                </div>
+              </article>
+              <article className="panel overview-workspace-card">
+                <div className="overview-card-heading">
+                  <div>
+                    <h3>{t("overviewWorkspace")}</h3>
+                    <p className="muted">{t("overviewIntro")}</p>
+                  </div>
+                </div>
+                <div className="overview-nav-grid">
+                  {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={17} /><span>{t("users")}</span><ExternalLink size={14} /></button>}
+                  {canReadClients && <button type="button" onClick={() => navigateToTab("clients")}><KeyRound size={17} /><span>{t("clients")}</span><ExternalLink size={14} /></button>}
+                  {canReadOrganizations && <button type="button" onClick={() => navigateToTab("organizations")}><Building2 size={17} /><span>{t("organizations")}</span><ExternalLink size={14} /></button>}
+                  {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={17} /><span>{t("security")}</span><ExternalLink size={14} /></button>}
+                </div>
+              </article>
+            </div>
           </section>
         )}
         {canReadUsers && tab === "users" && (
           <section className="users-layout">
-            {canManageUsers && (
+            {canManageUsers && editor === "user" && (
+              <Modal title={userForm.id ? t("updateUser") : t("createUser")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
               <form className="panel" onSubmit={saveUser}>
-                <h3>{userForm.id ? t("updateUser") : t("createUser")}</h3>
                 <Field label={t("email")} value={userForm.email} onChange={(value) => setUserForm({ ...userForm, email: value })} />
                 <Field label={t("username")} value={userForm.username} onChange={(value) => setUserForm({ ...userForm, username: value })} />
                 <Field label={t("displayName")} value={userForm.display_name} onChange={(value) => setUserForm({ ...userForm, display_name: value })} />
@@ -3765,9 +3625,150 @@ export function App() {
                   {t("save")}
                 </button>
               </form>
+              </Modal>
             )}
-            <div className="table-panel">
-              <div className="table-toolbar">
+            {canManageUsers && bulkImportOpen && (
+              <Modal
+                title={t("bulkUserImport")}
+                closeLabel={t("close")}
+                error={bulkImportError}
+                dismissible={!busy}
+                onClose={closeBulkUserImport}
+                wide
+              >
+                <form className="panel bulk-import-panel" onSubmit={submitBulkUserImport}>
+                  <div className="info bulk-import-intro">
+                    <strong>{t("bulkImportAtomicTitle")}</strong>
+                    <p>{t("bulkImportAtomicDescription")}</p>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="bulk-user-import-file">{t("bulkImportFile")}</label>
+                    <input
+                      id="bulk-user-import-file"
+                      type="file"
+                      accept=".csv,text/csv"
+                      onChange={(event) => void readBulkUserImportFile(event)}
+                    />
+                    <small className="field-description">
+                      {bulkImportFileName ? `${t("bulkImportSelectedFile")}: ${bulkImportFileName}` : t("bulkImportFileHint")}
+                    </small>
+                  </div>
+                  <Field
+                    label={t("bulkImportCsv")}
+                    textarea
+                    value={bulkImportCsv}
+                    onChange={(value) => {
+                      setBulkImportCsv(value);
+                      setBulkImportFileName("");
+                      setBulkImportResult(null);
+                    }}
+                    description={t("bulkImportCsvHint")}
+                  />
+                  <div className="bulk-import-template">
+                    <code>{BULK_USER_IMPORT_TEMPLATE}</code>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBulkImportCsv(BULK_USER_IMPORT_TEMPLATE);
+                        setBulkImportFileName("");
+                        setBulkImportResult(null);
+                        setBulkImportError("");
+                      }}
+                    >
+                      <FileUp size={14} />
+                      {t("bulkImportUseTemplate")}
+                    </button>
+                  </div>
+                  <Check
+                    label={t("bulkImportDryRun")}
+                    checked={bulkImportDryRun}
+                    onChange={(value) => {
+                      setBulkImportDryRun(value);
+                      if (value) setBulkImportCommitConfirmed(false);
+                    }}
+                  />
+                  {bulkImportDryRun ? (
+                    <div className="info">{t("bulkImportDryRunHint")}</div>
+                  ) : (
+                    <div className="error bulk-import-commit-warning" role="alert">
+                      <strong>{t("bulkImportCommitWarning")}</strong>
+                      <Check
+                        label={t("bulkImportCommitConfirmation")}
+                        checked={bulkImportCommitConfirmed}
+                        onChange={setBulkImportCommitConfirmed}
+                      />
+                    </div>
+                  )}
+                  <div className="actions bulk-import-actions">
+                    <button type="button" onClick={resetBulkUserImport} disabled={busy}>{t("clear")}</button>
+                    <button className="primary compact-primary" type="submit" disabled={busy}>
+                      <FileUp size={16} />
+                      {bulkImportDryRun ? t("bulkImportRunDryRun") : t("bulkImportCommit")}
+                    </button>
+                  </div>
+                  {bulkImportResult && (
+                    <section className="bulk-import-results" aria-live="polite" aria-label={t("bulkImportResults")}>
+                      <div className="bulk-import-result-header">
+                        <h4>{t("bulkImportResults")}</h4>
+                        <StatusBadge tone={bulkImportResult.committed ? "success" : bulkImportResult.summary.invalid > 0 ? "danger" : "info"}>
+                          {bulkImportResult.committed ? t("bulkImportCommitted") : bulkImportResult.dry_run ? t("bulkImportDryRunResult") : t("bulkImportNotCommitted")}
+                        </StatusBadge>
+                      </div>
+                      <div className="bulk-import-summary">
+                        <span><strong>{bulkImportResult.summary.total}</strong>{t("bulkImportTotal")}</span>
+                        <span><strong>{bulkImportResult.summary.created}</strong>{t("bulkImportCreated")}</span>
+                        <span><strong>{bulkImportResult.summary.would_create}</strong>{t("bulkImportWouldCreate")}</span>
+                        <span><strong>{bulkImportResult.summary.invalid}</strong>{t("bulkImportInvalid")}</span>
+                      </div>
+                      <div className="bulk-import-result-table">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>{t("bulkImportRow")}</th>
+                              <th>{t("email")}</th>
+                              <th>{t("username")}</th>
+                              <th>{t("status")}</th>
+                              <th>{t("bulkImportUserId")}</th>
+                              <th>{t("bulkImportError")}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bulkImportResult.rows.map((row) => (
+                              <tr key={`${row.row}-${row.email ?? ""}-${row.username ?? ""}`}>
+                                <td>{row.row}</td>
+                                <td>{row.email ?? "-"}</td>
+                                <td>{row.username ?? "-"}</td>
+                                <td>
+                                  <StatusBadge tone={bulkImportOutcomeTone(row.outcome)}>
+                                    {t(
+                                      row.outcome === "created"
+                                        ? "bulkImportOutcomeCreated"
+                                        : row.outcome === "would_create"
+                                          ? "bulkImportOutcomeWouldCreate"
+                                          : row.outcome === "not_committed"
+                                            ? "bulkImportOutcomeNotCommitted"
+                                            : "bulkImportOutcomeInvalid"
+                                    )}
+                                  </StatusBadge>
+                                </td>
+                                <td><code>{row.user_id ?? "-"}</code></td>
+                                <td>{row.error ?? "-"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  )}
+                </form>
+              </Modal>
+            )}
+            <div className="table-panel users-table-panel">
+              <div className="table-toolbar users-toolbar">
+                <div className="users-toolbar-actions">
+                  {canManageUsers && <button type="button" onClick={() => { setUserForm(emptyUserForm); setEditor("user"); }}><Plus size={14} />{t("createUser")}</button>}
+                  {canManageUsers && <button type="button" onClick={openBulkUserImport}><FileUp size={14} />{t("bulkUserImport")}</button>}
+                </div>
                 <label className="filter-control">
                   <span>{t("userFilter")}</span>
                   <select value={userFilter} onChange={(event) => setUserFilter(event.target.value as UserFilter)}>
@@ -3775,13 +3776,136 @@ export function App() {
                     <option value="active">{t("activeUsers")}</option>
                     <option value="disabled">{t("disabledUsers")}</option>
                     <option value="archived">{t("archivedUsers")}</option>
+                    <option value="authorization_code">{t("authorizationCodeUsers")}</option>
                     <option value="all">{t("allUsers")}</option>
                   </select>
                 </label>
               </div>
-              <table>
+              <section className="user-filter-panel" aria-label={t("userFilters")}>
+                <div className="user-filter-heading">
+                  <div>
+                    <Filter size={16} aria-hidden="true" />
+                    <strong>{t("userFilters")}</strong>
+                  </div>
+                  <button
+                    className="text-button"
+                    type="button"
+                    aria-expanded={userFiltersExpanded}
+                    onClick={() => setUserFiltersExpanded((value) => !value)}
+                  >
+                    {userFiltersExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                    {userFiltersExpanded ? t("userFiltersLess") : t("userFiltersMore")}
+                  </button>
+                </div>
+                <div className="user-filter-grid user-filter-grid-common">
+                  <label className="user-filter-field">
+                    <span>{t("filterEmail")}</span>
+                    <input value={userEmailFilter} onChange={(event) => setUserEmailFilter(event.target.value)} />
+                  </label>
+                  <label className="user-filter-field">
+                    <span>{t("filterRole")}</span>
+                    <select value={userRoleFilter} onChange={(event) => setUserRoleFilter(event.target.value as UserRoleFilter)}>
+                      <option value="all">{t("allRoles")}</option>
+                      <option value="admin">{t("admin")}</option>
+                      <option value="user">{t("normalUser")}</option>
+                    </select>
+                  </label>
+                  <div className="user-filter-field">
+                    <span>{t("filterRegistrationDate")}</span>
+                    <div className="user-date-range">
+                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateFrom")}`} type="date" value={userRegistrationFrom} onChange={(event) => setUserRegistrationFrom(event.target.value)} />
+                      <span aria-hidden="true">–</span>
+                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateTo")}`} type="date" value={userRegistrationTo} onChange={(event) => setUserRegistrationTo(event.target.value)} />
+                    </div>
+                  </div>
+                  <div className="user-filter-field">
+                    <span>{t("filterLastLoginDate")}</span>
+                    <div className="user-date-range">
+                      <input aria-label={`${t("filterLastLoginDate")} ${t("filterDateFrom")}`} type="date" value={userLastLoginFrom} onChange={(event) => setUserLastLoginFrom(event.target.value)} />
+                      <span aria-hidden="true">–</span>
+                      <input aria-label={`${t("filterLastLoginDate")} ${t("filterDateTo")}`} type="date" value={userLastLoginTo} onChange={(event) => setUserLastLoginTo(event.target.value)} />
+                    </div>
+                  </div>
+                </div>
+                {userFiltersExpanded && (
+                  <div className="user-filter-grid user-filter-grid-advanced">
+                    <label className="user-filter-field">
+                      <span>{t("filterPhone")}</span>
+                      <input value={userPhoneFilter} onChange={(event) => setUserPhoneFilter(event.target.value)} />
+                    </label>
+                    <label className="user-filter-field">
+                      <span>{t("filterLoginRegion")}</span>
+                      <select value={userLoginRegionFilter} onChange={(event) => setUserLoginRegionFilter(event.target.value as UserLoginRegionFilter)}>
+                        <option value="all">{t("allLoginRegions")}</option>
+                        <option value="domestic">{t("domestic")}</option>
+                        <option value="overseas">{t("overseas")}</option>
+                      </select>
+                    </label>
+                    <label className="user-filter-field">
+                      <span>{t("filterOrganization")}</span>
+                      <select value={userOrganizationFilter} onChange={(event) => setUserOrganizationFilter(event.target.value)}>
+                        <option value="">{t("allOrganizations")}</option>
+                        {userOrganizationFilter && !organizationOptions.some((organization) => organization.id === userOrganizationFilter) && (
+                          <option value={userOrganizationFilter}>{userOrganizationFilter}</option>
+                        )}
+                        {organizationOptions.map((organization) => (
+                          <option key={organization.id} value={organization.id}>
+                            {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="user-filter-field">
+                      <span>{t("filterLinkedIdentity")}</span>
+                      <select value={userLinkedIdentityFilter} onChange={(event) => setUserLinkedIdentityFilter(event.target.value as UserLinkedIdentityFilter)}>
+                        <option value="all">{t("allIdentityStates")}</option>
+                        <option value="linked">{t("linkedIdentityOnly")}</option>
+                        <option value="unlinked">{t("unlinkedIdentityOnly")}</option>
+                      </select>
+                    </label>
+                  </div>
+                )}
+                <div className="user-filter-footer">
+                  <button className="text-button" type="button" onClick={resetUserFilters}>{t("resetFilters")}</button>
+                </div>
+              </section>
+              {canManageUsers && selectedUserIds.length > 0 && (
+                <div className="bulk-user-actions" aria-live="polite">
+                  <strong>{t("selectedUsers").replace("{count}", String(selectedUserIds.length))}</strong>
+                  <div className="actions">
+                    {availableBulkUserActions.includes("enable") && <button type="button" onClick={() => requestBulkUserAction("enable")} disabled={busy}>
+                      <RotateCcw size={14} />{t("bulkEnable")}
+                    </button>}
+                    {availableBulkUserActions.includes("disable") && <button type="button" onClick={() => requestBulkUserAction("disable")} disabled={busy}>
+                      <Ban size={14} />{t("bulkDisable")}
+                    </button>}
+                    {availableBulkUserActions.includes("archive") && <button type="button" onClick={() => requestBulkUserAction("archive")} disabled={busy}>
+                      <Archive size={14} />{t("bulkArchive")}
+                    </button>}
+                    {availableBulkUserActions.includes("delete") && <button type="button" onClick={() => requestBulkUserAction("delete")} disabled={busy}>
+                      <Trash2 size={14} />{t("bulkDelete")}
+                    </button>}
+                    {availableBulkUserActions.includes("reset_mfa") && <button type="button" onClick={() => requestBulkUserAction("reset_mfa")} disabled={busy}>
+                      <KeyRound size={14} />{t("bulkResetMfa")}
+                    </button>}
+                    <button type="button" onClick={() => setSelectedUserIds([])} disabled={busy}>{t("clearSelection")}</button>
+                  </div>
+                </div>
+              )}
+              <table className="user-table">
+                <caption className="sr-only">{t("users")}</caption>
                 <thead>
                   <tr>
+                    {canManageUsers && (
+                      <th className="user-selection-column">
+                        <input
+                          type="checkbox"
+                          aria-label={t("selectAllUsers")}
+                          checked={allVisibleUsersSelected}
+                          onChange={(event) => toggleVisibleUserSelection(event.target.checked)}
+                        />
+                      </th>
+                    )}
                     <th>{t("email")}</th>
                     <th>{t("role")}</th>
                     <th>{t("registeredAt")}</th>
@@ -3791,18 +3915,35 @@ export function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {users.map((item) => (
+                  {filteredUsers.map((item) => (
                     <tr key={item.id}>
-                      <td>{item.email}<br /><small>{item.username}</small></td>
-                      <td>{item.is_admin ? t("admin") : t("normalUser")}</td>
-                      <td>{formatTime(item.created_at, locale)}</td>
-                      <td>{formatTime(item.last_login_at, locale)}</td>
-                      <td>
-                        {item.archived_at ? t("archived") : item.is_active ? t("active") : t("disabled")}
-                        {item.archived_at && <><br /><small>{formatTime(item.archived_at, locale)}</small></>}
+                      {canManageUsers && (
+                        <td className="user-selection-column">
+                          <input
+                            type="checkbox"
+                            aria-label={`${t("email")}: ${item.email}`}
+                            checked={selectedUserIdSet.has(item.id)}
+                            onChange={() => toggleUserSelection(item.id)}
+                          />
+                        </td>
+                      )}
+                      <td className="user-summary">{item.email}<br /><small>{item.username}</small></td>
+                      <td className="user-role">{item.is_admin ? t("admin") : t("normalUser")}</td>
+                      <td className="user-registration">{formatTime(item.created_at, locale)}</td>
+                      <td className="user-last-login">{formatTime(item.last_login_at, locale)}</td>
+                      <td className="user-status">
+                        <div className="user-status-stack">
+                          <StatusBadge tone={item.archived_at !== null ? "neutral" : item.is_active ? "success" : "warning"}>
+                            {item.archived_at !== null ? t("archived") : item.is_active ? t("active") : t("disabled")}
+                          </StatusBadge>
+                          {item.registration_source === "authorization_code" && (
+                            <StatusBadge tone="info">{t("authorizationCodeRegistered")}</StatusBadge>
+                          )}
+                        </div>
+                        {item.archived_at !== null && <><br /><small>{formatTime(item.archived_at, locale)}</small></>}
                       </td>
-                      <td className="actions">
-                        {canManageUsers && !item.archived_at && (
+                      <td className="actions user-actions">
+                        {canManageUsers && item.archived_at === null && (
                           <button type="button" onClick={() => {
                             setUserForm({
                               id: item.id,
@@ -3814,160 +3955,169 @@ export function App() {
                               is_admin: item.is_admin,
                               is_active: item.is_active
                             });
+                            setEditor("user");
                           }}>{t("edit")}</button>
                         )}
-                        <button type="button" onClick={() => showUserDetails(item.id)}>{t("details")}</button>
-                        {canManageUsers && !item.archived_at && (
-                          <button type="button" onClick={() => resetUserMfa(item.id)}>
+                        <button type="button" onClick={() => void showUserDetails(item.id)} disabled={busy}>{t("details")}</button>
+                        {canManageUsers && availableUserActions(item, user?.id).includes("reset_mfa") && (
+                          <button type="button" onClick={() => requestConfirmation(() => resetUserMfa(item.id))}>
                             <KeyRound size={14} />
                             {t("resetMfa")}
                           </button>
                         )}
-                        {canManageUsers && !item.archived_at && item.is_active && (
-                          <button type="button" onClick={() => advanceUserLifecycle(item.id)}>
+                        {canManageUsers && availableUserActions(item, user?.id).includes("disable") && (
+                          <button type="button" onClick={() => requestConfirmation(() => advanceUserLifecycle(item.id))}>
                             <Ban size={14} />
                             {t("disable")}
                           </button>
                         )}
-                        {canManageUsers && !item.archived_at && !item.is_active && (
-                          <>
-                            <button type="button" onClick={() => enableUser(item.id)}>
-                              <RotateCcw size={14} />
-                              {t("enable")}
-                            </button>
-                            <button type="button" onClick={() => advanceUserLifecycle(item.id)}>
-                              <Archive size={14} />
-                              {t("archive")}
-                            </button>
-                          </>
+                        {canManageUsers && availableUserActions(item, user?.id).includes("enable") && (
+                          <button type="button" onClick={() => void enableUser(item.id)} disabled={busy}>
+                            <RotateCcw size={14} />
+                            {t("enable")}
+                          </button>
                         )}
-                        {canManageUsers && item.archived_at && (
-                          <>
-                            <button type="button" onClick={() => enableUser(item.id)}>
-                              <RotateCcw size={14} />
-                              {t("enable")}
-                            </button>
-                            <button type="button" onClick={() => advanceUserLifecycle(item.id)}>
-                              <Trash2 size={14} />
-                              {t("delete")}
-                            </button>
-                          </>
+                        {canManageUsers && availableUserActions(item, user?.id).includes("archive") && (
+                          <button type="button" onClick={() => requestConfirmation(() => advanceUserLifecycle(item.id))}>
+                            <Archive size={14} />
+                            {t("archive")}
+                          </button>
+                        )}
+                        {canManageUsers && availableUserActions(item, user?.id).includes("delete") && (
+                          <button type="button" onClick={() => requestConfirmation(() => advanceUserLifecycle(item.id))}>
+                            <Trash2 size={14} />
+                            {t("delete")}
+                          </button>
                         )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {selectedUser && (
-                <UserDetailPanel detail={selectedUser} locale={locale} t={t} onClose={() => setSelectedUser(null)} />
-              )}
+              {filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
+              {selectedUser && <Modal title={t("userDetails")} closeLabel={t("close")} onClose={() => setSelectedUser(null)} wide className="user-detail-modal"><UserDetailPanel detail={selectedUser} locale={locale} t={t} /></Modal>}
             </div>
           </section>
         )}
         {canReadOrganizations && tab === "organizations" && (
-          <section className="split wide">
-            {canManageOrganizations && (
+          <section className="management-list">
+            {canManageOrganizations && editor === "organization" && (
+              <Modal title={organizationForm.id ? t("updateOrganization") : t("createOrganization")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
               <form className="panel" onSubmit={saveOrganization}>
-                <h3>{organizationForm.id ? t("updateOrganization") : t("createOrganization")}</h3>
                 <Field label={t("organizationSlug")} value={organizationForm.slug} onChange={(value) => setOrganizationForm({ ...organizationForm, slug: value })} />
                 <Field label={t("organizationName")} value={organizationForm.name} onChange={(value) => setOrganizationForm({ ...organizationForm, name: value })} />
                 <Field label={t("description")} value={organizationForm.description} onChange={(value) => setOrganizationForm({ ...organizationForm, description: value })} textarea />
                 <Field label={t("allowedEmailDomains")} value={organizationForm.allowed_email_domains} onChange={(value) => setOrganizationForm({ ...organizationForm, allowed_email_domains: value })} textarea />
                 <Check label={t("active")} checked={organizationForm.is_active} onChange={(value) => setOrganizationForm({ ...organizationForm, is_active: value })} />
                 <label>{t("organizationMembers")}</label>
-                <div className="checkbox-grid tall">
-                  {users.map((item) => {
-                    const role = organizationMemberRoles[item.id] ?? "";
-                    return (
-                      <div key={item.id} className="member-row">
-                        <Check
-                          label={`${item.email} · ${item.username}`}
-                          checked={Boolean(role)}
-                          onChange={(selected) => setOrganizationMemberRole(item.id, selected ? "member" : null)}
-                        />
-                        {role && (
-                          <select value={role} onChange={(event) => setOrganizationMemberRole(item.id, event.target.value)}>
-                            <option value="member">member</option>
-                            <option value="admin">admin</option>
-                            <option value="owner">owner</option>
-                          </select>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+                {organizationMembersLoading ? (
+                  <div className="info" role="status">{t("loading")}</div>
+                ) : (
+                  <div className="checkbox-grid tall">
+                    {users.map((item) => {
+                      const role = organizationMemberRoles[item.id] ?? "";
+                      return (
+                        <div key={item.id} className="member-row">
+                          <Check
+                            label={`${item.email} · ${item.username}`}
+                            checked={Boolean(role)}
+                            onChange={(selected) => setOrganizationMemberRole(item.id, selected ? "member" : null)}
+                          />
+                          {role && (
+                            <select
+                              aria-label={`${item.email} · ${t("role")}`}
+                              value={role}
+                              onChange={(event) => setOrganizationMemberRole(item.id, event.target.value)}
+                            >
+                              <option value="member">member</option>
+                              <option value="admin">admin</option>
+                              <option value="owner">owner</option>
+                            </select>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 <div className="actions">
-                  <button type="submit" disabled={busy}><Save size={14} />{organizationForm.id ? t("save") : t("create")}</button>
+                  <button type="submit" disabled={busy || organizationMembersLoading}><Save size={14} />{organizationForm.id ? t("save") : t("create")}</button>
                   {organizationForm.id && (
                     <button type="button" onClick={() => {
+                      organizationMembersLoadId.current += 1;
                       setOrganizationForm(emptyOrganizationForm);
                       setOrganizationMemberRoles({});
+                      setOrganizationMembersLoading(false);
                     }}>{t("clear")}</button>
                   )}
                 </div>
               </form>
+              </Modal>
             )}
             <div className="table-panel">
-              <h3>{t("organizations")}</h3>
+              <div className="table-toolbar"><h3>{t("organizations")}</h3>{canManageOrganizations && <button type="button" onClick={() => { organizationMembersLoadId.current += 1; setOrganizationForm(emptyOrganizationForm); setOrganizationMemberRoles({}); setOrganizationMembersLoading(false); setEditor("organization"); }}><Plus size={14} />{t("createOrganization")}</button>}</div>
               <table>
                 <thead>
                   <tr>
                     <th>{t("organizationName")}</th>
-                    <th>{t("organizationMembers")}</th>
+                    <th>{t("memberCount")}</th>
                     <th>{t("status")}</th>
                     <th>{t("updatedAt")}</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {organizations.map((organization) => (
+                  {filteredOrganizations.map((organization) => (
                     <tr key={organization.id}>
-                      <td>
-                        {organization.name}<br />
-                        <small>{organization.slug}</small>
-                        {organization.allowed_email_domains.length > 0 && (
-                          <div className="tag-row">
-                            {organization.allowed_email_domains.map((domain) => <span key={domain}>@{domain}</span>)}
-                          </div>
-                        )}
-                      </td>
-                      <td>
-                        <div className="token-list">
-                          {organization.members.map((member) => (
-                            <span key={member.user_id}>{member.email} · {member.role}</span>
-                          ))}
+                      <td className="organization-name-cell">
+                        <div className="organization-name-summary">
+                          <strong>{organization.name}</strong>
+                          <span className="organization-slug">{organization.slug}</span>
+                          {organization.allowed_email_domains.length > 0 && (
+                            <span
+                              className="organization-domains"
+                              title={organization.allowed_email_domains.map((domain) => `@${domain}`).join(", ")}
+                            >
+                              @{organization.allowed_email_domains[0]}
+                              {organization.allowed_email_domains.length > 1 && ` +${organization.allowed_email_domains.length - 1}`}
+                            </span>
+                          )}
                         </div>
                       </td>
-                      <td>{organization.is_active ? t("active") : t("disabled")}</td>
+                      <td className="organization-member-count">{organization.member_count}</td>
+                      <td><StatusBadge tone={organization.is_active ? "success" : "warning"}>{organization.is_active ? t("active") : t("disabled")}</StatusBadge></td>
                       <td>{formatTime(organization.updated_at, locale)}</td>
                       <td className="actions">
-                        {canManageOrganizations && <button type="button" onClick={() => editOrganization(organization)}>{t("edit")}</button>}
-                        {canManageOrganizations && <button type="button" onClick={() => deleteOrganization(organization.id)}>{t("delete")}</button>}
+                        {canReadUsers && <button type="button" onClick={() => {
+                          setUserOrganizationFilter(organization.id);
+                          navigateToTab("users");
+                        }}>{t("viewMembers")}</button>}
+                        {canManageOrganizations && <button type="button" onClick={() => void editOrganization(organization)}>{t("edit")}</button>}
+                        {canManageOrganizations && <button type="button" onClick={() => requestConfirmation(() => deleteOrganization(organization.id))}>{t("delete")}</button>}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {organizations.length === 0 && <div className="empty">{t("noData")}</div>}
+              {filteredOrganizations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Building2 size={22} />} />}
             </div>
           </section>
         )}
         {canReadClients && tab === "clients" && (
-          <section className="split wide">
-            {canManageClients && (
+          <section className="management-list">
+            {canManageClients && editor === "client" && (
+              <Modal title={clientForm.id ? t("save") : t("createClient")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor} wide>
               <form className="panel" onSubmit={saveClient}>
-                <h3>{clientForm.id ? t("save") : t("createClient")}</h3>
                 <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} />
                 <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} />
-                <label>{t("clientOrganization")}</label>
-                <select value={clientForm.organization_id} onChange={(event) => setClientForm({ ...clientForm, organization_id: event.target.value })}>
+                <Field label={t("clientLogoUri")} type="url" value={clientForm.logo_uri} onChange={(value) => setClientForm({ ...clientForm, logo_uri: value })} />
+                <SelectField label={t("clientOrganization")} value={clientForm.organization_id} onChange={(value) => setClientForm({ ...clientForm, organization_id: value })}>
                   <option value="">{t("noOrganization")}</option>
-                  {organizations.map((organization) => (
+                  {organizationOptions.map((organization) => (
                     <option key={organization.id} value={organization.id}>
                       {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
                     </option>
                   ))}
-                </select>
+                </SelectField>
                 <Field label={t("clientSecret")} type="password" value={clientForm.client_secret} onChange={(value) => setClientForm({ ...clientForm, client_secret: value })} />
                 <Field label={t("redirectUris")} textarea value={clientForm.redirect_uris} onChange={(value) => setClientForm({ ...clientForm, redirect_uris: value })} />
                 <Field label={t("postLogoutUris")} textarea value={clientForm.post_logout_redirect_uris} onChange={(value) => setClientForm({ ...clientForm, post_logout_redirect_uris: value })} />
@@ -3976,19 +4126,17 @@ export function App() {
                 <Field label={t("scopes")} value={clientForm.scopes} onChange={(value) => setClientForm({ ...clientForm, scopes: value })} />
                 <Field label={t("grantTypes")} value={clientForm.grant_types} onChange={(value) => setClientForm({ ...clientForm, grant_types: value })} />
                 <Field label={t("responseTypes")} value={clientForm.response_types} onChange={(value) => setClientForm({ ...clientForm, response_types: value })} />
-                <label>{t("tokenAuthMethod")}</label>
-                <select value={clientForm.token_endpoint_auth_method} onChange={(event) => setClientForm({ ...clientForm, token_endpoint_auth_method: event.target.value })}>
+                <SelectField label={t("tokenAuthMethod")} value={clientForm.token_endpoint_auth_method} onChange={(value) => setClientForm({ ...clientForm, token_endpoint_auth_method: value })}>
                   <option value="client_secret_basic">client_secret_basic</option>
                   <option value="client_secret_post">client_secret_post</option>
                   <option value="client_secret_jwt">client_secret_jwt</option>
                   <option value="private_key_jwt">private_key_jwt</option>
                   <option value="none">none</option>
-                </select>
-                <label>{t("subjectType")}</label>
-                <select value={clientForm.subject_type} onChange={(event) => setClientForm({ ...clientForm, subject_type: event.target.value })}>
+                </SelectField>
+                <SelectField label={t("subjectType")} value={clientForm.subject_type} onChange={(value) => setClientForm({ ...clientForm, subject_type: value })}>
                   <option value="public">public</option>
                   <option value="pairwise">pairwise</option>
-                </select>
+                </SelectField>
                 <Field label={t("sectorIdentifierUri")} value={clientForm.sector_identifier_uri} onChange={(value) => setClientForm({ ...clientForm, sector_identifier_uri: value })} />
                 <Field label={t("jwksUri")} value={clientForm.jwks_uri} onChange={(value) => setClientForm({ ...clientForm, jwks_uri: value })} />
                 <Field label={t("jwks")} value={clientForm.jwks} onChange={(value) => setClientForm({ ...clientForm, jwks: value })} textarea />
@@ -4018,25 +4166,19 @@ export function App() {
                     <div className="mapper-card" key={index}>
                       <div className="mapper-grid">
                         <Field label={t("claimName")} value={mapper.claim_name} onChange={(value) => updateClientClaimMapper(index, { claim_name: value })} />
-                        <div>
-                          <label>{t("claimSource")}</label>
-                          <select value={mapper.source} onChange={(event) => updateClientClaimMapper(index, { source: event.target.value })}>
+                        <SelectField label={t("claimSource")} value={mapper.source} onChange={(value) => updateClientClaimMapper(index, { source: value })}>
                             <option value="user_field">{t("userField")}</option>
                             <option value="static">{t("staticValue")}</option>
                             <option value="scope">{t("scopeFlag")}</option>
                             <option value="client">{t("clientField")}</option>
-                          </select>
-                        </div>
+                        </SelectField>
                         <Field label={t("sourceValue")} value={mapper.source_value} onChange={(value) => updateClientClaimMapper(index, { source_value: value })} />
-                        <div>
-                          <label>{t("valueType")}</label>
-                          <select value={mapper.value_type} onChange={(event) => updateClientClaimMapper(index, { value_type: event.target.value })}>
+                        <SelectField label={t("valueType")} value={mapper.value_type} onChange={(value) => updateClientClaimMapper(index, { value_type: value })}>
                             <option value="string">string</option>
                             <option value="bool">bool</option>
                             <option value="number">number</option>
                             <option value="json">json</option>
-                          </select>
-                        </div>
+                        </SelectField>
                       </div>
                       <div className="mapper-targets">
                         <Check label={t("includeIdToken")} checked={mapper.include_in_id_token} onChange={(value) => updateClientClaimMapper(index, { include_in_id_token: value })} />
@@ -4053,9 +4195,11 @@ export function App() {
                 </div>
                 <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
               </form>
+              </Modal>
             )}
-            <div className="client-list">
-              {clients.map((client) => (
+            <div className="client-list oidc-client-list">
+              {canManageClients && <div className="table-toolbar"><button type="button" onClick={() => { setClientForm(emptyClientForm); setEditor("client"); }}><Plus size={14} />{t("createClient")}</button></div>}
+              {filteredClients.map((client) => (
                 <article className="client-card" key={client.id}>
                   <div>
                     <h3>{client.client_name}</h3>
@@ -4091,74 +4235,85 @@ export function App() {
                     </div>
                   )}
                   <small>{client.redirect_uris.join(", ")}</small>
-                  {canManageClients && <button type="button" onClick={() => setClientForm({
-                    id: client.id,
-                    client_id: client.client_id,
-                    client_name: client.client_name,
-                    organization_id: client.organization_id ?? "",
-                    client_secret: "",
-                    redirect_uris: client.redirect_uris.join("\n"),
-                    post_logout_redirect_uris: client.post_logout_redirect_uris.join("\n"),
-                    scopes: joinList(client.scopes),
-                    grant_types: joinList(client.grant_types),
-                    response_types: joinList(client.response_types),
-                    token_endpoint_auth_method: client.token_endpoint_auth_method,
-                    require_pkce: client.require_pkce,
-                    require_mfa: client.require_mfa,
-                    require_pushed_authorization_requests: client.require_pushed_authorization_requests,
-                    require_s256_pkce: client.require_s256_pkce,
-                    require_confidential_client: client.require_confidential_client,
-                    require_dpop: client.require_dpop,
-                    require_account_selection: client.require_account_selection,
-                    trust_email_verified: client.trust_email_verified,
-                    authorization_details_types: joinList(client.authorization_details_types),
-                    subject_type: client.subject_type,
-                    sector_identifier_uri: client.sector_identifier_uri,
-                    jwks_uri: client.jwks_uri,
-                    jwks: client.jwks,
-                    backchannel_logout_uri: client.backchannel_logout_uri,
-                    backchannel_logout_session_required: client.backchannel_logout_session_required,
-                    frontchannel_logout_uri: client.frontchannel_logout_uri,
-                    frontchannel_logout_session_required: client.frontchannel_logout_session_required,
-                    service_account_enabled: client.service_account_enabled,
-                    service_account_permissions: client.service_account_permissions.join("\n"),
-                    is_active: client.is_active,
-                    claim_mappers: client.claim_mappers.map((mapper, index) => ({
-                      claim_name: mapper.claim_name,
-                      source: mapper.source,
-                      source_value: mapper.source_value,
-                      value_type: mapper.value_type,
-                      include_in_id_token: mapper.include_in_id_token,
-                      include_in_access_token: mapper.include_in_access_token,
-                      include_in_userinfo: mapper.include_in_userinfo,
-                      is_active: mapper.is_active,
-                      sort_order: mapper.sort_order ?? index
-                    }))
-                  })}>{t("edit")}</button>}
+                  {canManageClients && (
+                    <div className="actions client-card-actions">
+                      <button type="button" onClick={() => { setClientForm({
+                        id: client.id,
+                        client_id: client.client_id,
+                        client_name: client.client_name,
+                        logo_uri: client.logo_uri,
+                        organization_id: client.organization_id ?? "",
+                        client_secret: "",
+                        redirect_uris: client.redirect_uris.join("\n"),
+                        post_logout_redirect_uris: client.post_logout_redirect_uris.join("\n"),
+                        scopes: joinList(client.scopes),
+                        grant_types: joinList(client.grant_types),
+                        response_types: joinList(client.response_types),
+                        token_endpoint_auth_method: client.token_endpoint_auth_method,
+                        require_pkce: client.require_pkce,
+                        require_mfa: client.require_mfa,
+                        require_pushed_authorization_requests: client.require_pushed_authorization_requests,
+                        require_s256_pkce: client.require_s256_pkce,
+                        require_confidential_client: client.require_confidential_client,
+                        require_dpop: client.require_dpop,
+                        require_account_selection: client.require_account_selection,
+                        trust_email_verified: client.trust_email_verified,
+                        authorization_details_types: joinList(client.authorization_details_types),
+                        subject_type: client.subject_type,
+                        sector_identifier_uri: client.sector_identifier_uri,
+                        jwks_uri: client.jwks_uri,
+                        jwks: client.jwks,
+                        backchannel_logout_uri: client.backchannel_logout_uri,
+                        backchannel_logout_session_required: client.backchannel_logout_session_required,
+                        frontchannel_logout_uri: client.frontchannel_logout_uri,
+                        frontchannel_logout_session_required: client.frontchannel_logout_session_required,
+                        service_account_enabled: client.service_account_enabled,
+                        service_account_permissions: client.service_account_permissions.join("\n"),
+                        is_active: client.is_active,
+                        claim_mappers: client.claim_mappers.map((mapper, index) => ({
+                          claim_name: mapper.claim_name,
+                          source: mapper.source,
+                          source_value: mapper.source_value,
+                          value_type: mapper.value_type,
+                          include_in_id_token: mapper.include_in_id_token,
+                          include_in_access_token: mapper.include_in_access_token,
+                          include_in_userinfo: mapper.include_in_userinfo,
+                          is_active: mapper.is_active,
+                          sort_order: mapper.sort_order ?? index
+                        }))
+                      });
+                      setEditor("client");
+                      }}>{t("edit")}</button>
+                      <button className="danger-button" type="button" onClick={() => requestConfirmation(() => deleteClient(client.id))} disabled={busy}>
+                        <Trash2 size={14} />
+                        {t("delete")}
+                      </button>
+                    </div>
+                  )}
                 </article>
               ))}
+              {filteredClients.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<KeyRound size={22} />} />}
             </div>
           </section>
         )}
         {canReadIap && tab === "iap" && (
-          <section className="split wide">
-            {canManageIap && (
+          <section className="management-list">
+            {canManageIap && editor === "iap" && (
+              <Modal title={iapApplicationForm.id ? t("updateIapApplication") : t("createIapApplication")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
               <form className="panel" onSubmit={saveIapApplication}>
-                <h3>{iapApplicationForm.id ? t("updateIapApplication") : t("createIapApplication")}</h3>
                 <Field label={t("slug")} value={iapApplicationForm.slug} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, slug: value })} />
                 <Field label={t("iapApplication")} value={iapApplicationForm.name} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, name: value })} />
                 <Field label={t("description")} value={iapApplicationForm.description} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, description: value })} textarea />
                 <Field label={t("externalHost")} value={iapApplicationForm.external_host} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, external_host: value })} />
                 <Field label={t("pathPrefix")} value={iapApplicationForm.path_prefix} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, path_prefix: value })} />
-                <label>{t("requiredOrganization")}</label>
-                <select value={iapApplicationForm.required_organization_id} onChange={(event) => setIapApplicationForm({ ...iapApplicationForm, required_organization_id: event.target.value })}>
+                <SelectField label={t("requiredOrganization")} value={iapApplicationForm.required_organization_id} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, required_organization_id: value })}>
                   <option value="">{t("noOrganization")}</option>
-                  {organizations.map((organization) => (
+                  {organizationOptions.map((organization) => (
                     <option key={organization.id} value={organization.id}>
                       {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
                     </option>
                   ))}
-                </select>
+                </SelectField>
                 <label>{t("requiredOrganizationRoles")}</label>
                 <div className="checkbox-grid">
                   {["owner", "admin", "member"].map((role) => (
@@ -4187,10 +4342,12 @@ export function App() {
                   )}
                 </div>
               </form>
+              </Modal>
             )}
             <div className="client-list">
-              {iapApplications.map((application) => {
-                const organization = organizations.find((item) => item.id === application.required_organization_id);
+              {canManageIap && <div className="table-toolbar"><button type="button" onClick={() => { setIapApplicationForm(emptyIapApplicationForm); setEditor("iap"); }}><Plus size={14} />{t("createIapApplication")}</button></div>}
+              {filteredIapApplications.map((application) => {
+                const organization = organizationOptions.find((item) => item.id === application.required_organization_id);
                 return (
                   <article className="client-card" key={application.id}>
                     <div>
@@ -4214,27 +4371,190 @@ export function App() {
                     <small>{t("updatedAt")}: {formatTime(application.updated_at, locale)}</small>
                     {canManageIap && (
                       <div className="actions">
-                        <button type="button" onClick={() => editIapApplication(application)}>{t("edit")}</button>
-                        <button type="button" onClick={() => deleteIapApplication(application.id)}>{t("delete")}</button>
+                        <button type="button" onClick={() => { editIapApplication(application); setEditor("iap"); }}>{t("edit")}</button>
+                        <button type="button" onClick={() => requestConfirmation(() => deleteIapApplication(application.id))}>{t("delete")}</button>
                       </div>
                     )}
                   </article>
                 );
               })}
-              {iapApplications.length === 0 && <div className="empty">{t("noData")}</div>}
+              {filteredIapApplications.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Shield size={22} />} />}
             </div>
           </section>
         )}
         {canManageAuthorizationCodes && tab === "invitations" && (
-          <section className="split">
-            <form className="panel" onSubmit={saveInvitation}>
-              <h3>{invitationForm.id ? t("updateInvitation") : t("createInvitation")}</h3>
+          <section className="management-list">
+            {editor === "invitation" && (
+              <Modal
+                title={invitationForm.id ? t("updateInvitation") : t("createInvitation")}
+                closeLabel={t("close")}
+                error={error}
+                dismissible={!busy}
+                onClose={() => {
+                  setInvitationForm(emptyInvitationForm);
+                  setLastInvitationCode("");
+                  closeEditor();
+                }}
+                wide
+              >
+                <form className="panel" onSubmit={saveInvitation}>
+              <SelectField
+                label={t("authorizationCodeType")}
+                value={invitationForm.code_type}
+                disabled={Boolean(invitationForm.id)}
+                description={invitationForm.id ? t("authorizationCodeTypeLocked") : undefined}
+                onChange={(value) => {
+                  const codeType = value as AuthorizationCodeType;
+                  setInvitationForm({
+                    ...invitationForm,
+                    code_type: codeType,
+                    authorized_email: codeType === "login" ? "" : invitationForm.authorized_email,
+                    authorized_display_name: codeType === "login" ? "" : invitationForm.authorized_display_name,
+                    allowed_client_ids: codeType === "registration" ? [] : invitationForm.allowed_client_ids,
+                    organization_id: codeType === "registration" ? "" : invitationForm.organization_id,
+                    organization_role: codeType === "registration" ? "member" : invitationForm.organization_role
+                  });
+                }}
+              >
+                <option value="registration">{t("registrationAuthorizationCodeType")}</option>
+                <option value="login">{t("loginAuthorizationCodeType")}</option>
+              </SelectField>
+              {invitationForm.code_type === "login" && (
+                <SelectField
+                  label={t("loginCodeLevel")}
+                  value={invitationForm.login_code_level}
+                  disabled={Boolean(invitationForm.id)}
+                  description={invitationForm.id
+                    ? t("loginCodeLevelLocked")
+                    : t(
+                      invitationForm.login_code_level === "admin_universal"
+                        ? "adminUniversalCodeHint"
+                        : invitationForm.login_code_level === "trial_enrollment"
+                          ? "trialEnrollmentCodeHint"
+                          : "accountRecoveryCodeHint"
+                    )}
+                  onChange={(value) => {
+                    const level = value as LoginAuthorizationCodeLevel;
+                    const applicationBound = level === "trial_enrollment" || level === "admin_universal";
+                    setInvitationForm({
+                      ...invitationForm,
+                      login_code_level: level,
+                      authorized_username: applicationBound ? "" : invitationForm.authorized_username,
+                      authorized_display_name: applicationBound ? "" : invitationForm.authorized_display_name,
+                      allowed_client_ids: applicationBound ? invitationForm.allowed_client_ids : [],
+                      organization_id: level === "trial_enrollment" ? invitationForm.organization_id : "",
+                      organization_role: level === "trial_enrollment" ? invitationForm.organization_role : "member"
+                    });
+                  }}
+                >
+                  <option value="account_recovery">{t("accountRecoveryCode")}</option>
+                  <option value="trial_enrollment">{t("trialEnrollmentCode")}</option>
+                  <option value="admin_universal" disabled={!user?.is_admin}>{t("adminUniversalCode")}</option>
+                </SelectField>
+              )}
               <Field label={t("description")} value={invitationForm.description} onChange={(value) => setInvitationForm({ ...invitationForm, description: value })} />
-              <Field label={t("authorizedEmail")} value={invitationForm.authorized_email} onChange={(value) => setInvitationForm({ ...invitationForm, authorized_email: value })} />
-              <Field label={t("authorizedUsername")} value={invitationForm.authorized_username} onChange={(value) => setInvitationForm({ ...invitationForm, authorized_username: value })} />
-              <Field label={t("authorizedDisplayName")} value={invitationForm.authorized_display_name} onChange={(value) => setInvitationForm({ ...invitationForm, authorized_display_name: value })} />
-              <Field label={t("expiresAt")} type="datetime-local" value={invitationForm.expires_at} onChange={(value) => setInvitationForm({ ...invitationForm, expires_at: value })} />
-              <Field label={t("maxUses")} type="number" value={invitationForm.max_uses} onChange={(value) => setInvitationForm({ ...invitationForm, max_uses: value })} />
+              {invitationForm.code_type === "registration" && (
+                <Field label={t("authorizedEmail")} value={invitationForm.authorized_email} onChange={(value) => setInvitationForm({ ...invitationForm, authorized_email: value })} />
+              )}
+              {(invitationForm.code_type === "registration" || invitationForm.login_code_level === "account_recovery") && (
+                <Field
+                  label={invitationForm.code_type === "login" ? t("username") : t("authorizedUsername")}
+                  value={invitationForm.authorized_username}
+                  onChange={(value) => setInvitationForm({ ...invitationForm, authorized_username: value })}
+                  required={invitationForm.code_type === "login"}
+                  disabled={Boolean(invitationForm.id) && invitationForm.code_type === "login"}
+                  description={invitationForm.code_type === "login"
+                    ? t(invitationForm.id ? "boundAccountLocked" : "loginCodeUsernameHint")
+                    : undefined}
+                />
+              )}
+              {invitationForm.code_type === "registration" && (
+                <Field
+                  label={t("authorizedDisplayName")}
+                  value={invitationForm.authorized_display_name}
+                  onChange={(value) => setInvitationForm({ ...invitationForm, authorized_display_name: value })}
+                />
+              )}
+              {invitationForm.code_type === "login" && (invitationForm.login_code_level === "admin_universal" || invitationForm.login_code_level === "trial_enrollment") && (
+                <>
+                  {invitationForm.login_code_level === "admin_universal" ? (
+                    <div className="error" role="alert">{t("adminUniversalCodeRisk")}</div>
+                  ) : (
+                    <div className="info" role="status">{t("trialEnrollmentCodeScope")}</div>
+                  )}
+                  <div role="group" aria-label={t("allowedApplications")}>
+                    <label>{t("allowedApplications")}</label>
+                    {invitationForm.id && <small className="field-description">{t(invitationForm.login_code_level === "trial_enrollment" ? "trialEnrollmentScopeLocked" : "allowedApplicationsLocked")}</small>}
+                    {clients.length > 0 ? (
+                      <div className="checkbox-grid">
+                        {clients.map((client) => (
+                          <Check
+                            key={client.client_id}
+                            label={`${client.client_name} · ${client.client_id}${client.is_active ? "" : ` · ${t("disabled")}`}`}
+                            checked={invitationForm.allowed_client_ids.includes(client.client_id)}
+                            disabled={Boolean(invitationForm.id)}
+                            onChange={() => setInvitationForm({
+                              ...invitationForm,
+                              allowed_client_ids: toggleValue(invitationForm.allowed_client_ids, client.client_id)
+                            })}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="info">{t("noOidcClients")}</div>
+                    )}
+                  </div>
+                </>
+              )}
+              {invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment" && (
+                <div className="enrollment-code-scope">
+                  {!canManageOrganizations && <div className="error" role="alert">{t("trialEnrollmentOrganizationManageRequired")}</div>}
+                  <SelectField
+                    label={t("enrollmentOrganization")}
+                    value={invitationForm.organization_id}
+                    disabled={Boolean(invitationForm.id)}
+                    description={invitationForm.id ? t("trialEnrollmentScopeLocked") : t("trialEnrollmentOrganizationHint")}
+                    onChange={(value) => setInvitationForm({ ...invitationForm, organization_id: value })}
+                  >
+                    <option value="">{t("selectOrganization")}</option>
+                    {organizationOptions.map((organization) => (
+                      <option key={organization.id} value={organization.id} disabled={!organization.is_active}>
+                        {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
+                      </option>
+                    ))}
+                  </SelectField>
+                  {organizationOptions.length === 0 && <div className="error" role="alert">{t("trialEnrollmentOrganizationUnavailable")}</div>}
+                  <SelectField
+                    label={t("enrollmentOrganizationRole")}
+                    value={invitationForm.organization_role}
+                    disabled={Boolean(invitationForm.id)}
+                    description={invitationForm.id ? t("trialEnrollmentScopeLocked") : t("trialEnrollmentRoleHint")}
+                    onChange={(value) => setInvitationForm({ ...invitationForm, organization_role: value as OrganizationMemberRole })}
+                  >
+                    <option value="member">{t("organizationRoleMember")}</option>
+                    <option value="admin">{t("organizationRoleAdmin")}</option>
+                    <option value="owner">{t("organizationRoleOwner")}</option>
+                  </SelectField>
+                </div>
+              )}
+              <Field
+                label={t("expiresAt")}
+                type="datetime-local"
+                value={invitationForm.expires_at}
+                onChange={(value) => setInvitationForm({ ...invitationForm, expires_at: value })}
+                required={invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment"}
+                description={invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment" ? t("trialEnrollmentExpiryHint") : undefined}
+              />
+              <Field
+                label={t("maxUses")}
+                type="number"
+                min={1}
+                step={1}
+                value={invitationForm.max_uses}
+                onChange={(value) => setInvitationForm({ ...invitationForm, max_uses: value })}
+                required={invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment"}
+                description={invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment" ? t("trialEnrollmentUsesHint") : undefined}
+              />
               <Check label={t("active")} checked={invitationForm.is_active} onChange={(value) => setInvitationForm({ ...invitationForm, is_active: value })} />
               <button className="primary" type="submit" disabled={busy}><Ticket size={16} />{t("save")}</button>
               {lastInvitationCode && (
@@ -4246,47 +4566,198 @@ export function App() {
                   </button>
                 </div>
               )}
-            </form>
+                </form>
+              </Modal>
+            )}
+            {revealedInvitation && (
+              <Modal
+                title={t("authorizationCodeRevealTitle")}
+                closeLabel={t("close")}
+                error={invitationRevealError}
+                onClose={closeInvitationReveal}
+                className="invitation-reveal-modal"
+              >
+                <div className="invitation-reveal-content">
+                  <p>{t("authorizationCodeRevealHint")}</p>
+                  {revealingInvitationId === revealedInvitation.id ? (
+                    <div className="muted">{t("loading")}</div>
+                  ) : revealedInvitationCode ? (
+                    <div className="invitation-secret-value">
+                      <code>{revealedInvitationCode}</code>
+                      <button
+                        className="link-button"
+                        type="button"
+                        onClick={() => void copyTextToClipboard(
+                          revealedInvitationCode,
+                          "authorizationCodeCopied",
+                          "copyAuthorizationCodeUnavailable"
+                        )}
+                      >
+                        <Copy size={14} />
+                        {t("copyAuthorizationCode")}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </Modal>
+            )}
+            {redemptionsInvitation && (
+              <Modal
+                title={t("authorizationCodeRedemptionsTitle")}
+                closeLabel={t("close")}
+                error={invitationRedemptionsError}
+                onClose={closeInvitationRedemptions}
+                className="invitation-redemptions-modal"
+              >
+                <div className="invitation-redemptions-content">
+                  <div className="invitation-redemptions-summary">
+                    <code>{redemptionsInvitation.code_prefix}...</code>
+                    <span>{redemptionsInvitation.uses_count}/{redemptionsInvitation.max_uses ?? t("unlimited")}</span>
+                  </div>
+                  {invitationRedemptionsLoading && invitationRedemptions.length === 0 ? (
+                    <div className="muted">{t("loading")}</div>
+                  ) : invitationRedemptions.length === 0 ? (
+                    <EmptyState title={t("noAuthorizationCodeRedemptions")} icon={<Ticket size={22} />} />
+                  ) : (
+                    <div className="invitation-redemption-list">
+                      {invitationRedemptions.map((redemption) => (
+                        <article className="invitation-redemption-row" key={redemption.id}>
+                          <strong>{redemption.user_email ?? redemption.user_username ?? redemption.user_id}</strong>
+                          <span>{formatTime(redemption.redeemed_at, locale)}</span>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                  {invitationRedemptionsNextCursor && (
+                    <button
+                      type="button"
+                      onClick={() => void loadInvitationRedemptions(
+                        redemptionsInvitation,
+                        invitationRedemptionsNextCursor
+                      )}
+                      disabled={invitationRedemptionsLoading}
+                    >
+                      {invitationRedemptionsLoading ? t("loading") : t("loadMore")}
+                    </button>
+                  )}
+                </div>
+              </Modal>
+            )}
             <div className="table-panel">
-              <table>
-                <thead><tr><th>{t("authorizationCodePrefix")}</th><th>{t("description")}</th><th>{t("authorizedEmail")}</th><th>{t("expiresAt")}</th><th>{t("used")}</th><th>{t("status")}</th><th></th></tr></thead>
+              <div className="table-toolbar">
+                <h3>{t("invitations")}</h3>
+                <button type="button" onClick={() => {
+                  setInvitationForm(emptyInvitationForm);
+                  setLastInvitationCode("");
+                  setEditor("invitation");
+                }}>
+                  <Plus size={14} />
+                  {t("createInvitation")}
+                </button>
+              </div>
+              <table className="authorization-codes-table">
+                <thead><tr><th>{t("authorizationCodePrefix")}</th><th>{t("authorizationCodeType")}</th><th>{t("description")}</th><th>{t("authorizedIdentity")}</th><th>{t("expiresAt")}</th><th>{t("used")}</th><th>{t("status")}</th><th></th></tr></thead>
                 <tbody>
-                  {invitations.map((item) => (
+                  {filteredInvitations.map((item) => (
                     <tr key={item.id}>
-                      <td>{item.code_prefix}...</td>
-                      <td>{item.description ?? "-"}</td>
-                      <td>{item.authorized_email ?? "-"}</td>
-                      <td>{item.expires_at ? formatTime(item.expires_at, locale) : t("permanent")}</td>
+                      <td className="authorization-code-prefix-cell">
+                        <code>{item.code_prefix}...</code>
+                        <button
+                          className="icon-button compact-icon-button"
+                          type="button"
+                          aria-label={item.can_reveal ? t("revealAuthorizationCode") : t("authorizationCodeRevealUnavailable")}
+                          title={item.can_reveal ? t("revealAuthorizationCode") : t("authorizationCodeRevealUnavailable")}
+                          disabled={!item.can_reveal || revealingInvitationId === item.id}
+                          onClick={() => void revealInvitationCode(item)}
+                        >
+                          <Eye size={15} />
+                        </button>
+                      </td>
                       <td>
-                        {item.uses_count}/{item.max_uses ?? t("unlimited")}
-                        {item.redemptions.length > 0 && (
-                          <small>
-                            <br />{t("redemptions")}: {item.redemptions.slice(0, 3).map((redemption) => (
-                              <span key={redemption.id}>
-                                <br />{redemption.user_email ?? redemption.user_username ?? redemption.user_id} · {formatTime(redemption.redeemed_at, locale)}
+                        <div className="invitation-type-badges">
+                          <StatusBadge tone={item.code_type === "login" ? "info" : "neutral"}>
+                            {t(item.code_type === "login" ? "loginAuthorizationCodeType" : "registrationAuthorizationCodeType")}
+                          </StatusBadge>
+                          {item.code_type === "login" && (
+                            <StatusBadge tone={item.login_code_level === "admin_universal" ? "danger" : item.login_code_level === "trial_enrollment" ? "success" : "neutral"}>
+                              {t(
+                                item.login_code_level === "admin_universal"
+                                  ? "adminUniversalCode"
+                                  : item.login_code_level === "trial_enrollment"
+                                    ? "trialEnrollmentCode"
+                                    : "accountRecoveryCode"
+                              )}
+                            </StatusBadge>
+                          )}
+                        </div>
+                      </td>
+                      <td>{item.description ?? "-"}</td>
+                      <td>
+                        {item.code_type === "login" && item.login_code_level === "trial_enrollment" ? (
+                          <div className="token-list">
+                            <span>{organizationOptions.find((organization) => organization.id === item.organization_id)?.name ?? item.organization_id ?? "-"}</span>
+                            <span>{t("enrollmentOrganizationRole")}: {t(
+                              item.organization_role === "owner"
+                                ? "organizationRoleOwner"
+                                : item.organization_role === "admin"
+                                  ? "organizationRoleAdmin"
+                                  : "organizationRoleMember"
+                            )}</span>
+                            {(item.allowed_client_ids ?? []).map((clientId) => (
+                              <span key={clientId}>
+                                {clients.find((client) => client.client_id === clientId)?.client_name ?? clientId}
                               </span>
                             ))}
-                          </small>
+                          </div>
+                        ) : item.code_type === "login" && item.login_code_level === "admin_universal" ? (
+                          <div className="token-list">
+                            {(item.allowed_client_ids ?? []).map((clientId) => (
+                              <span key={clientId}>
+                                {clients.find((client) => client.client_id === clientId)?.client_name ?? clientId}
+                              </span>
+                            ))}
+                            {(item.allowed_client_ids ?? []).length === 0 && <span>-</span>}
+                          </div>
+                        ) : (
+                          item.authorized_email ?? item.authorized_username ?? "-"
                         )}
+                      </td>
+                      <td>{item.expires_at ? formatTime(item.expires_at, locale) : t("permanent")}</td>
+                      <td className="invitation-usage-cell">
+                        <span>{item.uses_count}/{item.max_uses ?? t("unlimited")}</span>
+                        <button type="button" className="link-button" onClick={() => openInvitationRedemptions(item)}>
+                          <Clock3 size={14} />
+                          {t("viewRedemptions")}
+                        </button>
                       </td>
                       <td>{item.is_active ? t("active") : t("disabled")}</td>
                       <td className="actions">
-                        <button type="button" onClick={() => setInvitationForm({
-                          id: item.id,
-                          description: item.description ?? "",
-                          authorized_email: item.authorized_email ?? "",
-                          authorized_username: item.authorized_username ?? "",
-                          authorized_display_name: item.authorized_display_name ?? "",
-                          expires_at: toDatetimeLocalValue(item.expires_at),
-                          max_uses: item.max_uses ? String(item.max_uses) : "",
-                          is_active: item.is_active
-                        })}>{t("edit")}</button>
-                        <button type="button" onClick={() => deleteInvitation(item.id)}>{t("delete")}</button>
+                        <button type="button" onClick={() => {
+                          setInvitationForm({
+                            id: item.id,
+                            code_type: item.code_type,
+                            login_code_level: item.login_code_level ?? "account_recovery",
+                            allowed_client_ids: item.allowed_client_ids ?? [],
+                            organization_id: item.organization_id ?? "",
+                            organization_role: item.organization_role ?? "member",
+                            description: item.description ?? "",
+                            authorized_email: item.authorized_email ?? "",
+                            authorized_username: item.authorized_username ?? "",
+                            authorized_display_name: item.authorized_display_name ?? "",
+                            expires_at: toDatetimeLocalValue(item.expires_at),
+                            max_uses: item.max_uses ? String(item.max_uses) : "",
+                            is_active: item.is_active
+                          });
+                          setLastInvitationCode("");
+                          setEditor("invitation");
+                        }}>{t("edit")}</button>
+                        <button type="button" onClick={() => requestConfirmation(() => deleteInvitation(item.id))}>{t("delete")}</button>
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {filteredInvitations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Ticket size={22} />} />}
             </div>
           </section>
         )}
@@ -4303,18 +4774,29 @@ export function App() {
           </form>
         )}
         {canManageProviders && tab === "providers" && (
-          <section className="split wide">
-            <form className="panel" onSubmit={saveProvider}>
-              <h3>{providerForm.id ? t("updateProvider") : t("createProvider")}</h3>
+          <section className="management-list identity-sources-page">
+            {editor === "provider" && (
+              <Modal
+                title={providerForm.id ? t("updateProvider") : t("createProvider")}
+                closeLabel={t("close")}
+                error={error}
+                dismissible={!busy}
+                onClose={() => {
+                  setProviderForm(emptyProviderForm);
+                  setProviderTemplateId("");
+                  closeEditor();
+                }}
+                wide
+              >
+                <form className="panel" onSubmit={saveProvider}>
               {providerTemplates.length > 0 && (
                 <>
-                  <label>{t("providerTemplate")}</label>
-                  <select value={providerTemplateId} onChange={(event) => setProviderTemplateId(event.target.value)}>
+                  <SelectField label={t("providerTemplate")} value={providerTemplateId} onChange={setProviderTemplateId}>
                     <option value="">-</option>
                     {providerTemplates.map((template) => (
                       <option key={template.id} value={template.id}>{template.display_name}</option>
                     ))}
-                  </select>
+                  </SelectField>
                   <div className="actions">
                     <button type="button" onClick={applyProviderTemplate} disabled={busy || !providerTemplateId}>
                       <Plus size={14} />
@@ -4325,15 +4807,14 @@ export function App() {
               )}
               <Field label={t("slug")} value={providerForm.slug} onChange={(value) => setProviderForm({ ...providerForm, slug: value, redirect_path: providerRedirectPath(value) })} />
               <Field label={t("displayName")} value={providerForm.display_name} onChange={(value) => setProviderForm({ ...providerForm, display_name: value })} />
-              <label>{t("clientOrganization")}</label>
-              <select value={providerForm.organization_id} onChange={(event) => setProviderForm({ ...providerForm, organization_id: event.target.value })}>
+              <SelectField label={t("clientOrganization")} value={providerForm.organization_id} onChange={(value) => setProviderForm({ ...providerForm, organization_id: value })}>
                 <option value="">{t("noOrganization")}</option>
-                {organizations.map((organization) => (
+                {organizationOptions.map((organization) => (
                   <option key={organization.id} value={organization.id}>
                     {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
                   </option>
                 ))}
-              </select>
+              </SelectField>
               <Field label={t("issuer")} value={providerForm.issuer} onChange={(value) => setProviderForm({ ...providerForm, issuer: value })} />
               <div className="actions">
                 <button type="button" onClick={() => void discoverProviderEndpoints()} disabled={busy || !providerForm.issuer.trim()}>
@@ -4342,7 +4823,20 @@ export function App() {
                 </button>
               </div>
               <Field label={t("clientId")} value={providerForm.client_id} onChange={(value) => setProviderForm({ ...providerForm, client_id: value })} />
-              <Field label={t("clientSecret")} type="password" value={providerForm.client_secret} onChange={(value) => setProviderForm({ ...providerForm, client_secret: value })} />
+              <Field
+                label={t("clientSecret")}
+                type="password"
+                value={providerForm.client_secret}
+                onChange={(value) => setProviderForm({ ...providerForm, client_secret: value, clear_client_secret: false })}
+                description={providerForm.id ? t("secretLeaveBlank") : undefined}
+              />
+              {providerForm.id && (
+                <Check
+                  label={t("clearClientSecret")}
+                  checked={providerForm.clear_client_secret}
+                  onChange={(value) => setProviderForm({ ...providerForm, clear_client_secret: value, client_secret: value ? "" : providerForm.client_secret })}
+                />
+              )}
               <Field label={t("authorizationEndpoint")} value={providerForm.authorization_endpoint} onChange={(value) => setProviderForm({ ...providerForm, authorization_endpoint: value })} />
               <Field label={t("tokenEndpoint")} value={providerForm.token_endpoint} onChange={(value) => setProviderForm({ ...providerForm, token_endpoint: value })} />
               <Field label={t("userinfoEndpoint")} value={providerForm.userinfo_endpoint} onChange={(value) => setProviderForm({ ...providerForm, userinfo_endpoint: value })} />
@@ -4353,12 +4847,26 @@ export function App() {
               <Check label={t("allowLogin")} checked={providerForm.allow_login} onChange={(value) => setProviderForm({ ...providerForm, allow_login: value })} />
               <Check label={t("allowRegistration")} checked={providerForm.allow_registration} onChange={(value) => setProviderForm({ ...providerForm, allow_registration: value })} />
               <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
-            </form>
-            <div className="client-list">
-              {providers.map((provider) => (
+                </form>
+              </Modal>
+            )}
+            <section className="identity-source-section">
+              <div className="table-toolbar identity-source-toolbar">
+                <div>
+                  <h3>{t("providers")}</h3>
+                  <p className="muted">{t("externalLogin")}</p>
+                </div>
+                <button type="button" onClick={() => {
+                  setProviderForm(emptyProviderForm);
+                  setProviderTemplateId("");
+                  setEditor("provider");
+                }}><Plus size={14} />{t("createProvider")}</button>
+              </div>
+              <div className="client-list identity-source-list">
+              {filteredProviders.map((provider) => (
                 <article className="client-card" key={provider.id}>
                   {(() => {
-                    const organization = organizations.find((item) => item.id === provider.organization_id);
+                    const organization = organizationOptions.find((item) => item.id === provider.organization_id);
                     return (
                       <>
                   <h3>{provider.display_name}</h3>
@@ -4374,34 +4882,52 @@ export function App() {
                     {provider.allow_registration && <span>{t("allowRegistration")}</span>}
                   </div>
                   <div className="actions">
-                    <button type="button" onClick={() => setProviderForm({
-                      id: provider.id,
-                      slug: provider.slug,
-                      display_name: provider.display_name,
-                      organization_id: provider.organization_id ?? "",
-                      issuer: provider.issuer,
-                      client_id: provider.client_id,
-                      client_secret: "",
-                      authorization_endpoint: provider.authorization_endpoint,
-                      token_endpoint: provider.token_endpoint,
-                      userinfo_endpoint: provider.userinfo_endpoint,
-                      redirect_path: provider.redirect_path,
-                      scopes: joinList(provider.scopes),
-                      email_domains: joinList(provider.email_domains),
-                      is_active: provider.is_active,
-                      allow_login: provider.allow_login,
-                      allow_registration: provider.allow_registration
-                    })}>{t("edit")}</button>
-                    <button type="button" onClick={() => deleteProvider(provider.id)}>{t("delete")}</button>
+                    <button type="button" onClick={() => {
+                      setProviderForm({
+                        id: provider.id,
+                        slug: provider.slug,
+                        display_name: provider.display_name,
+                        organization_id: provider.organization_id ?? "",
+                        issuer: provider.issuer,
+                        client_id: provider.client_id,
+                        client_secret: "",
+                        clear_client_secret: false,
+                        authorization_endpoint: provider.authorization_endpoint,
+                        token_endpoint: provider.token_endpoint,
+                        userinfo_endpoint: provider.userinfo_endpoint,
+                        redirect_path: provider.redirect_path,
+                        scopes: joinList(provider.scopes),
+                        email_domains: joinList(provider.email_domains),
+                        is_active: provider.is_active,
+                        allow_login: provider.allow_login,
+                        allow_registration: provider.allow_registration
+                      });
+                      setProviderTemplateId("");
+                      setEditor("provider");
+                    }}>{t("edit")}</button>
+                    <button type="button" onClick={() => requestConfirmation(() => deleteProvider(provider.id))}>{t("delete")}</button>
                   </div>
                       </>
                     );
                   })()}
                 </article>
               ))}
-            </div>
-            <form className="panel" onSubmit={saveLdapProvider}>
-              <h3>{ldapProviderForm.id ? t("updateLdapProvider") : t("createLdapProvider")}</h3>
+              {filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
+              </div>
+            </section>
+            {editor === "ldap" && (
+              <Modal
+                title={ldapProviderForm.id ? t("updateLdapProvider") : t("createLdapProvider")}
+                closeLabel={t("close")}
+                error={error}
+                dismissible={!busy}
+                onClose={() => {
+                  setLdapProviderForm(emptyLdapProviderForm);
+                  closeEditor();
+                }}
+                wide
+              >
+                <form className="panel" onSubmit={saveLdapProvider}>
               <Field label={t("slug")} value={ldapProviderForm.slug} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, slug: value })} />
               <Field label={t("displayName")} value={ldapProviderForm.display_name} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, display_name: value })} />
               <Field label={t("ldapUrl")} value={ldapProviderForm.url} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, url: value })} />
@@ -4427,9 +4953,22 @@ export function App() {
                   <button type="button" onClick={() => setLdapProviderForm(emptyLdapProviderForm)}>{t("clear")}</button>
                 )}
               </div>
-            </form>
-            <div className="client-list">
-              {ldapProviders.map((provider) => (
+                </form>
+              </Modal>
+            )}
+            <section className="identity-source-section">
+              <div className="table-toolbar identity-source-toolbar">
+                <div>
+                  <h3>{t("ldapProviders")}</h3>
+                  <p className="muted">{t("directoryLogin")}</p>
+                </div>
+                <button type="button" onClick={() => {
+                  setLdapProviderForm(emptyLdapProviderForm);
+                  setEditor("ldap");
+                }}><Plus size={14} />{t("createLdapProvider")}</button>
+              </div>
+              <div className="client-list identity-source-list">
+              {filteredLdapProviders.map((provider) => (
                 <article className="client-card" key={provider.id}>
                   <h3>{provider.display_name}</h3>
                   <p>{provider.slug} · {provider.is_active ? t("active") : t("disabled")}</p>
@@ -4448,18 +4987,26 @@ export function App() {
                   <small>{provider.user_filter}</small>
                   <div className="actions">
                     <button type="button" onClick={() => editLdapProvider(provider)}>{t("edit")}</button>
-                    <button type="button" onClick={() => deleteLdapProvider(provider.id)}>{t("delete")}</button>
+                    <button type="button" onClick={() => requestConfirmation(() => deleteLdapProvider(provider.id))}>{t("delete")}</button>
                   </div>
                 </article>
               ))}
-              {ldapProviders.length === 0 && <div className="empty">{t("noData")}</div>}
+              {filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
             </div>
+          </section>
           </section>
         )}
         {canManageSettings && tab === "portal" && loginSettings && (
           <section className="split wide">
             <form className="panel" onSubmit={saveLoginSettings}>
               <h3>{t("loginSettings")}</h3>
+              <Field
+                label={t("brandLogoUrl")}
+                type="url"
+                autoComplete="url"
+                value={loginSettingsDraft.brand_logo_url}
+                onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, brand_logo_url: value })}
+              />
               <Field
                 label={t("companyEmailDomains")}
                 textarea
@@ -4478,13 +5025,12 @@ export function App() {
               <h3>{quickLinkForm.id ? t("updateQuickLink") : t("createQuickLink")}</h3>
               <Field label={t("linkLabel")} value={quickLinkForm.label} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, label: value })} />
               <Field label={t("linkUrl")} value={quickLinkForm.url} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, url: value })} />
-              <label>{t("linkIcon")}</label>
-              <select value={quickLinkForm.icon} onChange={(event) => setQuickLinkForm({ ...quickLinkForm, icon: event.target.value })}>
+              <SelectField label={t("linkIcon")} value={quickLinkForm.icon} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, icon: value })}>
                 <option value="openai">OpenAI</option>
                 <option value="link">Link</option>
                 <option value="mail">Mail</option>
                 <option value="help">Help</option>
-              </select>
+              </SelectField>
               <Check label={t("active")} checked={quickLinkForm.is_active} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, is_active: value })} />
               <div className="actions">
                 <button type="submit" disabled={busy}>
@@ -4505,7 +5051,7 @@ export function App() {
                       <td>{link.is_active ? t("active") : t("disabled")}</td>
                       <td className="actions">
                         <button type="button" onClick={() => editQuickLink(link)} disabled={busy}>{t("edit")}</button>
-                        <button type="button" onClick={() => void removeQuickLink(link.id)} disabled={busy}>{t("delete")}</button>
+                        <button type="button" onClick={() => requestConfirmation(() => removeQuickLink(link.id))} disabled={busy}>{t("delete")}</button>
                       </td>
                     </tr>
                   ))}
@@ -4515,373 +5061,458 @@ export function App() {
           </section>
         )}
         {(canManageSecurity || canReadAudit) && tab === "security" && (
-          <section className="security-grid wide">
+          <section className="security-page wide">
             {canManageSecurity && (
               <>
-            <div className="panel">
-              <h3>{t("mfaSettings")}</h3>
-              <p className="muted">
-                {mfaStatus?.enabled ? t("active") : t("disabled")} · {t("recoveryCodesRemaining")}: {mfaStatus?.recovery_codes_remaining ?? 0}/{mfaStatus?.recovery_codes_total ?? 0}
-              </p>
-              <div className="actions">
-                <button type="button" onClick={startTotpSetup}><KeyRound size={14} />{t("startTotpSetup")}</button>
-                {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes}>{t("rotateRecoveryCodes")}</button>}
-                {mfaStatus?.enabled && <button type="button" onClick={disableMfa}>{t("disableMfa")}</button>}
-              </div>
-              {totpSetup && (
-                <div className="mfa-setup">
-                  <label>{t("totpSecret")}</label>
-                  <textarea readOnly value={totpSetup.secret} />
-                  <label>{t("otpauthUri")}</label>
-                  <textarea readOnly value={totpSetup.otpauth_uri} />
-                  <Field label={t("mfaCode")} value={totpSetupCode} onChange={setTotpSetupCode} />
-                  <div className="actions">
-                    <button type="button" onClick={confirmTotpSetup}><Save size={14} />{t("confirmTotp")}</button>
-                  </div>
+                <div className="security-overview-grid">
+                  <section className="panel security-card security-mfa-card" aria-labelledby="security-mfa-heading">
+                    <div className="security-card-heading">
+                      <div className="security-card-title">
+                        <span className="security-card-icon" aria-hidden="true"><Shield size={18} /></span>
+                        <div>
+                          <h3 id="security-mfa-heading">{t("mfaSettings")}</h3>
+                          <p>{t("recoveryCodesRemaining")}: {mfaStatus?.recovery_codes_remaining ?? 0}/{mfaStatus?.recovery_codes_total ?? 0}</p>
+                        </div>
+                      </div>
+                      <StatusBadge tone={mfaStatus?.enabled ? "success" : "neutral"}>
+                        <Shield size={13} aria-hidden="true" />
+                        {mfaStatus?.enabled ? t("active") : t("disabled")}
+                      </StatusBadge>
+                    </div>
+                    <div className="actions security-card-actions">
+                      <button className="security-action-primary" type="button" onClick={startTotpSetup} disabled={busy}><KeyRound size={14} />{t("startTotpSetup")}</button>
+                      {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
+                      {mfaStatus?.enabled && <button className="danger-button" type="button" onClick={() => requestConfirmation(disableMfa)} disabled={busy}>{t("disableMfa")}</button>}
+                    </div>
+                    {totpSetup && (
+                      <div className="mfa-setup security-mfa-setup">
+                        <label htmlFor="security-totp-secret">{t("totpSecret")}</label>
+                        <textarea id="security-totp-secret" readOnly value={totpSetup.secret} />
+                        <label htmlFor="security-otpauth-uri">{t("otpauthUri")}</label>
+                        <textarea id="security-otpauth-uri" readOnly value={totpSetup.otpauth_uri} />
+                        <Field label={t("mfaCode")} value={totpSetupCode} onChange={setTotpSetupCode} />
+                        <div className="actions">
+                          <button className="security-action-primary" type="button" onClick={confirmTotpSetup} disabled={busy}><Save size={14} />{t("confirmTotp")}</button>
+                        </div>
+                      </div>
+                    )}
+                    {newRecoveryCodes.length > 0 && (
+                      <div className="info security-recovery-codes">
+                        <strong>{t("recoveryCodes")}</strong>
+                        <p>{t("recoveryCodesOnce")}</p>
+                        <div className="token-list">
+                          {newRecoveryCodes.map((code) => <span key={code}>{code}</span>)}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="table-panel security-card security-signing-card" aria-labelledby="security-signing-keys-heading">
+                    <div className="security-card-heading">
+                      <div className="security-card-title">
+                        <span className="security-card-icon" aria-hidden="true"><KeyRound size={18} /></span>
+                        <div>
+                          <h3 id="security-signing-keys-heading">{t("signingKeys")}</h3>
+                          <p>{t("keyId")}</p>
+                        </div>
+                      </div>
+                      <StatusBadge tone={signingKeys.some((key) => key.is_active) ? "success" : "warning"}>
+                        {signingKeys.some((key) => key.is_active) ? t("activeSigningKey") : t("retiredSigningKey")}
+                      </StatusBadge>
+                    </div>
+                    <div className="security-key-controls">
+                      <Field label={t("keyId")} value={signingKeyKid} onChange={setSigningKeyKid} />
+                      <button className="security-action-primary" type="button" onClick={() => requestConfirmation(rotateSigningKey)} disabled={busy}><RotateCcw size={14} />{t("rotateSigningKey")}</button>
+                    </div>
+                    <table className="security-signing-table">
+                      <thead><tr><th>{t("keyId")}</th><th>{t("status")}</th><th>{t("registeredAt")}</th><th>{t("activatedAt")}</th><th>{t("retiredAt")}</th></tr></thead>
+                      <tbody>
+                        {signingKeys.map((key) => (
+                          <tr key={key.id}>
+                            <td>{key.kid}</td>
+                            <td>{key.is_active ? t("activeSigningKey") : t("retiredSigningKey")}</td>
+                            <td>{formatTime(key.created_at, locale)}</td>
+                            <td>{formatTime(key.activated_at, locale)}</td>
+                            <td>{formatTime(key.retired_at, locale)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {signingKeys.length === 0 && <div className="empty">{t("noData")}</div>}
+                  </section>
                 </div>
-              )}
-              {newRecoveryCodes.length > 0 && (
-                <div className="info">
-                  <strong>{t("recoveryCodes")}</strong>
-                  <p>{t("recoveryCodesOnce")}</p>
-                  <div className="token-list">
-                    {newRecoveryCodes.map((code) => <span key={code}>{code}</span>)}
-                  </div>
-                </div>
-              )}
-            </div>
-            <div className="table-panel">
-              <h3>{t("signingKeys")}</h3>
-              <Field label={t("keyId")} value={signingKeyKid} onChange={setSigningKeyKid} />
-              <div className="actions">
-                <button type="button" onClick={rotateSigningKey} disabled={busy}><RotateCcw size={14} />{t("rotateSigningKey")}</button>
-              </div>
-              <table>
-                <thead><tr><th>{t("keyId")}</th><th>{t("status")}</th><th>{t("registeredAt")}</th><th>{t("activatedAt")}</th><th>{t("retiredAt")}</th></tr></thead>
-                <tbody>
-                  {signingKeys.map((key) => (
-                    <tr key={key.id}>
-                      <td>{key.kid}</td>
-                      <td>{key.is_active ? t("activeSigningKey") : t("retiredSigningKey")}</td>
-                      <td>{formatTime(key.created_at, locale)}</td>
-                      <td>{formatTime(key.activated_at, locale)}</td>
-                      <td>{formatTime(key.retired_at, locale)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {signingKeys.length === 0 && <div className="empty">{t("noData")}</div>}
-            </div>
-            {securityPolicy && (
-              <form className="panel" onSubmit={saveSecurityPolicy}>
-                <h3>{t("securityPolicy")}</h3>
-                <label>{t("passwordPolicy")}</label>
-                <Field
-                  label={t("minPasswordLength")}
-                  type="number"
-                  value={String(securityPolicy.password_min_length)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_min_length: Number(value) })}
-                />
-                <Check label={t("requireUppercase")} checked={Boolean(securityPolicy.password_require_uppercase)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_uppercase: value ? 1 : 0 })} />
-                <Check label={t("requireLowercase")} checked={Boolean(securityPolicy.password_require_lowercase)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_lowercase: value ? 1 : 0 })} />
-                <Check label={t("requireDigit")} checked={Boolean(securityPolicy.password_require_digit)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_digit: value ? 1 : 0 })} />
-                <Check label={t("requireSymbol")} checked={Boolean(securityPolicy.password_require_symbol)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_symbol: value ? 1 : 0 })} />
-                <Check label={t("rejectUserInfo")} checked={Boolean(securityPolicy.password_reject_user_info)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_reject_user_info: value ? 1 : 0 })} />
-                <label>{t("loginLockout")}</label>
-                <Check label={t("active")} checked={Boolean(securityPolicy.login_lockout_enabled)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, login_lockout_enabled: value ? 1 : 0 })} />
-                <Field
-                  label={t("maxFailedAttempts")}
-                  type="number"
-                  value={String(securityPolicy.max_failed_login_attempts)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, max_failed_login_attempts: Number(value) })}
-                />
-                <Field
-                  label={t("failureWindowSeconds")}
-                  type="number"
-                  value={String(securityPolicy.failure_window_seconds)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, failure_window_seconds: Number(value) })}
-                />
-                <Field
-                  label={t("lockoutSeconds")}
-                  type="number"
-                  value={String(securityPolicy.lockout_seconds)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, lockout_seconds: Number(value) })}
-                />
-                <label>{t("captchaPolicy")}</label>
-                <Check
-                  label={t("active")}
-                  checked={securityPolicy.captcha_enabled}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_enabled: value })}
-                />
-                <Field
-                  label={t("captchaAfterFailedAttempts")}
-                  type="number"
-                  value={String(securityPolicy.captcha_after_failed_attempts)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_after_failed_attempts: Number(value) })}
-                />
-                <Field
-                  label={t("captchaTtlSeconds")}
-                  type="number"
-                  value={String(securityPolicy.captcha_ttl_seconds)}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_ttl_seconds: Number(value) })}
-                />
-                <label>{t("trustedNetworks")}</label>
-                <Field
-                  label={t("trustedIpCidrs")}
-                  textarea
-                  value={securityPolicy.trusted_ip_cidrs.join("\n")}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, trusted_ip_cidrs: splitList(value) })}
-                />
-                <Check
-                  label={t("requireMfaOutsideTrustedNetworks")}
-                  checked={securityPolicy.require_mfa_outside_trusted_networks}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, require_mfa_outside_trusted_networks: value })}
-                />
-                <label>{t("accessRiskRules")}</label>
-                <Field
-                  label={t("allowedIpCidrs")}
-                  textarea
-                  value={securityPolicy.allowed_ip_cidrs.join("\n")}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_ip_cidrs: splitList(value) })}
-                />
-                <Field
-                  label={t("blockedIpCidrs")}
-                  textarea
-                  value={securityPolicy.blocked_ip_cidrs.join("\n")}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_ip_cidrs: splitList(value) })}
-                />
-                <Field
-                  label={t("allowedEmailDomains")}
-                  textarea
-                  value={securityPolicy.allowed_email_domains.join("\n")}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_email_domains: splitList(value).map(normalizeDomain) })}
-                />
-                <Field
-                  label={t("blockedEmailDomains")}
-                  textarea
-                  value={securityPolicy.blocked_email_domains.join("\n")}
-                  onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_email_domains: splitList(value).map(normalizeDomain) })}
-                />
-                <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
-              </form>
-            )}
-            <form className="panel" onSubmit={saveRole}>
-              <h3>{roleForm.id ? t("updateRole") : t("createRole")}</h3>
-              <Field label={t("roleName")} value={roleForm.name} onChange={(value) => setRoleForm({ ...roleForm, name: value })} />
-              <Field label={t("description")} value={roleForm.description} onChange={(value) => setRoleForm({ ...roleForm, description: value })} textarea />
-              <label>{t("rolePermissions")}</label>
-              <div className="checkbox-grid">
-                {permissionCatalog.map((permission) => (
-                  <Check
-                    key={permission.key}
-                    label={`${permission.key} · ${permission.category}`}
-                    checked={roleForm.permissions.includes(permission.key)}
-                    onChange={() => setRoleForm({ ...roleForm, permissions: toggleValue(roleForm.permissions, permission.key) })}
-                  />
-                ))}
-              </div>
-              <div className="actions">
-                <button type="submit" disabled={busy}><Save size={14} />{roleForm.id ? t("save") : t("create")}</button>
-                {roleForm.id && (
-                  <button type="button" onClick={() => setRoleForm(emptyRoleForm)}>{t("clear")}</button>
+
+                {securityPolicy && (
+                  <form className="panel security-policy-panel" onSubmit={saveSecurityPolicy}>
+                    <div className="security-policy-header">
+                      <div className="security-card-title">
+                        <span className="security-card-icon" aria-hidden="true"><Shield size={18} /></span>
+                        <div>
+                          <h3>{t("securityPolicy")}</h3>
+                          <p>{t("passwordPolicy")} · {t("accessRiskRules")}</p>
+                        </div>
+                      </div>
+                      <button className="primary compact-action security-policy-save" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+                    </div>
+                    <div className="security-policy-sections">
+                      <section className="security-policy-section" aria-labelledby="security-password-policy-heading">
+                        <h4 id="security-password-policy-heading">{t("passwordPolicy")}</h4>
+                        <Field
+                          label={t("minPasswordLength")}
+                          type="number"
+                          value={String(securityPolicy.password_min_length)}
+                          onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_min_length: Number(value) })}
+                        />
+                        <div className="security-check-grid">
+                          <Check label={t("requireUppercase")} checked={Boolean(securityPolicy.password_require_uppercase)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_uppercase: value ? 1 : 0 })} />
+                          <Check label={t("requireLowercase")} checked={Boolean(securityPolicy.password_require_lowercase)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_lowercase: value ? 1 : 0 })} />
+                          <Check label={t("requireDigit")} checked={Boolean(securityPolicy.password_require_digit)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_digit: value ? 1 : 0 })} />
+                          <Check label={t("requireSymbol")} checked={Boolean(securityPolicy.password_require_symbol)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_require_symbol: value ? 1 : 0 })} />
+                          <Check label={t("rejectUserInfo")} checked={Boolean(securityPolicy.password_reject_user_info)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, password_reject_user_info: value ? 1 : 0 })} />
+                        </div>
+                      </section>
+
+                      <section className="security-policy-section" aria-labelledby="security-login-protection-heading">
+                        <h4 id="security-login-protection-heading">{t("loginLockout")}</h4>
+                        <Check label={t("active")} checked={Boolean(securityPolicy.login_lockout_enabled)} onChange={(value) => setSecurityPolicy({ ...securityPolicy, login_lockout_enabled: value ? 1 : 0 })} />
+                        <div className="security-field-grid security-compact-fields">
+                          <Field
+                            label={t("maxFailedAttempts")}
+                            type="number"
+                            value={String(securityPolicy.max_failed_login_attempts)}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, max_failed_login_attempts: Number(value) })}
+                          />
+                          <Field
+                            label={t("failureWindowSeconds")}
+                            type="number"
+                            value={String(securityPolicy.failure_window_seconds)}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, failure_window_seconds: Number(value) })}
+                          />
+                          <Field
+                            label={t("lockoutSeconds")}
+                            type="number"
+                            value={String(securityPolicy.lockout_seconds)}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, lockout_seconds: Number(value) })}
+                          />
+                        </div>
+                        <div className="security-policy-subsection">
+                          <h5>{t("captchaPolicy")}</h5>
+                          <Check
+                            label={t("active")}
+                            checked={securityPolicy.captcha_enabled}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_enabled: value })}
+                          />
+                          <div className="security-field-grid">
+                            <Field
+                              label={t("captchaAfterFailedAttempts")}
+                              type="number"
+                              value={String(securityPolicy.captcha_after_failed_attempts)}
+                              onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_after_failed_attempts: Number(value) })}
+                            />
+                            <Field
+                              label={t("captchaTtlSeconds")}
+                              type="number"
+                              value={String(securityPolicy.captcha_ttl_seconds)}
+                              onChange={(value) => setSecurityPolicy({ ...securityPolicy, captcha_ttl_seconds: Number(value) })}
+                            />
+                          </div>
+                        </div>
+                      </section>
+
+                      <section className="security-policy-section security-policy-section-wide" aria-labelledby="security-trusted-networks-heading">
+                        <h4 id="security-trusted-networks-heading">{t("trustedNetworks")}</h4>
+                        <div className="security-network-grid">
+                          <Field
+                            label={t("trustedIpCidrs")}
+                            textarea
+                            value={securityPolicy.trusted_ip_cidrs.join("\n")}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, trusted_ip_cidrs: splitList(value) })}
+                          />
+                          <div className="security-network-option">
+                            <Check
+                              label={t("requireMfaOutsideTrustedNetworks")}
+                              checked={securityPolicy.require_mfa_outside_trusted_networks}
+                              onChange={(value) => setSecurityPolicy({ ...securityPolicy, require_mfa_outside_trusted_networks: value })}
+                            />
+                          </div>
+                        </div>
+                      </section>
+
+                      <section className="security-policy-section security-policy-section-wide" aria-labelledby="security-risk-rules-heading">
+                        <h4 id="security-risk-rules-heading">{t("accessRiskRules")}</h4>
+                        <div className="security-risk-grid">
+                          <Field
+                            label={t("allowedIpCidrs")}
+                            textarea
+                            value={securityPolicy.allowed_ip_cidrs.join("\n")}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_ip_cidrs: splitList(value) })}
+                          />
+                          <Field
+                            label={t("blockedIpCidrs")}
+                            textarea
+                            value={securityPolicy.blocked_ip_cidrs.join("\n")}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_ip_cidrs: splitList(value) })}
+                          />
+                          <Field
+                            label={t("allowedEmailDomains")}
+                            textarea
+                            value={securityPolicy.allowed_email_domains.join("\n")}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_email_domains: splitList(value).map(normalizeDomain) })}
+                          />
+                          <Field
+                            label={t("blockedEmailDomains")}
+                            textarea
+                            value={securityPolicy.blocked_email_domains.join("\n")}
+                            onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_email_domains: splitList(value).map(normalizeDomain) })}
+                          />
+                        </div>
+                      </section>
+                    </div>
+                    <div className="security-form-footer">
+                      <button className="primary compact-action" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+                    </div>
+                  </form>
                 )}
-              </div>
-            </form>
-            <div className="table-panel">
-              <h3>{t("roles")}</h3>
-              <table>
-                <thead><tr><th>{t("role")}</th><th>{t("permissions")}</th><th>{t("status")}</th><th></th></tr></thead>
-                <tbody>
-                  {roles.map((role) => (
-                    <tr key={role.id}>
-                      <td>{role.name}<br /><small>{role.description ?? "-"}</small></td>
-                      <td><div className="token-list">{role.permissions.map((permission) => <span key={permission}>{permission}</span>)}</div></td>
-                      <td>{role.is_system ? t("systemRole") : t("customRole")}</td>
-                      <td className="actions">
-                        {!role.is_system && <button type="button" onClick={() => editRole(role)}>{t("edit")}</button>}
-                        {!role.is_system && <button type="button" onClick={() => deleteRole(role.id)}>{t("delete")}</button>}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <form className="panel" onSubmit={saveGroup}>
-              <h3>{groupForm.id ? t("updateGroup") : t("createGroup")}</h3>
-              <Field label={t("groupName")} value={groupForm.name} onChange={(value) => setGroupForm({ ...groupForm, name: value })} />
-              <Field label={t("description")} value={groupForm.description} onChange={(value) => setGroupForm({ ...groupForm, description: value })} textarea />
-              <label>{t("groupRoles")}</label>
-              <div className="checkbox-grid">
-                {roles.map((role) => (
-                  <Check
-                    key={role.id}
-                    label={role.name}
-                    checked={groupForm.role_ids.includes(role.id)}
-                    onChange={() => setGroupForm({ ...groupForm, role_ids: toggleValue(groupForm.role_ids, role.id) })}
-                  />
-                ))}
-              </div>
-              <label>{t("groupMembers")}</label>
-              <div className="checkbox-grid tall">
-                {users.map((item) => (
-                  <Check
-                    key={item.id}
-                    label={`${item.email} · ${item.username}`}
-                    checked={groupForm.user_ids.includes(item.id)}
-                    onChange={() => setGroupForm({ ...groupForm, user_ids: toggleValue(groupForm.user_ids, item.id) })}
-                  />
-                ))}
-              </div>
-              <div className="actions">
-                <button type="submit" disabled={busy}><Save size={14} />{groupForm.id ? t("save") : t("create")}</button>
-                {groupForm.id && (
-                  <button type="button" onClick={() => setGroupForm(emptyGroupForm)}>{t("clear")}</button>
-                )}
-              </div>
-            </form>
-            <div className="table-panel">
-              <h3>{t("groups")}</h3>
-              <table>
-                <thead><tr><th>{t("groups")}</th><th>{t("groupRoles")}</th><th>{t("groupMembers")}</th><th></th></tr></thead>
-                <tbody>
-                  {groups.map((group) => (
-                    <tr key={group.id}>
-                      <td>{group.name}<br /><small>{group.description ?? "-"}</small></td>
-                      <td><div className="token-list">{(group.roles ?? []).map((role) => <span key={role.id}>{role.name}</span>)}</div></td>
-                      <td><div className="token-list">{(group.members ?? []).map((member) => <span key={member.id}>{member.email}</span>)}</div></td>
-                      <td className="actions">
-                        <button type="button" onClick={() => editGroup(group)}>{t("edit")}</button>
-                        <button type="button" onClick={() => deleteGroup(group.id)}>{t("delete")}</button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="panel">
-              <h3>{t("userAccess")}</h3>
-              <label>{t("selectUser")}</label>
-              <select value={selectedAccessUserId} onChange={(event) => loadUserAccess(event.target.value)}>
-                <option value="">-</option>
-                {users.map((item) => (
-                  <option key={item.id} value={item.id}>{item.email}</option>
-                ))}
-              </select>
-              {userAccess && (
-                <>
-                  <label>{t("directRoles")}</label>
-                  <div className="checkbox-grid">
-                    {roles.map((role) => {
-                      const selected = userAccess.direct_roles.some((item) => item.id === role.id);
-                      return (
+
+                {editor === "role" && <Modal title={roleForm.id ? t("updateRole") : t("createRole")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
+                  <form className="panel" onSubmit={saveRole}>
+                    <Field label={t("roleName")} value={roleForm.name} onChange={(value) => setRoleForm({ ...roleForm, name: value })} />
+                    <Field label={t("description")} value={roleForm.description} onChange={(value) => setRoleForm({ ...roleForm, description: value })} textarea />
+                    <label>{t("rolePermissions")}</label>
+                    <div className="checkbox-grid">
+                      {permissionCatalog.map((permission) => (
+                        <Check
+                          key={permission.key}
+                          label={`${permission.key} · ${permission.category}`}
+                          checked={roleForm.permissions.includes(permission.key)}
+                          onChange={() => setRoleForm({ ...roleForm, permissions: toggleValue(roleForm.permissions, permission.key) })}
+                        />
+                      ))}
+                    </div>
+                    <div className="actions">
+                      <button type="submit" disabled={busy}><Save size={14} />{roleForm.id ? t("save") : t("create")}</button>
+                      {roleForm.id && (
+                        <button type="button" onClick={() => setRoleForm(emptyRoleForm)}>{t("clear")}</button>
+                      )}
+                    </div>
+                  </form>
+                </Modal>}
+
+                {editor === "group" && <Modal title={groupForm.id ? t("updateGroup") : t("createGroup")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
+                  <form className="panel" onSubmit={saveGroup}>
+                    <Field label={t("groupName")} value={groupForm.name} onChange={(value) => setGroupForm({ ...groupForm, name: value })} />
+                    <Field label={t("description")} value={groupForm.description} onChange={(value) => setGroupForm({ ...groupForm, description: value })} textarea />
+                    <label>{t("groupRoles")}</label>
+                    <div className="checkbox-grid">
+                      {roles.map((role) => (
                         <Check
                           key={role.id}
                           label={role.name}
-                          checked={selected}
-                          onChange={() => setUserAccess({
-                            ...userAccess,
-                            direct_roles: selected
-                              ? userAccess.direct_roles.filter((item) => item.id !== role.id)
-                              : [...userAccess.direct_roles, role]
-                          })}
+                          checked={groupForm.role_ids.includes(role.id)}
+                          onChange={() => setGroupForm({ ...groupForm, role_ids: toggleValue(groupForm.role_ids, role.id) })}
                         />
-                      );
-                    })}
-                  </div>
-                  <div className="actions">
-                    <button type="button" onClick={saveUserRoles}><Save size={14} />{t("save")}</button>
-                  </div>
-                  <label>{t("groups")}</label>
-                  <div className="token-list">{userAccess.groups.map((group) => <span key={group.id}>{group.name}</span>)}</div>
-                  <label>{t("effectivePermissions")}</label>
-                  <div className="token-list">{userAccess.effective_permissions.map((permission) => <span key={permission}>{permission}</span>)}</div>
-                </>
-              )}
-            </div>
-            <form className="panel" onSubmit={saveAuditWebhook}>
-              <h3>{auditWebhookForm.id ? t("updateAuditWebhook") : t("createAuditWebhook")}</h3>
-              <Field label={t("webhookName")} value={auditWebhookForm.name} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, name: value })} />
-              <Field label={t("webhookUrl")} value={auditWebhookForm.url} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, url: value })} />
-              <Field label={t("webhookSecret")} type="password" value={auditWebhookForm.secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, secret: value })} />
-              {auditWebhookForm.id && (
-                <Check label={t("clearWebhookSecret")} checked={auditWebhookForm.clear_secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, clear_secret: value })} />
-              )}
-              <Field label={t("webhookActions")} value={auditWebhookForm.actions} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, actions: value })} textarea />
-              <Field
-                label={t("webhookTimeout")}
-                type="number"
-                value={String(auditWebhookForm.timeout_seconds)}
-                onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, timeout_seconds: Number(value) })}
-              />
-              <Check label={t("active")} checked={auditWebhookForm.is_active} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, is_active: value })} />
-              <div className="actions">
-                <button type="submit" disabled={busy}><Save size={14} />{auditWebhookForm.id ? t("save") : t("create")}</button>
-                {auditWebhookForm.id && (
-                  <button type="button" onClick={() => setAuditWebhookForm(emptyAuditWebhookForm)}>{t("clear")}</button>
-                )}
-              </div>
-            </form>
+                      ))}
+                    </div>
+                    <label>{t("groupMembers")}</label>
+                    <div className="checkbox-grid tall">
+                      {users.map((item) => (
+                        <Check
+                          key={item.id}
+                          label={`${item.email} · ${item.username}`}
+                          checked={groupForm.user_ids.includes(item.id)}
+                          onChange={() => setGroupForm({ ...groupForm, user_ids: toggleValue(groupForm.user_ids, item.id) })}
+                        />
+                      ))}
+                    </div>
+                    <div className="actions">
+                      <button type="submit" disabled={busy}><Save size={14} />{groupForm.id ? t("save") : t("create")}</button>
+                      {groupForm.id && (
+                        <button type="button" onClick={() => setGroupForm(emptyGroupForm)}>{t("clear")}</button>
+                      )}
+                    </div>
+                  </form>
+                </Modal>}
+
+                <div className="security-management-grid">
+                  <section className="table-panel security-roles-panel">
+                    <div className="table-toolbar"><h3>{t("roles")}</h3><button type="button" onClick={() => { setRoleForm(emptyRoleForm); setEditor("role"); }}><Plus size={14} />{t("createRole")}</button></div>
+                    <table>
+                      <thead><tr><th>{t("role")}</th><th>{t("permissions")}</th><th>{t("status")}</th><th></th></tr></thead>
+                      <tbody>
+                        {filteredRoles.map((role) => (
+                          <tr key={role.id}>
+                            <td>{role.name}<br /><small>{role.description ?? "-"}</small></td>
+                            <td><div className="token-list">{role.permissions.map((permission) => <span key={permission}>{permission}</span>)}</div></td>
+                            <td>{role.is_system ? t("systemRole") : t("customRole")}</td>
+                            <td className="actions">
+                              {!role.is_system && <button type="button" onClick={() => { editRole(role); setEditor("role"); }}>{t("edit")}</button>}
+                              {!role.is_system && <button type="button" onClick={() => requestConfirmation(() => deleteRole(role.id))}>{t("delete")}</button>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {filteredRoles.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                  </section>
+
+                  <section className="panel security-user-access-panel">
+                    <h3>{t("userAccess")}</h3>
+                    <SelectField
+                      label={t("selectUser")}
+                      value={selectedAccessUserId}
+                      disabled={busy}
+                      onChange={(value) => void runUiAction(() => loadUserAccess(value))}
+                    >
+                      <option value="">-</option>
+                      {users.map((item) => (
+                        <option key={item.id} value={item.id}>{item.email}</option>
+                      ))}
+                    </SelectField>
+                    {userAccess && (
+                      <>
+                        <label>{t("directRoles")}</label>
+                        <div className="checkbox-grid">
+                          {roles.map((role) => {
+                            const selected = userAccess.direct_roles.some((item) => item.id === role.id);
+                            return (
+                              <Check
+                                key={role.id}
+                                label={role.name}
+                                checked={selected}
+                                onChange={() => setUserAccess({
+                                  ...userAccess,
+                                  direct_roles: selected
+                                    ? userAccess.direct_roles.filter((item) => item.id !== role.id)
+                                    : [...userAccess.direct_roles, role]
+                                })}
+                              />
+                            );
+                          })}
+                        </div>
+                        <div className="actions">
+                          <button className="security-action-primary" type="button" onClick={() => void saveUserRoles()} disabled={busy}><Save size={14} />{t("save")}</button>
+                        </div>
+                        <label>{t("groups")}</label>
+                        <div className="token-list security-access-token-list">{userAccess.groups.map((group) => <span key={group.id}>{group.name}</span>)}</div>
+                        <label>{t("effectivePermissions")}</label>
+                        <div className="token-list security-access-token-list">{userAccess.effective_permissions.map((permission) => <span key={permission}>{permission}</span>)}</div>
+                      </>
+                    )}
+                  </section>
+
+                  <section className="table-panel security-groups-panel">
+                    <div className="table-toolbar"><h3>{t("groups")}</h3><button type="button" onClick={() => { setGroupForm(emptyGroupForm); setEditor("group"); }}><Plus size={14} />{t("createGroup")}</button></div>
+                    <table>
+                      <thead><tr><th>{t("groups")}</th><th>{t("groupRoles")}</th><th>{t("groupMembers")}</th><th></th></tr></thead>
+                      <tbody>
+                        {filteredGroups.map((group) => (
+                          <tr key={group.id}>
+                            <td>{group.name}<br /><small>{group.description ?? "-"}</small></td>
+                            <td><div className="token-list">{(group.roles ?? []).map((role) => <span key={role.id}>{role.name}</span>)}</div></td>
+                            <td><div className="token-list">{(group.members ?? []).map((member) => <span key={member.id}>{member.email}</span>)}</div></td>
+                            <td className="actions">
+                              <button type="button" onClick={() => { editGroup(group); setEditor("group"); }}>{t("edit")}</button>
+                              <button type="button" onClick={() => requestConfirmation(() => deleteGroup(group.id))}>{t("delete")}</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {filteredGroups.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                  </section>
+                </div>
               </>
             )}
-            {(canReadAudit || canManageSecurity) && (
-            <div className="table-panel">
-              <h3>{t("auditWebhooks")}</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>{t("webhookName")}</th>
-                    <th>{t("webhookActions")}</th>
-                    <th>{t("deliveryStatus")}</th>
-                    <th>{t("status")}</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {auditWebhooks.map((webhook) => (
-                    <tr key={webhook.id}>
-                      <td>
-                        {webhook.name}<br />
-                        <a href={webhook.url} target="_blank" rel="noreferrer"><ExternalLink size={12} /> {webhook.url}</a>
-                      </td>
-                      <td>
-                        <div className="token-list">
-                          {(webhook.actions.length > 0 ? webhook.actions : ["*"]).map((action) => <span key={action}>{action}</span>)}
-                          {webhook.has_secret && <span>{t("hasSecret")}</span>}
-                        </div>
-                      </td>
-                      <td>
-                        {webhook.last_status_code ?? "-"}<br />
-                        <small>{webhook.last_error ?? formatTime(webhook.last_delivered_at, locale)}</small>
-                      </td>
-                      <td>{webhook.is_active ? t("active") : t("disabled")}</td>
-                      <td className="actions">
-                        {canManageSecurity && <button type="button" onClick={() => editAuditWebhook(webhook)}>{t("edit")}</button>}
-                        {canManageSecurity && <button type="button" onClick={() => deleteAuditWebhook(webhook.id)}>{t("delete")}</button>}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+
+            <div className="security-audit-layout">
+              {canManageSecurity && (
+                <form className="panel security-webhook-form" onSubmit={saveAuditWebhook}>
+                  <h3>{auditWebhookForm.id ? t("updateAuditWebhook") : t("createAuditWebhook")}</h3>
+                  <Field label={t("webhookName")} value={auditWebhookForm.name} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, name: value })} />
+                  <Field label={t("webhookUrl")} value={auditWebhookForm.url} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, url: value })} />
+                  <Field label={t("webhookSecret")} type="password" value={auditWebhookForm.secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, secret: value })} />
+                  {auditWebhookForm.id && (
+                    <Check label={t("clearWebhookSecret")} checked={auditWebhookForm.clear_secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, clear_secret: value })} />
+                  )}
+                  <Field label={t("webhookActions")} value={auditWebhookForm.actions} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, actions: value })} textarea />
+                  <Field
+                    label={t("webhookTimeout")}
+                    type="number"
+                    value={String(auditWebhookForm.timeout_seconds)}
+                    onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, timeout_seconds: Number(value) })}
+                  />
+                  <Check label={t("active")} checked={auditWebhookForm.is_active} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, is_active: value })} />
+                  <div className="actions">
+                    <button className="security-action-primary" type="submit" disabled={busy}><Save size={14} />{auditWebhookForm.id ? t("save") : t("create")}</button>
+                    {auditWebhookForm.id && (
+                      <button type="button" onClick={() => setAuditWebhookForm(emptyAuditWebhookForm)}>{t("clear")}</button>
+                    )}
+                  </div>
+                </form>
+              )}
+              {(canReadAudit || canManageSecurity) && (
+                <section className="table-panel security-webhooks-panel">
+                  <h3>{t("auditWebhooks")}</h3>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>{t("webhookName")}</th>
+                        <th>{t("webhookActions")}</th>
+                        <th>{t("deliveryStatus")}</th>
+                        <th>{t("status")}</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredAuditWebhooks.map((webhook) => (
+                        <tr key={webhook.id}>
+                          <td>
+                            {webhook.name}<br />
+                            <a href={webhook.url} target="_blank" rel="noreferrer"><ExternalLink size={12} /> {webhook.url}</a>
+                          </td>
+                          <td>
+                            <div className="token-list">
+                              {(webhook.actions.length > 0 ? webhook.actions : ["*"]).map((action) => <span key={action}>{action}</span>)}
+                              {webhook.has_secret && <span>{t("hasSecret")}</span>}
+                            </div>
+                          </td>
+                          <td>
+                            {webhook.last_status_code ?? "-"}<br />
+                            <small>{webhook.last_error ?? formatTime(webhook.last_delivered_at, locale)}</small>
+                          </td>
+                          <td>{webhook.is_active ? t("active") : t("disabled")}</td>
+                          <td className="actions">
+                            {canManageSecurity && <button type="button" onClick={() => editAuditWebhook(webhook)}>{t("edit")}</button>}
+                            {canManageSecurity && <button type="button" onClick={() => requestConfirmation(() => deleteAuditWebhook(webhook.id))}>{t("delete")}</button>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filteredAuditWebhooks.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                </section>
+              )}
             </div>
-            )}
+
             {canReadAudit && (
-            <div className="table-panel">
-              <h3>{t("auditEvents")}</h3>
-              <table>
-                <thead><tr><th>{t("action")}</th><th>{t("actor")}</th><th>{t("target")}</th><th>{t("outcome")}</th><th>{t("registeredAt")}</th></tr></thead>
-                <tbody>
-                  {auditEvents.map((event) => (
-                    <tr key={event.id}>
-                      <td>{event.action}<br /><small>{event.details}</small></td>
-                      <td>{event.actor_user_id ?? event.actor_client_id ?? "-"}</td>
-                      <td>{event.target_kind}<br /><small>{event.target_id ?? "-"}</small></td>
-                      <td>{event.outcome}</td>
-                      <td>{formatTime(event.created_at, locale)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+              <section className="table-panel security-audit-events-panel">
+                <h3>{t("auditEvents")}</h3>
+                <table>
+                  <thead><tr><th>{t("action")}</th><th>{t("actor")}</th><th>{t("target")}</th><th>{t("outcome")}</th><th>{t("registeredAt")}</th></tr></thead>
+                  <tbody>
+                    {filteredAuditEvents.map((event) => (
+                      <tr key={event.id}>
+                        <td>{event.action}<br /><small>{event.details}</small></td>
+                        <td>{event.actor_user_id ?? event.actor_client_id ?? "-"}</td>
+                        <td>{event.target_kind}<br /><small>{event.target_id ?? "-"}</small></td>
+                        <td>{event.outcome}</td>
+                        <td>{formatTime(event.created_at, locale)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {filteredAuditEvents.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+              </section>
             )}
           </section>
         )}
@@ -4909,38 +5540,70 @@ export function App() {
           </section>
         )}
       </main>
+      {pendingConfirmation && (
+        <Modal
+          title={pendingConfirmation.title}
+          closeLabel={t("close")}
+          error={error}
+          dismissible={!busy}
+          onClose={() => {
+            setPendingConfirmation(null);
+            setError("");
+          }}
+        >
+          <div className="confirm-dialog">
+            <div className="confirm-icon"><Trash2 size={22} /></div>
+            <p>{pendingConfirmation.description}</p>
+            <div className="actions confirm-actions">
+              <button type="button" onClick={() => { setPendingConfirmation(null); setError(""); }} disabled={busy}>{t("cancel")}</button>
+              <button type="button" className="danger-button" onClick={() => void runPendingConfirmation()} disabled={busy}>
+                {t("continue")}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
 
 function TopLanguage({
   locale,
+  supportedLocales,
   switchLocale,
   label,
   compact = false
 }: {
   locale: Locale;
+  supportedLocales: string[];
   switchLocale: (locale: Locale) => void;
   label: string;
   compact?: boolean;
 }) {
   return (
-    <div className={compact ? "language-row compact-language" : "language-row"}>
+    <div className={compact ? "language-row compact-language" : "language-row"} role="group" aria-label={label}>
       <Globe2 size={16} />
       <span>{label}</span>
-      <button type="button" className={locale === "zh-CN" ? "active" : ""} onClick={() => switchLocale("zh-CN")}>中文</button>
-      <button type="button" className={locale === "en-US" ? "active" : ""} onClick={() => switchLocale("en-US")}>EN</button>
+      {supportedLocales.includes("zh-CN") && <button type="button" className={locale === "zh-CN" ? "active" : ""} aria-pressed={locale === "zh-CN"} onClick={() => switchLocale("zh-CN")}>中文</button>}
+      {supportedLocales.includes("en-US") && <button type="button" className={locale === "en-US" ? "active" : ""} aria-pressed={locale === "en-US"} onClick={() => switchLocale("en-US")}>EN</button>}
     </div>
   );
 }
 
 function Metric({ label, value, detail }: { label: string; value: string | number; detail: string }) {
+  const text = String(value);
+  const compact = text.length > 12;
+  const schemeBoundary = typeof value === "string" && /^https?:\/\//.test(value)
+    ? value.indexOf("//") + 2
+    : 0;
   return (
-    <article className="metric">
+    <Card as="article" className="metric">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <strong className={compact ? "metric-compact" : undefined}>
+        {schemeBoundary ? <>{text.slice(0, schemeBoundary)}<wbr />{text.slice(schemeBoundary)}</> : value}
+      </strong>
       <p>{detail}</p>
-    </article>
+    </Card>
   );
 }
 
@@ -4966,9 +5629,9 @@ function EmailField({
   const customSuffix = usableEmailDomain(customDomain);
   return (
     <div className="email-field">
-      <Field label={label} value={value} onChange={onChange} type="email" />
+      <Field label={label} value={value} onChange={onChange} type="email" autoComplete="email" />
       {domains.length > 0 && (
-        <div className="domain-pills">
+        <div className="domain-pills" role="group" aria-label={label}>
           {domains.map((domain) => (
             <button type="button" key={domain} onClick={() => onChange(applyEmailDomain(value, domain))}>
               @{domain}
@@ -4977,7 +5640,7 @@ function EmailField({
         </div>
       )}
       <div className="custom-domain">
-        <input value={customDomain} placeholder={customLabel} onChange={(event) => onCustomDomainChange(event.target.value)} />
+        <input aria-label={customLabel} autoComplete="off" value={customDomain} placeholder={customLabel} onChange={(event) => onCustomDomainChange(event.target.value)} />
         <button type="button" disabled={!customSuffix} onClick={() => onChange(applyEmailDomain(value, customSuffix))}>
           <AtSign size={14} />
           {applyLabel}
@@ -5016,38 +5679,14 @@ function quickLinkIcon(icon: string) {
   }
 }
 
-function Field({
-  label,
-  value,
-  onChange,
-  type = "text",
-  textarea = false
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: string;
-  textarea?: boolean;
-}) {
-  return (
-    <>
-      <label>{label}</label>
-      {textarea ? (
-        <textarea value={value} onChange={(event) => onChange(event.target.value)} />
-      ) : (
-        <input type={type} value={value} onChange={(event) => onChange(event.target.value)} />
-      )}
-    </>
-  );
-}
-
 function InlineCode({
   icon,
   label,
   button,
   value,
   onChange,
-  onSend
+  onSend,
+  disabled = false
 }: {
   icon: React.ReactNode;
   label: string;
@@ -5055,45 +5694,35 @@ function InlineCode({
   value: string;
   onChange: (value: string) => void;
   onSend: () => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="inline-code">
-      <Field label={label} value={value} onChange={onChange} />
-      <button type="button" onClick={onSend}>{icon}{button}</button>
+      <Field label={label} value={value} onChange={onChange} autoComplete="one-time-code" />
+      <button type="button" onClick={onSend} disabled={disabled}>{icon}{button}</button>
     </div>
-  );
-}
-
-function Check({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return (
-    <label className="check">
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
-      {label}
-    </label>
   );
 }
 
 function UserDetailPanel({
   detail,
   locale,
-  t,
-  onClose
+  t
 }: {
   detail: UserDetail;
   locale: Locale;
   t: (key: TranslationKey) => string;
-  onClose: () => void;
 }) {
   return (
-    <section className="detail-panel">
-      <div className="detail-header">
-        <h3>{t("userDetails")}</h3>
-        <button type="button" onClick={onClose}>×</button>
-      </div>
+    <section className="detail-panel modal-detail-panel">
       <div className="detail-grid">
         <Info label={t("email")} value={`${detail.user.email} · ${detail.user.email_verified_at ? t("verified") : t("unverified")}`} />
         <Info label={t("phone")} value={`${detail.user.phone ?? "-"} · ${detail.user.phone_verified_at ? t("verified") : t("unverified")}`} />
-        <Info label={t("status")} value={detail.user.archived_at ? t("archived") : detail.user.is_active ? t("active") : t("disabled")} />
+        <Info label={t("status")} value={detail.user.archived_at !== null ? t("archived") : detail.user.is_active ? t("active") : t("disabled")} />
+        <Info
+          label={t("registrationSource")}
+          value={detail.user.registration_source === "authorization_code" ? t("authorizationCodeRegistered") : t("localRegistration")}
+        />
         <Info label={t("archivedAt")} value={formatTime(detail.user.archived_at, locale)} />
         <Info label={t("registeredAt")} value={formatTime(detail.user.created_at, locale)} />
         <Info label={t("lastLogin")} value={formatTime(detail.user.last_login_at, locale)} />
@@ -5101,7 +5730,7 @@ function UserDetailPanel({
         <Info label={t("lastClient")} value={detail.user.last_oidc_client_id ?? "-"} />
         <Info label={t("loginMethod")} value={detail.user.last_login_method ?? "-"} />
       </div>
-      {detail.user.archived_at && <p className="muted">{t("archivedReadOnly")}</p>}
+      {detail.user.archived_at !== null && <p className="muted">{t("archivedReadOnly")}</p>}
       <h4>{t("organizations")}</h4>
       {detail.organizations.length === 0 ? <p className="muted">{t("noData")}</p> : detail.organizations.map((organization) => (
         <div className="event-row" key={organization.id}>
@@ -5117,12 +5746,51 @@ function UserDetailPanel({
         </div>
       ))}
       <h4>{t("loginEvents")}</h4>
-      {detail.login_events.length === 0 ? <p className="muted">{t("noData")}</p> : detail.login_events.map((event) => (
-        <div className="event-row" key={event.id}>
-          <strong>{formatTime(event.login_at, locale)}</strong>
-          <span>{event.method} · {event.ip_address ?? "-"} · {event.oidc_client_id ?? event.external_provider ?? "-"}</span>
-        </div>
-      ))}
+      {detail.login_events.length === 0 ? <p className="muted">{t("noData")}</p> : (
+        <ol className="login-event-list">
+          {detail.login_events.map((event) => {
+            const clientOrProvider = event.oidc_client_id ?? event.external_provider;
+            const clientOrProviderLabel = event.oidc_client_id
+              ? t("lastClient")
+              : t("linkedIdentities");
+            return (
+              <li className="login-event" key={event.id}>
+                <span className="login-event-marker" aria-hidden="true"><Activity size={16} /></span>
+                <div className="login-event-content">
+                  <div className="login-event-heading">
+                    <div className="login-event-method">
+                      <KeyRound size={16} aria-hidden="true" />
+                      <strong>{event.method || "-"}</strong>
+                    </div>
+                    <time dateTime={new Date(event.login_at * 1000).toISOString()}>
+                      <Clock3 size={15} aria-hidden="true" />
+                      <span>{formatTime(event.login_at, locale)}</span>
+                    </time>
+                  </div>
+                  <dl className="login-event-meta">
+                    <div>
+                      <dt><Globe2 size={14} aria-hidden="true" />{t("lastIp")}</dt>
+                      <dd>{event.ip_address ?? "-"}</dd>
+                    </div>
+                    {clientOrProvider && (
+                      <div>
+                        <dt><Link2 size={14} aria-hidden="true" />{clientOrProviderLabel}</dt>
+                        <dd>{clientOrProvider}</dd>
+                      </div>
+                    )}
+                    {event.user_agent && (
+                      <div className="login-event-device" title={event.user_agent}>
+                        <dt><Monitor size={14} aria-hidden="true" />{t("userAgent")}</dt>
+                        <dd>{event.user_agent}</dd>
+                      </div>
+                    )}
+                  </dl>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
     </section>
   );
 }
