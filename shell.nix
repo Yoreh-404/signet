@@ -2,10 +2,6 @@
 
 pkgs.mkShell {
   packages = with pkgs; [
-    cargo
-    rustc
-    rustfmt
-    clippy
     pkg-config
     openssl
     sqlite
@@ -20,6 +16,6 @@ pkgs.mkShell {
     export PQ_INCLUDE_DIR=${pkgs.postgresql}/include
     export MYSQLCLIENT_LIB_DIR=${pkgs.mariadb-connector-c}/lib
     export MYSQLCLIENT_INCLUDE_DIR=${pkgs.mariadb-connector-c}/include/mariadb
-    echo "gpt-sso dev shell: cargo, node, sqlite, libpq, mysqlclient are available"
+    echo "Signet dev shell: cargo, node, sqlite, libpq, mysqlclient are available"
   '';
 }

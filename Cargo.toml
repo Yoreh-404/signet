@@ -6,4 +6,4 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://example.local/gpt-sso"
+repository = "https://example.local/signet"
