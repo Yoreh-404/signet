@@ -1,6 +1,6 @@
 use crate::{
-    AppState, Settings, admin, browser_accounts, csrf, frontend, health, iap, oidc, passkeys,
-    registration, scim,
+    AppState, Settings, admin, browser_accounts, cas_sso, csrf, frontend, health, iap, jwt_sso,
+    oidc, passkeys, registration, saml_sso, scim,
 };
 use anyhow::Context;
 use axum::{
@@ -32,6 +32,9 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
         .merge(passkeys::routes())
         .merge(registration::routes())
         .merge(scim::routes())
+        .merge(jwt_sso::routes())
+        .merge(saml_sso::routes())
+        .merge(cas_sso::routes())
         .fallback(frontend::serve)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -125,7 +128,11 @@ async fn sensitive_response_headers(request: Request, next: Next) -> Response {
     let sensitive = path.starts_with("/api/")
         || path.starts_with("/scim/")
         || path.starts_with("/connect/register")
-        || (path.starts_with("/oauth2/") && path != "/oauth2/jwks");
+        || (path.starts_with("/oauth2/") && path != "/oauth2/jwks")
+        || path.starts_with("/cas/")
+        || (path.starts_with("/saml/")
+            && !path.ends_with("/metadata")
+            && (path.ends_with("/sso") || path.ends_with("/sso/continue")));
     let conditional_admin_get = method == Method::GET && path.starts_with("/api/admin/");
     let mut response = next.run(request).await;
     if conditional_admin_get {

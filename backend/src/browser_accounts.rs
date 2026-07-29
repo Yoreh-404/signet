@@ -1,5 +1,5 @@
 use crate::{
-    AppState, auth,
+    AppState, applications, auth,
     db::{BrowserContextAccountRecord, BrowserContextRecord, PublicUser, UserRecord},
     error::{AppError, AppResult},
     redirects, util,
@@ -94,6 +94,22 @@ async fn list_accounts(
             // Do not offer a remembered trial identity for an application it
             // can never authorize. This keeps account selection actionable.
             continue;
+        }
+        if let Some(interaction) = interaction.as_ref() {
+            let Some(client) = state
+                .db
+                .find_client_by_client_id(&interaction.client_id)
+                .await?
+            else {
+                continue;
+            };
+            if !applications::user_can_authorize_client(&state, &client, &user).await? {
+                // The active-account boundary and factor uniqueness are
+                // enforced server-side. Hiding ineligible remembered
+                // identities keeps the chooser actionable but is never the
+                // only check.
+                continue;
+            }
         }
         let has_redemption = if user.archived_at.is_some() {
             state.db.user_has_invitation_redemption(&user.id).await?

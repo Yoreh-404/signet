@@ -112,14 +112,14 @@ async function main() {
           login_code_level: null,
           permissions: [],
         });
-        const client = (id, name, active = true) => ({
+        const client = (id, name, active = true, organizationId = "org-club") => ({
           id: "db-" + id,
           client_id: id,
           client_name: name,
           logo_uri: "https://assets.mock.example/" + id + ".svg",
-          organization_id: null,
-          organization_slug: null,
-          organization_name: null,
+          organization_id: organizationId,
+          organization_slug: organizationId === "org-club" ? "mock-club" : "mock-lab",
+          organization_name: organizationId === "org-club" ? "Mock Club" : "Mock Lab",
           redirect_uris: ["https://example.invalid/callback"],
           post_logout_redirect_uris: [],
           scopes: ["openid", "profile", "email"],
@@ -189,10 +189,69 @@ async function main() {
           { account_ref: "account-bob", user: user("bob-id", "bob@mock.example", "bob", "Bob"), session_kind: "temporary_authorization_code", current: false, last_login_at: now - 20, last_selected_at: now - 500 },
           { account_ref: "account-trial", user: { ...user("trial-id", "trial@mock.example", "trial-user", "Trial User"), session_kind: "trial_enrollment", login_code_level: "trial_enrollment" }, session_kind: "trial_enrollment", current: false, last_login_at: now - 120, last_selected_at: now - 200 },
         ];
-        const clients = [client("app-one", "App One"), client("app-two", "App Two")];
-        const organizationOptions = [
-          { id: "org-club", slug: "mock-club", name: "Mock Club", is_active: true },
+        const clients = [
+          client("app-one", "App One"),
+          client("app-two", "App Two"),
+          client("lab-app", "Lab App", true, "org-lab"),
         ];
+        const organizationOptions = [
+          { id: "org-club", slug: "mock-club", name: "Mock Club", kind: "tenant", is_active: true },
+        ];
+        const enterpriseMemberships = [
+          { id: "org-club", slug: "mock-club", name: "Mock Club", kind: "tenant", description: "Mock customer enterprise", is_active: 1, role: "owner", membership_created_at: now - 3600, membership_updated_at: now - 60 },
+          { id: "org-lab", slug: "mock-lab", name: "Mock Lab", kind: "tenant", description: "A second enterprise for context-switch testing", is_active: 1, role: "admin", membership_created_at: now - 3000, membership_updated_at: now - 30 },
+        ];
+        let activeEnterpriseId = "org-club";
+        let applications = [
+          {
+            id: "application-one",
+            organization_id: "org-club",
+            slug: "member-portal",
+            name: "Member Portal",
+            description: "A policy-rich mock application",
+            account_selection_mode: "required",
+            unique_identity_factors: ["email", "phone"],
+            is_active: true,
+            oidc_clients: [clients[0]],
+            created_at: now - 3600,
+            updated_at: now - 60,
+          },
+          {
+            id: "application-two",
+            organization_id: "org-club",
+            slug: "migrated-legacy",
+            name: "Migrated Legacy Portal",
+            description: "A compatibility application awaiting explicit policy migration",
+            account_selection_mode: "optional",
+            unique_identity_factors: [],
+            is_active: true,
+            oidc_clients: [clients[1]],
+            created_at: now - 3500,
+            updated_at: now - 55,
+          },
+          {
+            id: "application-lab",
+            organization_id: "org-lab",
+            slug: "lab-portal",
+            name: "Lab Portal",
+            description: "An application in a second enterprise",
+            account_selection_mode: "optional",
+            unique_identity_factors: [],
+            is_active: true,
+            oidc_clients: [clients[2]],
+            created_at: now - 3400,
+            updated_at: now - 40,
+          },
+        ];
+        const enterpriseMembers = {
+          "org-club": [
+            { organization_id: "org-club", user_id: "admin-id", role: "owner", email: "admin@mock.example", username: "mock-admin", display_name: "Mock Admin", is_active: true, archived_at: null, created_at: now - 3600, updated_at: now - 60 },
+            { organization_id: "org-club", user_id: "alice-id", role: "member", email: "alice@mock.example", username: "alice", display_name: "Alice", is_active: true, archived_at: null, created_at: now - 3500, updated_at: now - 50 },
+          ],
+          "org-lab": [
+            { organization_id: "org-lab", user_id: "admin-id", role: "admin", email: "admin@mock.example", username: "mock-admin", display_name: "Mock Admin", is_active: true, archived_at: null, created_at: now - 3400, updated_at: now - 40 },
+          ],
+        };
         const managedUsers = [
           admin,
           user("alice-id", "alice@mock.example", "alice", "Alice"),
@@ -295,9 +354,35 @@ async function main() {
           if (path === "/api/passkeys") return response([]);
           if (path === "/api/me/consents") return response([]);
           if (path === "/api/me/sessions") return response([]);
+          if (path === "/api/me/organizations" && method === "GET") return response(enterpriseMemberships);
+          if (path === "/api/me/organization-context" && method === "GET") {
+            return response({ organization: enterpriseMemberships.find((organization) => organization.id === activeEnterpriseId) ?? null });
+          }
+          if (path === "/api/me/organization-context" && method === "PUT") {
+            const payload = typeof init.body === "string" ? JSON.parse(init.body) : {};
+            const next = enterpriseMemberships.find((organization) => organization.id === payload.organization_id);
+            if (!next) return response({ message: "unknown mock enterprise" }, 404);
+            activeEnterpriseId = next.id;
+            return response({ organization: next });
+          }
           if (path === "/api/admin/overview") return response({ users: 3, active_users: 3, clients: 2, active_clients: 2, issuer: location.origin, database_kind: "mock" });
-          if (path === "/api/admin/clients") return response(clients);
+          if (path === "/api/admin/clients") return response(clients.filter((client) => client.organization_id === activeEnterpriseId));
+          if (path === "/api/admin/external-oidc-providers") return response([]);
+          if (path === "/api/admin/ldap-providers") return response([]);
+          if (path === "/api/admin/applications" && method === "GET") return response(applications.filter((application) => application.organization_id === activeEnterpriseId));
+          const applicationModulePath = /^\/api\/admin\/applications\/([^/]+)\/modules(?:\/([^/]+))?$/.exec(path);
+          if (applicationModulePath && method === "GET") return response([]);
           if (path === "/api/admin/organization-options") return response(organizationOptions);
+          if (path === "/api/admin/organizations/" + activeEnterpriseId + "/members") return response(enterpriseMembers[activeEnterpriseId] ?? []);
+          if (path === "/api/admin/organizations/" + activeEnterpriseId + "/member-invitations") return response([]);
+          const applicationPath = /^\/api\/admin\/applications\/([^/]+)\/(oidc-clients|enrollment-codes)$/.exec(path);
+          if (applicationPath && method === "GET") {
+            const [, applicationId, resource] = applicationPath;
+            const application = applications.find((candidate) => candidate.id === applicationId);
+            if (!application) return response({ message: "unknown mock application" }, 404);
+            if (resource === "oidc-clients") return response(application.oidc_clients);
+            return response([]);
+          }
           if (path === "/api/admin/users" && method === "GET") return response(managedUsers);
           if (path === "/api/admin/users/import-csv" && method === "POST") {
             const rawCsv = typeof init.body === "string" ? init.body : "";
@@ -872,6 +957,78 @@ async function main() {
       throw new Error(`Admin header chrome is incorrect: ${JSON.stringify(adminHeader)}`);
     }
     await screenshot("auth-ui-mock-admin-header-desktop", 1280, 900);
+
+    // Website applications are the primary management workflow. Exercise the
+    // enterprise context switcher and the bundled capability workspace so the
+    // mock smoke catches drift in the product's application-first model.
+    await navigate("/?smoke_admin=1#/applications");
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('Member Portal') && document.body.innerText.includes('网站接入')"),
+      "enterprise application workspace",
+    );
+    const switchedToLab = await evaluate(`(() => {
+      const select = document.querySelector('select[aria-label="切换企业"]');
+      if (!(select instanceof HTMLSelectElement)) return false;
+      select.value = 'org-lab';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    if (!switchedToLab) throw new Error("Enterprise context switcher was not available");
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('Lab Portal') && !document.body.innerText.includes('Member Portal')"),
+      "switched enterprise application workspace",
+    );
+    const switchedBackToClub = await evaluate(`(() => {
+      const select = document.querySelector('select[aria-label="切换企业"]');
+      if (!(select instanceof HTMLSelectElement)) return false;
+      select.value = 'org-club';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    if (!switchedBackToClub) throw new Error("Enterprise context switcher could not return to the original enterprise");
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('Member Portal') && !document.body.innerText.includes('Lab Portal')"),
+      "returned enterprise application workspace",
+    );
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('统一登录链路') && document.body.innerText.includes('协议') && document.body.innerText.includes('权限')"),
+      "website access bundle overview",
+    );
+    await waitFor(
+      async () => evaluate(`(() => {
+        const protocols = [...document.querySelectorAll('.application-detail-tabs button')]
+          .find((button) => button.textContent?.includes('协议'));
+        protocols?.click();
+        return document.body.innerText.includes('OAuth 2.0 / OIDC')
+          && document.body.innerText.includes('SAML 2.0')
+          && document.body.innerText.includes('CAS')
+          && document.body.innerText.includes('JWT')
+          && document.body.innerText.includes('App One');
+      })()`),
+      "application protocol modules",
+    );
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('OAuth 2.0 / OIDC') && document.body.innerText.includes('SAML 2.0')"),
+      "application protocol module details",
+    );
+    await screenshot("auth-ui-mock-application-workspace-desktop", 1280, 900);
+
+    await navigate("/?smoke_admin=1#/clients");
+    await waitFor(
+      async () => evaluate(`(() => {
+        const card = [...document.querySelectorAll('.client-card')]
+          .find((candidate) => candidate.textContent?.includes('App One'));
+        return card?.textContent?.includes('所属应用')
+          && card.textContent.includes('Member Portal')
+          && [...card.querySelectorAll('button')].some((button) => button.textContent?.includes('打开应用策略'));
+      })()`),
+      "OIDC connection to application policy bridge",
+    );
+    await navigate("/?smoke_admin=1&smoke_trial_form=1#/invitations");
+    await waitFor(
+      async () => evaluate("document.body.innerText.includes('Mock universal code')"),
+      "return to authorization-code administration",
+    );
     await clickText("创建授权码");
     await waitFor(
       async () => evaluate("[...document.querySelectorAll('label')].some((label) => label.textContent.trim() === '授权码类型')"),

@@ -71,7 +71,12 @@ export function randomLocalPart(): string {
 
 function currentLocalReturnTo(): string {
   const target = `${window.location.pathname}${window.location.search}${window.location.hash}` || "/";
-  return localReturnTo(target) ?? "/";
+  // The login UI itself is commonly reached as
+  // `/?auth=login&return_to=/oauth2/authorize?...`. Preserve that inner
+  // authorization request when handing control to an external IdP; otherwise
+  // the server cannot determine which tenant application selected the IdP.
+  const nestedReturnTo = localReturnTo(new URLSearchParams(window.location.search).get("return_to"));
+  return nestedReturnTo ?? localReturnTo(target) ?? "/";
 }
 
 export function oidcStartUrl(

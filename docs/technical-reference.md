@@ -6,6 +6,19 @@
 
 为兼容已有部署，默认 SQLite 文件名、会话 Cookie 名和既有协议扩展字段（例如 `X-GPT-SSO-*`、`gpt_sso_*`、`urn:gpt-sso:*`）继续使用历史标识；它们不代表当前产品名称。
 
+## 网站应用模型
+
+Signet 的“应用”对应一个需要接入的网站，不是需要把用户逐个加入的成员组。新建应用默认使用 `all_users` 访问模式：任何启用且未归档的 Signet 统一账户都可以进入网站，企业成员关系只用于企业默认权限和管理边界。
+
+应用工作区把接入拆成四个可以独立保存的模块：
+
+- `protocols`：OAuth 2.0 / OIDC 客户端连接，以及 SAML 2.0、CAS、JWT 的网站端点与令牌配置。
+- `login_adapters`：应用允许使用的第三方 OIDC 登录适配器；外部身份最终绑定到同一个 Signet 账户。
+- `directory_sync`：应用使用的 LDAP/AD 源和 SCIM 2.0 用户/组供应配置。
+- `authorization`：继承企业默认角色后叠加应用专属角色和 Claim 的映射配置。
+
+模块通过管理 API `/api/admin/applications/{id}/modules/{module_key}` 保存 JSON 配置。历史的 `assigned_accounts`、`organization_members` 和 `legacy_all_users` 字段仅为升级兼容而保留；当前登录准入统一由“应用 active + 企业 active + Signet 账户 active 且未归档”决定，不再建立或依赖应用成员关系。
+
 ## 功能
 
 - OIDC Provider 端点：discovery、JWKS、authorize、token、userinfo、logout。
@@ -93,6 +106,8 @@ url = "mysql://sso:sso@127.0.0.1:3306/gpt_sso"
 受保护范围包括 `/api/admin/*`、`/api/logout`、`/api/me/*`、`/api/mfa/*`，以及 Passkey 注册和删除接口。若这些请求带有 `Origin` 或 `Referer`，其 scheme、host 和 port 还必须与运行时 `public_base_url`、OIDC `issuer` 或 `[cors].allowed_origins` 中的一个精确一致；没有来源头的非浏览器调用仍必须提交有效 CSRF 令牌。
 
 登录、注册、验证码、密码重置和 Passkey 登录等尚未建立会话的公共浏览器写接口不能预取会话令牌，因此必须带可信的 `Origin` 或 `Referer`，缺失或不匹配都会返回 `403 csrf_failed`。反向代理部署时应确保运行时公网地址正确；跨域管理前端还需把其完整 origin 显式加入 `[cors].allowed_origins`。
+
+本地调试若暂时无法配置 HTTPS 或固定前端来源，可设置 `SSO_DISABLE_CSRF_ORIGIN_CHECK=true` 跳过来源校验。该选项只适用于回环地址测试；它不会关闭会话写请求的 CSRF token 校验，但会允许公共浏览器写接口不带可信来源头，因此生产环境必须保持关闭。
 
 OAuth/OIDC 和机器调用端点不受这层浏览器 `X-CSRF-Token` 中间件影响，例如 `/oauth2/token`、`/oauth2/par`、`/oauth2/introspect`、`/oauth2/revoke`、`/oauth2/device_authorization`、动态客户端注册 `/connect/register`、`/scim/v2/*` 和 `/api/iap/forward-auth`。这些端点继续使用各协议规定的客户端认证、Bearer token、DPoP 或专用交互表单校验，协议客户端不应先调用 `/api/csrf`。
 
@@ -448,19 +463,30 @@ alex@example.com,alex,Alex Example,example-club,member,true
 
 ## 组织管理
 
-后台 `组织` 页可维护多组织边界：
+Signet 以“一个账号可属于多个企业”为基本模型。登录后的右上角企业选择器只保存管理台上下文；每个 API 仍会重新校验当前账号对目标企业的成员资格，不能依赖前端过滤实现隔离。
 
-- 组织包含 `slug`、名称、描述、启用状态和可选邮箱域 allowlist；allowlist 为空表示不额外限制。
-- 成员支持 `owner`、`admin`、`member` 三种组织内角色。
-- OIDC 客户端和第三方 OIDC Provider 可选择所属组织；客户端列表会显示组织名称，后端公开响应包含 `organization_id`、`organization_slug` 和 `organization_name`。
-- 外部 OIDC Provider 绑定组织后，首次通过该 Provider 自动创建的用户会加入该组织，组织角色为 `member`。
-- 如果组织配置了邮箱域 allowlist，Provider 自动建号入组前必须先满足该组织域规则；父域规则同样匹配子域。
-- 用户详情会展示该用户所属组织和组织角色。
-- 删除组织会移除该组织的成员关系，并自动清空关联客户端的组织归属，同时停用并撤销绑定该组织的体验入驻码会话；禁用或归档用户会保留组织归属用于审计，物理删除用户时才清理成员关系。
-- RBAC 权限包含 `organizations.read` 和 `organizations.manage`，可授权非超级管理员读取或管理完整组织及成员。客户端、IAP 和身份源管理员只通过 `/api/admin/organization-options` 获取绑定所需的 `id/slug/name/is_active`，不会连带暴露成员邮箱。
-- 授权码管理员可通过 `/api/admin/organization-options` 读取创建体验码所需的最小组织元数据；实际创建或更新体验入驻码还必须同时拥有 `organizations.manage`，因为它会授予组织成员资格。这不会暴露组织成员邮箱或完整成员列表。
+- 企业包含 `slug`、名称、描述、启用状态和可选邮箱域 allowlist；allowlist 为空表示不额外限制。成员角色为 `owner`、`admin`、`member`。普通用户可自助创建企业，并自动成为该企业 owner。
+- 内置的 `Signet` 是系统企业，用于平台级资源和历史资源迁移。它不可自助创建、编辑或删除；其成员名单只能由拥有平台 `organizations.manage` 权限的管理员修改，企业内角色本身不会提升为平台管理员。
+- 所有业务资源属于一个企业：应用、OIDC 连接、外部 OIDC/LDAP 身份源以及应用入驻码均不能跨企业引用。身份源首次自动建号时会将用户加入其所属企业，并执行该企业的邮箱域规则。
+- **应用**是网站接入配置与授权策略的主体，OIDC client 只是应用的协议连接。一个连接只属于一个应用，同一应用可有多个连接；新建管理台 OIDC client 会同时得到一个默认的、关闭注册且允许所有 active Signet 统一账户登录的应用。
+- 升级前已有的连接会保留必要的兼容数据，以免升级时意外中断服务；移除连接或删除应用时，连接会自动获得新的默认锁定应用，绝不会因为脱离原应用而回落到未定义的协议策略。
+- 活跃且未归档的 Signet 统一账户都可以登录 active 网站应用，不需要加入应用。企业成员关系只影响企业默认权限、目录同步归属和管理边界；应用角色、应用权限和 Claims 再叠加网站专属授权，不能被解释为“应用成员资格”。
+- 应用注册策略可选关闭、仅应用邀请码或企业目录/邀请流程；它只控制新 Signet 账户如何创建以及是否加入企业，不会把既有账户加入应用成员名单。邀请码会同时校验应用、企业和 OIDC 返回上下文，不能被转用于其他企业或应用。
+- 应用可要求选账号。该策略会与 OIDC client 的 `require_account_selection` 合并，账户选择页只展示当前浏览器中 active 且未归档的 Signet 统一账户；最终授权、授权码换 token、refresh、userinfo 与设备授权都会再执行同一应用校验。
+- 应用可要求“已验证邮箱唯一”和/或“已验证手机号唯一”。服务端以加密摘要保存每个应用内的当前身份租约，并由数据库唯一键处理并发冲突；邮箱或手机号改变只释放对应因子，账号停用或归档会释放其全部相关租约。应用成员名单的历史兼容数据不会成为登录拒绝规则。
+- 删除企业前必须先转移或删除其应用，避免 OIDC 连接脱离策略边界。禁用或归档用户会保留企业关系用于审计，物理删除用户时才清理成员关系。
+- 平台 RBAC 仍支持 `organizations.read` / `organizations.manage` 等全局权限；企业 owner/admin 则只可管理自己当前企业的应用、OIDC 连接、身份源和成员，不会获得其他企业可见性。
 
-当前组织能力已经建立账号和 OIDC 客户端的归属边界；组织品牌和按组织路由第三方 IdP 可在这个模型上继续扩展。
+### 传统 SaaS 应用如何映射
+
+以“差旅报销”这个传统企业 SaaS 为例：`Acme` 企业创建一个 `expense` 应用；它的 Web、iOS 和后台任务可以各有一个 OIDC 连接，但都归属同一个应用。因此三个入口共享同一份“谁能进入、是否可自助入驻、是否必须选账号、身份是否已被占用”的业务规则，而不必把规则复制到每一个回调地址或客户端配置中。
+
+- 员工版可绑定企业 LDAP/AD 或 SCIM 作为人员主数据，并通过企业默认角色和应用角色授予报销权限；所有 active Signet 账户仍通过统一账户登录，目录同步只负责企业成员和权限生命周期。
+- 供应商版可使用独立第三方身份源、邀请码和应用专属权限/Claims；同一企业中的普通员工不会因为登录 Signet 而获得供应商网站的业务权限，但也不需要维护一份应用成员名单。
+- 如果用户常在同一浏览器登录个人与工作账号，可要求账号选择；即使某个 OIDC 连接没有单独要求，应用级规则仍会阻止静默选错账号。
+- 若业务需要降低重复开户风险，可要求已验证邮箱和/或手机号在该应用内唯一。该约束仅是可审计的身份信号与成本提升，不能证明现实中的“同一个自然人”；需要更强保证时，应接入企业 IdP、SCIM 人员主数据或业务侧实名/KYC 校验。
+
+这保留了传统应用常见的组合能力：同一企业可以同时拥有面向员工、供应商和测试人员的不同应用；同一用户也可以属于多个企业。每次 OIDC 授权、换取或刷新 token、调用 userinfo、设备授权及账号选择都会重新计算应用资格，因而策略变更会立即作用于已建立的协议会话，而不是只影响管理台列表。
 
 ## MFA 与客户端 Step-Up
 
@@ -613,6 +639,14 @@ http://localhost:8080/oauth2/authorize?response_type=code&client_id=demo-web&red
 ```
 
 `resource` 必须是绝对 URI 且不能包含 fragment。授权码、Device Flow 和 refresh token 会记住 resource，签发的 access token 使用该值作为 `aud`；未提供时继续使用客户端 ID 作为 `aud`。refresh token 续签时不能把 resource 换成另一个 audience。
+
+运行时受众策略：
+
+- `/oauth2/userinfo` 是面向 OIDC client 的具体资源端点，只接受 `aud` 精确等于签发该 token 的当前 `client_id` 的 access token。面向 API 的 Resource Indicators token 不能拿来调用 UserInfo。
+- `/oauth2/introspect` 是 issuer 级别的检查端点，可以检查带有 API resource audience 的 token；但调用方只能 introspect `claims.client_id` 等于自身的 token，不能依靠 `aud` 绕过客户端绑定。
+- Token Exchange 允许 subject token 原本面向另一个 resource，但请求中的目标 `audience` 只能省略（默认当前 client）或精确等于认证 client，不能借此签发任意资源的 token。
+- SCIM 普通用户 token 的 `aud` 必须是 `{public_base_url}/scim/v2`；Application 专用 SCIM token 的 `aud` 必须精确匹配该网站 directory_sync 模块配置的 `scim_audience`。应用和所属企业停用后两种 token 都立即失效。
+- 没有具体 resource 上下文的内部兼容 bearer helper 只做签名、issuer、过期和 token-use 检查；新的资源端点必须先确定受众，再调用 audience-aware 验证 API。
 
 Rich Authorization Requests：
 
@@ -797,7 +831,7 @@ DPoP: RESOURCE_PROOF_JWT
 - `static`：输出固定值，值类型支持 `string`、`bool`、`number`、`json`。
 - `scope`：按请求 scope 输出布尔标记。
 
-为避免破坏 OIDC 标准行为，`iss`、`sub`、`aud`、`exp`、`iat`、`email`、`name`、`preferred_username` 等结构性标准 claim 不允许被 mapper 覆盖。对于 OpenAI 等要求 `email_verified=true` 的客户端，推荐在客户端设置里开启“信任邮箱已验证”；这会按客户端把 ID token、access token 和 userinfo 的 `email_verified` 视为 `true`，适用于本系统已通过企业邮箱或线下流程信任该邮箱的场景。登录设置页中的公司邮箱后缀只用于登录和注册表单的快速选择，不会限制 OIDC 客户端可使用的账户。如需限制客户端的访问范围，应使用客户端所属组织、用户角色或权限策略。OpenAI 当前可能不传 `login_hint`，如果同一浏览器里可能登录多个本系统账户，建议同时开启“强制账号选择”，避免静默复用错误账户。
+为避免破坏 OIDC 标准行为，`iss`、`sub`、`aud`、`exp`、`iat`、`email`、`name`、`preferred_username` 等结构性标准 claim 不允许被 mapper 覆盖。对于 OpenAI 等要求 `email_verified=true` 的客户端，推荐在客户端设置里开启“信任邮箱已验证”；这会按客户端把 ID token、access token 和 userinfo 的 `email_verified` 视为 `true`，适用于本系统已通过企业邮箱或线下流程信任该邮箱的场景。登录设置页中的公司邮箱后缀只用于登录和注册表单的快速选择，不会限制 OIDC 客户端可使用的账户。网站的登录准入由应用、企业和 Signet 账户生命周期决定；网站内的具体业务范围应使用企业角色、应用角色、应用权限和 Claims。OpenAI 当前可能不传 `login_hint`，如果同一浏览器里可能登录多个本系统账户，建议同时开启“强制账号选择”，避免静默复用错误账户。
 
 ### PAR
 
@@ -990,7 +1024,7 @@ curl -u demo-web:demo-secret-change-me \
 - `[server]`：监听地址、公网 base URL、是否信任代理/内网穿透转发头。
 - `[database]`：数据库类型、连接 URL、连接池大小、是否启动迁移。
 - `[oidc]`：issuer、端点路径、token TTL、scope、consent 策略。
-- `[security]`：cookie 名称/domain/secure/same_site、session TTL、密码长度、RSA 私钥、key id。
+- `[security]`：cookie 名称/domain/secure/same_site、CSRF 来源校验开关、session TTL、密码长度、RSA 私钥、key id。
 - `[registration]`：注册方式、是否要求验证/授权码、首个用户管理员策略。
 - `[verification]`：邮箱/手机号验证码 TTL、投递方式、最大尝试次数。
 - `[i18n]`：默认语言和支持语言。
@@ -1002,7 +1036,7 @@ curl -u demo-web:demo-secret-change-me \
 
 [CI](../.github/workflows/ci.yml) 会执行前端类型检查/构建/依赖审计，以及后端格式、Clippy 和全数据库 feature 测试。
 
-`scripts/browser-smoke.mjs` 通过 Chromium DevTools Protocol 检查认证页和用户生命周期。`lifecycle` 会创建并变更账号，只允许连接回环地址，并要求使用一次性数据库显式确认：
+`scripts/browser-smoke.mjs` 通过 Chromium DevTools Protocol 检查认证页和用户生命周期。`auth-ui-mock` 还覆盖企业上下文切换、应用策略即时预览，以及 OIDC 连接回到其所属应用策略的管理路径。`lifecycle` 会创建并变更账号，只允许连接回环地址，并要求使用一次性数据库显式确认：
 
 ```bash
 APP_URL=http://127.0.0.1:8080 \

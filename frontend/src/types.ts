@@ -120,6 +120,7 @@ export type Organization = {
   id: string;
   slug: string;
   name: string;
+  kind: "tenant" | "system";
   description: string | null;
   allowed_email_domains: string[];
   is_active: boolean;
@@ -128,17 +129,146 @@ export type Organization = {
   updated_at: number;
 };
 
-export type OrganizationOption = Pick<Organization, "id" | "slug" | "name" | "is_active">;
+export type OrganizationOption = Pick<Organization, "id" | "slug" | "name" | "kind" | "is_active">;
 
 export type UserOrganization = {
   id: string;
   slug: string;
   name: string;
+  kind: "tenant" | "system";
   description: string | null;
   is_active: number;
   role: string;
   membership_created_at: number;
   membership_updated_at: number;
+};
+
+export type OrganizationContext = {
+  organization: UserOrganization | null;
+};
+
+/** An authorization domain owned by one enterprise. OIDC connections attach
+ * to an application; access and identity-factor rules live here, not on the
+ * connection itself. */
+export type TenantApplication = {
+  id: string;
+  organization_id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  account_selection_mode: "optional" | "required";
+  unique_identity_factors: Array<"email" | "phone">;
+  is_active: boolean;
+  oidc_clients: Client[];
+  modules?: ApplicationModule[];
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationModuleKey = "protocols" | "login_adapters" | "directory_sync" | "authorization";
+
+export type ApplicationModule = {
+  module_key: ApplicationModuleKey;
+  config: Record<string, unknown>;
+  is_enabled: boolean;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationRole = {
+  id: string;
+  application_id: string;
+  name: string;
+  description: string | null;
+  permissions: string[];
+  is_default: boolean;
+  is_active: boolean;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationAuthorizationGroup = {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationAuthorizationSubjects = {
+  users: OrganizationMember[];
+  groups: ApplicationAuthorizationGroup[];
+  organization_roles: string[];
+};
+
+export type ApplicationPermissionOverride = {
+  permission: string;
+  effect: "allow" | "deny";
+};
+
+export type ApplicationAuthorizationPreview = {
+  decision: {
+    allowed: boolean;
+    reason: string;
+    policy_version: string;
+  };
+  entitlements: {
+    roles: string[];
+    permissions: string[];
+    groups: string[];
+    organization_role: string | null;
+    policy_version: string;
+    claims: Record<string, unknown>;
+  } | null;
+};
+
+export type ApplicationJwtClient = {
+  client_id: string;
+  client_type: "public" | "confidential";
+  is_active: boolean;
+  secret_count: number;
+  active_secret_count: number;
+  latest_secret_created_at: number | null;
+  latest_secret_expires_at: number | null;
+};
+
+/** Application-scoped SCIM credentials never expose their hash or raw value. */
+export type ApplicationScimToken = {
+  id: string;
+  application_id: string;
+  token_prefix: string;
+  scopes: string[];
+  expires_at: number | null;
+  revoked_at: number | null;
+  last_used_at: number | null;
+  created_at: number;
+  /** Present only in the create response; never returned by list. */
+  token?: string;
+};
+
+export type ApplicationDirectorySyncRun = {
+  id: string;
+  application_id: string;
+  provider_id: string;
+  status: string;
+  total_seen: number;
+  created_count: number;
+  updated_count: number;
+  disabled_count: number;
+  error: string | null;
+  cursor: string | null;
+  started_at: number;
+  finished_at: number | null;
+};
+
+export type ApplicationEnrollmentCodeCreateResponse = {
+  invitation: Invitation;
+  code: string;
+};
+
+export type OrganizationMemberInvitationCreateResponse = {
+  invitation: Invitation;
+  code: string;
 };
 
 export type PermissionInfo = {
@@ -561,6 +691,7 @@ export type LdapProvider = {
   id: string;
   slug: string;
   display_name: string;
+  organization_id: string | null;
   url: string;
   starttls: boolean;
   bind_dn: string;
@@ -610,7 +741,7 @@ export type RuntimeSettings = {
   updated_at: number;
 };
 
-export type Tab = "account" | "overview" | "users" | "clients" | "iap" | "organizations" | "invitations" | "registration" | "providers" | "portal" | "security" | "settings";
+export type Tab = "account" | "overview" | "users" | "applications" | "clients" | "iap" | "organizations" | "invitations" | "registration" | "providers" | "portal" | "security" | "settings";
 export type UserFilter = "live" | "active" | "disabled" | "archived" | "authorization_code" | "all";
 export type Theme = "light" | "dark";
 

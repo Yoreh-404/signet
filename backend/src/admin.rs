@@ -1,24 +1,28 @@
 use crate::{
     AppState,
     access::{Authorizer, Permission, PermissionInfo, permission_catalog},
-    archived_accounts,
+    applications, archived_accounts,
     audit::{self, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, backchannel_logout, claim_mapper, client_assertion, client_policy, csrf,
+    auth_flow, authorization, backchannel_logout, claim_mapper, client_assertion, client_policy,
+    csrf,
     db::{
-        AuditEventRecord, AuthorizationCodeType, GroupRecord, InvitationUpdate,
-        LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord, NewBulkProvisionedUser, NewClient,
-        NewClientClaimMapper, NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation,
-        NewLdapProvider, NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole,
-        NewRuntimeSettings, NewSecurityPolicy, NewUser, OrganizationMemberInput,
-        OrganizationMemberWithUserRecord, OrganizationRecord, PublicAuditWebhook, PublicClient,
-        PublicClientClaimMapper, PublicExternalOidcProvider, PublicIapApplication,
-        PublicInvitation, PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
+        ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationRecord,
+        ApplicationRoleRecord, ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
+        GroupRecord, InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel,
+        LoginEventRecord, NewApplication, NewApplicationJwtClient, NewApplicationRole,
+        NewApplicationScimToken, NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
+        NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation, NewLdapProvider,
+        NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole, NewRuntimeSettings,
+        NewSecurityPolicy, NewUser, OrganizationMemberInput, OrganizationMemberWithUserRecord,
+        OrganizationRecord, PublicAuditWebhook, PublicClient, PublicClientClaimMapper,
+        PublicExternalOidcProvider, PublicIapApplication, PublicInvitation,
+        PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
         PublicRegistrationSettings, PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord,
         SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserConsentWithClientRecord,
         UserListScope, UserOrganizationRecord, UserUpdate,
     },
-    directory,
+    directory, directory_sync,
     error::{AppError, AppResult},
     frontchannel_logout, iap,
     identity_sources::{self, OidcDiscoveryResult, OidcProviderTemplate},
@@ -50,6 +54,14 @@ pub fn routes() -> Router<AppState> {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route(
+            "/api/me/organizations",
+            get(my_organizations).post(create_my_organization),
+        )
+        .route(
+            "/api/me/organization-context",
+            get(my_organization_context).put(set_my_organization_context),
+        )
         .route("/api/csrf", get(csrf_token))
         .route("/api/me/sessions", get(list_my_sessions))
         .route("/api/me/sessions/{session_id}", delete(revoke_my_session))
@@ -104,6 +116,100 @@ pub fn routes() -> Router<AppState> {
             put(update_client).delete(delete_client),
         )
         .route(
+            "/api/admin/applications",
+            get(list_applications).post(create_application),
+        )
+        .route(
+            "/api/admin/applications/{id}",
+            put(update_application).delete(delete_application),
+        )
+        .route(
+            "/api/admin/applications/{id}/oidc-clients",
+            get(list_application_oidc_clients).put(replace_application_oidc_clients),
+        )
+        .route(
+            "/api/admin/applications/{id}/modules",
+            get(list_application_modules),
+        )
+        .route(
+            "/api/admin/applications/{id}/modules/{module_key}",
+            put(update_application_module).delete(delete_application_module),
+        )
+        .route(
+            "/api/admin/applications/{id}/directory-sync/runs",
+            get(list_application_directory_sync_runs),
+        )
+        .route(
+            "/api/admin/applications/{id}/directory-sync/{provider_id}/run",
+            post(run_application_directory_sync),
+        )
+        .route(
+            "/api/admin/applications/{id}/jwt-client",
+            get(get_application_jwt_client).put(update_application_jwt_client),
+        )
+        .route(
+            "/api/admin/applications/{id}/jwt-client/secret",
+            post(rotate_application_jwt_secret),
+        )
+        .route(
+            "/api/admin/applications/{id}/jwt-client/secrets",
+            delete(revoke_application_jwt_secrets),
+        )
+        .route(
+            "/api/admin/applications/{id}/scim-tokens",
+            get(list_application_scim_tokens).post(create_application_scim_token),
+        )
+        .route(
+            "/api/admin/applications/{id}/scim-tokens/{token_id}",
+            delete(revoke_application_scim_token),
+        )
+        .route(
+            "/api/admin/applications/{id}/roles",
+            get(list_application_roles).post(create_application_role),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/catalog",
+            get(application_permission_catalog),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/subjects",
+            get(application_authorization_subjects),
+        )
+        .route(
+            "/api/admin/applications/{id}/roles/{role_id}",
+            put(update_application_role).delete(delete_application_role),
+        )
+        .route(
+            "/api/admin/applications/{id}/users/{user_id}/roles",
+            get(list_application_user_roles).put(update_application_user_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/groups/{group_id}/roles",
+            get(list_application_group_roles).put(update_application_group_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/organization-roles/{organization_role}/roles",
+            get(list_application_organization_role_roles)
+                .put(update_application_organization_role_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/users/{user_id}/permission-overrides",
+            get(list_application_user_permission_overrides)
+                .put(update_application_user_permission_overrides),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/{user_id}",
+            get(application_authorization_preview),
+        )
+        .route(
+            "/api/admin/applications/{id}/enrollment-codes",
+            get(list_application_enrollment_codes).post(create_application_enrollment_code),
+        )
+        .route(
+            "/api/admin/applications/{id}/enrollment-codes/{code_id}",
+            delete(delete_application_enrollment_code),
+        )
+        .route(
             "/api/admin/iap-applications",
             get(list_iap_applications).post(create_iap_application),
         )
@@ -156,7 +262,17 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/organizations/{id}/members",
-            get(list_organization_members).put(update_organization_members),
+            get(list_organization_members)
+                .post(upsert_organization_member)
+                .put(update_organization_members),
+        )
+        .route(
+            "/api/admin/organizations/{id}/member-invitations",
+            get(list_organization_member_invitations).post(create_organization_member_invitation),
+        )
+        .route(
+            "/api/admin/organizations/{id}/member-invitations/{invitation_id}",
+            delete(delete_organization_member_invitation),
         )
         .route("/api/admin/users/{id}/access", get(user_access))
         .route("/api/admin/users/{id}/roles", put(update_user_roles))
@@ -682,6 +798,121 @@ async fn me(
     Ok(Json(Some(
         auth::current_user_response_for_session(&state, current).await?,
     )))
+}
+
+#[derive(Debug, Deserialize)]
+struct OrganizationContextInput {
+    organization_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OrganizationContextResponse {
+    organization: Option<UserOrganizationRecord>,
+}
+
+/// The tenant creation endpoint is intentionally self-service.  It creates a
+/// regular tenant only (never the protected Signet system tenant), makes the
+/// caller its owner, and selects it for the console.  Global platform roles
+/// are therefore not a prerequisite for a customer to start using Signet.
+#[derive(Debug, Deserialize)]
+struct MyOrganizationInput {
+    slug: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    allowed_email_domains: Vec<String>,
+}
+
+async fn my_organizations(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> AppResult<Json<Vec<UserOrganizationRecord>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    Ok(Json(
+        state.db.list_user_organizations(&current.user.id).await?,
+    ))
+}
+
+async fn create_my_organization(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<MyOrganizationInput>,
+) -> AppResult<Json<OrganizationResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    let organization = state
+        .db
+        .insert_organization(NewOrganization {
+            slug: organizations::normalize_slug(&payload.slug)?,
+            name: organizations::normalize_name(&payload.name)?,
+            kind: organizations::ORGANIZATION_KIND_TENANT.to_string(),
+            description: normalize_optional_text(payload.description),
+            allowed_email_domains: security_policy::normalize_email_domain_rules(
+                payload.allowed_email_domains,
+            )?,
+            is_active: true,
+        })
+        .await?;
+    state
+        .db
+        .upsert_organization_member(
+            &organization.id,
+            &current.user.id,
+            organizations::ROLE_OWNER,
+        )
+        .await?;
+    state
+        .db
+        .set_active_user_organization(&current.user.id, &organization.id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "organization.self_service_create",
+            "organization",
+            Some(organization.id.clone()),
+            serde_json::json!({ "slug": organization.slug, "name": organization.name }),
+        ))
+        .await?;
+    Ok(Json(organization_response(&state, organization).await?))
+}
+
+async fn my_organization_context(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> AppResult<Json<OrganizationContextResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    Ok(Json(OrganizationContextResponse {
+        organization: state.db.active_user_organization(&current.user.id).await?,
+    }))
+}
+
+async fn set_my_organization_context(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<OrganizationContextInput>,
+) -> AppResult<Json<OrganizationContextResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    let organization = state
+        .db
+        .set_active_user_organization(&current.user.id, payload.organization_id.trim())
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "organization.context.select",
+            "organization",
+            Some(organization.id.clone()),
+            serde_json::json!({ "slug": organization.slug }),
+        ))
+        .await?;
+    Ok(Json(OrganizationContextResponse {
+        organization: Some(organization),
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -1702,6 +1933,7 @@ struct OrganizationResponse {
     id: String,
     slug: String,
     name: String,
+    kind: String,
     description: Option<String>,
     allowed_email_domains: Vec<String>,
     is_active: bool,
@@ -1715,6 +1947,7 @@ struct OrganizationOptionResponse {
     id: String,
     slug: String,
     name: String,
+    kind: String,
     is_active: bool,
 }
 
@@ -1764,13 +1997,36 @@ struct OrganizationInput {
 
 #[derive(Debug, Deserialize)]
 struct OrganizationMemberPayload {
-    user_id: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
     role: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct OrganizationMembersInput {
     members: Vec<OrganizationMemberPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrganizationMemberInvitationInput {
+    email: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    expires_at: i64,
+    #[serde(default = "default_organization_role")]
+    organization_role: String,
+    #[serde(default = "default_true")]
+    is_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OrganizationMemberInvitationCreateResponse {
+    invitation: PublicInvitation,
+    code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1805,14 +2061,6 @@ const USER_READ_PERMISSIONS: &[Permission] = &[
     Permission::UsersManage,
     Permission::OrganizationsManage,
     Permission::SecurityManage,
-];
-const CLIENT_READ_PERMISSIONS: &[Permission] = &[
-    Permission::ClientsRead,
-    Permission::ClientsManage,
-    // Authorization-code operators need the non-secret client metadata from
-    // this endpoint to bind a recovery, trial, or universal code to an
-    // existing application. Client writes remain clients.manage-only.
-    Permission::AuthorizationCodesManage,
 ];
 const IAP_READ_PERMISSIONS: &[Permission] = &[Permission::IapRead, Permission::IapManage];
 const ORGANIZATION_READ_PERMISSIONS: &[Permission] = &[
@@ -1855,14 +2103,6 @@ async fn require_user_manager(state: &AppState, jar: &CookieJar) -> AppResult<au
     require_permission(state, jar, Permission::UsersManage).await
 }
 
-async fn require_client_reader(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
-    require_any_permission(state, jar, CLIENT_READ_PERMISSIONS).await
-}
-
-async fn require_client_manager(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
-    require_permission(state, jar, Permission::ClientsManage).await
-}
-
 async fn require_iap_reader(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
     require_any_permission(state, jar, IAP_READ_PERMISSIONS).await
 }
@@ -1876,13 +2116,6 @@ async fn require_authorization_code_manager(
     jar: &CookieJar,
 ) -> AppResult<auth::CurrentUser> {
     require_permission(state, jar, Permission::AuthorizationCodesManage).await
-}
-
-async fn require_provider_manager(
-    state: &AppState,
-    jar: &CookieJar,
-) -> AppResult<auth::CurrentUser> {
-    require_permission(state, jar, Permission::ProvidersManage).await
 }
 
 async fn require_security_manager(
@@ -1997,6 +2230,7 @@ fn organization_response_with_member_count(
         id: organization.id,
         slug: organization.slug,
         name: organization.name,
+        kind: organization.kind,
         description: organization.description,
         allowed_email_domains: security_policy::normalize_email_domain_rules(util::from_json::<
             Vec<String>,
@@ -2031,6 +2265,7 @@ fn organization_input_to_new(input: OrganizationInput) -> AppResult<NewOrganizat
     Ok(NewOrganization {
         slug: organizations::normalize_slug(&input.slug)?,
         name: organizations::normalize_name(&input.name)?,
+        kind: organizations::ORGANIZATION_KIND_TENANT.to_string(),
         description: normalize_optional_text(input.description),
         allowed_email_domains: security_policy::normalize_email_domain_rules(
             input.allowed_email_domains,
@@ -2039,19 +2274,38 @@ fn organization_input_to_new(input: OrganizationInput) -> AppResult<NewOrganizat
     })
 }
 
-fn organization_members_input(
+async fn organization_members_input(
+    state: &AppState,
     input: OrganizationMembersInput,
 ) -> AppResult<Vec<OrganizationMemberInput>> {
-    input
-        .members
-        .into_iter()
-        .map(|member| {
-            Ok(OrganizationMemberInput {
-                user_id: member.user_id,
-                role: organizations::normalize_role(&member.role)?,
-            })
-        })
-        .collect()
+    let mut members = Vec::with_capacity(input.members.len());
+    for member in input.members {
+        let user_id = member.user_id.unwrap_or_default().trim().to_string();
+        let email = member.email.unwrap_or_default().trim().to_string();
+        let user_id = match (user_id.is_empty(), email.is_empty()) {
+            (false, true) => user_id,
+            (true, false) => {
+                state
+                    .db
+                    .find_user_by_email(&email)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::BadRequest("no account found for member email".to_string())
+                    })?
+                    .id
+            }
+            _ => {
+                return Err(AppError::BadRequest(
+                    "organization member must provide exactly one of user_id or email".to_string(),
+                ));
+            }
+        };
+        members.push(OrganizationMemberInput {
+            user_id,
+            role: organizations::normalize_role(&member.role)?,
+        });
+    }
+    Ok(members)
 }
 
 async fn list_permissions(
@@ -2353,6 +2607,7 @@ async fn list_organization_options(
                 id: organization.id,
                 slug: organization.slug,
                 name: organization.name,
+                kind: organization.kind,
                 is_active: organization.is_active == 1,
             })
             .collect(),
@@ -2436,12 +2691,14 @@ async fn list_organization_members(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<OrganizationMemberResponse>>> {
-    require_organization_manager(&state, &jar).await?;
-    state
+    let current = auth::require_current_user(&state, &jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    let organization = state
         .db
         .find_organization_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
     Ok(Json(
         state
             .db
@@ -2453,19 +2710,265 @@ async fn list_organization_members(
     ))
 }
 
+/// Adds a known Signet account to one enterprise without exposing the global
+/// user directory. Tenant administrators may use an email address; platform
+/// administrators can retain the stable-ID workflow used by the old console.
+async fn upsert_organization_member(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<OrganizationMemberPayload>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    let organization = state
+        .db
+        .find_organization_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM
+        && !state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage)
+            .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let member = organization_members_input(
+        &state,
+        OrganizationMembersInput {
+            members: vec![payload],
+        },
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| AppError::BadRequest("organization member is required".to_string()))?;
+    ensure_assignable_user_ids(
+        &state,
+        &BTreeSet::from([member.user_id.clone()]),
+        &BTreeSet::new(),
+        "organizations",
+    )
+    .await?;
+    state
+        .db
+        .upsert_organization_member(&id, &member.user_id, &member.role)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "organization.member.upsert",
+            "organization",
+            Some(id),
+            serde_json::json!({ "user_id": member.user_id, "role": member.role }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Creates a one-time registration capability for a specific email address.
+/// Unlike application trial enrollment, this produces a normal Signet account
+/// and grants it membership in the enterprise on successful registration.
+/// Existing accounts continue to be added through the member-by-email action.
+async fn list_organization_member_invitations(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<PublicInvitation>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let organization = state
+        .db
+        .find_organization_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM
+        && !state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage)
+            .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(Json(
+        state
+            .db
+            .list_organization_registration_invitations(&organization.id)
+            .await?
+            .into_iter()
+            .map(InvitationRecord::public)
+            .collect::<AppResult<Vec<_>>>()?,
+    ))
+}
+
+async fn create_organization_member_invitation(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<OrganizationMemberInvitationInput>,
+) -> AppResult<Json<OrganizationMemberInvitationCreateResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let organization = state
+        .db
+        .find_organization_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM
+        && !state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage)
+            .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    if organization.is_active != 1 {
+        return Err(AppError::BadRequest(
+            "cannot invite members to a disabled organization".to_string(),
+        ));
+    }
+    if payload.expires_at <= util::now_ts() {
+        return Err(AppError::BadRequest(
+            "organization member invitations require a future expiry".to_string(),
+        ));
+    }
+    let email = normalize_optional_email(Some(payload.email))?.ok_or_else(|| {
+        AppError::BadRequest("organization member invitation email is required".to_string())
+    })?;
+    if !organization.allows_email(&email)? {
+        return Err(AppError::BadRequest(
+            "email is not allowed by the organization policy".to_string(),
+        ));
+    }
+    let organization_role = organizations::normalize_role(&payload.organization_role)?;
+    let code = format!("ORG-{}", util::random_token(18));
+    let signing_key = state
+        .db
+        .list_signing_keys()
+        .await?
+        .into_iter()
+        .find(|key| key.is_active == 1)
+        .ok_or_else(|| {
+            AppError::Configuration(
+                "an active signing key is required to create a revealable organization invitation"
+                    .to_string(),
+            )
+        })?;
+    let ciphertext =
+        util::encrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &code)?;
+    let (invitation, code) = state
+        .db
+        .insert_invitation_with_reveal_secret(
+            NewInvitation {
+                code_type: AuthorizationCodeType::Registration,
+                login_code_level: LoginCodeLevel::AccountRecovery,
+                allowed_client_ids: Vec::new(),
+                organization_id: Some(organization.id.clone()),
+                organization_role: Some(organization_role.clone()),
+                description: normalize_optional_text(payload.description),
+                authorized_email: Some(email.clone()),
+                authorized_username: None,
+                authorized_user_id: None,
+                authorized_display_name: normalize_optional_text(payload.display_name),
+                expires_at: Some(payload.expires_at),
+                max_uses: Some(1),
+                is_active: payload.is_active,
+                created_by: Some(current.user.id.clone()),
+            },
+            code,
+            signing_key.kid,
+            ciphertext,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "organization.member_invitation.create",
+            "organization",
+            Some(organization.id.clone()),
+            serde_json::json!({
+                "invitation_id": invitation.id,
+                "email": email,
+                "organization_role": organization_role,
+            }),
+        ))
+        .await?;
+    Ok(Json(OrganizationMemberInvitationCreateResponse {
+        invitation: invitation.public()?,
+        code,
+    }))
+}
+
+async fn delete_organization_member_invitation(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, invitation_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let organization = state
+        .db
+        .find_organization_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM
+        && !state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage)
+            .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    if !state
+        .db
+        .organization_registration_invitation_belongs_to(&organization.id, &invitation_id)
+        .await?
+    {
+        return Err(AppError::NotFound);
+    }
+    state.db.delete_invitation(&invitation_id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "organization.member_invitation.delete",
+            "organization",
+            Some(organization.id),
+            serde_json::json!({ "invitation_id": invitation_id }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 async fn update_organization_members(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
     Json(payload): Json<OrganizationMembersInput>,
 ) -> AppResult<Json<OrganizationResponse>> {
-    let current = require_organization_manager(&state, &jar).await?;
-    let members = organization_members_input(payload)?;
-    state
+    let current = auth::require_current_user(&state, &jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    let members = organization_members_input(&state, payload).await?;
+    let organization = state
         .db
         .find_organization_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    // Signet is the platform-control tenant. Its roster may be managed only
+    // by a global organization administrator, never merely by a membership
+    // role within the system tenant.
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM
+        && !state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage)
+            .await?
+    {
+        return Err(AppError::Forbidden);
+    }
     ensure_organization_members_editable(&state, &id, &members).await?;
     state
         .db
@@ -3577,12 +4080,59 @@ async fn list_clients(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicClient>>> {
-    require_client_reader(&state, &jar).await?;
+    let (_, organization) = current_organization_client_manager(&state, &jar, false).await?;
     let mut clients = Vec::new();
-    for client in state.db.list_clients().await? {
+    for client in state
+        .db
+        .list_clients_for_organization(&organization.id)
+        .await?
+    {
         clients.push(public_client_with_claim_mappers(&state, client).await?);
     }
     Ok(Json(clients))
+}
+
+/// OIDC connections are enterprise-owned. A global client permission remains
+/// a platform escape hatch, while an owner/admin of the selected enterprise
+/// can manage its own connections without receiving visibility into others.
+async fn current_organization_client_manager(
+    state: &AppState,
+    jar: &CookieJar,
+    manage: bool,
+) -> AppResult<(auth::CurrentUser, UserOrganizationRecord)> {
+    let (current, organization) = current_organization_context(state, jar).await?;
+    let global_permission = if manage {
+        Permission::ClientsManage
+    } else {
+        Permission::ClientsRead
+    };
+    if state
+        .db
+        .has_permission(&current.user, global_permission)
+        .await?
+        || (!manage
+            && state
+                .db
+                .has_permission(&current.user, Permission::ClientsManage)
+                .await?)
+    {
+        return Ok((current, organization));
+    }
+    require_organization_manager_for(state, &current, &organization.id).await?;
+    Ok((current, organization))
+}
+
+fn client_organization_from_context(
+    submitted_organization_id: Option<String>,
+    organization: &UserOrganizationRecord,
+) -> AppResult<Option<String>> {
+    if let Some(submitted) = submitted_organization_id {
+        let submitted = submitted.trim();
+        if !submitted.is_empty() && submitted != organization.id {
+            return Err(AppError::Forbidden);
+        }
+    }
+    Ok(Some(organization.id.clone()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3659,15 +4209,16 @@ async fn create_client(
     jar: CookieJar,
     Json(payload): Json<ClientInput>,
 ) -> AppResult<Json<PublicClient>> {
-    let current = require_client_manager(&state, &jar).await?;
+    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
     validate_client_input(&payload)?;
     let organization_id =
-        normalize_client_organization_id(&state, payload.organization_id.clone()).await?;
+        client_organization_from_context(payload.organization_id.clone(), &organization)?;
     let claim_mappers = client_input_to_claim_mappers(&payload)?;
     let client = state
         .db
         .insert_client(client_input_to_new(payload, None, organization_id.clone())?)
         .await?;
+    let application = state.db.harden_new_client_application(&client.id).await?;
     state
         .db
         .replace_client_claim_mappers(&client.id, claim_mappers)
@@ -3682,6 +4233,7 @@ async fn create_client(
             serde_json::json!({
                 "client_id": client.client_id.clone(),
                 "organization_id": organization_id,
+                "application_id": application.id,
                 "require_mfa": client.require_mfa == 1,
                 "require_pushed_authorization_requests": client.require_pushed_authorization_requests == 1,
                 "require_s256_pkce": client.require_s256_pkce == 1,
@@ -3705,16 +4257,19 @@ async fn update_client(
     Path(id): Path<String>,
     Json(payload): Json<ClientInput>,
 ) -> AppResult<Json<PublicClient>> {
-    let current = require_client_manager(&state, &jar).await?;
+    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
     validate_client_input(&payload)?;
-    let organization_id =
-        normalize_client_organization_id(&state, payload.organization_id.clone()).await?;
-    let claim_mappers = client_input_to_claim_mappers(&payload)?;
     let existing = state
         .db
         .find_client_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
+    if existing.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
+    let organization_id =
+        client_organization_from_context(payload.organization_id.clone(), &organization)?;
+    let claim_mappers = client_input_to_claim_mappers(&payload)?;
     let client = state
         .db
         .update_client(
@@ -3762,12 +4317,15 @@ async fn delete_client(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = require_client_manager(&state, &jar).await?;
+    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
     let client = state
         .db
         .find_client_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
+    if client.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
     state.db.delete_client(&id).await?;
     state
         .db
@@ -3780,6 +4338,1790 @@ async fn delete_client(
                 "client_id": client.client_id,
                 "organization_id": client.organization_id
             }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationInput {
+    slug: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    account_selection_mode: String,
+    #[serde(default)]
+    unique_identity_factors: Vec<String>,
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationOidcClientsInput {
+    client_ids: Vec<String>,
+}
+
+const APPLICATION_MODULE_KEYS: &[&str] = &[
+    "protocols",
+    "login_adapters",
+    "directory_sync",
+    "authorization",
+];
+
+#[derive(Debug, Serialize)]
+struct ApplicationModuleResponse {
+    module_key: String,
+    config: serde_json::Value,
+    is_enabled: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationModuleInput {
+    #[serde(default)]
+    config: serde_json::Value,
+    #[serde(default = "default_true")]
+    is_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationJwtClientResponse {
+    client_id: String,
+    client_type: String,
+    is_active: bool,
+    secret_count: usize,
+    active_secret_count: usize,
+    latest_secret_created_at: Option<i64>,
+    latest_secret_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationJwtClientInput {
+    client_id: String,
+    #[serde(default = "default_application_jwt_client_type")]
+    client_type: String,
+    #[serde(default = "default_true")]
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationJwtSecretRotationInput {
+    #[serde(default = "default_jwt_secret_grace_seconds")]
+    grace_seconds: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationJwtSecretRotationResponse {
+    client_id: String,
+    secret: String,
+    created_at: i64,
+    grace_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationScimTokenResponse {
+    id: String,
+    application_id: String,
+    token_prefix: String,
+    scopes: Vec<String>,
+    expires_at: Option<i64>,
+    revoked_at: Option<i64>,
+    last_used_at: Option<i64>,
+    created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationScimTokenInput {
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationRoleResponse {
+    id: String,
+    application_id: String,
+    name: String,
+    description: Option<String>,
+    permissions: Vec<String>,
+    is_default: bool,
+    is_active: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationRoleInput {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    is_default: bool,
+    #[serde(default = "default_true")]
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationRoleIdsInput {
+    role_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationPermissionOverrideResponse {
+    permission: String,
+    effect: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationPermissionOverridesInput {
+    overrides: Vec<ApplicationPermissionOverrideInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationPermissionOverrideInput {
+    permission: String,
+    effect: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationAuthorizationGroupResponse {
+    id: String,
+    name: String,
+    description: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationAuthorizationSubjectsResponse {
+    users: Vec<OrganizationMemberResponse>,
+    groups: Vec<ApplicationAuthorizationGroupResponse>,
+    organization_roles: Vec<String>,
+}
+
+fn application_role_response(role: ApplicationRoleRecord) -> AppResult<ApplicationRoleResponse> {
+    let permissions = role.permission_keys()?;
+    Ok(ApplicationRoleResponse {
+        id: role.id,
+        application_id: role.application_id,
+        name: role.name,
+        description: role.description,
+        permissions,
+        is_default: role.is_default == 1,
+        is_active: role.is_active == 1,
+        created_at: role.created_at,
+        updated_at: role.updated_at,
+    })
+}
+
+fn application_module_response(
+    module: ApplicationModuleRecord,
+) -> AppResult<ApplicationModuleResponse> {
+    let config = serde_json::from_str(&module.config_json).map_err(|err| {
+        AppError::Internal(format!("application module config is invalid: {err}"))
+    })?;
+    Ok(ApplicationModuleResponse {
+        module_key: module.module_key,
+        config,
+        is_enabled: module.is_enabled == 1,
+        created_at: module.created_at,
+        updated_at: module.updated_at,
+    })
+}
+
+async fn application_jwt_client_response(
+    state: &AppState,
+    client: ApplicationJwtClientRecord,
+) -> AppResult<ApplicationJwtClientResponse> {
+    let secrets = state
+        .db
+        .list_application_jwt_secrets(&client.application_id, &client.client_id)
+        .await?;
+    let now = util::now_ts();
+    let active_secret_count = secrets
+        .iter()
+        .filter(|secret| {
+            secret.revoked_at.is_none()
+                && secret.expires_at.is_none_or(|expires_at| expires_at >= now)
+        })
+        .count();
+    let latest_secret = secrets.first();
+    Ok(ApplicationJwtClientResponse {
+        client_id: client.client_id,
+        client_type: client.client_type,
+        is_active: client.is_active == 1,
+        secret_count: secrets.len(),
+        active_secret_count,
+        latest_secret_created_at: latest_secret.map(|secret| secret.created_at),
+        latest_secret_expires_at: latest_secret.and_then(|secret| secret.expires_at),
+    })
+}
+
+fn normalize_application_module_key(value: &str) -> AppResult<String> {
+    let key = value.trim();
+    if APPLICATION_MODULE_KEYS.contains(&key) {
+        return Ok(key.to_string());
+    }
+    Err(AppError::BadRequest(format!(
+        "unsupported application module: {key}"
+    )))
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationResponse {
+    id: String,
+    organization_id: String,
+    slug: String,
+    name: String,
+    description: Option<String>,
+    account_selection_mode: String,
+    unique_identity_factors: Vec<String>,
+    is_active: bool,
+    oidc_clients: Vec<PublicClient>,
+    modules: Vec<ApplicationModuleResponse>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn default_organization_role() -> String {
+    "member".to_string()
+}
+
+fn default_application_jwt_client_type() -> String {
+    "public".to_string()
+}
+
+fn default_jwt_secret_grace_seconds() -> i64 {
+    300
+}
+
+fn application_input_to_new(
+    organization_id: String,
+    input: ApplicationInput,
+    _allow_legacy: bool,
+) -> AppResult<NewApplication> {
+    Ok(NewApplication {
+        organization_id,
+        slug: applications::normalize_application_slug(&input.slug)?,
+        name: applications::normalize_application_name(&input.name)?,
+        description: normalize_optional_text(input.description),
+        // Applications are website containers. Login eligibility is the
+        // active Signet account, never an application member roster.
+        access_mode: applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+        registration_mode: applications::REGISTRATION_DISABLED.to_string(),
+        account_selection_mode: applications::normalize_account_selection_mode(
+            &input.account_selection_mode,
+        )?,
+        unique_identity_factors: applications::normalize_unique_identity_factors(
+            input.unique_identity_factors,
+        )?,
+        is_active: input.is_active,
+    })
+}
+
+async fn application_response(
+    state: &AppState,
+    application: ApplicationRecord,
+) -> AppResult<ApplicationResponse> {
+    let mut oidc_clients = Vec::new();
+    for client_db_id in state
+        .db
+        .list_application_oidc_client_ids(&application.id)
+        .await?
+    {
+        if let Some(client) = state.db.find_client_by_id(&client_db_id).await? {
+            oidc_clients.push(public_client_with_claim_mappers(state, client).await?);
+        }
+    }
+    let unique_identity_factors = application.unique_identity_factors()?;
+    let modules = state
+        .db
+        .list_application_modules(&application.id)
+        .await?
+        .into_iter()
+        .map(application_module_response)
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(ApplicationResponse {
+        id: application.id,
+        organization_id: application.organization_id,
+        slug: application.slug,
+        name: application.name,
+        description: application.description,
+        account_selection_mode: application.account_selection_mode,
+        unique_identity_factors,
+        is_active: application.is_active == 1,
+        oidc_clients,
+        modules,
+        created_at: application.created_at,
+        updated_at: application.updated_at,
+    })
+}
+
+async fn current_organization_context(
+    state: &AppState,
+    jar: &CookieJar,
+) -> AppResult<(auth::CurrentUser, UserOrganizationRecord)> {
+    let current = auth::require_current_user(state, jar).await?;
+    if !current.can_mutate_account() {
+        return Err(AppError::Forbidden);
+    }
+    let organization = state
+        .db
+        .active_user_organization(&current.user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "join or create an organization before using the management console".to_string(),
+            )
+        })?;
+    Ok((current, organization))
+}
+
+async fn require_organization_manager_for(
+    state: &AppState,
+    current: &auth::CurrentUser,
+    organization_id: &str,
+) -> AppResult<()> {
+    auth::ensure_current_account_mutable(current)?;
+    let organization = state
+        .db
+        .find_organization_by_id(organization_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // Signet is the platform-control tenant. Its membership roster is useful
+    // for console context, but it must never turn an ordinary tenant role
+    // into platform administration.
+    if organization.kind == organizations::ORGANIZATION_KIND_SYSTEM {
+        state
+            .db
+            .require_permission(&current.user, Permission::OrganizationsManage)
+            .await?;
+        return Ok(());
+    }
+    if state
+        .db
+        .has_permission(&current.user, Permission::OrganizationsManage)
+        .await?
+    {
+        return Ok(());
+    }
+    let membership = state
+        .db
+        .list_user_organizations(&current.user.id)
+        .await?
+        .into_iter()
+        .find(|organization| organization.id == organization_id && organization.is_active == 1);
+    match membership
+        .as_ref()
+        .map(|membership| membership.role.as_str())
+    {
+        Some(organizations::ROLE_OWNER | organizations::ROLE_ADMIN) => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+/// External OIDC sources follow the same enterprise boundary as applications
+/// and OIDC clients. Platform provider managers retain cross-tenant access;
+/// an enterprise owner/admin can operate only sources owned by the selected
+/// enterprise.
+async fn current_organization_provider_manager(
+    state: &AppState,
+    jar: &CookieJar,
+) -> AppResult<(auth::CurrentUser, UserOrganizationRecord, bool)> {
+    let (current, organization) = current_organization_context(state, jar).await?;
+    let platform_manager = state
+        .db
+        .has_permission(&current.user, Permission::ProvidersManage)
+        .await?;
+    if !platform_manager {
+        require_organization_manager_for(state, &current, &organization.id).await?;
+    }
+    Ok((current, organization, platform_manager))
+}
+
+async fn list_applications(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> AppResult<Json<Vec<ApplicationResponse>>> {
+    let (current, organization) = current_organization_context(&state, &jar).await?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let mut result = Vec::new();
+    for application in state.db.list_applications(Some(&organization.id)).await? {
+        result.push(application_response(&state, application).await?);
+    }
+    Ok(Json(result))
+}
+
+async fn list_application_modules(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<ApplicationModuleResponse>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let modules = state
+        .db
+        .list_application_modules(&id)
+        .await?
+        .into_iter()
+        .map(application_module_response)
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(Json(modules))
+}
+
+async fn list_application_directory_sync_runs(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<crate::db::DirectorySyncRunRecord>>> {
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
+    Ok(Json(
+        directory_sync::list_application_ldap_sync_runs(&state, &application.id).await?,
+    ))
+}
+
+async fn run_application_directory_sync(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, provider_id)): Path<(String, String)>,
+) -> AppResult<Json<crate::db::DirectorySyncRunRecord>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let result =
+        directory_sync::run_application_ldap_sync(&state, &application.id, &provider_id).await;
+    match result {
+        Ok(run) => {
+            state
+                .db
+                .record_audit_event(audit::management_event(
+                    current.user.id,
+                    "application.directory_sync.run",
+                    "application",
+                    Some(application.id),
+                    serde_json::json!({
+                        "organization_id": application.organization_id,
+                        "provider_id": provider_id,
+                        "status": run.status,
+                        "run_id": run.id,
+                    }),
+                ))
+                .await?;
+            Ok(Json(run))
+        }
+        Err(error) => {
+            // The sync coordinator records a failed run when it has started
+            // one. Keep the management audit deliberately metadata-only so
+            // LDAP bind credentials and provider response details cannot leak.
+            let _ = state
+                .db
+                .record_audit_event(audit::management_event(
+                    current.user.id,
+                    "application.directory_sync.run",
+                    "application",
+                    Some(application.id),
+                    serde_json::json!({
+                        "organization_id": application.organization_id,
+                        "provider_id": provider_id,
+                        "status": "failed",
+                    }),
+                ))
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn update_application_module(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, module_key)): Path<(String, String)>,
+    Json(payload): Json<ApplicationModuleInput>,
+) -> AppResult<Json<ApplicationModuleResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let module_key = normalize_application_module_key(&module_key)?;
+    let config = applications::normalize_module_config(&module_key, payload.config)?;
+    applications::validate_module_bindings(
+        &state,
+        &application,
+        &module_key,
+        config.as_object().ok_or_else(|| {
+            AppError::BadRequest("application module config must be an object".to_string())
+        })?,
+    )
+    .await?;
+    let config_json = serde_json::to_string(&config).map_err(|err| {
+        AppError::BadRequest(format!("application module config is invalid: {err}"))
+    })?;
+    if config_json.len() > 512 * 1024 {
+        return Err(AppError::BadRequest(
+            "application module config is too large".to_string(),
+        ));
+    }
+    let module = state
+        .db
+        .upsert_application_module(&id, &module_key, &config_json, payload.is_enabled)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.module.update",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "module": module_key,
+                "is_enabled": payload.is_enabled,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_module_response(module)?))
+}
+
+async fn get_application_jwt_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Option<ApplicationJwtClientResponse>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let Some(module) = applications::enabled_protocol_config(&state, &id, "jwt").await? else {
+        return Ok(Json(None));
+    };
+    let client_id = module
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(application.slug.as_str());
+    let client = state.db.find_application_jwt_client(&id, client_id).await?;
+    match client {
+        Some(client) => Ok(Json(Some(
+            application_jwt_client_response(&state, client).await?,
+        ))),
+        None => Ok(Json(None)),
+    }
+}
+
+async fn update_application_jwt_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationJwtClientInput>,
+) -> AppResult<Json<ApplicationJwtClientResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let client_type = payload.client_type.trim().to_ascii_lowercase();
+    if !matches!(client_type.as_str(), "public" | "confidential") {
+        return Err(AppError::BadRequest(
+            "application JWT client_type must be public or confidential".to_string(),
+        ));
+    }
+    let client = state
+        .db
+        .upsert_application_jwt_client(
+            &id,
+            NewApplicationJwtClient {
+                client_id: payload.client_id,
+                client_type,
+                is_active: payload.is_active,
+            },
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.jwt_client.update",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "client_id": client.client_id,
+                "client_type": client.client_type,
+                "is_active": client.is_active == 1,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_jwt_client_response(&state, client).await?))
+}
+
+async fn rotate_application_jwt_secret(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationJwtSecretRotationInput>,
+) -> AppResult<Json<ApplicationJwtSecretRotationResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    if !(0..=86_400).contains(&payload.grace_seconds) {
+        return Err(AppError::BadRequest(
+            "JWT secret grace_seconds must be between 0 and 86400".to_string(),
+        ));
+    }
+    let module = applications::enabled_protocol_config(&state, &id, "jwt")
+        .await?
+        .ok_or_else(|| AppError::BadRequest("JWT protocol is not enabled".to_string()))?;
+    let client_id = module
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(application.slug.as_str())
+        .to_string();
+    let client = state
+        .db
+        .find_application_jwt_client(&id, &client_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest("configure the JWT client before rotating its secret".to_string())
+        })?;
+    if client.client_type != "confidential" || client.is_active != 1 {
+        return Err(AppError::BadRequest(
+            "JWT secret rotation requires an active confidential client".to_string(),
+        ));
+    }
+    let secret = format!("jwt_{}", util::random_token(32));
+    let secret_hash = client_assertion::store_client_secret("client_secret_post", &secret)?
+        .ok_or_else(|| AppError::Internal("failed to hash JWT client secret".to_string()))?;
+    let record = state
+        .db
+        .rotate_application_jwt_secret(&id, &client_id, &secret_hash, payload.grace_seconds)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.jwt_client.secret.rotate",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "client_id": client_id,
+                "grace_seconds": payload.grace_seconds,
+                "secret_id": record.id,
+            }),
+        ))
+        .await?;
+    Ok(Json(ApplicationJwtSecretRotationResponse {
+        client_id,
+        secret,
+        created_at: record.created_at,
+        grace_seconds: payload.grace_seconds,
+    }))
+}
+
+async fn revoke_application_jwt_secrets(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let module = applications::enabled_protocol_config(&state, &id, "jwt")
+        .await?
+        .ok_or_else(|| AppError::BadRequest("JWT protocol is not enabled".to_string()))?;
+    let client_id = module
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(application.slug.as_str())
+        .to_string();
+    state
+        .db
+        .revoke_application_jwt_secrets(&id, &client_id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.jwt_client.secret.revoke",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "client_id": client_id,
+            }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn application_scim_token_response(
+    token: ApplicationScimTokenRecord,
+    raw_token: Option<String>,
+) -> AppResult<ApplicationScimTokenResponse> {
+    Ok(ApplicationScimTokenResponse {
+        id: token.id,
+        application_id: token.application_id,
+        token_prefix: token.token_prefix,
+        scopes: util::from_json(&token.scopes)?,
+        expires_at: token.expires_at,
+        revoked_at: token.revoked_at,
+        last_used_at: token.last_used_at,
+        created_at: token.created_at,
+        token: raw_token,
+    })
+}
+
+fn normalize_application_scim_token_scopes(values: Vec<String>) -> AppResult<Vec<String>> {
+    let values = if values.is_empty() {
+        vec!["scim.read".to_string(), "scim.write".to_string()]
+    } else {
+        values
+    };
+    let mut scopes = BTreeSet::new();
+    for value in values {
+        match value.trim() {
+            "scim.read" | "scim.write" => {
+                scopes.insert(value.trim().to_string());
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported application SCIM token scope: {other}"
+                )));
+            }
+        }
+    }
+    Ok(scopes.into_iter().collect())
+}
+
+async fn list_application_scim_tokens(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<ApplicationScimTokenResponse>>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let tokens = state
+        .db
+        .list_application_scim_tokens(&application.id)
+        .await?
+        .into_iter()
+        .map(|token| application_scim_token_response(token, None))
+        .collect::<AppResult<Vec<_>>>()?;
+    let _ = current;
+    Ok(Json(tokens))
+}
+
+async fn create_application_scim_token(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationScimTokenInput>,
+) -> AppResult<Json<ApplicationScimTokenResponse>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let module = applications::enabled_module_config(&state, &id, "directory_sync")
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest("enable directory sync before creating a SCIM token".to_string())
+        })?;
+    if module
+        .get("scim_enabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(AppError::BadRequest(
+            "enable application SCIM before creating a token".to_string(),
+        ));
+    }
+    let scopes = normalize_application_scim_token_scopes(payload.scopes)?;
+    if payload
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= util::now_ts())
+    {
+        return Err(AppError::BadRequest(
+            "application SCIM token expiry must be in the future".to_string(),
+        ));
+    }
+    let raw_token = format!("scim_v1_{}", util::random_token(32));
+    let record = state
+        .db
+        .insert_application_scim_token(NewApplicationScimToken {
+            id: uuid::Uuid::new_v4().to_string(),
+            application_id: application.id.clone(),
+            token_prefix: raw_token.chars().take(16).collect(),
+            token_hash: util::token_hash(&raw_token),
+            scopes,
+            expires_at: payload.expires_at,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.scim_token.create",
+            "application",
+            Some(application.id),
+            serde_json::json!({ "token_id": record.id, "token_prefix": record.token_prefix }),
+        ))
+        .await?;
+    Ok(Json(application_scim_token_response(
+        record,
+        Some(raw_token),
+    )?))
+}
+
+async fn revoke_application_scim_token(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, token_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    state
+        .db
+        .revoke_application_scim_token(&application.id, &token_id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.scim_token.revoke",
+            "application",
+            Some(application.id),
+            serde_json::json!({ "token_id": token_id }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_application_module(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, module_key)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let module_key = normalize_application_module_key(&module_key)?;
+    state.db.delete_application_module(&id, &module_key).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.module.delete",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "module": module_key,
+            }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn managed_application(
+    state: &AppState,
+    jar: &CookieJar,
+    id: &str,
+) -> AppResult<(auth::CurrentUser, ApplicationRecord)> {
+    let current = auth::require_current_user(state, jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(state, &current, &application.organization_id).await?;
+    Ok((current, application))
+}
+
+async fn list_application_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<ApplicationRoleResponse>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    let roles = state
+        .db
+        .list_application_roles(&id)
+        .await?
+        .into_iter()
+        .map(application_role_response)
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(Json(roles))
+}
+
+async fn application_permission_catalog(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<PermissionInfo>>> {
+    // Application managers need the same stable standard-permission catalog
+    // used by the role validator. Requiring the global security-manager
+    // permission here would make an enterprise owner unable to configure the
+    // website they own, while returning the catalog does not grant any
+    // permission by itself.
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    Ok(Json(permission_catalog()))
+}
+
+async fn application_authorization_subjects(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<ApplicationAuthorizationSubjectsResponse>> {
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
+    let users = state
+        .db
+        .list_organization_members(&application.organization_id)
+        .await?
+        .into_iter()
+        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
+        .map(|member| OrganizationMemberResponse {
+            organization_id: member.organization_id,
+            user_id: member.user_id,
+            role: member.role,
+            email: member.email,
+            username: member.username,
+            display_name: member.display_name,
+            is_active: true,
+            archived_at: None,
+            created_at: member.membership_created_at,
+            updated_at: member.membership_updated_at,
+        })
+        .collect();
+    let groups = state
+        .db
+        .list_groups()
+        .await?
+        .into_iter()
+        .map(|group| ApplicationAuthorizationGroupResponse {
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+        })
+        .collect();
+    Ok(Json(ApplicationAuthorizationSubjectsResponse {
+        users,
+        groups,
+        organization_roles: vec![
+            organizations::ROLE_OWNER.to_string(),
+            organizations::ROLE_ADMIN.to_string(),
+            organizations::ROLE_MEMBER.to_string(),
+        ],
+    }))
+}
+
+async fn create_application_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationRoleInput>,
+) -> AppResult<Json<ApplicationRoleResponse>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let role = state
+        .db
+        .upsert_application_role(
+            &id,
+            NewApplicationRole {
+                name: payload.name,
+                description: payload.description,
+                permissions: payload.permissions,
+                is_default: payload.is_default,
+                is_active: payload.is_active,
+            },
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.role.create",
+            "application_role",
+            Some(role.id.clone()),
+            serde_json::json!({
+                "application_id": application.id,
+                "organization_id": application.organization_id,
+                "role": role.name,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_role_response(role)?))
+}
+
+async fn update_application_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, role_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationRoleInput>,
+) -> AppResult<Json<ApplicationRoleResponse>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    state
+        .db
+        .find_application_role_by_id(&id, &role_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let role = state
+        .db
+        .update_application_role(
+            &id,
+            &role_id,
+            NewApplicationRole {
+                name: payload.name,
+                description: payload.description,
+                permissions: payload.permissions,
+                is_default: payload.is_default,
+                is_active: payload.is_active,
+            },
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.role.update",
+            "application_role",
+            Some(role.id.clone()),
+            serde_json::json!({
+                "application_id": application.id,
+                "organization_id": application.organization_id,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_role_response(role)?))
+}
+
+async fn delete_application_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, role_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    state.db.delete_application_role(&id, &role_id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.role.delete",
+            "application_role",
+            Some(role_id),
+            serde_json::json!({
+                "application_id": application.id,
+                "organization_id": application.organization_id,
+            }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn list_application_user_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, user_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_user_role_ids(&id, &user_id)
+            .await?,
+    ))
+}
+
+async fn update_application_user_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, user_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let user = state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_user_role_ids(&id, &user.id, payload.role_ids)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.user_roles.update",
+            "application",
+            Some(id.clone()),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "user_id": user.id,
+            }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_user_role_ids(&id, &user_id)
+            .await?,
+    ))
+}
+
+async fn list_application_group_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, group_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    state
+        .db
+        .find_group_by_id(&group_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(
+        state
+            .db
+            .list_application_group_role_ids(&id, &group_id)
+            .await?,
+    ))
+}
+
+async fn update_application_group_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, group_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    state
+        .db
+        .find_group_by_id(&group_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_group_role_ids(&id, &group_id, payload.role_ids)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.group_roles.update",
+            "application",
+            Some(id.clone()),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "group_id": group_id,
+            }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_group_role_ids(&id, &group_id)
+            .await?,
+    ))
+}
+
+async fn list_application_organization_role_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, organization_role)): Path<(String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    let organization_role = organizations::normalize_role(&organization_role)?;
+    Ok(Json(
+        state
+            .db
+            .list_application_organization_role_ids(&id, &organization_role)
+            .await?,
+    ))
+}
+
+async fn update_application_organization_role_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, organization_role)): Path<(String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let organization_role = organizations::normalize_role(&organization_role)?;
+    state
+        .db
+        .replace_application_organization_role_ids(&id, &organization_role, payload.role_ids)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.organization_role_mapping.update",
+            "application",
+            Some(id.clone()),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "organization_role": organization_role,
+            }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_organization_role_ids(&id, &organization_role)
+            .await?,
+    ))
+}
+
+async fn list_application_user_permission_overrides(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, user_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    let values = state
+        .db
+        .list_application_user_permission_overrides(&id, &user_id)
+        .await?
+        .into_iter()
+        .map(|value| ApplicationPermissionOverrideResponse {
+            permission: value.permission,
+            effect: value.effect,
+        })
+        .collect();
+    Ok(Json(values))
+}
+
+async fn update_application_user_permission_overrides(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, user_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationPermissionOverridesInput>,
+) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_user_permission_overrides(
+            &id,
+            &user_id,
+            payload
+                .overrides
+                .into_iter()
+                .map(|item| (item.permission, item.effect))
+                .collect(),
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.user_permission_overrides.update",
+            "application",
+            Some(id.clone()),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "user_id": user_id,
+            }),
+        ))
+        .await?;
+    let values = state
+        .db
+        .list_application_user_permission_overrides(&id, &user_id)
+        .await?
+        .into_iter()
+        .map(|value| ApplicationPermissionOverrideResponse {
+            permission: value.permission,
+            effect: value.effect,
+        })
+        .collect();
+    Ok(Json(values))
+}
+
+async fn application_authorization_preview(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, user_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
+    let user = state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let decision = authorization::check_login_access(&state, &application, &user.id).await?;
+    let entitlements = if decision.allowed {
+        Some(authorization::resolve_entitlements(&state, &application, &user).await?)
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "decision": decision,
+        "entitlements": entitlements,
+    })))
+}
+
+async fn create_application(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<ApplicationInput>,
+) -> AppResult<Json<ApplicationResponse>> {
+    let (current, organization) = current_organization_context(&state, &jar).await?;
+    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let application = state
+        .db
+        .insert_application(application_input_to_new(
+            organization.id.clone(),
+            payload,
+            false,
+        )?)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.create",
+            "application",
+            Some(application.id.clone()),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "slug": application.slug,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_response(&state, application).await?))
+}
+
+async fn update_application(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationInput>,
+) -> AppResult<Json<ApplicationResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &existing.organization_id).await?;
+    let application = state
+        .db
+        .update_application(
+            &id,
+            application_input_to_new(existing.organization_id.clone(), payload, false)?,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.update",
+            "application",
+            Some(application.id.clone()),
+            serde_json::json!({ "organization_id": application.organization_id }),
+        ))
+        .await?;
+    Ok(Json(application_response(&state, application).await?))
+}
+
+async fn delete_application(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &existing.organization_id).await?;
+    // An enrollment capability must never outlive the application that owns
+    // it. Deleting it also revokes the restricted sessions it created.
+    for invitation in state.db.list_application_enrollment_codes(&id).await? {
+        state.db.delete_invitation(&invitation.id).await?;
+    }
+    state.db.delete_application(&id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.delete",
+            "application",
+            Some(id),
+            serde_json::json!({ "organization_id": existing.organization_id }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn list_application_oidc_clients(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<PublicClient>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let mut clients = Vec::new();
+    for client_id in state.db.list_application_oidc_client_ids(&id).await? {
+        let client = state
+            .db
+            .find_client_by_id(&client_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        clients.push(public_client_with_claim_mappers(&state, client).await?);
+    }
+    Ok(Json(clients))
+}
+
+async fn replace_application_oidc_clients(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationOidcClientsInput>,
+) -> AppResult<Json<Vec<PublicClient>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let requested_ids = payload
+        .client_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    for client_id in &requested_ids {
+        let client = state
+            .db
+            .find_client_by_id(client_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("OIDC client does not exist".to_string()))?;
+        if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
+            return Err(AppError::Forbidden);
+        }
+    }
+    for existing_client_id in state.db.list_application_oidc_client_ids(&id).await? {
+        if !requested_ids.contains(&existing_client_id) {
+            // Removing a connection leaves its compatibility application in
+            // place only when explicitly linked elsewhere. The mapping table
+            // is the sole authority, so deletion is safe here.
+            state
+                .db
+                .unlink_oidc_client_from_application(&existing_client_id)
+                .await?;
+        }
+    }
+    for client_id in &requested_ids {
+        state
+            .db
+            .link_oidc_client_to_application(&id, client_id)
+            .await?;
+    }
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.oidc_clients.update",
+            "application",
+            Some(id.clone()),
+            serde_json::json!({ "client_ids": requested_ids }),
+        ))
+        .await?;
+    list_application_oidc_clients(State(state), jar, Path(id)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationEnrollmentCodeInput {
+    #[serde(default)]
+    description: Option<String>,
+    /// Normal enrollment creates a reusable multi-enterprise Signet account.
+    /// Restricted trial is retained for short-lived, application-only trials.
+    #[serde(default = "default_application_enrollment_account_kind")]
+    account_kind: String,
+    expires_at: i64,
+    max_uses: i32,
+    #[serde(default = "default_organization_role")]
+    organization_role: String,
+    #[serde(default = "default_true")]
+    is_active: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ApplicationEnrollmentAccountKind {
+    Normal,
+    RestrictedTrial,
+}
+
+impl ApplicationEnrollmentAccountKind {
+    fn parse(value: &str) -> AppResult<Self> {
+        match value.trim() {
+            "normal" => Ok(Self::Normal),
+            "restricted_trial" => Ok(Self::RestrictedTrial),
+            other => Err(AppError::BadRequest(format!(
+                "unsupported application enrollment account kind: {other}"
+            ))),
+        }
+    }
+
+    const fn audit_value(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::RestrictedTrial => "restricted_trial",
+        }
+    }
+}
+
+// Keep the previous API behavior for callers that have not yet sent the new
+// field. The management UI deliberately sends `normal` as its product
+// default, because it is the right choice for a regular enterprise member.
+fn default_application_enrollment_account_kind() -> String {
+    "restricted_trial".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationEnrollmentCodeCreateResponse {
+    invitation: PublicInvitation,
+    code: String,
+}
+
+async fn active_application_client_ids(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<Vec<String>> {
+    let mut client_ids = Vec::new();
+    for client_db_id in state
+        .db
+        .list_application_oidc_client_ids(&application.id)
+        .await?
+    {
+        let client = state
+            .db
+            .find_client_by_id(&client_db_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
+            return Err(AppError::Internal(
+                "application has an OIDC connection from a different organization".to_string(),
+            ));
+        }
+        if client.is_active == 1 {
+            client_ids.push(client.client_id);
+        }
+    }
+    Ok(client_ids)
+}
+
+async fn list_application_enrollment_codes(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<PublicInvitation>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_enrollment_codes(&id)
+            .await?
+            .into_iter()
+            .map(|invitation| invitation.public())
+            .collect::<AppResult<Vec<_>>>()?,
+    ))
+}
+
+async fn create_application_enrollment_code(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationEnrollmentCodeInput>,
+) -> AppResult<Json<ApplicationEnrollmentCodeCreateResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    if application.is_active != 1 {
+        return Err(AppError::BadRequest(
+            "application enrollment is unavailable while the application is disabled".to_string(),
+        ));
+    }
+    if application.registration_mode != applications::REGISTRATION_INVITATION {
+        return Err(AppError::BadRequest(
+            "set this application's registration policy to invitation before creating enrollment codes"
+                .to_string(),
+        ));
+    }
+    if payload.expires_at <= util::now_ts() {
+        return Err(AppError::BadRequest(
+            "application enrollment codes require a future expiry".to_string(),
+        ));
+    }
+    if payload.max_uses <= 0 {
+        return Err(AppError::BadRequest(
+            "application enrollment codes require a positive maximum use count".to_string(),
+        ));
+    }
+    let account_kind = ApplicationEnrollmentAccountKind::parse(&payload.account_kind)?;
+    let organization_role = organizations::normalize_role(&payload.organization_role)?;
+    let allowed_client_ids = active_application_client_ids(&state, &application).await?;
+    if allowed_client_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "attach at least one active OIDC connection before creating an enrollment code"
+                .to_string(),
+        ));
+    }
+    let code = format!("APP-{}", util::random_token(18));
+    let signing_key = state
+        .db
+        .list_signing_keys()
+        .await?
+        .into_iter()
+        .find(|key| key.is_active == 1)
+        .ok_or_else(|| {
+            AppError::Configuration(
+                "an active signing key is required to create a revealable enrollment code"
+                    .to_string(),
+            )
+        })?;
+    let ciphertext =
+        util::encrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &code)?;
+    let (invitation, code) = state
+        .db
+        .insert_invitation_with_reveal_secret(
+            NewInvitation {
+                code_type: match account_kind {
+                    ApplicationEnrollmentAccountKind::Normal => AuthorizationCodeType::Registration,
+                    ApplicationEnrollmentAccountKind::RestrictedTrial => {
+                        AuthorizationCodeType::Login
+                    }
+                },
+                login_code_level: match account_kind {
+                    ApplicationEnrollmentAccountKind::Normal => LoginCodeLevel::AccountRecovery,
+                    ApplicationEnrollmentAccountKind::RestrictedTrial => {
+                        LoginCodeLevel::TrialEnrollment
+                    }
+                },
+                allowed_client_ids: allowed_client_ids.clone(),
+                organization_id: Some(application.organization_id.clone()),
+                organization_role: Some(organization_role.clone()),
+                description: normalize_optional_text(payload.description),
+                authorized_email: None,
+                authorized_username: None,
+                authorized_user_id: None,
+                authorized_display_name: None,
+                expires_at: Some(payload.expires_at),
+                max_uses: Some(payload.max_uses),
+                is_active: payload.is_active,
+                created_by: Some(current.user.id.clone()),
+            },
+            code,
+            signing_key.kid,
+            ciphertext,
+        )
+        .await?;
+    state
+        .db
+        .link_application_enrollment_code(&application.id, &invitation.id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.enrollment_code.create",
+            "application",
+            Some(application.id),
+            serde_json::json!({
+                "invitation_id": invitation.id,
+                "organization_id": application.organization_id,
+                "allowed_client_ids": allowed_client_ids,
+                "organization_role": organization_role,
+                "max_uses": payload.max_uses,
+                "account_kind": account_kind.audit_value(),
+            }),
+        ))
+        .await?;
+    Ok(Json(ApplicationEnrollmentCodeCreateResponse {
+        invitation: invitation.public()?,
+        code,
+    }))
+}
+
+async fn delete_application_enrollment_code(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, code_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    if !state
+        .db
+        .application_enrollment_code_belongs_to(&id, &code_id)
+        .await?
+    {
+        return Err(AppError::NotFound);
+    }
+    state.db.delete_invitation(&code_id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.enrollment_code.delete",
+            "application",
+            Some(id),
+            serde_json::json!({ "invitation_id": code_id }),
         ))
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -4699,9 +7041,15 @@ async fn list_external_oidc_providers(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicExternalOidcProvider>>> {
-    require_provider_manager(&state, &jar).await?;
+    let (_, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
     let mut providers = Vec::new();
     for provider in state.db.list_external_oidc_providers().await? {
+        if !platform_manager
+            && provider.organization_id.as_deref() != Some(organization.id.as_str())
+        {
+            continue;
+        }
         providers.push(provider.public()?);
     }
     Ok(Json(providers))
@@ -4711,7 +7059,7 @@ async fn list_external_oidc_provider_templates(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<OidcProviderTemplate>>> {
-    require_provider_manager(&state, &jar).await?;
+    current_organization_provider_manager(&state, &jar).await?;
     Ok(Json(identity_sources::oidc_provider_templates()))
 }
 
@@ -4725,7 +7073,7 @@ async fn discover_external_oidc_provider(
     jar: CookieJar,
     Json(payload): Json<OidcDiscoveryInput>,
 ) -> AppResult<Json<OidcDiscoveryResult>> {
-    require_provider_manager(&state, &jar).await?;
+    current_organization_provider_manager(&state, &jar).await?;
     identity_sources::discover_oidc_provider(&payload.issuer)
         .await
         .map(Json)
@@ -4763,9 +7111,13 @@ async fn create_external_oidc_provider(
     jar: CookieJar,
     Json(payload): Json<ExternalOidcProviderInput>,
 ) -> AppResult<Json<PublicExternalOidcProvider>> {
-    let current = require_provider_manager(&state, &jar).await?;
-    let organization_id =
-        normalize_client_organization_id(&state, payload.organization_id.clone()).await?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
+    let organization_id = if platform_manager {
+        normalize_client_organization_id(&state, payload.organization_id.clone()).await?
+    } else {
+        client_organization_from_context(payload.organization_id.clone(), &organization)?
+    };
     let provider_input = normalize_external_provider_input(payload, organization_id.clone())?;
     let provider = state
         .db
@@ -4795,14 +7147,21 @@ async fn update_external_oidc_provider(
     Path(id): Path<String>,
     Json(payload): Json<ExternalOidcProviderInput>,
 ) -> AppResult<Json<PublicExternalOidcProvider>> {
-    let current = require_provider_manager(&state, &jar).await?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
     let existing = state
         .db
         .find_external_oidc_provider_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let organization_id =
-        normalize_client_organization_id(&state, payload.organization_id.clone()).await?;
+    if !platform_manager && existing.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
+    let organization_id = if platform_manager {
+        normalize_client_organization_id(&state, payload.organization_id.clone()).await?
+    } else {
+        client_organization_from_context(payload.organization_id.clone(), &organization)?
+    };
     let clear_client_secret = payload.clear_client_secret;
     let mut provider_input = normalize_external_provider_input(payload, organization_id.clone())?;
     apply_external_provider_secret_update(
@@ -4837,7 +7196,16 @@ async fn delete_external_oidc_provider(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = require_provider_manager(&state, &jar).await?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_external_oidc_provider_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !platform_manager && existing.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
     state.db.delete_external_oidc_provider(&id).await?;
     state
         .db
@@ -4856,12 +7224,17 @@ async fn list_ldap_providers(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicLdapProvider>>> {
-    require_provider_manager(&state, &jar).await?;
+    let (_, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
     let providers = state
         .db
         .list_ldap_providers()
         .await?
         .into_iter()
+        .filter(|provider| {
+            platform_manager
+                || provider.organization_id.as_deref() == Some(organization.id.as_str())
+        })
         .map(|provider| provider.public())
         .collect();
     Ok(Json(providers))
@@ -4871,6 +7244,8 @@ async fn list_ldap_providers(
 struct LdapProviderInput {
     slug: String,
     display_name: String,
+    #[serde(default)]
+    organization_id: Option<String>,
     url: String,
     starttls: bool,
     bind_dn: String,
@@ -4895,8 +7270,14 @@ async fn create_ldap_provider(
     jar: CookieJar,
     Json(payload): Json<LdapProviderInput>,
 ) -> AppResult<Json<PublicLdapProvider>> {
-    let current = require_provider_manager(&state, &jar).await?;
-    let provider_input = normalize_ldap_provider_input(payload)?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
+    let organization_id = if platform_manager {
+        normalize_client_organization_id(&state, payload.organization_id.clone()).await?
+    } else {
+        client_organization_from_context(payload.organization_id.clone(), &organization)?
+    };
+    let provider_input = normalize_ldap_provider_input(payload, organization_id.clone())?;
     let provider = state.db.insert_ldap_provider(provider_input).await?;
     state
         .db
@@ -4905,7 +7286,10 @@ async fn create_ldap_provider(
             "ldap_provider.create",
             "ldap_provider",
             Some(provider.id.clone()),
-            serde_json::json!({ "slug": provider.slug.clone() }),
+            serde_json::json!({
+                "slug": provider.slug.clone(),
+                "organization_id": organization_id,
+            }),
         ))
         .await?;
     Ok(Json(provider.public()))
@@ -4917,8 +7301,27 @@ async fn update_ldap_provider(
     Path(id): Path<String>,
     Json(payload): Json<LdapProviderInput>,
 ) -> AppResult<Json<PublicLdapProvider>> {
-    let current = require_provider_manager(&state, &jar).await?;
-    let provider_input = normalize_ldap_provider_input(payload)?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_ldap_provider_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !platform_manager && existing.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
+    let organization_id = if platform_manager {
+        normalize_client_organization_id(&state, payload.organization_id.clone()).await?
+    } else {
+        client_organization_from_context(payload.organization_id.clone(), &organization)?
+    };
+    if organization_id != existing.organization_id {
+        return Err(AppError::BadRequest(
+            "LDAP provider organization cannot be changed after creation".to_string(),
+        ));
+    }
+    let provider_input = normalize_ldap_provider_input(payload, organization_id.clone())?;
     let provider = state.db.update_ldap_provider(&id, provider_input).await?;
     state
         .db
@@ -4927,7 +7330,10 @@ async fn update_ldap_provider(
             "ldap_provider.update",
             "ldap_provider",
             Some(id),
-            serde_json::json!({ "slug": provider.slug.clone() }),
+            serde_json::json!({
+                "slug": provider.slug.clone(),
+                "organization_id": organization_id,
+            }),
         ))
         .await?;
     Ok(Json(provider.public()))
@@ -4938,7 +7344,16 @@ async fn delete_ldap_provider(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = require_provider_manager(&state, &jar).await?;
+    let (current, organization, platform_manager) =
+        current_organization_provider_manager(&state, &jar).await?;
+    let existing = state
+        .db
+        .find_ldap_provider_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !platform_manager && existing.organization_id.as_deref() != Some(organization.id.as_str()) {
+        return Err(AppError::NotFound);
+    }
     state.db.delete_ldap_provider(&id).await?;
     state
         .db
@@ -5021,7 +7436,10 @@ fn apply_external_provider_secret_update(
     }
 }
 
-fn normalize_ldap_provider_input(payload: LdapProviderInput) -> AppResult<NewLdapProvider> {
+fn normalize_ldap_provider_input(
+    payload: LdapProviderInput,
+    organization_id: Option<String>,
+) -> AppResult<NewLdapProvider> {
     let slug = normalize_provider_slug(payload.slug)?;
     let display_name = normalize_required_text(payload.display_name, "display_name")?;
     let url = normalize_ldap_url(payload.url)?;
@@ -5061,6 +7479,7 @@ fn normalize_ldap_provider_input(payload: LdapProviderInput) -> AppResult<NewLda
     Ok(NewLdapProvider {
         slug,
         display_name,
+        organization_id,
         url,
         starttls: payload.starttls,
         bind_dn,
@@ -5683,6 +8102,7 @@ mod tests {
             .insert_organization(NewOrganization {
                 slug: "corp".to_string(),
                 name: "Corp".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
                 description: None,
                 allowed_email_domains: vec!["example.com".to_string()],
                 is_active: true,
@@ -5763,6 +8183,41 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn enterprise_resource_inputs_cannot_override_selected_context() {
+        let organization = UserOrganizationRecord {
+            id: "selected-organization".to_string(),
+            slug: "selected".to_string(),
+            name: "Selected".to_string(),
+            kind: organizations::ORGANIZATION_KIND_TENANT.to_string(),
+            description: None,
+            is_active: 1,
+            role: organizations::ROLE_ADMIN.to_string(),
+            membership_created_at: 1,
+            membership_updated_at: 1,
+        };
+
+        assert_eq!(
+            client_organization_from_context(None, &organization).unwrap(),
+            Some(organization.id.clone())
+        );
+        assert_eq!(
+            client_organization_from_context(Some(organization.id.clone()), &organization).unwrap(),
+            Some(organization.id.clone())
+        );
+        assert!(matches!(
+            client_organization_from_context(Some("other-organization".to_string()), &organization,),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            client_organization_from_context(
+                Some("  other-organization  ".to_string()),
+                &organization,
+            ),
+            Err(AppError::Forbidden)
+        ));
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn bulk_import_commits_roles_atomically_and_rejects_existing_identities() {
@@ -5774,6 +8229,7 @@ mod tests {
             .insert_organization(NewOrganization {
                 slug: "corp".to_string(),
                 name: "Corp".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
                 description: None,
                 allowed_email_domains: Vec::new(),
                 is_active: true,
@@ -6146,6 +8602,7 @@ mod tests {
         LdapProviderInput {
             slug: "Corp_LDAP".to_string(),
             display_name: " Corp LDAP ".to_string(),
+            organization_id: None,
             url: "ldap://ldap.example.com/".to_string(),
             starttls: true,
             bind_dn: " cn=reader,dc=example,dc=com ".to_string(),
@@ -6254,7 +8711,7 @@ mod tests {
 
     #[test]
     fn ldap_provider_input_is_normalized() {
-        let provider = normalize_ldap_provider_input(ldap_provider_input()).unwrap();
+        let provider = normalize_ldap_provider_input(ldap_provider_input(), None).unwrap();
 
         assert_eq!(provider.slug, "corp_ldap");
         assert_eq!(provider.display_name, "Corp LDAP");
@@ -6272,21 +8729,21 @@ mod tests {
         let mut provider = ldap_provider_input();
         provider.url = "http://ldap.example.com".to_string();
         assert!(matches!(
-            normalize_ldap_provider_input(provider),
+            normalize_ldap_provider_input(provider, None),
             Err(AppError::BadRequest(_))
         ));
 
         let mut provider = ldap_provider_input();
         provider.user_filter = "(objectClass=person)".to_string();
         assert!(matches!(
-            normalize_ldap_provider_input(provider),
+            normalize_ldap_provider_input(provider, None),
             Err(AppError::BadRequest(_))
         ));
 
         let mut provider = ldap_provider_input();
         provider.email_attribute = "mail)(uid=*".to_string();
         assert!(matches!(
-            normalize_ldap_provider_input(provider),
+            normalize_ldap_provider_input(provider, None),
             Err(AppError::BadRequest(_))
         ));
     }
@@ -6299,7 +8756,7 @@ mod tests {
         provider.base_dn = String::new();
         provider.user_filter = String::new();
 
-        let provider = normalize_ldap_provider_input(provider).unwrap();
+        let provider = normalize_ldap_provider_input(provider, None).unwrap();
         assert_eq!(provider.url, "");
         assert!(provider.user_filter.contains("{login}"));
     }

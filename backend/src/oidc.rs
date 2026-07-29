@@ -1,9 +1,9 @@
 use crate::{
-    AppState,
+    AppState, applications,
     assurance::{self, AssurancePolicy, SessionAuthenticationAssurance},
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization_details,
+    auth_flow, authorization, authorization_details,
     claim_mapper::{self, ClaimContext, ClaimOutputTarget},
     client_assertion,
     client_policy::{
@@ -12,8 +12,8 @@ use crate::{
     },
     consent::{self, OidcConsentPolicy},
     db::{
-        ClientRecord, LoginCodeLevel, NewAuthorizationCode, RefreshTokenInput, SessionRecord,
-        UserRecord,
+        ApplicationRecord, ClientRecord, LoginCodeLevel, NewAuthorizationCode, RefreshTokenInput,
+        SessionRecord, UserRecord,
     },
     directory,
     dpop::{self, DpopBinding},
@@ -514,13 +514,13 @@ async fn authorize(
             && request.selected_user_id.is_none()
             && request.selected_session_id.is_none();
         let has_remembered_accounts = if may_offer_remembered_accounts {
-            has_selectable_browser_accounts(&state, &jar).await?
+            has_selectable_browser_accounts(&state, &jar, Some(&client)).await?
         } else {
             false
         };
         if request.account_selection_required
             || prompt.select_account
-            || client_requires_account_selection(&client, &request)
+            || client_requires_account_selection(&state, &client, &request).await?
             || has_remembered_accounts
         {
             let return_to = authorize_return_to_for_account_selection(&state, &request).await?;
@@ -619,7 +619,7 @@ async fn authorize(
     }
     if (request.account_selection_required
         || prompt.select_account
-        || client_requires_account_selection(&client, &request))
+        || client_requires_account_selection(&state, &client, &request).await?)
         && !request.account_selection_prompted
     {
         if prompt.none {
@@ -1206,6 +1206,7 @@ async fn issue_authorization_code_redirect(
 ) -> AppResult<Response> {
     ensure_trial_enrollment_client_allowed_for_user(context.state, &user.id, &client.client_id)
         .await?;
+    ensure_application_client_allowed_for_user(context.state, user, client).await?;
     let code = util::random_token(32);
     let session_assurance = session.authentication_assurance();
     let requested_assurance = request.requested_assurance()?;
@@ -1427,6 +1428,14 @@ async fn validate_authorize_request(
         .await?
         .ok_or_else(|| AppError::Oidc("unknown client_id".to_string()))?;
     validate_authorize_request_for_client(&client, request)?;
+    // Resolve the website boundary before starting any browser interaction.
+    // This keeps an archived application or a disabled OAuth/OIDC module from
+    // reaching the login page and then failing only after the user has
+    // authenticated. Unbound historical clients intentionally remain on the
+    // compatibility path inside `authorize_client_for_protocol`.
+    applications::authorize_client_for_protocol(state, &client, "oauth2_oidc")
+        .await
+        .map_err(|_| AppError::Oidc("client application is unavailable".to_string()))?;
     Ok(client)
 }
 
@@ -1463,11 +1472,53 @@ pub(crate) fn validate_authorize_request_for_client(
             "PKCE is required for this client".to_string(),
         ));
     }
+    validate_authorization_request_parameters(request)?;
     authorization_details::normalize_authorization_details_for_client(
         client,
         request.authorization_details.as_deref(),
     )?;
     DefaultClientSecurityPolicy.validate_authorization_request(client, request)?;
+    Ok(())
+}
+
+fn validate_authorization_request_parameters(request: &ResolvedAuthorizeRequest) -> AppResult<()> {
+    for (field, value, max_length) in [
+        ("state", request.state.as_deref(), 4096usize),
+        ("nonce", request.nonce.as_deref(), 512usize),
+        ("login_hint", request.login_hint.as_deref(), 512usize),
+        (
+            "code_challenge",
+            request.code_challenge.as_deref(),
+            128usize,
+        ),
+    ] {
+        if value.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > max_length
+                || value.bytes().any(|byte| byte.is_ascii_control())
+        }) {
+            return Err(AppError::Oidc(format!("{field} is invalid")));
+        }
+    }
+    if request.code_challenge.as_deref().is_some_and(|challenge| {
+        !(43..=128).contains(&challenge.len())
+            || challenge.bytes().any(|byte| {
+                !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~')
+            })
+    }) {
+        return Err(AppError::Oidc("code_challenge is invalid".to_string()));
+    }
+    if request
+        .code_challenge_method
+        .as_deref()
+        .is_some_and(|method| {
+            !matches!(method, "plain" | "S256") || request.code_challenge.is_none()
+        })
+    {
+        return Err(AppError::Oidc(
+            "code_challenge_method is invalid".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1517,6 +1568,29 @@ async fn ensure_trial_enrollment_client_allowed_for_user(
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+async fn ensure_application_client_allowed_for_user(
+    state: &AppState,
+    user: &UserRecord,
+    client: &ClientRecord,
+) -> AppResult<()> {
+    // Older platform clients may predate the Application model.  They do not
+    // have a website boundary to enforce, so keep their existing behavior;
+    // clients attached to an Application must pass the live website and
+    // account eligibility checks below.
+    if state
+        .db
+        .find_application_for_client(&client.id)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    applications::authorize_user_for_client(state, client, user)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1739,23 +1813,21 @@ async fn token_from_authorization_code(
     let code = payload
         .code
         .ok_or_else(|| AppError::Oidc("code is required".to_string()))?;
-    let record = state.db.consume_authorization_code(&code).await?;
-    if record.client_id != client.client_id {
-        return Err(AppError::Oidc(
-            "authorization code was issued to a different client".to_string(),
-        ));
-    }
-    if let Some(redirect_uri) = payload.redirect_uri
-        && redirect_uri != record.redirect_uri
-    {
-        return Err(AppError::Oidc("redirect_uri mismatch".to_string()));
-    }
-    util::check_pkce(
-        record.code_challenge.as_deref(),
-        record.code_challenge_method.as_deref(),
-        payload.code_verifier.as_deref(),
-        client.require_pkce == 1,
-    )?;
+    let redirect_uri = payload
+        .redirect_uri
+        .as_deref()
+        .ok_or_else(|| AppError::Oidc("redirect_uri is required".to_string()))?;
+    let record = state
+        .db
+        .consume_authorization_code_for_client(
+            &code,
+            &client.client_id,
+            Some(redirect_uri),
+            payload.code_verifier.as_deref(),
+            client.require_pkce == 1,
+            client.require_s256_pkce == 1,
+        )
+        .await?;
     let amr = util::from_json::<Vec<String>>(&record.amr)?;
     let login_code_level = authorization_code_login_level(record.session_id.as_deref(), &amr);
     issue_tokens_for_user(
@@ -1930,6 +2002,11 @@ async fn token_from_refresh_token(
         }
     }
     let user = load_active_user(&state, &record.user_id).await?;
+    // Refresh tokens can outlive both the browser session and the original
+    // authorization-code exchange. Re-run the live Application/enterprise
+    // gate before minting another token so disabling a website or its tenant
+    // revokes access immediately rather than waiting for token expiry.
+    ensure_application_client_allowed_for_user(&state, &user, &client).await?;
     let scope = record.scope;
     let resource = merge_token_resource(record.resource, payload.resource)?;
     let authorization_details = authorization_details::merge_authorization_details(
@@ -2063,6 +2140,7 @@ async fn issue_tokens_for_user(
     // enrollment code also blocks a previously issued OAuth code at token
     // exchange time.
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
+    ensure_application_client_allowed_for_user(state, &user, client).await?;
     tracing::info!(
         client_id = %client.client_id,
         user_id = %user.id,
@@ -2192,6 +2270,20 @@ async fn mapped_claims_for_user(
         },
         target,
     )?);
+
+    // Client claim mappers describe the protocol connection; application
+    // entitlements describe the website that owns that connection.  Keep the
+    // latter as a separate, live policy layer so role/group changes are
+    // visible on the next token or UserInfo request and cannot be hidden by a
+    // stale mapper configuration.
+    if let Some(application) = state.db.find_application_for_client(&client.id).await? {
+        let entitlements = authorization::resolve_entitlements(state, &application, user).await?;
+        claims.extend(entitlements.claims);
+        claims.insert(
+            "policy_version".to_string(),
+            serde_json::Value::String(entitlements.policy_version),
+        );
+    }
     Ok(claims)
 }
 
@@ -2212,9 +2304,28 @@ async fn userinfo(
     let (auth_scheme, token) = authorization_token(&headers)?;
     let issuers = state.accepted_issuers(&headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    let claims = state
+    // The access token identifies the client connection first. UserInfo is a
+    // concrete OIDC resource endpoint, so the second verification must bind
+    // its audience to that client; a token minted for an RFC 8707 API must
+    // not be replayed against UserInfo merely because it carries the same
+    // user subject.
+    let bootstrap_claims = state
         .jwt
-        .verify_access_token_with_issuers(token, &issuer_refs)?;
+        .verify_access_token_for_generic_bearer(token, &issuer_refs)?;
+    let client = state
+        .db
+        .find_client_by_client_id(&bootstrap_claims.client_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if client.is_active != 1 {
+        return Err(AppError::Unauthorized);
+    }
+    let audiences = [client.client_id.clone()];
+    let claims = state.jwt.verify_access_token_with_issuers_and_audiences(
+        token,
+        &issuer_refs,
+        &audiences,
+    )?;
     if let Some(cnf) = claims.cnf.as_ref() {
         if auth_scheme != dpop::TOKEN_TYPE {
             return Err(AppError::Unauthorized);
@@ -2232,12 +2343,8 @@ async fn userinfo(
         return Err(AppError::Unauthorized);
     }
     let user = load_oidc_user(&state, &claims.sub).await?;
-    let client = state
-        .db
-        .find_client_by_client_id(&claims.client_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
     ensure_trial_enrollment_client_allowed_for_user(&state, &user.id, &client.client_id).await?;
+    ensure_application_client_allowed_for_user(&state, &user, &client).await?;
     tracing::info!(
         client_id = %client.client_id,
         user_id = %user.id,
@@ -2320,9 +2427,14 @@ async fn introspect(
     let _hint = payload.token_type_hint.as_deref();
     let issuers = state.accepted_issuers(&headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
+    // Introspection is an issuer-level endpoint rather than the resource
+    // represented by the token's `aud`. Resource Indicators therefore remain
+    // valid here; `claims.client_id == client.client_id` below is the
+    // authorization boundary that prevents one client from introspecting
+    // another client's token.
     if let Ok(claims) = state
         .jwt
-        .verify_access_token_with_issuers(&payload.token, &issuer_refs)
+        .verify_access_token_for_introspection(&payload.token, &issuer_refs)
     {
         let mut active = claims.exp > util::now_ts() && claims.client_id == client.client_id;
         if active && claims.sub != claims.client_id {
@@ -2677,13 +2789,31 @@ async fn validated_logout_hint(
     };
     let issuers = state.accepted_issuers(headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    let Ok(claims) = state
+    let Ok(bootstrap_claims) = state
         .jwt
-        .verify_id_token_hint_with_issuers(id_token_hint, &issuer_refs)
+        .verify_id_token_hint_for_logout_bootstrap(id_token_hint, &issuer_refs)
     else {
         return Ok(None);
     };
-    let Some(client) = state.db.find_client_by_client_id(&claims.client_id).await? else {
+    let Some(client) = state
+        .db
+        .find_client_by_client_id(&bootstrap_claims.client_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if client.is_active != 1 {
+        return Ok(None);
+    }
+    // ID tokens issued by Signet are always audience-bound to the OIDC
+    // client. Do not let a syntactically valid signed token for another
+    // audience authorize a logout request for this client.
+    let audiences = [client.client_id.clone()];
+    let Ok(claims) = state.jwt.verify_id_token_hint_with_issuers_and_audiences(
+        id_token_hint,
+        &issuer_refs,
+        &audiences,
+    ) else {
         return Ok(None);
     };
     if let Some(current) = current {
@@ -2694,7 +2824,6 @@ async fn validated_logout_hint(
     }
     if let Some(client_id) = request.client_id.as_deref()
         && client_id != claims.client_id
-        && client_id != claims.aud
     {
         return Ok(None);
     }
@@ -2906,6 +3035,9 @@ async fn login_form(
     let password = payload.password.as_deref().ok_or(AppError::Unauthorized)?;
     let subject = security_policy::normalize_login_subject(email);
     auth::assert_login_entry_allowed(&state, &subject, request_ip.as_deref()).await?;
+    let return_to = redirects::local_return_to(payload.return_to.as_deref());
+    let login_context =
+        authorization_login_context_from_return_to(&state, &headers, Some(&return_to)).await?;
     if let Some(captcha) = auth::login_captcha_prompt_if_required(
         &state,
         &subject,
@@ -2939,8 +3071,13 @@ async fn login_form(
     });
     if user.is_none() {
         let directory_login =
-            match directory::authenticate_with_configured_directories(&state, &subject, password)
-                .await
+            match directory::authenticate_with_configured_directories_for_application(
+                &state,
+                &subject,
+                password,
+                login_context.application.as_ref(),
+            )
+            .await
             {
                 Ok(value) => value,
                 Err(AppError::Unauthorized | AppError::Forbidden) => None,
@@ -2963,9 +3100,6 @@ async fn login_form(
         .await?;
         return Err(AppError::Unauthorized);
     };
-    let return_to = redirects::local_return_to(payload.return_to.as_deref());
-    let login_context =
-        authorization_login_context_from_return_to(&state, &headers, Some(&return_to)).await?;
     let user_has_totp = state.db.find_totp_method(&user.id).await?.is_some();
     let policy = state.db.security_policy().await?;
     let policy_requires_mfa =
@@ -3021,6 +3155,7 @@ struct ClientCredentials {
 
 pub(crate) struct AuthorizationLoginContext {
     pub(crate) client: Option<ClientRecord>,
+    pub(crate) application: Option<ApplicationRecord>,
     pub(crate) request_requires_mfa: bool,
 }
 
@@ -3039,6 +3174,9 @@ pub(crate) async fn authenticate_client_at<T: ClientAuthFields>(
     if client.is_active != 1 {
         return Err(AppError::Unauthorized);
     }
+    applications::authorize_client_for_protocol(state, &client, "oauth2_oidc")
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
     match client.token_endpoint_auth_method.as_str() {
         "none" => Ok(client),
         "client_secret_post" | "client_secret_basic" => {
@@ -3453,11 +3591,20 @@ fn account_selection_prompted_request(
     request
 }
 
-fn client_requires_account_selection(
+async fn client_requires_account_selection(
+    state: &AppState,
     client: &ClientRecord,
     request: &ResolvedAuthorizeRequest,
-) -> bool {
-    client.require_account_selection == 1 && !request.account_selection_prompted
+) -> AppResult<bool> {
+    if request.account_selection_prompted {
+        return Ok(false);
+    }
+    Ok(client.require_account_selection == 1
+        || state
+            .db
+            .find_application_for_client(&client.id)
+            .await?
+            .is_some_and(|application| application.requires_account_selection()))
 }
 
 fn reauthentication_pending(request: &ResolvedAuthorizeRequest) -> bool {
@@ -3472,7 +3619,11 @@ fn session_binding_satisfies_reauthentication(
         && request.selected_session_id.as_deref() == Some(session.id.as_str())
 }
 
-async fn has_selectable_browser_accounts(state: &AppState, jar: &CookieJar) -> AppResult<bool> {
+async fn has_selectable_browser_accounts(
+    state: &AppState,
+    jar: &CookieJar,
+    client: Option<&ClientRecord>,
+) -> AppResult<bool> {
     let Some(context_id) = auth::browser_context_id_from_jar(state, jar) else {
         return Ok(false);
     };
@@ -3511,6 +3662,11 @@ async fn has_selectable_browser_accounts(state: &AppState, jar: &CookieJar) -> A
         )
         .is_some()
         {
+            if let Some(client) = client
+                && !applications::user_can_authorize_client(state, client, &user).await?
+            {
+                continue;
+            }
             return Ok(true);
         }
     }
@@ -3551,12 +3707,14 @@ pub(crate) async fn authorization_login_context_from_return_to(
     let Some(return_to) = return_to else {
         return Ok(AuthorizationLoginContext {
             client: None,
+            application: None,
             request_requires_mfa: false,
         });
     };
     let Some(query) = authorize_request_from_return_to(return_to)? else {
         return Ok(AuthorizationLoginContext {
             client: None,
+            application: None,
             request_requires_mfa: false,
         });
     };
@@ -3566,6 +3724,7 @@ pub(crate) async fn authorization_login_context_from_return_to(
         else {
             return Ok(AuthorizationLoginContext {
                 client: None,
+                application: None,
                 request_requires_mfa: false,
             });
         };
@@ -3574,6 +3733,7 @@ pub(crate) async fn authorization_login_context_from_return_to(
         let Some(request) = crate::par::peek_request_uri(state, request_uri).await? else {
             return Ok(AuthorizationLoginContext {
                 client: None,
+                application: None,
                 request_requires_mfa: false,
             });
         };
@@ -3582,9 +3742,11 @@ pub(crate) async fn authorization_login_context_from_return_to(
         resolve_authorize_request(state, headers, query).await?
     };
     let client = validate_authorize_request(state, &request).await?;
+    let application = state.db.find_application_for_client(&client.id).await?;
     let requested_assurance = request.requested_assurance()?;
     Ok(AuthorizationLoginContext {
         client: Some(client),
+        application,
         request_requires_mfa: assurance::DefaultAssurancePolicy.requires_mfa(&requested_assurance),
     })
 }
@@ -3701,6 +3863,7 @@ pub(crate) async fn complete_browser_account_selection(
         .filter(|user| user.is_active == 1)
         .ok_or(AppError::Unauthorized)?;
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
+    ensure_application_client_allowed_for_user(state, &user, &client).await?;
     let trial_enrollment = state.db.find_trial_enrollment_for_user(&user.id).await?;
     if trial_enrollment
         .as_ref()
@@ -3952,7 +4115,13 @@ fn oauth_json_error(error: &str, description: &str, status: StatusCode) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+        response::Response,
+    };
     use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+    use tower::ServiceExt;
 
     struct StubInteractionStore {
         request_uri: String,
@@ -4022,6 +4191,32 @@ mod tests {
         assert!(behavior.none);
         assert!(!behavior.force_login);
         assert!(!behavior.force_consent);
+    }
+
+    #[test]
+    fn authorization_request_parameters_are_bounded_and_pkce_is_well_formed() {
+        let mut client = test_client();
+        client.require_pkce = 1;
+        let mut request = test_authorize_request(None, None);
+        request.code_challenge = Some("a".repeat(43));
+        request.code_challenge_method = Some("S256".to_string());
+        assert!(validate_authorize_request_for_client(&client, &request).is_ok());
+
+        request.state = Some("x".repeat(4097));
+        assert!(validate_authorize_request_for_client(&client, &request).is_err());
+        request.state = Some("line\nfeed".to_string());
+        assert!(validate_authorize_request_for_client(&client, &request).is_err());
+
+        request.state = Some("safe-state".to_string());
+        request.code_challenge = Some("a".repeat(42));
+        assert!(validate_authorize_request_for_client(&client, &request).is_err());
+        request.code_challenge = Some("a".repeat(43));
+        request.code_challenge_method = Some("plain-ish".to_string());
+        assert!(validate_authorize_request_for_client(&client, &request).is_err());
+        request.code_challenge_method = None;
+        assert!(validate_authorize_request_for_client(&client, &request).is_ok());
+        client.require_s256_pkce = 1;
+        assert!(validate_authorize_request_for_client(&client, &request).is_err());
     }
 
     #[test]
@@ -5320,6 +5515,7 @@ mod tests {
             .insert_organization(crate::db::NewOrganization {
                 slug: "trial-oidc".to_string(),
                 name: "Trial OIDC".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
                 description: None,
                 allowed_email_domains: vec!["example.com".to_string()],
                 is_active: true,
@@ -5943,7 +6139,7 @@ mod tests {
         client.require_pkce = 1;
         client.require_s256_pkce = 1;
         let mut request = test_authorize_request(None, None);
-        request.code_challenge = Some("challenge".to_string());
+        request.code_challenge = Some("c".repeat(43));
         request.code_challenge_method = Some("plain".to_string());
 
         assert!(validate_authorize_request_for_client(&client, &request).is_err());
@@ -6115,6 +6311,186 @@ mod tests {
         let mut client = test_client();
         client.grant_types = serde_json::json!(["refresh_token"]).to_string();
         client
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn oidc_http_body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn oidc_http_flow_exposes_application_entitlements_and_rechecks_access() {
+        let (state, path) = test_app_state().await;
+        let user = insert_refresh_test_user(&state, "application-http").await;
+        let (_session, cookie_value) = state
+            .db
+            .insert_session(&user.id, 600, crate::db::SessionMetadata::default())
+            .await
+            .unwrap();
+        let cookie = format!("{}={cookie_value}", state.settings.security.cookie_name);
+        let app = routes().with_state(state.clone());
+
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let discovery_body = oidc_http_body_json(discovery).await;
+        assert_eq!(
+            discovery_body["authorization_endpoint"],
+            "http://localhost:8080/oauth2/authorize"
+        );
+        assert_eq!(
+            discovery_body["token_endpoint"],
+            "http://localhost:8080/oauth2/token"
+        );
+        assert_eq!(
+            discovery_body["jwks_uri"],
+            "http://localhost:8080/oauth2/jwks"
+        );
+
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", "demo-web")
+            .append_pair("redirect_uri", "http://localhost:3000/callback")
+            .append_pair("scope", "openid profile email")
+            .append_pair("state", "oidc-state")
+            .append_pair("nonce", "oidc-nonce");
+        let mut authorize_request = Request::builder()
+            .uri(format!("/oauth2/authorize?{}", query.finish()))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        authorize_request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43000))));
+        let authorize_response = app.clone().oneshot(authorize_request).await.unwrap();
+        assert_eq!(authorize_response.status(), StatusCode::SEE_OTHER);
+        let redirect = redirect_url(&authorize_response);
+        assert_eq!(redirect.path(), "/callback");
+        assert_eq!(query_value(&redirect, "state"), "oidc-state");
+        let code = query_value(&redirect, "code");
+
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "http://localhost:3000/callback"),
+        ])
+        .unwrap();
+        let basic = STANDARD.encode("demo-web:demo-secret-change-me");
+        let wrong_redirect_form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "http://localhost:3000/wrong-callback"),
+        ])
+        .unwrap();
+        let wrong_redirect = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth2/token")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(wrong_redirect_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_redirect.status(), StatusCode::BAD_REQUEST);
+
+        let token_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth2/token")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token_response.status(), StatusCode::OK);
+        let token_body = oidc_http_body_json(token_response).await;
+        let access_token = token_body["access_token"].as_str().unwrap();
+        let claims = state.jwt.verify_access_token(access_token).unwrap();
+        assert_eq!(claims.sub, user.id);
+        assert_eq!(claims.client_id, "demo-web");
+        assert_eq!(claims.nonce, None);
+
+        let userinfo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth2/userinfo")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(userinfo.status(), StatusCode::OK);
+        let userinfo_body = oidc_http_body_json(userinfo).await;
+        assert_eq!(userinfo_body["email"], user.email);
+
+        let application = state
+            .db
+            .find_application_for_client(
+                &state
+                    .db
+                    .find_client_by_client_id("demo-web")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .update_application(
+                &application.id,
+                crate::db::NewApplication {
+                    organization_id: application.organization_id.clone(),
+                    slug: application.slug.clone(),
+                    name: application.name.clone(),
+                    description: application.description.clone(),
+                    access_mode: applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+                    registration_mode: applications::REGISTRATION_DISABLED.to_string(),
+                    account_selection_mode: application.account_selection_mode.clone(),
+                    unique_identity_factors: application.unique_identity_factors().unwrap(),
+                    is_active: false,
+                },
+            )
+            .await
+            .unwrap();
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth2/userinfo")
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_file(path);
     }
 
     async fn insert_refresh_test_user(state: &AppState, suffix: &str) -> UserRecord {

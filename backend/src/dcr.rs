@@ -418,6 +418,10 @@ pub async fn register_client(
     let (client, client_secret) = registrar.new_client(payload, None)?;
     let registration_access_token = util::random_token(32);
     let client = state.db.insert_client(client).await?;
+    // Dynamic registration creates a new integration rather than migrating an
+    // existing one. Keep its automatically-created Signet application closed
+    // until an administrator deliberately configures account access.
+    state.db.harden_new_client_application(&client.id).await?;
     state
         .db
         .upsert_client_registration(&client.id, util::token_hash(&registration_access_token))
@@ -683,6 +687,24 @@ fn normalize_logo_uri(value: Option<&str>) -> AppResult<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
+    async fn test_state() -> (AppState, std::path::PathBuf) {
+        let mut settings: crate::Settings =
+            toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("gpt-sso-dcr-test-{}.sqlite3", uuid::Uuid::new_v4()));
+        settings.database.kind = crate::config::DatabaseKind::Sqlite;
+        settings.database.url = path.to_string_lossy().into_owned();
+        settings.bootstrap.admin.create_on_startup = false;
+        settings.bootstrap.clients.clear();
+        settings.oidc.allow_dynamic_client_registration = true;
+        let db = crate::db::Db::connect(&settings).unwrap();
+        db.migrate().await.unwrap();
+        db.seed(&settings).await.unwrap();
+        let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+        (AppState { settings, db, jwt }, path)
+    }
+
     #[test]
     fn redirect_uri_rejects_fragments() {
         assert!(validate_uri("https://app.example/callback").is_ok());
@@ -702,5 +724,50 @@ mod tests {
         ] {
             assert!(normalize_logo_uri(Some(logo_uri)).is_err());
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dynamic_client_registration_starts_with_a_locked_signet_application() {
+        let (state, path) = test_state().await;
+        let payload: ClientMetadata = serde_json::from_value(serde_json::json!({
+            "client_name": "Dynamic test client",
+            "redirect_uris": ["https://example.test/callback"]
+        }))
+        .unwrap();
+
+        let response = register_client(State(state.clone()), HeaderMap::new(), Json(payload))
+            .await
+            .unwrap()
+            .0;
+        let client = state
+            .db
+            .find_client_by_client_id(&response.client_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let application = state
+            .db
+            .find_application_for_client(&client.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            client.organization_id.as_deref(),
+            Some(crate::organizations::SIGNET_ORGANIZATION_ID)
+        );
+        assert_eq!(
+            application.access_mode,
+            crate::applications::ACCESS_ALL_SIGNET_USERS
+        );
+        assert_eq!(
+            application.registration_mode,
+            crate::applications::REGISTRATION_DISABLED
+        );
+        assert_eq!(application.is_active, 1);
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
-    AppState,
-    db::{LdapProviderRecord, NewUser, UserRecord},
+    AppState, applications, authorization,
+    db::{ApplicationRecord, LdapProviderRecord, NewUser, UserRecord},
     error::{AppError, AppResult},
     util,
 };
@@ -101,15 +101,59 @@ pub async fn authenticate_with_configured_directories(
     authenticate_with_directories(state, login, password, &LdapDirectoryAuthenticator).await
 }
 
+/// Application-aware directory authentication used by a website's OIDC
+/// login flow. The global admin login keeps using the compatibility function
+/// above, while a website can only invoke the LDAP/AD providers explicitly
+/// bound in its `directory_sync` module.
+pub async fn authenticate_with_configured_directories_for_application(
+    state: &AppState,
+    login: &str,
+    password: &str,
+    application: Option<&ApplicationRecord>,
+) -> AppResult<Option<DirectoryLogin>> {
+    authenticate_with_directories_for_application(
+        state,
+        login,
+        password,
+        application,
+        &LdapDirectoryAuthenticator,
+    )
+    .await
+}
+
 pub async fn authenticate_with_directories<A: DirectoryAuthenticator>(
     state: &AppState,
     login: &str,
     password: &str,
     authenticator: &A,
 ) -> AppResult<Option<DirectoryLogin>> {
+    authenticate_with_directories_for_application(state, login, password, None, authenticator).await
+}
+
+pub async fn authenticate_with_directories_for_application<A: DirectoryAuthenticator>(
+    state: &AppState,
+    login: &str,
+    password: &str,
+    application: Option<&ApplicationRecord>,
+    authenticator: &A,
+) -> AppResult<Option<DirectoryLogin>> {
     for provider in state.db.list_ldap_providers().await? {
         if provider.is_active != 1 || provider.allow_login != 1 {
             continue;
+        }
+        match application {
+            Some(application)
+                if !applications::application_directory_provider_enabled(
+                    state,
+                    &application.id,
+                    &provider.id,
+                )
+                .await? =>
+            {
+                continue;
+            }
+            None if provider.organization_id.is_some() => continue,
+            _ => {}
         }
         let profile = match authenticator.authenticate(&provider, login, password).await {
             Ok(Some(profile)) => profile,
@@ -119,9 +163,17 @@ pub async fn authenticate_with_directories<A: DirectoryAuthenticator>(
                 continue;
             }
         };
-        return resolve_directory_user(state, &provider, profile)
-            .await
-            .map(Some);
+        let login = resolve_directory_user(state, &provider, profile).await?;
+        if let Some(application) = application
+            && !authorization::check_login_access(state, application, &login.user.id)
+                .await?
+                .allowed
+        {
+            // A directory adapter may select the identity source, but it
+            // cannot turn a stale website/tenant context into a valid login.
+            return Err(AppError::Forbidden);
+        }
+        return Ok(Some(login));
     }
     Ok(None)
 }
@@ -173,7 +225,7 @@ async fn resolve_directory_user(
                 &profile.provider_key,
                 &profile.subject,
                 Some(email),
-                None,
+                provider.organization_id.clone(),
                 first_user,
             )
             .await?
@@ -304,6 +356,7 @@ mod tests {
             id: "id".to_string(),
             slug: "corp".to_string(),
             display_name: "Corp LDAP".to_string(),
+            organization_id: None,
             url: "ldap://ldap.example.com".to_string(),
             starttls: 1,
             bind_dn: "cn=reader,dc=example,dc=com".to_string(),

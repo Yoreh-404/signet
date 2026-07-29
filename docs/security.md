@@ -14,6 +14,7 @@
 - `cookie_same_site = "None"` 时，`cookie_secure` 必须为 `true`。
 - 需要携带 Cookie 的跨域前端，必须逐项配置 `[cors].allowed_origins`；不能使用 `*`。
 - 只允许实际需要的 origin、method 和 header。内置前端已包含所需的 `x-csrf-token` 请求头。
+- 本地没有 HTTPS 证书时可临时设置 `SSO_DISABLE_CSRF_ORIGIN_CHECK=true`，仅跳过 `Origin`/`Referer` 来源校验；会话写请求仍要求有效 CSRF token。该开关不要用于生产环境。
 
 ## 自建浏览器前端与 CSRF
 

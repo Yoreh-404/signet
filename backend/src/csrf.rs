@@ -175,13 +175,16 @@ fn is_public_browser_write(path: &str) -> bool {
             | "/api/passkeys/authentication/start"
             | "/api/passkeys/authentication/finish"
             | "/login"
-    )
+    ) || (path.starts_with("/saml/") && path.ends_with("/sso"))
 }
 
 async fn has_trusted_request_origin(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<bool, AppError> {
+    if state.settings.security.disable_csrf_origin_check {
+        return Ok(true);
+    }
     let Some(origin) = request_origin(headers) else {
         return Ok(false);
     };
@@ -201,6 +204,9 @@ fn request_origin(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn is_trusted_origin(state: &AppState, candidate: &str) -> Result<bool, AppError> {
+    if state.settings.security.disable_csrf_origin_check {
+        return Ok(true);
+    }
     let Some(candidate) = origin_tuple(candidate) else {
         return Ok(false);
     };
@@ -405,6 +411,32 @@ mod tests {
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
         assert_eq!(state.db.user_count().await.unwrap(), 2);
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn csrf_origin_check_can_be_disabled_for_local_testing() {
+        let (mut state, path, cookie_value, csrf_token) = test_state().await;
+        state.settings.security.disable_csrf_origin_check = true;
+        assert!(
+            has_trusted_request_origin(&state, &HeaderMap::new())
+                .await
+                .unwrap()
+        );
+
+        let app = csrf_test_router(state.clone());
+        let response = app
+            .oneshot(protected_write_request(
+                &session_cookie_header(&state, &cookie_value),
+                Some(&csrf_token),
+                UNTRUSTED_ORIGIN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         drop(state);
         let _ = std::fs::remove_file(path);

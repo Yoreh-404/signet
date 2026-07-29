@@ -1,11 +1,12 @@
-import { Search, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Eye, EyeOff, Plus, Search, X } from "lucide-react";
 import {
   ComponentPropsWithoutRef,
   FormEvent,
   ReactNode,
   useEffect,
   useId,
-  useRef
+  useRef,
+  useState
 } from "react";
 
 export function Card({
@@ -143,6 +144,241 @@ export function Check({
       />
       <span>{label}</span>
     </label>
+  );
+}
+
+/**
+ * A compact section primitive for long configuration forms.  The content is
+ * kept in the DOM while collapsed so browser validation and screen-reader
+ * navigation remain predictable when a section is reopened.
+ */
+export function SettingsSection({
+  title,
+  description,
+  children,
+  defaultOpen = true,
+  collapsible = true,
+  className = ""
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+  collapsible?: boolean;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const headingId = useId();
+
+  return (
+    <section className={`settings-section ${open ? "is-open" : "is-collapsed"} ${className}`.trim()}>
+      {collapsible ? (
+        <button
+          type="button"
+          className="settings-section-toggle"
+          aria-expanded={open}
+          aria-controls={`${headingId}-content`}
+          onClick={() => setOpen((current) => !current)}
+        >
+          <span>
+            <strong id={headingId}>{title}</strong>
+            {description && <small>{description}</small>}
+          </span>
+          {open ? <ChevronUp size={17} aria-hidden="true" /> : <ChevronDown size={17} aria-hidden="true" />}
+        </button>
+      ) : (
+        <div className="settings-section-heading">
+          <strong id={headingId}>{title}</strong>
+          {description && <small>{description}</small>}
+        </div>
+      )}
+      <div id={`${headingId}-content`} className="settings-section-content" hidden={!open}>
+        {children}
+      </div>
+    </section>
+  );
+}
+
+export function FormActions({
+  submitLabel,
+  cancelLabel,
+  onCancel,
+  busy = false,
+  dirty = false,
+  statusLabel,
+  savingLabel,
+  className = ""
+}: {
+  submitLabel: string;
+  cancelLabel?: string;
+  onCancel?: () => void;
+  busy?: boolean;
+  dirty?: boolean;
+  statusLabel?: string;
+  savingLabel?: string;
+  className?: string;
+}) {
+  return (
+    <div className={`form-actions ${className}`.trim()}>
+      <span className="form-actions-status" aria-live="polite">
+        {statusLabel ?? (dirty ? "" : "")}
+      </span>
+      <div className="actions">
+        {onCancel && cancelLabel && (
+          <button type="button" onClick={onCancel} disabled={busy}>{cancelLabel}</button>
+        )}
+        <button className="primary" type="submit" disabled={busy}>
+          {busy ? (savingLabel ?? submitLabel) : submitLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function SecretField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  autoComplete,
+  required,
+  disabled,
+  description,
+  revealLabel,
+  hideLabel
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  autoComplete?: string;
+  required?: boolean;
+  disabled?: boolean;
+  description?: string;
+  revealLabel: string;
+  hideLabel: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  const id = useId();
+  const descriptionId = description ? `${id}-description` : undefined;
+
+  return (
+    <div className="field secret-field">
+      <label htmlFor={id}>{label}</label>
+      <div className="secret-input-row">
+        <input
+          id={id}
+          type={revealed ? "text" : "password"}
+          value={value}
+          placeholder={placeholder}
+          autoComplete={autoComplete}
+          required={required}
+          disabled={disabled}
+          aria-describedby={descriptionId}
+          onChange={(event) => onChange(event.currentTarget.value)}
+        />
+        <button
+          type="button"
+          className="icon-button"
+          aria-label={revealed ? hideLabel : revealLabel}
+          title={revealed ? hideLabel : revealLabel}
+          onClick={() => setRevealed((current) => !current)}
+          disabled={disabled}
+        >
+          {revealed ? <EyeOff size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
+        </button>
+      </div>
+      {description && <small id={descriptionId} className="field-description">{description}</small>}
+    </div>
+  );
+}
+
+export function ListField({
+  label,
+  value,
+  onChange,
+  addLabel,
+  removeLabel,
+  placeholder,
+  description,
+  type = "text",
+  disabled = false
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  addLabel: string;
+  removeLabel: string;
+  placeholder?: string;
+  description?: string;
+  type?: string;
+  disabled?: boolean;
+}) {
+  const id = useId();
+  const descriptionId = description ? `${id}-description` : undefined;
+  const items = value === "" ? [""] : value.split(/\r?\n/);
+
+  function updateItem(index: number, nextValue: string) {
+    const next = items.map((item, itemIndex) => itemIndex === index ? nextValue : item);
+    onChange(next.join("\n"));
+  }
+
+  function removeItem(index: number) {
+    const next = items.filter((_, itemIndex) => itemIndex !== index);
+    onChange(next.length > 0 ? next.join("\n") : "");
+  }
+
+  return (
+    <div className="field list-field">
+      <label id={`${id}-label`}>{label}</label>
+      <div className="list-field-items" role="group" aria-labelledby={`${id}-label`} aria-describedby={descriptionId}>
+        {items.map((item, index) => (
+          <div className="list-field-row" key={`${id}-${index}`}>
+            <input
+              type={type}
+              value={item}
+              placeholder={placeholder}
+              disabled={disabled}
+              onChange={(event) => updateItem(index, event.currentTarget.value)}
+            />
+            <button
+              type="button"
+              className="icon-button list-field-remove"
+              aria-label={`${removeLabel} ${index + 1}`}
+              title={removeLabel}
+              onClick={() => removeItem(index)}
+              disabled={disabled || (items.length === 1 && item === "")}
+            >
+              <X size={15} aria-hidden="true" />
+            </button>
+          </div>
+        ))}
+      </div>
+      <button type="button" className="list-field-add" onClick={() => onChange(`${value}\n`)} disabled={disabled}>
+        <Plus size={14} aria-hidden="true" />
+        {addLabel}
+      </button>
+      {description && <small id={descriptionId} className="field-description">{description}</small>}
+    </div>
+  );
+}
+
+export function FormErrorSummary({
+  title,
+  errors
+}: {
+  title: string;
+  errors: string[];
+}) {
+  const visibleErrors = errors.filter(Boolean);
+  if (visibleErrors.length === 0) return null;
+  return (
+    <div className="form-error-summary" role="alert" tabIndex={-1}>
+      <strong>{title}</strong>
+      <ul>
+        {visibleErrors.map((error, index) => <li key={`${error}-${index}`}>{error}</li>)}
+      </ul>
+    </div>
   );
 }
 

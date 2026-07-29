@@ -41,8 +41,13 @@ import {
   Check,
   EmptyState,
   Field,
+  FormActions,
+  FormErrorSummary,
+  ListField,
   Modal,
   SearchField,
+  SecretField,
+  SettingsSection,
   SelectField,
   StatusBadge
 } from "./components/ui";
@@ -51,6 +56,7 @@ import {
   LoginMethodSwitcher
 } from "./components/LoginMethod";
 import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
+import { ApplicationWorkspace } from "./features/applications/ApplicationWorkspace";
 import { translations } from "./i18n";
 import type { TranslationKey } from "./i18n";
 import {
@@ -89,6 +95,7 @@ import {
   createQuickLinkId,
   emptyAuditWebhookForm,
   emptyAuthorizationCodeLoginForm,
+  emptyApplicationForm,
   emptyClaimMapperForm,
   emptyClientForm,
   emptyGroupForm,
@@ -112,6 +119,7 @@ import {
 } from "./lib/webauthn";
 import type {
   AccessGroup,
+  ApplicationModule,
   AuditEvent,
   AuditWebhook,
   BrowserAccount,
@@ -144,7 +152,9 @@ import type {
   MyConsent,
   MySession,
   Organization,
+  OrganizationContext,
   OrganizationMember,
+  OrganizationMemberInvitationCreateResponse,
   OrganizationMemberRole,
   OrganizationOption,
   OidcContinuationLoginResponse,
@@ -163,11 +173,13 @@ import type {
   SigningKey,
   Tab,
   Theme,
+  TenantApplication,
   TotpSetup,
   User,
   UserAccess,
   UserDetail,
-  UserFilter
+  UserFilter,
+  UserOrganization
 } from "./types";
 
 const AUTHORIZATION_CODES_API = "/api/admin/authorization-codes";
@@ -282,6 +294,19 @@ function inlineAccountLoginFlow(loginUrl: string, expectedReturnTo: string): str
   }
 }
 
+function matchesHttpUrl(url: URL): boolean {
+  return (url.protocol === "http:" || url.protocol === "https:") && Boolean(url.host);
+}
+
+function formatDiagnosticValue(
+  value: string | number | boolean | string[],
+  translate: (key: TranslationKey) => string
+): string {
+  if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "-";
+  if (typeof value === "boolean") return value ? translate("active") : translate("disabled");
+  return String(value);
+}
+
 export function App() {
   const initialAuth = useMemo(initialAuthContext, []);
   const [locale, setLocale] = useState<Locale>(() => {
@@ -310,9 +335,11 @@ export function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
+  const [applications, setApplications] = useState<TenantApplication[]>([]);
   const [iapApplications, setIapApplications] = useState<IapApplication[]>([]);
   const [invitations, setInvitations] = useState<Invitation[]>([]);
   const [registrationSettings, setRegistrationSettings] = useState<RegistrationSettings | null>(null);
+  const [registrationSettingsBaseline, setRegistrationSettingsBaseline] = useState<RegistrationSettings | null>(null);
   const [providers, setProviders] = useState<ExternalProvider[]>([]);
   const [providerTemplates, setProviderTemplates] = useState<ExternalProviderTemplate[]>([]);
   const [ldapProviders, setLdapProviders] = useState<LdapProvider[]>([]);
@@ -323,6 +350,9 @@ export function App() {
   const [groups, setGroups] = useState<AccessGroup[]>([]);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [organizationOptions, setOrganizationOptions] = useState<OrganizationOption[]>([]);
+  const [myOrganizations, setMyOrganizations] = useState<UserOrganization[]>([]);
+  const [organizationContext, setOrganizationContext] = useState<UserOrganization | null>(null);
+  const [enterpriseContextReady, setEnterpriseContextReady] = useState(false);
   const [mfaStatus, setMfaStatus] = useState<MfaStatus | null>(null);
   const [totpSetup, setTotpSetup] = useState<TotpSetup | null>(null);
   const [totpSetupCode, setTotpSetupCode] = useState("");
@@ -336,7 +366,10 @@ export function App() {
   const [signingKeyKid, setSigningKeyKid] = useState("");
   const [settings, setSettings] = useState<SettingsSummary | null>(null);
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
+  const [runtimeSettingsBaseline, setRuntimeSettingsBaseline] = useState<RuntimeSettings | null>(null);
   const [loginSettings, setLoginSettings] = useState<LoginSettings | null>(null);
+  const [loginSettingsBaseline, setLoginSettingsBaseline] = useState<LoginSettingsDraft | null>(null);
+  const [securityPolicyBaseline, setSecurityPolicyBaseline] = useState<SecurityPolicy | null>(null);
   const [selectedUser, setSelectedUser] = useState<UserDetail | null>(null);
   const [userFilter, setUserFilter] = useState<UserFilter>("live");
   const [userOrganizationFilter, setUserOrganizationFilter] = useState("");
@@ -364,6 +397,27 @@ export function App() {
   const [registrationCodeInspecting, setRegistrationCodeInspecting] = useState(false);
   const [passwordResetForm, setPasswordResetForm] = useState(emptyPasswordResetForm);
   const [clientForm, setClientForm] = useState(emptyClientForm);
+  const [clientFormBaseline, setClientFormBaseline] = useState<typeof emptyClientForm | null>(null);
+  const [clientFormErrors, setClientFormErrors] = useState<string[]>([]);
+  const [applicationForm, setApplicationForm] = useState(emptyApplicationForm);
+  const [enterpriseForm, setEnterpriseForm] = useState({
+    slug: "",
+    name: "",
+    description: "",
+    allowed_email_domains: ""
+  });
+  const [enterpriseMemberEmail, setEnterpriseMemberEmail] = useState("");
+  const [enterpriseMemberRole, setEnterpriseMemberRole] = useState<OrganizationMemberRole>("member");
+  const [organizationMemberInvitations, setOrganizationMemberInvitations] = useState<Invitation[]>([]);
+  const [organizationMemberInvitationForm, setOrganizationMemberInvitationForm] = useState({
+    email: "",
+    display_name: "",
+    description: "",
+    expires_at: "",
+    organization_role: "member" as OrganizationMemberRole,
+    is_active: true
+  });
+  const [revealedOrganizationMemberInvitation, setRevealedOrganizationMemberInvitation] = useState<OrganizationMemberInvitationCreateResponse | null>(null);
   const [iapApplicationForm, setIapApplicationForm] = useState(emptyIapApplicationForm);
   const [invitationForm, setInvitationForm] = useState(emptyInvitationForm);
   const [revealedInvitation, setRevealedInvitation] = useState<Invitation | null>(null);
@@ -380,16 +434,20 @@ export function App() {
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
   const [organizationForm, setOrganizationForm] = useState(emptyOrganizationForm);
   const [organizationMemberRoles, setOrganizationMemberRoles] = useState<Record<string, string>>({});
+  const [organizationMembers, setOrganizationMembers] = useState<OrganizationMember[]>([]);
   const [organizationMembersLoading, setOrganizationMembersLoading] = useState(false);
   const organizationMembersLoadId = useRef(0);
   const [selectedAccessUserId, setSelectedAccessUserId] = useState("");
   const [userAccess, setUserAccess] = useState<UserAccess | null>(null);
   const [providerForm, setProviderForm] = useState(emptyProviderForm);
+  const [providerFormBaseline, setProviderFormBaseline] = useState<typeof emptyProviderForm | null>(null);
   const [providerTemplateId, setProviderTemplateId] = useState("");
   const [ldapProviderForm, setLdapProviderForm] = useState(emptyLdapProviderForm);
+  const [ldapProviderFormBaseline, setLdapProviderFormBaseline] = useState<typeof emptyLdapProviderForm | null>(null);
   const [auditWebhookForm, setAuditWebhookForm] = useState(emptyAuditWebhookForm);
+  const [auditWebhookFormBaseline, setAuditWebhookFormBaseline] = useState<typeof emptyAuditWebhookForm>(emptyAuditWebhookForm);
   const [editor, setEditor] = useState<
-    "user" | "organization" | "client" | "iap" | "invitation" | "provider" | "ldap" | "role" | "group" | null
+    "user" | "organization" | "enterprise" | "application" | "client" | "iap" | "invitation" | "provider" | "ldap" | "role" | "group" | null
   >(null);
   const [loginSettingsDraft, setLoginSettingsDraft] = useState<LoginSettingsDraft>({
     brand_logo_url: "",
@@ -447,11 +505,22 @@ export function App() {
   const authFormsVisible = accountLoginExpanded || !selectedBrowserAccount;
   const hasPermission = (...permissions: string[]) =>
     permissions.some((permission) => userPermissions.includes(permission));
-  const canAdmin = !isRestrictedLoginCodeSession && userPermissions.length > 0;
+  const canManageActiveOrganization = Boolean(
+    organizationContext
+    && (
+      hasPermission("organizations.manage")
+      || (
+        organizationContext.kind !== "system"
+        && (organizationContext.role === "owner" || organizationContext.role === "admin")
+      )
+    )
+  );
+  const hasGlobalConsolePermission = userPermissions.length > 0;
+  const canAdmin = !isRestrictedLoginCodeSession && (hasGlobalConsolePermission || canManageActiveOrganization);
   const canReadUsers = hasPermission("users.read", "users.manage", "organizations.manage", "security.manage");
   const canManageUsers = hasPermission("users.manage");
-  const canReadClients = hasPermission("clients.read", "clients.manage");
-  const canManageClients = hasPermission("clients.manage");
+  const canReadClients = hasPermission("clients.read", "clients.manage") || canManageActiveOrganization;
+  const canManageClients = hasPermission("clients.manage") || canManageActiveOrganization;
   const canReadIap = hasPermission("iap.read", "iap.manage");
   const canManageIap = hasPermission("iap.manage");
   const canReadOrganizations = hasPermission(
@@ -461,7 +530,8 @@ export function App() {
   const canManageOrganizations = hasPermission("organizations.manage");
   const canManageAuthorizationCodes = hasPermission("authorization_codes.manage");
   const canManageSettings = hasPermission("settings.manage");
-  const canManageProviders = hasPermission("providers.manage");
+  const canManagePlatformProviders = hasPermission("providers.manage");
+  const canManageProviders = canManagePlatformProviders || canManageActiveOrganization;
   const canReadAudit = hasPermission("audit.read");
   const canManageSecurity = hasPermission("security.manage");
 
@@ -596,7 +666,8 @@ export function App() {
   }
 
   async function loadBootstrap() {
-    const next = await api<Bootstrap>("/api/public/bootstrap");
+    const target = authReturnTo ? `?return_to=${encodeURIComponent(authReturnTo)}` : "";
+    const next = await api<Bootstrap>(`/api/public/bootstrap${target}`);
     setBootstrap(next);
     if (!localStorage.getItem("gpt-sso-locale") && next.default_locale === "en-US") {
       setLocale("en-US");
@@ -610,6 +681,21 @@ export function App() {
     const me = await api<User | null>("/api/me");
     setApiCacheScope(me?.id ?? null);
     setUser(me);
+    return me;
+  }
+
+  async function loadEnterpriseContext(userId?: string) {
+    try {
+      const [nextOrganizations, nextContext] = await Promise.all([
+        api<UserOrganization[]>("/api/me/organizations"),
+        api<OrganizationContext>("/api/me/organization-context")
+      ]);
+      setMyOrganizations(nextOrganizations);
+      setOrganizationContext(nextContext.organization);
+      setApiCacheScope(`${userId ?? user?.id ?? "anonymous"}:${nextContext.organization?.id ?? "none"}`);
+    } finally {
+      setEnterpriseContextReady(true);
+    }
   }
 
   async function loadAccountData() {
@@ -643,6 +729,7 @@ export function App() {
     switch (targetTab) {
       case "overview": return cachedApiValue<Overview>("/api/admin/overview") !== undefined;
       case "users": return cachedApiValue<User[]>(usersListPath()) !== undefined;
+      case "applications": return cachedApiValue<TenantApplication[]>("/api/admin/applications") !== undefined;
       case "clients": return cachedApiValue<Client[]>("/api/admin/clients") !== undefined;
       case "iap": return cachedApiValue<IapApplication[]>("/api/admin/iap-applications") !== undefined;
       case "organizations": return cachedApiValue<Organization[]>("/api/admin/organizations") !== undefined;
@@ -693,8 +780,32 @@ export function App() {
           if (!canReadClients) break;
           await Promise.all([
             loadCached<Client[]>("/api/admin/clients", setClients),
-            canManageClients
+            // A client is only the protocol connection. Load the current
+            // enterprise applications beside it so the client list can make
+            // its governing access policy visible and reachable.
+            canManageActiveOrganization
+              ? loadCached<TenantApplication[]>("/api/admin/applications", setApplications).catch(() => undefined)
+              : Promise.resolve(undefined),
+            hasPermission("clients.manage")
               ? loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
+              : Promise.resolve(undefined)
+          ]);
+          break;
+        }
+        case "applications": {
+          if (!canManageActiveOrganization) break;
+          await Promise.all([
+            loadCached<TenantApplication[]>("/api/admin/applications", setApplications),
+            loadCached<Client[]>("/api/admin/clients", setClients).catch(() => undefined),
+            loadCached<ExternalProvider[]>("/api/admin/external-oidc-providers", setProviders).catch(() => undefined),
+            canManagePlatformProviders
+              ? loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders).catch(() => undefined)
+              : Promise.resolve(undefined),
+            organizationContext
+              ? Promise.all([
+                  loadCached<OrganizationMember[]>(`/api/admin/organizations/${organizationContext.id}/members`, setOrganizationMembers),
+                  loadCached<Invitation[]>(`/api/admin/organizations/${organizationContext.id}/member-invitations`, setOrganizationMemberInvitations)
+                ]).catch(() => undefined)
               : Promise.resolve(undefined)
           ]);
           break;
@@ -712,7 +823,7 @@ export function App() {
           await Promise.all([
             loadCached<Organization[]>("/api/admin/organizations", (next) => {
               setOrganizations(next);
-              setOrganizationOptions(next.map(({ id, slug, name, is_active }) => ({ id, slug, name, is_active })));
+              setOrganizationOptions(next.map(({ id, slug, name, kind, is_active }) => ({ id, slug, name, kind, is_active })));
             }),
             canManageOrganizations
               ? loadCached<User[]>("/api/admin/users?status=live", (next) => setUsers(sortUsersForDisplay(next)))
@@ -733,28 +844,38 @@ export function App() {
         }
         case "registration": {
           if (!canManageSettings) break;
-          await loadCached<RegistrationSettings>("/api/admin/registration-settings", setRegistrationSettings);
+          await loadCached<RegistrationSettings>("/api/admin/registration-settings", (next) => {
+            setRegistrationSettings(next);
+            setRegistrationSettingsBaseline(next);
+          });
           break;
         }
         case "providers": {
           if (!canManageProviders) break;
-          await Promise.all([
+          const requests: Promise<unknown>[] = [
             loadCached<ExternalProvider[]>("/api/admin/external-oidc-providers", setProviders),
-            loadCached<ExternalProviderTemplate[]>("/api/admin/external-oidc-provider-templates", setProviderTemplates),
-            loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders),
-            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
-          ]);
+            loadCached<ExternalProviderTemplate[]>("/api/admin/external-oidc-provider-templates", setProviderTemplates)
+          ];
+          if (canManagePlatformProviders) {
+            requests.push(
+              loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders),
+              loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
+            );
+          }
+          await Promise.all(requests);
           break;
         }
         case "portal": {
           if (!canManageSettings) break;
           await loadCached<LoginSettings>("/api/admin/login-settings", (next) => {
             setLoginSettings(next);
-            setLoginSettingsDraft({
+            const draft = {
               brand_logo_url: next.brand_logo_url,
               email_domains: next.email_domains.join("\n"),
               quick_links: next.quick_links
-            });
+            };
+            setLoginSettingsDraft(draft);
+            setLoginSettingsBaseline(draft);
           });
           break;
         }
@@ -762,7 +883,10 @@ export function App() {
           if (!canManageSecurity && !canReadAudit) break;
           await Promise.all([
             canManageSecurity
-              ? loadCached<SecurityPolicy>("/api/admin/security-policy", setSecurityPolicy)
+              ? loadCached<SecurityPolicy>("/api/admin/security-policy", (next) => {
+                  setSecurityPolicy(next);
+                  setSecurityPolicyBaseline(next);
+                })
               : Promise.resolve(undefined),
             canManageSecurity
               ? loadCached<SigningKey[]>("/api/admin/signing-keys", setSigningKeys)
@@ -789,7 +913,10 @@ export function App() {
         case "settings": {
           if (!canManageSettings) break;
           await Promise.all([
-            loadCached<RuntimeSettings>("/api/admin/runtime-settings", setRuntimeSettings),
+            loadCached<RuntimeSettings>("/api/admin/runtime-settings", (next) => {
+              setRuntimeSettings(next);
+              setRuntimeSettingsBaseline(next);
+            }),
             loadCached<SettingsSummary>("/api/admin/settings", setSettings)
           ]);
           break;
@@ -813,9 +940,14 @@ export function App() {
   async function initialize() {
     setInitialLoadError("");
     try {
-      await Promise.all([loadBootstrap(), loadMe()]);
+      const [, me] = await Promise.all([loadBootstrap(), loadMe()]);
+      if (me) await loadEnterpriseContext(me.id);
+      else setEnterpriseContextReady(true);
     } catch (err) {
       setUser(null);
+      setMyOrganizations([]);
+      setOrganizationContext(null);
+      setEnterpriseContextReady(true);
       setInitialLoadError(messageOr(err, "loadFailed"));
     }
   }
@@ -845,11 +977,11 @@ export function App() {
   }, [initialAuth.isAuthPage, user?.id]);
 
   useEffect(() => {
-    if (!canAdmin || initialAuth.isAuthPage) return;
-    loadAdminData(tab === "account" ? "overview" : tab).catch((err) =>
+    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || (tab === "overview" && !hasGlobalConsolePermission)) return;
+    loadAdminData(tab).catch((err) =>
       setError(messageOr(err, "loadFailed"))
     );
-  }, [canAdmin, initialAuth.isAuthPage, tab, userFilter, userOrganizationFilter, userLinkedIdentityFilter]);
+  }, [canAdmin, canManageActiveOrganization, hasGlobalConsolePermission, initialAuth.isAuthPage, tab, userFilter, userOrganizationFilter, userLinkedIdentityFilter, organizationContext?.id]);
 
   useEffect(() => {
     const authorizationCode = registerForm.authorization_code.trim();
@@ -1116,6 +1248,7 @@ export function App() {
       bootstrap?.has_users
       && !bootstrap.registration.allow_password_registration
       && !bootstrap.registration.require_invitation
+      && !registerForm.authorization_code.trim()
     ) {
       setError(t("passwordRegistrationUnavailable"));
       return;
@@ -1129,6 +1262,7 @@ export function App() {
             // manufacture usernames, passwords or code rules in the browser.
             email: authEmail,
             authorization_code: registerForm.authorization_code.trim() || null,
+            return_to: authReturnTo,
             account_flow: effectiveAccountFlow
           }
         : {
@@ -1139,9 +1273,8 @@ export function App() {
             password: registerForm.password,
             email_code: registerForm.email_code || null,
             phone_code: registerForm.phone_code || null,
-            authorization_code: registrationCodeRequired
-              ? registerForm.authorization_code.trim() || null
-              : null,
+            authorization_code: registerForm.authorization_code.trim() || null,
+            return_to: authReturnTo,
             account_flow: effectiveAccountFlow
           };
       const result = await api<{ user: User; first_admin: boolean } | OidcContinuationLoginResponse>("/api/register", {
@@ -1420,8 +1553,44 @@ export function App() {
 
   async function saveClient(event: FormEvent) {
     event.preventDefault();
+    const isNewClient = !clientForm.id;
+    const validationErrors: string[] = [];
+    if (!clientForm.client_id.trim()) validationErrors.push(`${t("clientId")} · ${t("requiredField")}`);
+    if (!clientForm.client_name.trim()) validationErrors.push(`${t("clientName")} · ${t("requiredField")}`);
+    const redirectValues = splitList(clientForm.redirect_uris);
+    if (redirectValues.length === 0) {
+      validationErrors.push(`${t("redirectUris")} · ${t("requiredField")}`);
+    } else {
+      redirectValues.forEach((value) => {
+        try {
+          const url = new URL(value);
+          if (!matchesHttpUrl(url)) throw new Error("invalid");
+        } catch {
+          validationErrors.push(`${t("redirectUris")}: ${value} · ${t("invalidUrl")}`);
+        }
+      });
+    }
+    if (clientForm.post_logout_redirect_uris.trim()) {
+      splitList(clientForm.post_logout_redirect_uris).forEach((value) => {
+        try {
+          const url = new URL(value);
+          if (!matchesHttpUrl(url)) throw new Error("invalid");
+        } catch {
+          validationErrors.push(`${t("postLogoutUris")}: ${value} · ${t("invalidUrl")}`);
+        }
+      });
+    }
+    if (clientForm.require_s256_pkce && !clientForm.require_pkce) {
+      validationErrors.push(`${t("requireS256Pkce")} · ${t("requirePkce")}`);
+    }
+    if (validationErrors.length > 0) {
+      setClientFormErrors(validationErrors);
+      window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".form-error-summary")?.focus());
+      return;
+    }
     setBusy(true);
     setError("");
+    setClientFormErrors([]);
     try {
       const body = JSON.stringify({
         client_id: clientForm.client_id,
@@ -1475,9 +1644,12 @@ export function App() {
         await api<Client>("/api/admin/clients", { method: "POST", body });
       }
       setClientForm(emptyClientForm);
+      setClientFormBaseline(null);
+      setClientFormErrors([]);
       setEditor(null);
-      setVerificationMessage(t("changesSaved"));
+      setVerificationMessage(t(isNewClient ? "clientCreatedApplicationHint" : "changesSaved"));
       await loadAdminData();
+      if (isNewClient) await loadAdminData("applications", { force: true });
     } catch (err) {
       setError(messageOr(err, "saveClientFailed"));
     } finally {
@@ -1492,6 +1664,172 @@ export function App() {
       setEditor(null);
     }
     await loadAdminData("clients");
+  }
+
+  async function editApplication(application: TenantApplication) {
+    const protocolModule = application.modules?.find((module) => module.module_key === "protocols");
+    const protocolConfig = protocolModule?.config && typeof protocolModule.config === "object"
+      ? protocolModule.config
+      : {};
+    const websiteUrl = typeof protocolConfig.website_url === "string" ? protocolConfig.website_url : "";
+    setApplicationForm({
+      id: application.id,
+      slug: application.slug,
+      name: application.name,
+      website_url: websiteUrl,
+      description: application.description ?? "",
+      account_selection_mode: application.account_selection_mode,
+      unique_identity_factors: application.unique_identity_factors,
+      is_active: application.is_active,
+      oidc_client_ids: application.oidc_clients.map((client) => client.id)
+    });
+    setEditor("application");
+  }
+
+  async function saveApplication(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const body = JSON.stringify({
+        slug: applicationForm.slug,
+        name: applicationForm.name,
+        description: applicationForm.description || null,
+        account_selection_mode: applicationForm.account_selection_mode,
+        unique_identity_factors: applicationForm.unique_identity_factors,
+        is_active: applicationForm.is_active
+      });
+      const application = applicationForm.id
+        ? await api<TenantApplication>(`/api/admin/applications/${applicationForm.id}`, { method: "PUT", body })
+        : await api<TenantApplication>("/api/admin/applications", { method: "POST", body });
+      // Protocol connections are configured in the application's Protocols
+      // module. Application membership is not part of the website contract.
+      await api<Client[]>(`/api/admin/applications/${application.id}/oidc-clients`, {
+        method: "PUT",
+        body: JSON.stringify({ client_ids: applicationForm.oidc_client_ids })
+      });
+      const currentProtocolModule = application.modules?.find((module) => module.module_key === "protocols");
+      const currentProtocolConfig = currentProtocolModule?.config ?? {};
+      await api<ApplicationModule>(`/api/admin/applications/${application.id}/modules/protocols`, {
+        method: "PUT",
+        body: JSON.stringify({
+          config: {
+            ...(currentProtocolConfig && typeof currentProtocolConfig === "object" ? currentProtocolConfig : {}),
+            website_url: applicationForm.website_url
+          },
+          is_enabled: currentProtocolModule?.is_enabled ?? Boolean(application.oidc_clients.length)
+        })
+      });
+      setApplicationForm(emptyApplicationForm);
+      setEditor(null);
+      setVerificationMessage(t("changesSaved"));
+      await loadAdminData("applications", { force: true });
+    } catch (err) {
+      setError(messageOr(err, "saveApplicationFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteApplication(id: string) {
+    await api(`/api/admin/applications/${id}`, { method: "DELETE" });
+    if (applicationForm.id === id) {
+      setApplicationForm(emptyApplicationForm);
+      setEditor(null);
+    }
+    await loadAdminData("applications", { force: true });
+  }
+
+  function updateApplicationModuleInState(
+    applicationId: string,
+    module: ApplicationModule,
+    oidcClients?: Client[]
+  ) {
+    setApplications((current) => current.map((application) => {
+      if (application.id !== applicationId) return application;
+      const modules = [...(application.modules ?? [])];
+      const index = modules.findIndex((item) => item.module_key === module.module_key);
+      if (index >= 0) modules[index] = module;
+      else modules.push(module);
+      return {
+        ...application,
+        modules,
+        ...(oidcClients ? { oidc_clients: oidcClients } : {})
+      };
+    }));
+  }
+
+  async function addEnterpriseMember() {
+    if (!organizationContext || !enterpriseMemberEmail.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/admin/organizations/${organizationContext.id}/members`, {
+        method: "POST",
+        body: JSON.stringify({ email: enterpriseMemberEmail.trim(), role: enterpriseMemberRole })
+      });
+      setOrganizationMembers(await api<OrganizationMember[]>(`/api/admin/organizations/${organizationContext.id}/members`));
+      setEnterpriseMemberEmail("");
+      setEnterpriseMemberRole("member");
+      setVerificationMessage(t("operationCompleted"));
+    } catch (err) {
+      setError(messageOr(err, "operationFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createOrganizationMemberInvitation() {
+    if (!organizationContext) return;
+    const expiresAt = toTimestamp(organizationMemberInvitationForm.expires_at);
+    if (!organizationMemberInvitationForm.email.trim() || expiresAt === null) {
+      setError(t("organizationMemberInvitationValidation"));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const created = await api<OrganizationMemberInvitationCreateResponse>(
+        `/api/admin/organizations/${organizationContext.id}/member-invitations`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            email: organizationMemberInvitationForm.email.trim(),
+            display_name: organizationMemberInvitationForm.display_name || null,
+            description: organizationMemberInvitationForm.description || null,
+            expires_at: expiresAt,
+            organization_role: organizationMemberInvitationForm.organization_role,
+            is_active: organizationMemberInvitationForm.is_active
+          })
+        }
+      );
+      setOrganizationMemberInvitations((current) => [created.invitation, ...current]);
+      setRevealedOrganizationMemberInvitation(created);
+      setOrganizationMemberInvitationForm({
+        email: "",
+        display_name: "",
+        description: "",
+        expires_at: "",
+        organization_role: "member",
+        is_active: true
+      });
+      setVerificationMessage(t("organizationMemberInvitationCreated"));
+    } catch (err) {
+      setError(messageOr(err, "operationFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteOrganizationMemberInvitation(invitationId: string) {
+    if (!organizationContext) return;
+    await api(`/api/admin/organizations/${organizationContext.id}/member-invitations/${invitationId}`, {
+      method: "DELETE"
+    });
+    setOrganizationMemberInvitations((current) => current.filter((invitation) => invitation.id !== invitationId));
+    setRevealedOrganizationMemberInvitation((current) =>
+      current?.invitation.id === invitationId ? null : current
+    );
   }
 
   function addClientClaimMapper() {
@@ -2101,6 +2439,7 @@ export function App() {
         })
       });
       setSecurityPolicy(updated);
+      setSecurityPolicyBaseline(updated);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
@@ -2133,15 +2472,16 @@ export function App() {
     event.preventDefault();
     if (!registrationSettings) return;
     setBusy(true);
+    setError("");
     try {
       const updated = await api<RegistrationSettings>("/api/admin/registration-settings", {
         method: "PUT",
         body: JSON.stringify({
-          ...registrationSettings,
-          first_user_direct_admin: true
+          ...registrationSettings
         })
       });
       setRegistrationSettings(updated);
+      setRegistrationSettingsBaseline(updated);
       setVerificationMessage(t("changesSaved"));
       await loadBootstrap();
     } catch (err) {
@@ -2166,6 +2506,7 @@ export function App() {
         })
       });
       setRuntimeSettings(updated);
+      setRuntimeSettingsBaseline(updated);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
@@ -2189,6 +2530,11 @@ export function App() {
       });
       setLoginSettings(updated);
       setLoginSettingsDraft({
+        brand_logo_url: updated.brand_logo_url,
+        email_domains: updated.email_domains.join("\n"),
+        quick_links: updated.quick_links
+      });
+      setLoginSettingsBaseline({
         brand_logo_url: updated.brand_logo_url,
         email_domains: updated.email_domains.join("\n"),
         quick_links: updated.quick_links
@@ -2318,6 +2664,7 @@ export function App() {
         await api<ExternalProvider>("/api/admin/external-oidc-providers", { method: "POST", body });
       }
       setProviderForm(emptyProviderForm);
+      setProviderFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -2343,6 +2690,7 @@ export function App() {
       const body = JSON.stringify({
         slug: ldapProviderForm.slug,
         display_name: ldapProviderForm.display_name,
+        organization_id: ldapProviderForm.organization_id || null,
         url: ldapProviderForm.url,
         starttls: ldapProviderForm.starttls,
         bind_dn: ldapProviderForm.bind_dn,
@@ -2368,6 +2716,7 @@ export function App() {
         await api<LdapProvider>("/api/admin/ldap-providers", { method: "POST", body });
       }
       setLdapProviderForm(emptyLdapProviderForm);
+      setLdapProviderFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -2386,11 +2735,12 @@ export function App() {
   }
 
   function editLdapProvider(provider: LdapProvider) {
-    setLdapProviderForm({
-      id: provider.id,
-      slug: provider.slug,
-      display_name: provider.display_name,
-      url: provider.url,
+    const nextForm = {
+                        id: provider.id,
+                        slug: provider.slug,
+                        display_name: provider.display_name,
+                        organization_id: provider.organization_id ?? "",
+                        url: provider.url,
       starttls: provider.starttls,
       bind_dn: provider.bind_dn,
       bind_password: "",
@@ -2405,7 +2755,9 @@ export function App() {
       is_active: provider.is_active,
       allow_login: provider.allow_login,
       allow_registration: provider.allow_registration
-    });
+    };
+    setLdapProviderForm(nextForm);
+    setLdapProviderFormBaseline(nextForm);
     setEditor("ldap");
   }
 
@@ -2432,6 +2784,7 @@ export function App() {
         await api<AuditWebhook>("/api/admin/audit-webhooks", { method: "POST", body });
       }
       setAuditWebhookForm(emptyAuditWebhookForm);
+      setAuditWebhookFormBaseline(emptyAuditWebhookForm);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
     } catch (err) {
@@ -2442,7 +2795,7 @@ export function App() {
   }
 
   function editAuditWebhook(webhook: AuditWebhook) {
-    setAuditWebhookForm({
+    const nextForm = {
       id: webhook.id,
       name: webhook.name,
       url: webhook.url,
@@ -2451,12 +2804,15 @@ export function App() {
       actions: webhook.actions.join("\n"),
       is_active: webhook.is_active,
       timeout_seconds: webhook.timeout_seconds
-    });
+    };
+    setAuditWebhookForm(nextForm);
+    setAuditWebhookFormBaseline(nextForm);
   }
 
   async function deleteAuditWebhook(id: string) {
     await api(`/api/admin/audit-webhooks/${id}`, { method: "DELETE" });
     setAuditWebhookForm((current) => (current.id === id ? emptyAuditWebhookForm : current));
+    setAuditWebhookFormBaseline((current) => (current.id === id ? emptyAuditWebhookForm : current));
     await loadAdminData();
   }
 
@@ -2477,7 +2833,58 @@ export function App() {
     }
   }
 
+  async function switchEnterprise(organizationId: string) {
+    if (!organizationId || organizationId === organizationContext?.id) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = await api<OrganizationContext>("/api/me/organization-context", {
+        method: "PUT",
+        body: JSON.stringify({ organization_id: organizationId })
+      });
+      setOrganizationContext(next.organization);
+      setApiCacheScope(`${user?.id ?? "anonymous"}:${next.organization?.id ?? "none"}`);
+      setApplications([]);
+      setClients([]);
+      setOrganizationMembers([]);
+      setVerificationMessage(t("operationCompleted"));
+    } catch (err) {
+      setError(messageOr(err, "operationFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveEnterprise(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api<Organization>("/api/me/organizations", {
+        method: "POST",
+        body: JSON.stringify({
+          slug: enterpriseForm.slug,
+          name: enterpriseForm.name,
+          description: enterpriseForm.description || null,
+          allowed_email_domains: splitList(enterpriseForm.allowed_email_domains).map(normalizeDomain)
+        })
+      });
+      setEnterpriseForm({ slug: "", name: "", description: "", allowed_email_domains: "" });
+      setEditor(null);
+      await loadEnterpriseContext(user?.id);
+      setVerificationMessage(t("changesSaved"));
+      navigateToTab("applications");
+    } catch (err) {
+      setError(messageOr(err, "saveOrganizationFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function navigateToTab(next: Tab) {
+    if (next !== tab && configurationFormsDirty() && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
+      return;
+    }
     setTab(next);
     setSearchQuery("");
     setSidebarOpen(false);
@@ -2487,13 +2894,98 @@ export function App() {
     }
   }
 
-  function closeEditor() {
+  function clientDraftIsDirty(): boolean {
+    return clientFormBaseline !== null
+      && JSON.stringify(clientForm) !== JSON.stringify(clientFormBaseline);
+  }
+
+  function providerFormIsDirty(): boolean {
+    return providerFormBaseline !== null
+      && JSON.stringify(providerForm) !== JSON.stringify(providerFormBaseline);
+  }
+
+  function ldapProviderFormIsDirty(): boolean {
+    return ldapProviderFormBaseline !== null
+      && JSON.stringify(ldapProviderForm) !== JSON.stringify(ldapProviderFormBaseline);
+  }
+
+  function auditWebhookFormIsDirty(): boolean {
+    return JSON.stringify(auditWebhookForm) !== JSON.stringify(auditWebhookFormBaseline);
+  }
+
+  function registrationSettingsIsDirty(): boolean {
+    return registrationSettingsBaseline !== null
+      && registrationSettings !== null
+      && JSON.stringify(registrationSettings) !== JSON.stringify(registrationSettingsBaseline);
+  }
+
+  function runtimeSettingsIsDirty(): boolean {
+    return runtimeSettingsBaseline !== null
+      && runtimeSettings !== null
+      && JSON.stringify(runtimeSettings) !== JSON.stringify(runtimeSettingsBaseline);
+  }
+
+  function loginSettingsIsDirty(): boolean {
+    return loginSettingsBaseline !== null
+      && JSON.stringify(loginSettingsDraft) !== JSON.stringify(loginSettingsBaseline);
+  }
+
+  function securityPolicyIsDirty(): boolean {
+    return securityPolicyBaseline !== null
+      && securityPolicy !== null
+      && JSON.stringify(securityPolicy) !== JSON.stringify(securityPolicyBaseline);
+  }
+
+  function configurationFormsDirty(): boolean {
+    return clientDraftIsDirty()
+      || providerFormIsDirty()
+      || ldapProviderFormIsDirty()
+      || auditWebhookFormIsDirty()
+      || registrationSettingsIsDirty()
+      || runtimeSettingsIsDirty()
+      || loginSettingsIsDirty()
+      || securityPolicyIsDirty();
+  }
+
+  function openClientEditor(next: typeof emptyClientForm) {
+    setClientForm(next);
+    setClientFormBaseline(next);
+    setClientFormErrors([]);
+    setError("");
+    setEditor("client");
+  }
+
+  function closeEditor(force = false): boolean {
+    const editorDirty = editor === "client"
+      ? clientDraftIsDirty()
+      : editor === "provider"
+        ? providerFormIsDirty()
+        : editor === "ldap"
+          ? ldapProviderFormIsDirty()
+          : false;
+    if (!force && editorDirty && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
+      return false;
+    }
     if (editor === "organization") {
       organizationMembersLoadId.current += 1;
       setOrganizationMembersLoading(false);
     }
+    if (editor === "client") {
+      setClientFormBaseline(null);
+      setClientFormErrors([]);
+    }
+    if (editor === "provider") {
+      setProviderForm(emptyProviderForm);
+      setProviderFormBaseline(null);
+      setProviderTemplateId("");
+    }
+    if (editor === "ldap") {
+      setLdapProviderForm(emptyLdapProviderForm);
+      setLdapProviderFormBaseline(null);
+    }
     setEditor(null);
     setError("");
+    return true;
   }
 
   function requestConfirmation(
@@ -2524,8 +3016,9 @@ export function App() {
     () => {
       const accountTab = { id: "account" as const, label: t("account"), icon: UserRound };
       const adminTabs = [
-        { id: "overview" as const, label: t("overview"), icon: Shield },
+        hasGlobalConsolePermission ? { id: "overview" as const, label: t("overview"), icon: Shield } : null,
         canReadUsers ? { id: "users" as const, label: t("users"), icon: Users } : null,
+        canManageActiveOrganization ? { id: "applications" as const, label: t("applications"), icon: Building2 } : null,
         canReadClients ? { id: "clients" as const, label: t("clients"), icon: KeyRound } : null,
         canReadIap ? { id: "iap" as const, label: t("iap"), icon: Shield } : null,
         canReadOrganizations ? { id: "organizations" as const, label: t("organizations"), icon: Building2 } : null,
@@ -2541,7 +3034,9 @@ export function App() {
     [
       locale,
       canAdmin,
+      hasGlobalConsolePermission,
       canReadUsers,
+      canManageActiveOrganization,
       canReadClients,
       canReadIap,
       canReadOrganizations,
@@ -2553,12 +3048,72 @@ export function App() {
     ]
   );
 
+  const navigationGroups = useMemo(() => {
+    const groups = [
+      {
+        id: "workspace",
+        label: t("navWorkspace"),
+        hint: t("navWorkspaceHint"),
+        ids: ["overview"] as Tab[]
+      },
+      {
+        id: "directory",
+        label: t("navDirectory"),
+        hint: t("navDirectoryHint"),
+        ids: ["users", "organizations", "invitations"] as Tab[]
+      },
+      {
+        id: "applications",
+        label: t("navApplications"),
+        hint: t("navApplicationsHint"),
+        ids: ["applications", "clients", "iap"] as Tab[]
+      },
+      {
+        id: "access",
+        label: t("navAccess"),
+        hint: t("navAccessHint"),
+        ids: ["registration", "providers", "portal", "security", "settings"] as Tab[]
+      }
+    ];
+    return groups
+      .map((group) => ({
+        ...group,
+        items: group.ids
+          .map((id) => tabs.find((item) => item.id === id))
+          .filter((item): item is (typeof tabs)[number] => Boolean(item))
+      }))
+      .filter((group) => group.items.length > 0);
+  }, [locale, tabs]);
+
+  const activeNavigationGroup = navigationGroups.find((group) => group.items.some((item) => item.id === tab));
+
   useEffect(() => {
-    if (!user) return;
+    if (!user || !enterpriseContextReady) return;
     if (!tabs.some((item) => item.id === tab)) {
       navigateToTab("account");
     }
-  }, [tab, tabs, user]);
+  }, [enterpriseContextReady, tab, tabs, user]);
+
+  useEffect(() => {
+    if (!configurationFormsDirty()) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [
+    clientForm,
+    clientFormBaseline,
+    registrationSettings,
+    registrationSettingsBaseline,
+    runtimeSettings,
+    runtimeSettingsBaseline,
+    loginSettingsDraft,
+    loginSettingsBaseline,
+    securityPolicy,
+    securityPolicyBaseline
+  ]);
 
   useEffect(() => {
     const authenticated = Boolean(
@@ -2618,6 +3173,11 @@ export function App() {
     item.organization_name,
     item.scopes.join(" ")
   ));
+  const applicationByOidcClientId = new Map(
+    applications.flatMap((application) =>
+      application.oidc_clients.map((client) => [client.id, application] as const)
+    )
+  );
   const filteredIapApplications = iapApplications.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.name,
@@ -2687,6 +3247,7 @@ export function App() {
   ));
   const searchableTabs: Tab[] = [
     "users",
+    "applications",
     "clients",
     "iap",
     "organizations",
@@ -2814,11 +3375,16 @@ export function App() {
   const registrationCodeRequired = bootstrap.has_users
     && authMode === "register"
     && bootstrap.registration.require_invitation;
-  const isTrialEnrollmentRegistration = registrationCodeRequired
-    && registrationCodeMode === "trial_enrollment";
+  // An application can require its own enrollment code even while platform
+  // registration remains open. OIDC return context is the safe signal to
+  // offer a code field without making an app policy a browser-controlled
+  // value.
+  const registrationCodeVisible = registrationCodeRequired || Boolean(authReturnTo);
+  const isTrialEnrollmentRegistration = registrationCodeMode === "trial_enrollment";
   const registrationCodeAccepted = registrationCodeMode === "registration"
     || registrationCodeMode === "trial_enrollment";
-  const registrationFieldsVisible = !registrationCodeRequired || registrationCodeMode === "registration";
+  const registrationFieldsVisible = !isTrialEnrollmentRegistration
+    && (!registrationCodeRequired || registrationCodeAccepted);
   const registrationCodeBlocksSubmit = registrationCodeRequired
     && (!hasRegistrationAuthorizationCode || registrationCodeInspecting || !registrationCodeAccepted);
   const registrationCodeHint = registrationCodeInspecting
@@ -2838,7 +3404,8 @@ export function App() {
     bootstrap.has_users
     && authMode === "register"
     && !registrationCodeRequired
-    && !bootstrap.registration.allow_password_registration;
+    && !bootstrap.registration.allow_password_registration
+    && !hasRegistrationAuthorizationCode;
   const loginExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_login);
   const registerExternalProviders = bootstrap.external_oidc_providers.filter((provider) => provider.allow_registration);
   const visibleExternalProviders =
@@ -3095,13 +3662,13 @@ export function App() {
                 customLabel={t("customDomain")}
                 applyLabel={t("applySuffix")}
               />
-              {registrationCodeRequired && (
+              {registrationCodeVisible && (
                 <>
                   <Field
                     label={t("registrationAuthorizationCode")}
                     value={registerForm.authorization_code}
                     onChange={(value) => setRegisterForm({ ...registerForm, authorization_code: value })}
-                    required
+                    required={registrationCodeRequired}
                   />
                   {hasRegistrationAuthorizationCode && registrationCodeHint && (
                     <div
@@ -3228,23 +3795,28 @@ export function App() {
         </div>
         <TopLanguage locale={locale} supportedLocales={bootstrap.supported_locales} switchLocale={switchLocale} label={t("language")} compact />
         <nav aria-label={t("adminConsole")}>
-          {tabs.filter((item) => item.id !== "account").map((item) => {
-            const Icon = item.icon;
-            return (
-              <button
-                type="button"
-                key={item.id}
-                className={tab === item.id ? "active" : ""}
-                onClick={() => navigateToTab(item.id)}
-                aria-current={tab === item.id ? "page" : undefined}
-                aria-label={item.label}
-                title={item.label}
-              >
-                <Icon size={18} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+          {navigationGroups.map((group) => (
+            <div className="nav-group" key={group.id}>
+              <p className="nav-group-label">{group.label}</p>
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={tab === item.id ? "active" : ""}
+                    onClick={() => navigateToTab(item.id)}
+                    aria-current={tab === item.id ? "page" : undefined}
+                    aria-label={item.label}
+                    title={item.label}
+                  >
+                    <Icon size={18} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         <div className="sidebar-footer">
           <button
@@ -3297,8 +3869,31 @@ export function App() {
             <Menu size={19} />
           </button>
           <div className="page-heading">
+            {activeNavigationGroup && <span className="page-heading-context">{activeNavigationGroup.label}</span>}
             <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
+            {activeNavigationGroup && <small className="page-heading-hint">{activeNavigationGroup.hint}</small>}
           </div>
+          {user && (
+            <div className="enterprise-switcher">
+              <Building2 size={16} aria-hidden="true" />
+              <select
+                aria-label={t("switchEnterprise")}
+                value={organizationContext?.id ?? ""}
+                onChange={(event) => void switchEnterprise(event.target.value)}
+                disabled={busy || myOrganizations.length === 0}
+              >
+                {myOrganizations.length === 0 && <option value="">{t("noEnterprise")}</option>}
+                {myOrganizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>
+                    {organization.name}{organization.kind === "system" ? ` · ${t("systemEnterprise")}` : ""}
+                  </option>
+                ))}
+              </select>
+              <button className="icon-button" type="button" onClick={() => setEditor("enterprise")} title={t("createEnterprise")} aria-label={t("createEnterprise")} disabled={busy}>
+                <Plus size={16} />
+              </button>
+            </div>
+          )}
           <div className="header-actions">
             {searchEnabled && (
               <SearchField
@@ -3322,6 +3917,18 @@ export function App() {
             </button>
           </div>
         </header>
+        {editor === "enterprise" && (
+          <Modal title={t("createEnterprise")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
+            <form className="panel" onSubmit={saveEnterprise}>
+              <p className="muted">{t("createEnterpriseHint")}</p>
+              <Field label={t("enterpriseSlug")} value={enterpriseForm.slug} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, slug: value })} />
+              <Field label={t("enterpriseName")} value={enterpriseForm.name} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, name: value })} />
+              <Field label={t("enterpriseDescription")} value={enterpriseForm.description} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, description: value })} textarea />
+              <Field label={t("enterpriseEmailDomains")} value={enterpriseForm.allowed_email_domains} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, allowed_email_domains: value })} textarea />
+              <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{t("createEnterprise")}</button></div>
+            </form>
+          </Modal>
+        )}
         {adminLoading && <div className="loading-bar" role="progressbar" aria-label={t("loading")} />}
         {error && !editor && !pendingConfirmation && <div className="error" role="alert">{error}</div>}
         {isRestrictedLoginCodeSession && (
@@ -4100,103 +4707,195 @@ export function App() {
             </div>
           </section>
         )}
+        {canManageActiveOrganization && tab === "applications" && (
+          <>
+            {editor === "application" && (
+              <Modal
+                title={applicationForm.id ? t("updateApplication") : t("createApplication")}
+                closeLabel={t("close")}
+                error={error}
+                dismissible={!busy}
+                onClose={closeEditor}
+              >
+                <form className="panel application-basics-form" onSubmit={saveApplication}>
+                  <div className="application-form-intro">
+                    <span className="application-hero-avatar"><Globe2 size={22} /></span>
+                    <div><strong>{t("websiteApplication")}</strong><p>{t("websiteApplicationHint")}</p></div>
+                  </div>
+                  <Field label={t("applicationSlug")} value={applicationForm.slug} onChange={(value) => setApplicationForm({ ...applicationForm, slug: value })} required />
+                  <Field label={t("applicationName")} value={applicationForm.name} onChange={(value) => setApplicationForm({ ...applicationForm, name: value })} required />
+                  <Field label={t("websiteUrl")} type="url" value={applicationForm.website_url} onChange={(value) => setApplicationForm({ ...applicationForm, website_url: value })} />
+                  <Field label={t("description")} value={applicationForm.description} onChange={(value) => setApplicationForm({ ...applicationForm, description: value })} textarea />
+                  <SelectField label={t("applicationAccountSelection")} value={applicationForm.account_selection_mode} onChange={(value) => setApplicationForm({ ...applicationForm, account_selection_mode: value as typeof applicationForm.account_selection_mode })}>
+                    <option value="optional">{t("accountSelectionOptional")}</option>
+                    <option value="required">{t("accountSelectionRequired")}</option>
+                  </SelectField>
+                  <Check label={t("active")} checked={applicationForm.is_active} onChange={(value) => setApplicationForm({ ...applicationForm, is_active: value })} />
+                  <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{applicationForm.id ? t("save") : t("create")}</button></div>
+                </form>
+              </Modal>
+            )}
+            <ApplicationWorkspace
+              applications={applications}
+              clients={clients}
+              providers={providers}
+              ldapProviders={ldapProviders}
+              locale={locale}
+              canManage={canManageActiveOrganization}
+              onCreateApplication={() => {
+                setApplicationForm(emptyApplicationForm);
+                setEditor("application");
+              }}
+              onEditApplication={(application) => void editApplication(application)}
+              onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id))}
+              onApplicationModuleChanged={updateApplicationModuleInState}
+            />
+          </>
+        )}
         {canReadClients && tab === "clients" && (
           <section className="management-list">
             {canManageClients && editor === "client" && (
               <Modal title={clientForm.id ? t("save") : t("createClient")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor} wide>
               <form className="panel" onSubmit={saveClient}>
-                <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} />
-                <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} />
-                <Field label={t("clientLogoUri")} type="url" value={clientForm.logo_uri} onChange={(value) => setClientForm({ ...clientForm, logo_uri: value })} />
-                <SelectField label={t("clientOrganization")} value={clientForm.organization_id} onChange={(value) => setClientForm({ ...clientForm, organization_id: value })}>
-                  <option value="">{t("noOrganization")}</option>
-                  {organizationOptions.map((organization) => (
-                    <option key={organization.id} value={organization.id}>
-                      {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
-                    </option>
-                  ))}
-                </SelectField>
-                <Field label={t("clientSecret")} type="password" value={clientForm.client_secret} onChange={(value) => setClientForm({ ...clientForm, client_secret: value })} />
-                <Field label={t("redirectUris")} textarea value={clientForm.redirect_uris} onChange={(value) => setClientForm({ ...clientForm, redirect_uris: value })} />
-                <Field label={t("postLogoutUris")} textarea value={clientForm.post_logout_redirect_uris} onChange={(value) => setClientForm({ ...clientForm, post_logout_redirect_uris: value })} />
-                <Field label={t("backchannelLogoutUri")} value={clientForm.backchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_uri: value })} />
-                <Field label={t("frontchannelLogoutUri")} value={clientForm.frontchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_uri: value })} />
-                <Field label={t("scopes")} value={clientForm.scopes} onChange={(value) => setClientForm({ ...clientForm, scopes: value })} />
-                <Field label={t("grantTypes")} value={clientForm.grant_types} onChange={(value) => setClientForm({ ...clientForm, grant_types: value })} />
-                <Field label={t("responseTypes")} value={clientForm.response_types} onChange={(value) => setClientForm({ ...clientForm, response_types: value })} />
-                <SelectField label={t("tokenAuthMethod")} value={clientForm.token_endpoint_auth_method} onChange={(value) => setClientForm({ ...clientForm, token_endpoint_auth_method: value })}>
-                  <option value="client_secret_basic">client_secret_basic</option>
-                  <option value="client_secret_post">client_secret_post</option>
-                  <option value="client_secret_jwt">client_secret_jwt</option>
-                  <option value="private_key_jwt">private_key_jwt</option>
-                  <option value="none">none</option>
-                </SelectField>
-                <SelectField label={t("subjectType")} value={clientForm.subject_type} onChange={(value) => setClientForm({ ...clientForm, subject_type: value })}>
-                  <option value="public">public</option>
-                  <option value="pairwise">pairwise</option>
-                </SelectField>
-                <Field label={t("sectorIdentifierUri")} value={clientForm.sector_identifier_uri} onChange={(value) => setClientForm({ ...clientForm, sector_identifier_uri: value })} />
-                <Field label={t("jwksUri")} value={clientForm.jwks_uri} onChange={(value) => setClientForm({ ...clientForm, jwks_uri: value })} />
-                <Field label={t("jwks")} value={clientForm.jwks} onChange={(value) => setClientForm({ ...clientForm, jwks: value })} textarea />
-                <Check label={t("backchannelLogoutSessionRequired")} checked={clientForm.backchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_session_required: value })} />
-                <Check label={t("frontchannelLogoutSessionRequired")} checked={clientForm.frontchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_session_required: value })} />
-                <Check label={t("requirePkce")} checked={clientForm.require_pkce} onChange={(value) => setClientForm({ ...clientForm, require_pkce: value })} />
-                <Check label={t("requireClientMfa")} checked={clientForm.require_mfa} onChange={(value) => setClientForm({ ...clientForm, require_mfa: value })} />
-                <Check label={t("requirePar")} checked={clientForm.require_pushed_authorization_requests} onChange={(value) => setClientForm({ ...clientForm, require_pushed_authorization_requests: value })} />
-                <Check label={t("requireS256Pkce")} checked={clientForm.require_s256_pkce} onChange={(value) => setClientForm({ ...clientForm, require_s256_pkce: value, require_pkce: value ? true : clientForm.require_pkce })} />
-                <Check label={t("requireConfidentialClient")} checked={clientForm.require_confidential_client} onChange={(value) => setClientForm({ ...clientForm, require_confidential_client: value })} />
-                <Check label={t("requireDpop")} checked={clientForm.require_dpop} onChange={(value) => setClientForm({ ...clientForm, require_dpop: value })} />
-                <Check label={t("requireAccountSelection")} checked={clientForm.require_account_selection} onChange={(value) => setClientForm({ ...clientForm, require_account_selection: value })} />
-                <Check label={t("trustEmailVerified")} checked={clientForm.trust_email_verified} onChange={(value) => setClientForm({ ...clientForm, trust_email_verified: value })} />
-                <Field label={t("authorizationDetailsTypes")} textarea value={clientForm.authorization_details_types} onChange={(value) => setClientForm({ ...clientForm, authorization_details_types: value })} />
-                <Check label={t("serviceAccount")} checked={clientForm.service_account_enabled} onChange={(value) => setClientForm({ ...clientForm, service_account_enabled: value })} />
-                <Field label={t("serviceAccountPermissions")} textarea value={clientForm.service_account_permissions} onChange={(value) => setClientForm({ ...clientForm, service_account_permissions: value })} />
-                <Check label={t("active")} checked={clientForm.is_active} onChange={(value) => setClientForm({ ...clientForm, is_active: value })} />
-                <div className="mapper-list">
-                  <div className="mapper-heading">
-                    <h4>{t("claimMappers")}</h4>
-                    <button type="button" onClick={addClientClaimMapper}>
-                      <Plus size={14} />
-                      {t("addClaimMapper")}
-                    </button>
+                <FormErrorSummary title={t("fixFormErrors")} errors={clientFormErrors} />
+                <SettingsSection title={t("clientBasics")} description={t("clientBasicsHint")} collapsible={false}>
+                  <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} required />
+                  <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} required />
+                  <Field label={t("clientLogoUri")} type="url" value={clientForm.logo_uri} onChange={(value) => setClientForm({ ...clientForm, logo_uri: value })} />
+                  <div className="info client-enterprise-lock" role="status">
+                    <strong>{t("clientOrganization")}</strong>
+                    <span>{organizationContext?.name ?? t("noEnterprise")}</span>
+                    <small>{t("clientOrganizationFixed")}</small>
                   </div>
-                  {clientForm.claim_mappers.map((mapper, index) => (
-                    <div className="mapper-card" key={index}>
-                      <div className="mapper-grid">
-                        <Field label={t("claimName")} value={mapper.claim_name} onChange={(value) => updateClientClaimMapper(index, { claim_name: value })} />
-                        <SelectField label={t("claimSource")} value={mapper.source} onChange={(value) => updateClientClaimMapper(index, { source: value })}>
+                  <SecretField
+                    label={t("clientSecret")}
+                    value={clientForm.client_secret}
+                    onChange={(value) => setClientForm({ ...clientForm, client_secret: value })}
+                    description={clientForm.id ? t("clientSecretHint") : undefined}
+                    revealLabel={t("revealSecret")}
+                    hideLabel={t("hideSecret")}
+                  />
+                </SettingsSection>
+                <SettingsSection title={t("clientRedirects")} description={t("clientRedirectsHint")}>
+                  <ListField
+                    label={t("redirectUris")}
+                    value={clientForm.redirect_uris}
+                    onChange={(value) => setClientForm({ ...clientForm, redirect_uris: value })}
+                    addLabel={t("addItem")}
+                    removeLabel={t("removeItem")}
+                    type="url"
+                    description={t("clientRedirectListHint")}
+                  />
+                  <ListField
+                    label={t("postLogoutUris")}
+                    value={clientForm.post_logout_redirect_uris}
+                    onChange={(value) => setClientForm({ ...clientForm, post_logout_redirect_uris: value })}
+                    addLabel={t("addItem")}
+                    removeLabel={t("removeItem")}
+                    type="url"
+                  />
+                  <Field label={t("backchannelLogoutUri")} type="url" value={clientForm.backchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_uri: value })} />
+                  <Field label={t("frontchannelLogoutUri")} type="url" value={clientForm.frontchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_uri: value })} />
+                  <div className="check-grid-inline">
+                    <Check label={t("backchannelLogoutSessionRequired")} checked={clientForm.backchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_session_required: value })} />
+                    <Check label={t("frontchannelLogoutSessionRequired")} checked={clientForm.frontchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_session_required: value })} />
+                  </div>
+                </SettingsSection>
+                <SettingsSection title={t("clientProtocol")} description={t("clientProtocolHint")}>
+                  <div className="form-grid-2">
+                    <Field label={t("scopes")} value={clientForm.scopes} onChange={(value) => setClientForm({ ...clientForm, scopes: value })} />
+                    <Field label={t("grantTypes")} value={clientForm.grant_types} onChange={(value) => setClientForm({ ...clientForm, grant_types: value })} />
+                    <Field label={t("responseTypes")} value={clientForm.response_types} onChange={(value) => setClientForm({ ...clientForm, response_types: value })} />
+                    <SelectField label={t("tokenAuthMethod")} value={clientForm.token_endpoint_auth_method} onChange={(value) => setClientForm({ ...clientForm, token_endpoint_auth_method: value })}>
+                      <option value="client_secret_basic">client_secret_basic</option>
+                      <option value="client_secret_post">client_secret_post</option>
+                      <option value="client_secret_jwt">client_secret_jwt</option>
+                      <option value="private_key_jwt">private_key_jwt</option>
+                      <option value="none">none</option>
+                    </SelectField>
+                    <SelectField label={t("subjectType")} value={clientForm.subject_type} onChange={(value) => setClientForm({ ...clientForm, subject_type: value })}>
+                      <option value="public">public</option>
+                      <option value="pairwise">pairwise</option>
+                    </SelectField>
+                    <Field label={t("sectorIdentifierUri")} type="url" value={clientForm.sector_identifier_uri} onChange={(value) => setClientForm({ ...clientForm, sector_identifier_uri: value })} />
+                  </div>
+                </SettingsSection>
+                <SettingsSection title={t("clientSecurity")} description={t("clientSecurityHint")}>
+                  <div className="check-grid-inline">
+                    <Check label={t("requirePkce")} checked={clientForm.require_pkce} onChange={(value) => setClientForm({ ...clientForm, require_pkce: value })} />
+                    <Check label={t("requireS256Pkce")} checked={clientForm.require_s256_pkce} onChange={(value) => setClientForm({ ...clientForm, require_s256_pkce: value, require_pkce: value ? true : clientForm.require_pkce })} />
+                    <Check label={t("requireClientMfa")} checked={clientForm.require_mfa} onChange={(value) => setClientForm({ ...clientForm, require_mfa: value })} />
+                    <Check label={t("requirePar")} checked={clientForm.require_pushed_authorization_requests} onChange={(value) => setClientForm({ ...clientForm, require_pushed_authorization_requests: value })} />
+                    <Check label={t("requireConfidentialClient")} checked={clientForm.require_confidential_client} onChange={(value) => setClientForm({ ...clientForm, require_confidential_client: value })} />
+                    <Check label={t("requireDpop")} checked={clientForm.require_dpop} onChange={(value) => setClientForm({ ...clientForm, require_dpop: value })} />
+                    <Check label={t("requireAccountSelection")} checked={clientForm.require_account_selection} onChange={(value) => setClientForm({ ...clientForm, require_account_selection: value })} />
+                    <Check label={t("trustEmailVerified")} checked={clientForm.trust_email_verified} onChange={(value) => setClientForm({ ...clientForm, trust_email_verified: value })} />
+                  </div>
+                </SettingsSection>
+                <SettingsSection title={t("clientExtensions")} description={t("clientExtensionsHint")}>
+                  <Field label={t("jwksUri")} type="url" value={clientForm.jwks_uri} onChange={(value) => setClientForm({ ...clientForm, jwks_uri: value })} />
+                  <Field label={t("jwks")} value={clientForm.jwks} onChange={(value) => setClientForm({ ...clientForm, jwks: value })} textarea />
+                  <Field label={t("authorizationDetailsTypes")} textarea value={clientForm.authorization_details_types} onChange={(value) => setClientForm({ ...clientForm, authorization_details_types: value })} />
+                  <Check label={t("serviceAccount")} checked={clientForm.service_account_enabled} onChange={(value) => setClientForm({ ...clientForm, service_account_enabled: value })} />
+                  {clientForm.service_account_enabled && <Field label={t("serviceAccountPermissions")} textarea value={clientForm.service_account_permissions} onChange={(value) => setClientForm({ ...clientForm, service_account_permissions: value })} />}
+                  <Check label={t("active")} checked={clientForm.is_active} onChange={(value) => setClientForm({ ...clientForm, is_active: value })} />
+                </SettingsSection>
+                <SettingsSection title={t("clientClaims")} description={t("clientClaimsHint")}>
+                  <div className="mapper-list">
+                    <div className="mapper-heading">
+                      <h4>{t("claimMappers")}</h4>
+                      <button type="button" onClick={addClientClaimMapper}>
+                        <Plus size={14} />
+                        {t("addClaimMapper")}
+                      </button>
+                    </div>
+                    {clientForm.claim_mappers.length === 0 && <p className="muted">{t("noData")}</p>}
+                    {clientForm.claim_mappers.map((mapper, index) => (
+                      <div className="mapper-card" key={index}>
+                        <div className="mapper-grid">
+                          <Field label={t("claimName")} value={mapper.claim_name} onChange={(value) => updateClientClaimMapper(index, { claim_name: value })} />
+                          <SelectField label={t("claimSource")} value={mapper.source} onChange={(value) => updateClientClaimMapper(index, { source: value })}>
                             <option value="user_field">{t("userField")}</option>
                             <option value="static">{t("staticValue")}</option>
                             <option value="scope">{t("scopeFlag")}</option>
                             <option value="client">{t("clientField")}</option>
-                        </SelectField>
-                        <Field label={t("sourceValue")} value={mapper.source_value} onChange={(value) => updateClientClaimMapper(index, { source_value: value })} />
-                        <SelectField label={t("valueType")} value={mapper.value_type} onChange={(value) => updateClientClaimMapper(index, { value_type: value })}>
+                          </SelectField>
+                          <Field label={t("sourceValue")} value={mapper.source_value} onChange={(value) => updateClientClaimMapper(index, { source_value: value })} />
+                          <SelectField label={t("valueType")} value={mapper.value_type} onChange={(value) => updateClientClaimMapper(index, { value_type: value })}>
                             <option value="string">string</option>
                             <option value="bool">bool</option>
                             <option value="number">number</option>
                             <option value="json">json</option>
-                        </SelectField>
+                          </SelectField>
+                        </div>
+                        <div className="mapper-targets">
+                          <Check label={t("includeIdToken")} checked={mapper.include_in_id_token} onChange={(value) => updateClientClaimMapper(index, { include_in_id_token: value })} />
+                          <Check label={t("includeAccessToken")} checked={mapper.include_in_access_token} onChange={(value) => updateClientClaimMapper(index, { include_in_access_token: value })} />
+                          <Check label={t("includeUserInfo")} checked={mapper.include_in_userinfo} onChange={(value) => updateClientClaimMapper(index, { include_in_userinfo: value })} />
+                          <Check label={t("active")} checked={mapper.is_active} onChange={(value) => updateClientClaimMapper(index, { is_active: value })} />
+                          <button type="button" onClick={() => removeClientClaimMapper(index)}>
+                            <Trash2 size={14} />
+                            {t("delete")}
+                          </button>
+                        </div>
                       </div>
-                      <div className="mapper-targets">
-                        <Check label={t("includeIdToken")} checked={mapper.include_in_id_token} onChange={(value) => updateClientClaimMapper(index, { include_in_id_token: value })} />
-                        <Check label={t("includeAccessToken")} checked={mapper.include_in_access_token} onChange={(value) => updateClientClaimMapper(index, { include_in_access_token: value })} />
-                        <Check label={t("includeUserInfo")} checked={mapper.include_in_userinfo} onChange={(value) => updateClientClaimMapper(index, { include_in_userinfo: value })} />
-                        <Check label={t("active")} checked={mapper.is_active} onChange={(value) => updateClientClaimMapper(index, { is_active: value })} />
-                        <button type="button" onClick={() => removeClientClaimMapper(index)}>
-                          <Trash2 size={14} />
-                          {t("delete")}
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+                    ))}
+                  </div>
+                </SettingsSection>
+                <FormActions
+                  submitLabel={t("save")}
+                  cancelLabel={t("cancel")}
+                  onCancel={() => closeEditor()}
+                  busy={busy}
+                  dirty={clientDraftIsDirty()}
+                  statusLabel={clientDraftIsDirty() ? t("unsavedChanges") : undefined}
+                  savingLabel={t("saving")}
+                />
               </form>
               </Modal>
             )}
             <div className="client-list oidc-client-list">
-              {canManageClients && <div className="table-toolbar"><button type="button" onClick={() => { setClientForm(emptyClientForm); setEditor("client"); }}><Plus size={14} />{t("createClient")}</button></div>}
+              {canManageClients && <div className="table-toolbar"><button type="button" onClick={() => openClientEditor({ ...emptyClientForm, organization_id: organizationContext?.id ?? "" })}><Plus size={14} />{t("createClient")}</button></div>}
               {filteredClients.map((client) => (
                 <article className="client-card" key={client.id}>
                   <div>
@@ -4204,6 +4903,23 @@ export function App() {
                     <p>{client.client_id} · {client.subject_type} · {client.organization_name ?? t("noOrganization")}</p>
                   </div>
                   <div className="tag-row">{client.scopes.map((scope) => <span key={scope}>{scope}</span>)}</div>
+                  {(() => {
+                    const application = applicationByOidcClientId.get(client.id);
+                    return application ? (
+                      <div className="application-connection-summary">
+                        <span>{t("applicationConnection")}</span>
+                        <strong>{application.name}</strong>
+                        {canManageActiveOrganization && (
+                          <button className="text-button" type="button" onClick={() => navigateToTab("applications")}>
+                            <Link2 size={14} />
+                            {t("openApplicationPolicy")}
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="muted application-connection-summary">{t("applicationConnectionUnlinked")}</p>
+                    );
+                  })()}
                   {client.require_mfa && <div className="tag-row"><span>{t("requireClientMfa")}</span></div>}
                   {(client.require_pushed_authorization_requests || client.require_s256_pkce || client.require_confidential_client || client.require_dpop || client.require_account_selection || client.trust_email_verified) && (
                     <div className="tag-row">
@@ -4235,7 +4951,7 @@ export function App() {
                   <small>{client.redirect_uris.join(", ")}</small>
                   {canManageClients && (
                     <div className="actions client-card-actions">
-                      <button type="button" onClick={() => { setClientForm({
+                      <button type="button" onClick={() => openClientEditor({
                         id: client.id,
                         client_id: client.client_id,
                         client_name: client.client_name,
@@ -4279,9 +4995,7 @@ export function App() {
                           is_active: mapper.is_active,
                           sort_order: mapper.sort_order ?? index
                         }))
-                      });
-                      setEditor("client");
-                      }}>{t("edit")}</button>
+                      })}>{t("edit")}</button>
                       <button className="danger-button" type="button" onClick={() => requestConfirmation(() => deleteClient(client.id))} disabled={busy}>
                         <Trash2 size={14} />
                         {t("delete")}
@@ -4760,15 +5474,27 @@ export function App() {
           </section>
         )}
         {canManageSettings && tab === "registration" && registrationSettings && (
-          <form className="panel narrow" onSubmit={saveRegistrationSettings}>
+          <form className="panel narrow configuration-form" onSubmit={saveRegistrationSettings}>
             <h3>{t("registrationSettings")}</h3>
-            <Check label={t("passwordRegistration")} checked={registrationSettings.allow_password_registration} onChange={(value) => setRegistrationSettings({ ...registrationSettings, allow_password_registration: value })} />
-            <Check label={t("requireEmailVerification")} checked={registrationSettings.require_email_verification} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_email_verification: value })} />
-            <Check label={t("requirePhoneVerification")} checked={registrationSettings.require_phone_verification} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_phone_verification: value })} />
-            <Check label={t("allowExternalOidc")} checked={registrationSettings.allow_external_oidc_registration} onChange={(value) => setRegistrationSettings({ ...registrationSettings, allow_external_oidc_registration: value })} />
-            <Check label={t("requireInvitation")} checked={registrationSettings.require_invitation} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_invitation: value })} />
-            <Check label={t("defaultUserActive")} checked={registrationSettings.default_user_active} onChange={(value) => setRegistrationSettings({ ...registrationSettings, default_user_active: value })} />
-            <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+            <p className="muted">{t("registrationPolicyHint")}</p>
+            <SettingsSection title={t("registrationSettings")} description={t("registrationPolicyHint")} collapsible={false}>
+              <Check label={t("passwordRegistration")} checked={registrationSettings.allow_password_registration} onChange={(value) => setRegistrationSettings({ ...registrationSettings, allow_password_registration: value })} />
+              <Check label={t("requireEmailVerification")} checked={registrationSettings.require_email_verification} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_email_verification: value })} />
+              <Check label={t("requirePhoneVerification")} checked={registrationSettings.require_phone_verification} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_phone_verification: value })} />
+              <Check label={t("allowExternalOidc")} checked={registrationSettings.allow_external_oidc_registration} onChange={(value) => setRegistrationSettings({ ...registrationSettings, allow_external_oidc_registration: value })} />
+              <Check label={t("requireInvitation")} checked={registrationSettings.require_invitation} onChange={(value) => setRegistrationSettings({ ...registrationSettings, require_invitation: value })} />
+            </SettingsSection>
+            <SettingsSection title={t("firstUserAdmin")} description={t("firstUserAdminHint")}>
+              <Check label={t("firstUserAdmin")} checked={registrationSettings.first_user_direct_admin} onChange={(value) => setRegistrationSettings({ ...registrationSettings, first_user_direct_admin: value })} />
+              <Check label={t("defaultUserActive")} checked={registrationSettings.default_user_active} onChange={(value) => setRegistrationSettings({ ...registrationSettings, default_user_active: value })} />
+            </SettingsSection>
+            <FormActions
+              submitLabel={t("save")}
+              busy={busy}
+              dirty={registrationSettingsIsDirty()}
+              statusLabel={registrationSettingsIsDirty() ? t("unsavedChanges") : undefined}
+              savingLabel={t("saving")}
+            />
           </form>
         )}
         {canManageProviders && tab === "providers" && (
@@ -4779,72 +5505,87 @@ export function App() {
                 closeLabel={t("close")}
                 error={error}
                 dismissible={!busy}
-                onClose={() => {
-                  setProviderForm(emptyProviderForm);
-                  setProviderTemplateId("");
-                  closeEditor();
-                }}
+                onClose={closeEditor}
                 wide
               >
                 <form className="panel" onSubmit={saveProvider}>
-              {providerTemplates.length > 0 && (
-                <>
-                  <SelectField label={t("providerTemplate")} value={providerTemplateId} onChange={setProviderTemplateId}>
-                    <option value="">-</option>
-                    {providerTemplates.map((template) => (
-                      <option key={template.id} value={template.id}>{template.display_name}</option>
-                    ))}
-                  </SelectField>
-                  <div className="actions">
-                    <button type="button" onClick={applyProviderTemplate} disabled={busy || !providerTemplateId}>
-                      <Plus size={14} />
-                      {t("applyTemplate")}
-                    </button>
-                  </div>
-                </>
-              )}
-              <Field label={t("slug")} value={providerForm.slug} onChange={(value) => setProviderForm({ ...providerForm, slug: value, redirect_path: providerRedirectPath(value) })} />
-              <Field label={t("displayName")} value={providerForm.display_name} onChange={(value) => setProviderForm({ ...providerForm, display_name: value })} />
-              <SelectField label={t("clientOrganization")} value={providerForm.organization_id} onChange={(value) => setProviderForm({ ...providerForm, organization_id: value })}>
-                <option value="">{t("noOrganization")}</option>
-                {organizationOptions.map((organization) => (
-                  <option key={organization.id} value={organization.id}>
-                    {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
-                  </option>
-                ))}
-              </SelectField>
-              <Field label={t("issuer")} value={providerForm.issuer} onChange={(value) => setProviderForm({ ...providerForm, issuer: value })} />
-              <div className="actions">
-                <button type="button" onClick={() => void discoverProviderEndpoints()} disabled={busy || !providerForm.issuer.trim()}>
-                  <RefreshCw size={14} />
-                  {t("discoverProvider")}
-                </button>
-              </div>
-              <Field label={t("clientId")} value={providerForm.client_id} onChange={(value) => setProviderForm({ ...providerForm, client_id: value })} />
-              <Field
-                label={t("clientSecret")}
-                type="password"
-                value={providerForm.client_secret}
-                onChange={(value) => setProviderForm({ ...providerForm, client_secret: value, clear_client_secret: false })}
-                description={providerForm.id ? t("secretLeaveBlank") : undefined}
-              />
-              {providerForm.id && (
-                <Check
-                  label={t("clearClientSecret")}
-                  checked={providerForm.clear_client_secret}
-                  onChange={(value) => setProviderForm({ ...providerForm, clear_client_secret: value, client_secret: value ? "" : providerForm.client_secret })}
-                />
-              )}
-              <Field label={t("authorizationEndpoint")} value={providerForm.authorization_endpoint} onChange={(value) => setProviderForm({ ...providerForm, authorization_endpoint: value })} />
-              <Field label={t("tokenEndpoint")} value={providerForm.token_endpoint} onChange={(value) => setProviderForm({ ...providerForm, token_endpoint: value })} />
-              <Field label={t("userinfoEndpoint")} value={providerForm.userinfo_endpoint} onChange={(value) => setProviderForm({ ...providerForm, userinfo_endpoint: value })} />
-              <Field label={t("redirectPath")} value={providerForm.redirect_path} onChange={(value) => setProviderForm({ ...providerForm, redirect_path: value })} />
-              <Field label={t("scopes")} value={providerForm.scopes} onChange={(value) => setProviderForm({ ...providerForm, scopes: value })} />
-              <Field label={t("providerEmailDomains")} value={providerForm.email_domains} onChange={(value) => setProviderForm({ ...providerForm, email_domains: value })} textarea />
-              <Check label={t("active")} checked={providerForm.is_active} onChange={(value) => setProviderForm({ ...providerForm, is_active: value })} />
-              <Check label={t("allowLogin")} checked={providerForm.allow_login} onChange={(value) => setProviderForm({ ...providerForm, allow_login: value })} />
-              <Check label={t("allowRegistration")} checked={providerForm.allow_registration} onChange={(value) => setProviderForm({ ...providerForm, allow_registration: value })} />
-              <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+                  <SettingsSection title={t("providerBasics")} description={t("providerBasicsHint")} collapsible={false}>
+                    {providerTemplates.length > 0 && (
+                      <>
+                        <SelectField label={t("providerTemplate")} value={providerTemplateId} onChange={setProviderTemplateId}>
+                          <option value="">-</option>
+                          {providerTemplates.map((template) => (
+                            <option key={template.id} value={template.id}>{template.display_name}</option>
+                          ))}
+                        </SelectField>
+                        <div className="actions">
+                          <button type="button" onClick={applyProviderTemplate} disabled={busy || !providerTemplateId}>
+                            <Plus size={14} />
+                            {t("applyTemplate")}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    <Field label={t("slug")} value={providerForm.slug} onChange={(value) => setProviderForm({ ...providerForm, slug: value, redirect_path: providerRedirectPath(value) })} />
+                    <Field label={t("displayName")} value={providerForm.display_name} onChange={(value) => setProviderForm({ ...providerForm, display_name: value })} />
+                    {canManagePlatformProviders && (
+                      <SelectField label={t("clientOrganization")} value={providerForm.organization_id} onChange={(value) => setProviderForm({ ...providerForm, organization_id: value })}>
+                        <option value="">{t("noOrganization")}</option>
+                        {organizationOptions.map((organization) => (
+                          <option key={organization.id} value={organization.id}>
+                            {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
+                          </option>
+                        ))}
+                      </SelectField>
+                    )}
+                  </SettingsSection>
+                  <SettingsSection title={t("providerConnection")} description={t("providerConnectionHint")}>
+                    <Field label={t("issuer")} type="url" value={providerForm.issuer} onChange={(value) => setProviderForm({ ...providerForm, issuer: value })} />
+                    <div className="actions">
+                      <button type="button" onClick={() => void discoverProviderEndpoints()} disabled={busy || !providerForm.issuer.trim()}>
+                        <RefreshCw size={14} />
+                        {t("discoverProvider")}
+                      </button>
+                    </div>
+                    <Field label={t("clientId")} value={providerForm.client_id} onChange={(value) => setProviderForm({ ...providerForm, client_id: value })} />
+                    <SecretField
+                      label={t("clientSecret")}
+                      value={providerForm.client_secret}
+                      onChange={(value) => setProviderForm({ ...providerForm, client_secret: value, clear_client_secret: false })}
+                      description={providerForm.id ? t("secretLeaveBlank") : undefined}
+                      revealLabel={t("revealSecret")}
+                      hideLabel={t("hideSecret")}
+                    />
+                    {providerForm.id && (
+                      <Check
+                        label={t("clearClientSecret")}
+                        checked={providerForm.clear_client_secret}
+                        onChange={(value) => setProviderForm({ ...providerForm, clear_client_secret: value, client_secret: value ? "" : providerForm.client_secret })}
+                      />
+                    )}
+                    <div className="form-grid-2">
+                      <Field label={t("authorizationEndpoint")} type="url" value={providerForm.authorization_endpoint} onChange={(value) => setProviderForm({ ...providerForm, authorization_endpoint: value })} />
+                      <Field label={t("tokenEndpoint")} type="url" value={providerForm.token_endpoint} onChange={(value) => setProviderForm({ ...providerForm, token_endpoint: value })} />
+                      <Field label={t("userinfoEndpoint")} type="url" value={providerForm.userinfo_endpoint} onChange={(value) => setProviderForm({ ...providerForm, userinfo_endpoint: value })} />
+                      <Field label={t("redirectPath")} value={providerForm.redirect_path} onChange={(value) => setProviderForm({ ...providerForm, redirect_path: value })} />
+                    </div>
+                    <Field label={t("scopes")} value={providerForm.scopes} onChange={(value) => setProviderForm({ ...providerForm, scopes: value })} />
+                    <Field label={t("providerEmailDomains")} value={providerForm.email_domains} onChange={(value) => setProviderForm({ ...providerForm, email_domains: value })} textarea />
+                  </SettingsSection>
+                  <SettingsSection title={t("providerAccess")} description={t("providerAccessHint")}>
+                    <Check label={t("active")} checked={providerForm.is_active} onChange={(value) => setProviderForm({ ...providerForm, is_active: value })} />
+                    <Check label={t("allowLogin")} checked={providerForm.allow_login} onChange={(value) => setProviderForm({ ...providerForm, allow_login: value })} />
+                    <Check label={t("allowRegistration")} checked={providerForm.allow_registration} onChange={(value) => setProviderForm({ ...providerForm, allow_registration: value })} />
+                  </SettingsSection>
+                  <FormActions
+                    submitLabel={t("save")}
+                    cancelLabel={t("cancel")}
+                    onCancel={closeEditor}
+                    busy={busy}
+                    dirty={providerFormIsDirty()}
+                    statusLabel={providerFormIsDirty() ? t("unsavedChanges") : undefined}
+                    savingLabel={t("saving")}
+                  />
                 </form>
               </Modal>
             )}
@@ -4856,6 +5597,7 @@ export function App() {
                 </div>
                 <button type="button" onClick={() => {
                   setProviderForm(emptyProviderForm);
+                  setProviderFormBaseline(emptyProviderForm);
                   setProviderTemplateId("");
                   setEditor("provider");
                 }}><Plus size={14} />{t("createProvider")}</button>
@@ -4864,7 +5606,8 @@ export function App() {
               {filteredProviders.map((provider) => (
                 <article className="client-card" key={provider.id}>
                   {(() => {
-                    const organization = organizationOptions.find((item) => item.id === provider.organization_id);
+                    const organization = organizationOptions.find((item) => item.id === provider.organization_id)
+                      ?? (provider.organization_id === organizationContext?.id ? organizationContext : undefined);
                     return (
                       <>
                   <h3>{provider.display_name}</h3>
@@ -4881,7 +5624,7 @@ export function App() {
                   </div>
                   <div className="actions">
                     <button type="button" onClick={() => {
-                      setProviderForm({
+                      const nextForm = {
                         id: provider.id,
                         slug: provider.slug,
                         display_name: provider.display_name,
@@ -4899,7 +5642,9 @@ export function App() {
                         is_active: provider.is_active,
                         allow_login: provider.allow_login,
                         allow_registration: provider.allow_registration
-                      });
+                      };
+                      setProviderForm(nextForm);
+                      setProviderFormBaseline(nextForm);
                       setProviderTemplateId("");
                       setEditor("provider");
                     }}>{t("edit")}</button>
@@ -4913,47 +5658,74 @@ export function App() {
               {filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
               </div>
             </section>
-            {editor === "ldap" && (
+            {canManagePlatformProviders && editor === "ldap" && (
               <Modal
                 title={ldapProviderForm.id ? t("updateLdapProvider") : t("createLdapProvider")}
                 closeLabel={t("close")}
                 error={error}
                 dismissible={!busy}
-                onClose={() => {
-                  setLdapProviderForm(emptyLdapProviderForm);
-                  closeEditor();
-                }}
+                onClose={closeEditor}
                 wide
               >
                 <form className="panel" onSubmit={saveLdapProvider}>
-              <Field label={t("slug")} value={ldapProviderForm.slug} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, slug: value })} />
-              <Field label={t("displayName")} value={ldapProviderForm.display_name} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, display_name: value })} />
-              <Field label={t("ldapUrl")} value={ldapProviderForm.url} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, url: value })} />
-              <Check label={t("startTls")} checked={ldapProviderForm.starttls} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, starttls: value })} />
-              <Field label={t("bindDn")} value={ldapProviderForm.bind_dn} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, bind_dn: value })} />
-              <Field label={t("bindPassword")} type="password" value={ldapProviderForm.bind_password} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, bind_password: value })} />
-              {ldapProviderForm.id && (
-                <Check label={t("clearBindPassword")} checked={ldapProviderForm.clear_bind_password} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, clear_bind_password: value })} />
-              )}
-              <Field label={t("baseDn")} value={ldapProviderForm.base_dn} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, base_dn: value })} />
-              <Field label={t("ldapUserFilter")} value={ldapProviderForm.user_filter} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, user_filter: value })} textarea />
-              <Field label={t("userIdAttribute")} value={ldapProviderForm.user_id_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, user_id_attribute: value })} />
-              <Field label={t("emailAttribute")} value={ldapProviderForm.email_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, email_attribute: value })} />
-              <Field label={t("usernameAttribute")} value={ldapProviderForm.username_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, username_attribute: value })} />
-              <Field label={t("displayNameAttribute")} value={ldapProviderForm.display_name_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, display_name_attribute: value })} />
-              <Field label={t("phoneAttribute")} value={ldapProviderForm.phone_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, phone_attribute: value })} />
-              <Check label={t("active")} checked={ldapProviderForm.is_active} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, is_active: value })} />
-              <Check label={t("allowLogin")} checked={ldapProviderForm.allow_login} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, allow_login: value })} />
-              <Check label={t("allowRegistration")} checked={ldapProviderForm.allow_registration} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, allow_registration: value })} />
-              <div className="actions">
-                <button type="submit" className="primary" disabled={busy}><Save size={16} />{t("save")}</button>
-                {ldapProviderForm.id && (
-                  <button type="button" onClick={() => setLdapProviderForm(emptyLdapProviderForm)}>{t("clear")}</button>
-                )}
-              </div>
+                  <SettingsSection title={t("providerBasics")} description={t("providerBasicsHint")} collapsible={false}>
+                    <Field label={t("slug")} value={ldapProviderForm.slug} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, slug: value })} />
+                    <Field label={t("displayName")} value={ldapProviderForm.display_name} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, display_name: value })} />
+                    {canManagePlatformProviders && (
+                      <SelectField label={t("clientOrganization")} value={ldapProviderForm.organization_id} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, organization_id: value })}>
+                        <option value="">{t("noOrganization")}</option>
+                        {organizationOptions.map((organization) => (
+                          <option key={organization.id} value={organization.id}>
+                            {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
+                          </option>
+                        ))}
+                      </SelectField>
+                    )}
+                  </SettingsSection>
+                  <SettingsSection title={t("directoryConnection")} description={t("directoryConnectionHint")}>
+                    <Field label={t("ldapUrl")} value={ldapProviderForm.url} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, url: value })} />
+                    <Check label={t("startTls")} checked={ldapProviderForm.starttls} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, starttls: value })} />
+                    <Field label={t("bindDn")} value={ldapProviderForm.bind_dn} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, bind_dn: value })} />
+                    <SecretField
+                      label={t("bindPassword")}
+                      value={ldapProviderForm.bind_password}
+                      onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, bind_password: value })}
+                      revealLabel={t("revealSecret")}
+                      hideLabel={t("hideSecret")}
+                    />
+                    {ldapProviderForm.id && (
+                      <Check label={t("clearBindPassword")} checked={ldapProviderForm.clear_bind_password} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, clear_bind_password: value })} />
+                    )}
+                    <Field label={t("baseDn")} value={ldapProviderForm.base_dn} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, base_dn: value })} />
+                    <Field label={t("ldapUserFilter")} value={ldapProviderForm.user_filter} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, user_filter: value })} textarea />
+                  </SettingsSection>
+                  <SettingsSection title={t("directoryMapping")} description={t("directoryMappingHint")}>
+                    <div className="form-grid-2">
+                      <Field label={t("userIdAttribute")} value={ldapProviderForm.user_id_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, user_id_attribute: value })} />
+                      <Field label={t("emailAttribute")} value={ldapProviderForm.email_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, email_attribute: value })} />
+                      <Field label={t("usernameAttribute")} value={ldapProviderForm.username_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, username_attribute: value })} />
+                      <Field label={t("displayNameAttribute")} value={ldapProviderForm.display_name_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, display_name_attribute: value })} />
+                      <Field label={t("phoneAttribute")} value={ldapProviderForm.phone_attribute} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, phone_attribute: value })} />
+                    </div>
+                  </SettingsSection>
+                  <SettingsSection title={t("providerAccess")} description={t("providerAccessHint")}>
+                    <Check label={t("active")} checked={ldapProviderForm.is_active} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, is_active: value })} />
+                    <Check label={t("allowLogin")} checked={ldapProviderForm.allow_login} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, allow_login: value })} />
+                    <Check label={t("allowRegistration")} checked={ldapProviderForm.allow_registration} onChange={(value) => setLdapProviderForm({ ...ldapProviderForm, allow_registration: value })} />
+                  </SettingsSection>
+                  <FormActions
+                    submitLabel={t("save")}
+                    cancelLabel={t("cancel")}
+                    onCancel={closeEditor}
+                    busy={busy}
+                    dirty={ldapProviderFormIsDirty()}
+                    statusLabel={ldapProviderFormIsDirty() ? t("unsavedChanges") : undefined}
+                    savingLabel={t("saving")}
+                  />
                 </form>
               </Modal>
             )}
+            {canManagePlatformProviders && (
             <section className="identity-source-section">
               <div className="table-toolbar identity-source-toolbar">
                 <div>
@@ -4962,6 +5734,7 @@ export function App() {
                 </div>
                 <button type="button" onClick={() => {
                   setLdapProviderForm(emptyLdapProviderForm);
+                  setLdapProviderFormBaseline(emptyLdapProviderForm);
                   setEditor("ldap");
                 }}><Plus size={14} />{t("createLdapProvider")}</button>
               </div>
@@ -4992,26 +5765,36 @@ export function App() {
               {filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
             </div>
           </section>
+            )}
           </section>
         )}
         {canManageSettings && tab === "portal" && loginSettings && (
           <section className="split wide">
-            <form className="panel" onSubmit={saveLoginSettings}>
+            <form className="panel configuration-form" onSubmit={saveLoginSettings}>
               <h3>{t("loginSettings")}</h3>
-              <Field
-                label={t("brandLogoUrl")}
-                type="url"
-                autoComplete="url"
-                value={loginSettingsDraft.brand_logo_url}
-                onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, brand_logo_url: value })}
+              <p className="muted">{t("loginSettingsHint")}</p>
+              <SettingsSection title={t("loginSettings")} description={t("loginSettingsHint")} collapsible={false}>
+                <Field
+                  label={t("brandLogoUrl")}
+                  type="url"
+                  autoComplete="url"
+                  value={loginSettingsDraft.brand_logo_url}
+                  onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, brand_logo_url: value })}
+                />
+                <Field
+                  label={t("companyEmailDomains")}
+                  textarea
+                  value={loginSettingsDraft.email_domains}
+                  onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, email_domains: value })}
+                />
+              </SettingsSection>
+              <FormActions
+                submitLabel={t("save")}
+                busy={busy}
+                dirty={loginSettingsIsDirty()}
+                statusLabel={loginSettingsIsDirty() ? t("unsavedChanges") : undefined}
+                savingLabel={t("saving")}
               />
-              <Field
-                label={t("companyEmailDomains")}
-                textarea
-                value={loginSettingsDraft.email_domains}
-                onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, email_domains: value })}
-              />
-              <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
             </form>
             <form
               className="table-panel"
@@ -5021,18 +5804,20 @@ export function App() {
               }}
             >
               <h3>{quickLinkForm.id ? t("updateQuickLink") : t("createQuickLink")}</h3>
-              <Field label={t("linkLabel")} value={quickLinkForm.label} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, label: value })} />
-              <Field label={t("linkUrl")} value={quickLinkForm.url} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, url: value })} />
-              <Check label={t("active")} checked={quickLinkForm.is_active} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, is_active: value })} />
-              <div className="actions">
-                <button type="submit" disabled={busy}>
-                  <Plus size={14} />
-                  {quickLinkForm.id ? t("save") : t("create")}
-                </button>
-                {quickLinkForm.id && (
-                  <button type="button" onClick={() => setQuickLinkForm(emptyQuickLinkForm)} disabled={busy}>{t("refresh")}</button>
-                )}
-              </div>
+              <SettingsSection title={t("quickLinks")} description={t("loginSettingsHint")} collapsible={false}>
+                <Field label={t("linkLabel")} value={quickLinkForm.label} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, label: value })} />
+                <Field label={t("linkUrl")} type="url" value={quickLinkForm.url} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, url: value })} />
+                <Check label={t("active")} checked={quickLinkForm.is_active} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, is_active: value })} />
+                <div className="actions">
+                  <button type="submit" disabled={busy}>
+                    <Plus size={14} />
+                    {quickLinkForm.id ? t("save") : t("create")}
+                  </button>
+                  {quickLinkForm.id && (
+                    <button type="button" onClick={() => setQuickLinkForm(emptyQuickLinkForm)} disabled={busy}>{t("refresh")}</button>
+                  )}
+                </div>
+              </SettingsSection>
               <table>
                 <thead><tr><th>{t("linkLabel")}</th><th>{t("linkUrl")}</th><th>{t("status")}</th><th></th></tr></thead>
                 <tbody>
@@ -5144,7 +5929,9 @@ export function App() {
                           <p>{t("passwordPolicy")} · {t("accessRiskRules")}</p>
                         </div>
                       </div>
-                      <button className="primary compact-action security-policy-save" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
+                      <span className="security-policy-status" aria-live="polite">
+                        {securityPolicyIsDirty() ? t("unsavedChanges") : t("changesSaved")}
+                      </span>
                     </div>
                     <div className="security-policy-sections">
                       <section className="security-policy-section" aria-labelledby="security-password-policy-heading">
@@ -5214,11 +6001,12 @@ export function App() {
                       <section className="security-policy-section security-policy-section-wide" aria-labelledby="security-trusted-networks-heading">
                         <h4 id="security-trusted-networks-heading">{t("trustedNetworks")}</h4>
                         <div className="security-network-grid">
-                          <Field
+                          <ListField
                             label={t("trustedIpCidrs")}
-                            textarea
-                            value={securityPolicy.trusted_ip_cidrs.join("\n")}
+                            value={joinList(securityPolicy.trusted_ip_cidrs)}
                             onChange={(value) => setSecurityPolicy({ ...securityPolicy, trusted_ip_cidrs: splitList(value) })}
+                            addLabel={t("addItem")}
+                            removeLabel={t("removeItem")}
                           />
                           <div className="security-network-option">
                             <Check
@@ -5233,36 +6021,45 @@ export function App() {
                       <section className="security-policy-section security-policy-section-wide" aria-labelledby="security-risk-rules-heading">
                         <h4 id="security-risk-rules-heading">{t("accessRiskRules")}</h4>
                         <div className="security-risk-grid">
-                          <Field
+                          <ListField
                             label={t("allowedIpCidrs")}
-                            textarea
-                            value={securityPolicy.allowed_ip_cidrs.join("\n")}
+                            value={joinList(securityPolicy.allowed_ip_cidrs)}
                             onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_ip_cidrs: splitList(value) })}
+                            addLabel={t("addItem")}
+                            removeLabel={t("removeItem")}
                           />
-                          <Field
+                          <ListField
                             label={t("blockedIpCidrs")}
-                            textarea
-                            value={securityPolicy.blocked_ip_cidrs.join("\n")}
+                            value={joinList(securityPolicy.blocked_ip_cidrs)}
                             onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_ip_cidrs: splitList(value) })}
+                            addLabel={t("addItem")}
+                            removeLabel={t("removeItem")}
                           />
-                          <Field
+                          <ListField
                             label={t("allowedEmailDomains")}
-                            textarea
-                            value={securityPolicy.allowed_email_domains.join("\n")}
+                            value={joinList(securityPolicy.allowed_email_domains)}
                             onChange={(value) => setSecurityPolicy({ ...securityPolicy, allowed_email_domains: splitList(value).map(normalizeDomain) })}
+                            addLabel={t("addItem")}
+                            removeLabel={t("removeItem")}
                           />
-                          <Field
+                          <ListField
                             label={t("blockedEmailDomains")}
-                            textarea
-                            value={securityPolicy.blocked_email_domains.join("\n")}
+                            value={joinList(securityPolicy.blocked_email_domains)}
                             onChange={(value) => setSecurityPolicy({ ...securityPolicy, blocked_email_domains: splitList(value).map(normalizeDomain) })}
+                            addLabel={t("addItem")}
+                            removeLabel={t("removeItem")}
                           />
                         </div>
                       </section>
                     </div>
-                    <div className="security-form-footer">
-                      <button className="primary compact-action" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
-                    </div>
+                    <FormActions
+                      className="security-form-actions"
+                      submitLabel={t("save")}
+                      busy={busy}
+                      dirty={securityPolicyIsDirty()}
+                      statusLabel={securityPolicyIsDirty() ? t("unsavedChanges") : undefined}
+                      savingLabel={t("saving")}
+                    />
                   </form>
                 )}
 
@@ -5420,26 +6217,49 @@ export function App() {
               {canManageSecurity && (
                 <form className="panel security-webhook-form" onSubmit={saveAuditWebhook}>
                   <h3>{auditWebhookForm.id ? t("updateAuditWebhook") : t("createAuditWebhook")}</h3>
-                  <Field label={t("webhookName")} value={auditWebhookForm.name} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, name: value })} />
-                  <Field label={t("webhookUrl")} value={auditWebhookForm.url} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, url: value })} />
-                  <Field label={t("webhookSecret")} type="password" value={auditWebhookForm.secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, secret: value })} />
-                  {auditWebhookForm.id && (
-                    <Check label={t("clearWebhookSecret")} checked={auditWebhookForm.clear_secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, clear_secret: value })} />
-                  )}
-                  <Field label={t("webhookActions")} value={auditWebhookForm.actions} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, actions: value })} textarea />
-                  <Field
-                    label={t("webhookTimeout")}
-                    type="number"
-                    value={String(auditWebhookForm.timeout_seconds)}
-                    onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, timeout_seconds: Number(value) })}
-                  />
-                  <Check label={t("active")} checked={auditWebhookForm.is_active} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, is_active: value })} />
-                  <div className="actions">
-                    <button className="security-action-primary" type="submit" disabled={busy}><Save size={14} />{auditWebhookForm.id ? t("save") : t("create")}</button>
+                  <SettingsSection title={t("providerBasics")} description={t("auditWebhooks")} collapsible={false}>
+                    <Field label={t("webhookName")} value={auditWebhookForm.name} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, name: value })} />
+                    <Field label={t("webhookUrl")} type="url" value={auditWebhookForm.url} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, url: value })} />
+                    <SecretField
+                      label={t("webhookSecret")}
+                      value={auditWebhookForm.secret}
+                      onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, secret: value, clear_secret: false })}
+                      description={auditWebhookForm.id ? t("secretLeaveBlank") : undefined}
+                      revealLabel={t("revealSecret")}
+                      hideLabel={t("hideSecret")}
+                    />
                     {auditWebhookForm.id && (
-                      <button type="button" onClick={() => setAuditWebhookForm(emptyAuditWebhookForm)}>{t("clear")}</button>
+                      <Check label={t("clearWebhookSecret")} checked={auditWebhookForm.clear_secret} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, clear_secret: value, secret: value ? "" : auditWebhookForm.secret })} />
                     )}
-                  </div>
+                  </SettingsSection>
+                  <SettingsSection title={t("webhookActions")} description={t("webhookActions")}>
+                    <ListField
+                      label={t("webhookActions")}
+                      value={auditWebhookForm.actions}
+                      onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, actions: value })}
+                      addLabel={t("addItem")}
+                      removeLabel={t("removeItem")}
+                    />
+                    <Field
+                      label={t("webhookTimeout")}
+                      type="number"
+                      value={String(auditWebhookForm.timeout_seconds)}
+                      onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, timeout_seconds: Number(value) })}
+                    />
+                    <Check label={t("active")} checked={auditWebhookForm.is_active} onChange={(value) => setAuditWebhookForm({ ...auditWebhookForm, is_active: value })} />
+                  </SettingsSection>
+                  <FormActions
+                    submitLabel={auditWebhookForm.id ? t("save") : t("create")}
+                    busy={busy}
+                    dirty={auditWebhookFormIsDirty()}
+                    statusLabel={auditWebhookFormIsDirty() ? t("unsavedChanges") : undefined}
+                    savingLabel={t("saving")}
+                    cancelLabel={auditWebhookForm.id ? t("clear") : undefined}
+                    onCancel={auditWebhookForm.id ? () => {
+                      setAuditWebhookForm(emptyAuditWebhookForm);
+                      setAuditWebhookFormBaseline(emptyAuditWebhookForm);
+                    } : undefined}
+                  />
                 </form>
               )}
               {(canReadAudit || canManageSecurity) && (
@@ -5510,24 +6330,60 @@ export function App() {
         )}
         {canManageSettings && tab === "settings" && settings && runtimeSettings && (
           <section className="split wide">
-            <form className="panel" onSubmit={saveRuntimeSettings}>
+            <form className="panel configuration-form" onSubmit={saveRuntimeSettings}>
               <h3>{t("runtimeSettings")}</h3>
-              <Field label={t("publicBaseUrl")} value={runtimeSettings.public_base_url} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, public_base_url: value })} />
-              <Field label={t("issuer")} value={runtimeSettings.issuer} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, issuer: value })} />
-              <Check label={t("trustProxyHeaders")} checked={runtimeSettings.trust_proxy_headers} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, trust_proxy_headers: value })} />
-              <div className="info">
-                <strong>{t("effectivePublicBaseUrl")}:</strong> {runtimeSettings.effective_public_base_url}<br />
-                <strong>{t("effectiveIssuer")}:</strong> {runtimeSettings.effective_issuer}
-              </div>
-              <button className="primary" type="submit" disabled={busy}><Save size={16} />{t("save")}</button>
-            </form>
-            <div className="settings-grid">
-              {Object.entries(settings).map(([key, value]) => (
-                <div className="setting-row" key={key}>
-                  <span>{key}</span>
-                  <strong>{Array.isArray(value) ? value.join(", ") : String(value)}</strong>
+              <p className="muted">{t("runtimeSettingsHint")}</p>
+              <SettingsSection title={t("runtimeSettings")} description={t("runtimeSettingsHint")} collapsible={false}>
+                <Field label={t("publicBaseUrl")} type="url" value={runtimeSettings.public_base_url} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, public_base_url: value })} required />
+                <Field label={t("issuer")} type="url" value={runtimeSettings.issuer} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, issuer: value })} />
+                <Check label={t("trustProxyHeaders")} checked={runtimeSettings.trust_proxy_headers} onChange={(value) => setRuntimeSettings({ ...runtimeSettings, trust_proxy_headers: value })} />
+                <div className="info">
+                  <strong>{t("effectivePublicBaseUrl")}:</strong> {runtimeSettings.effective_public_base_url}<br />
+                  <strong>{t("effectiveIssuer")}:</strong> {runtimeSettings.effective_issuer}
                 </div>
-              ))}
+              </SettingsSection>
+              <FormActions
+                submitLabel={t("save")}
+                busy={busy}
+                dirty={runtimeSettingsIsDirty()}
+                statusLabel={runtimeSettingsIsDirty() ? t("unsavedChanges") : undefined}
+                savingLabel={t("saving")}
+              />
+            </form>
+            <div className="panel diagnostics-panel">
+              <h3>{t("diagnostics")}</h3>
+              <p className="muted">{t("diagnosticsHint")}</p>
+              <SettingsSection title={t("diagnosticsRuntime")} collapsible={false}>
+                <div className="settings-grid diagnostics-grid">
+                  <div className="setting-row"><span>{t("effectivePublicBaseUrl")}</span><strong>{runtimeSettings.effective_public_base_url}</strong></div>
+                  <div className="setting-row"><span>{t("effectiveIssuer")}</span><strong>{runtimeSettings.effective_issuer}</strong></div>
+                  <div className="setting-row"><span>{t("publicBaseUrl")}</span><strong>{settings.runtime_public_base_url}</strong></div>
+                  <div className="setting-row"><span>{t("trustProxyHeaders")}</span><strong>{formatDiagnosticValue(settings.runtime_trust_proxy_headers, t)}</strong></div>
+                </div>
+              </SettingsSection>
+              <SettingsSection title={t("diagnosticsOidc")}>
+                <div className="settings-grid diagnostics-grid">
+                  <div className="setting-row"><span>{t("issuer")}</span><strong>{settings.config_issuer}</strong></div>
+                  <div className="setting-row"><span>{t("scopes")}</span><strong>{formatDiagnosticValue(settings.supported_scopes, t)}</strong></div>
+                  <div className="setting-row"><span>{t("accessTokenTtl")}</span><strong>{settings.access_token_ttl_seconds}s</strong></div>
+                  <div className="setting-row"><span>{t("idTokenTtl")}</span><strong>{settings.id_token_ttl_seconds}s</strong></div>
+                  <div className="setting-row"><span>{t("refreshTokenTtl")}</span><strong>{settings.refresh_token_ttl_seconds}s</strong></div>
+                </div>
+              </SettingsSection>
+              <SettingsSection title={t("diagnosticsStorage")}>
+                <div className="settings-grid diagnostics-grid">
+                  <div className="setting-row"><span>{t("database")}</span><strong>{settings.database_kind}</strong></div>
+                  <div className="setting-row"><span>{t("databasePoolSize")}</span><strong>{settings.database_pool_size}</strong></div>
+                  <div className="setting-row"><span>{t("runMigrations")}</span><strong>{formatDiagnosticValue(settings.run_migrations, t)}</strong></div>
+                </div>
+              </SettingsSection>
+              <SettingsSection title={t("diagnosticsSecurity")}>
+                <div className="settings-grid diagnostics-grid">
+                  <div className="setting-row"><span>{t("cookieSecure")}</span><strong>{formatDiagnosticValue(settings.cookie_secure, t)}</strong></div>
+                  <div className="setting-row"><span>{t("cookieSameSite")}</span><strong>{settings.cookie_same_site}</strong></div>
+                  <div className="setting-row"><span>{t("corsAllowedOrigins")}</span><strong>{formatDiagnosticValue(settings.cors_allowed_origins, t)}</strong></div>
+                </div>
+              </SettingsSection>
             </div>
           </section>
         )}

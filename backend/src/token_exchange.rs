@@ -123,9 +123,15 @@ pub async fn exchange_token(
     policy.assert_target(client)?;
     let issuers = state.accepted_issuers(headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
+    // RFC 8693 permits exchanging a token that was issued for another
+    // resource. The target policy above is intentionally stricter: this
+    // endpoint can only mint a token for the authenticated OAuth client.
+    // Keeping the issuer-level verification in a named JWT API makes that
+    // cross-resource decision explicit instead of looking like an accidental
+    // audience bypass.
     let subject_claims = state
         .jwt
-        .verify_access_token_with_issuers(&input.subject_token, &issuer_refs)
+        .verify_access_token_for_token_exchange(&input.subject_token, &issuer_refs)
         .map_err(|_| oauth_error("invalid_grant", "subject_token is invalid"))?;
     if subject_claims.sub == subject_claims.client_id {
         return Err(oauth_error(
@@ -152,12 +158,16 @@ pub async fn exchange_token(
         },
         ClaimOutputTarget::AccessToken,
     )?;
+    let target_audience = input
+        .audience
+        .as_deref()
+        .unwrap_or(client.client_id.as_str());
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         issuer,
         TokenSubject {
             user: &user,
             client_id: &client.client_id,
-            audience: None,
+            audience: Some(target_audience),
             scope: &scope,
             nonce: None,
             auth_time: subject_claims.auth_time,
@@ -174,6 +184,7 @@ pub async fn exchange_token(
             serde_json::json!({
                 "subject_client_id": subject_claims.client_id,
                 "subject": subject_claims.sub,
+                "audience": target_audience,
                 "scope": scope,
             }),
         ))

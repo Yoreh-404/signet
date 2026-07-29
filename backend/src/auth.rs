@@ -681,7 +681,9 @@ pub async fn bearer_user_claims(
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
     let claims = state
         .jwt
-        .verify_access_token_with_issuers(token, &issuer_refs)?;
+        // This legacy helper has no resource context. Resource-bearing
+        // endpoints must use the audience-aware JWT API instead.
+        .verify_access_token_for_generic_bearer(token, &issuer_refs)?;
     if claims.cnf.is_some() {
         return Err(AppError::Unauthorized);
     }

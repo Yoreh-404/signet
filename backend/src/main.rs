@@ -10,6 +10,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let settings = Settings::load()?;
+    if settings.security.disable_csrf_origin_check {
+        tracing::warn!(
+            "CSRF Origin/Referer verification is disabled; use this setting only for local testing"
+        );
+    }
     let db = Db::connect(&settings)?;
     if settings.database.run_migrations {
         db.migrate().await?;

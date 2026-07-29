@@ -1,16 +1,17 @@
 use crate::{
-    AppState,
+    AppState, applications,
     audit::{self, AuditOutcome, AuditSink},
-    auth,
+    auth, authorization,
     config::VerificationChannelSettings,
     db::{
-        AdminLoginCodeRedemptionInput, AuthorizationCodeType, ExternalOidcProviderRecord,
-        InvitationRecord, LoginCodeLevel, NewTrialEnrollmentUser, NewUser, NewVerificationCode,
-        PublicExternalOidcProvider, PublicLoginSettings, PublicRegistrationSettings,
-        VerificationCodeClaim,
+        AdminLoginCodeRedemptionInput, ApplicationRecord, AuthorizationCodeType,
+        ExternalOidcProviderRecord, InvitationRecord, LoginCodeLevel, NewTrialEnrollmentUser,
+        NewUser, NewVerificationCode, PublicExternalOidcProvider, PublicLoginSettings,
+        PublicRegistrationSettings, VerificationCodeClaim,
     },
     domain_discovery::EmailDomainRoutable,
     error::{AppError, AppResult},
+    identity_sources,
     network_policy::TrustedNetworkPolicy,
     redirects,
     security_policy::{PasswordPolicy, PasswordSubject},
@@ -24,7 +25,10 @@ use axum::{
     routing::{get, post},
 };
 use axum_extra::extract::cookie::CookieJar;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 use url::Url;
 
@@ -84,14 +88,45 @@ struct PublicDirectorySummary {
     display_name: String,
 }
 
-async fn bootstrap(State(state): State<AppState>) -> AppResult<Json<BootstrapResponse>> {
+#[derive(Debug, Deserialize, Default)]
+struct BootstrapQuery {
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+async fn bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BootstrapQuery>,
+) -> AppResult<Json<BootstrapResponse>> {
     let has_users = state.db.user_count().await? > 0;
     let issuer = state.db.runtime_settings().await?.issuer;
     let settings = state.db.registration_settings().await?.public();
+    let target_application =
+        registration_target_application(&state, &headers, query.return_to.as_deref()).await?;
+    let target_organization_id = target_application
+        .as_ref()
+        .map(|application| application.organization_id.as_str());
     let mut login = state.db.login_settings().await?.public()?;
     login.quick_links.retain(|link| link.is_active);
     let mut providers = Vec::new();
     for provider in state.db.list_external_oidc_providers().await? {
+        if let Some(application) = target_application.as_ref()
+            && !applications::application_login_adapter_enabled(
+                &state,
+                &application.id,
+                &provider.id,
+            )
+            .await?
+        {
+            continue;
+        }
+        if !external_oidc_provider_is_available_to_organization(
+            &provider,
+            target_organization_id.as_deref(),
+        ) {
+            continue;
+        }
         let allow_login = external_oidc_login_available(has_users, provider.allow_login == 1);
         let allow_registration = external_oidc_registration_available(
             has_users,
@@ -109,25 +144,42 @@ async fn bootstrap(State(state): State<AppState>) -> AppResult<Json<BootstrapRes
             });
         }
     }
-    let ldap_providers = state
-        .db
-        .list_ldap_providers()
-        .await?
-        .into_iter()
-        .filter(|provider| {
-            let allow_login = external_oidc_login_available(has_users, provider.allow_login == 1);
-            let allow_registration = external_oidc_registration_available(
-                has_users,
-                settings.allow_external_oidc_registration,
-                provider.allow_registration == 1,
-            );
-            provider.is_active == 1 && (allow_login || allow_registration)
-        })
-        .map(|provider| PublicDirectorySummary {
-            slug: provider.slug,
-            display_name: provider.display_name,
-        })
-        .collect();
+    let mut ldap_providers = Vec::new();
+    for provider in state.db.list_ldap_providers().await? {
+        if provider.is_active != 1 {
+            continue;
+        }
+        if let Some(application) = target_application.as_ref() {
+            // Directory login is an explicit application binding, just like
+            // an external OIDC adapter. The callback path checks this again;
+            // bootstrap must not advertise a source the runtime rejects.
+            if !applications::application_directory_provider_enabled(
+                &state,
+                &application.id,
+                &provider.id,
+            )
+            .await?
+            {
+                continue;
+            }
+        } else if provider.organization_id.is_some() {
+            // Tenant-owned directories are never ambient login choices when
+            // no website application has established the target tenant.
+            continue;
+        }
+        let allow_login = external_oidc_login_available(has_users, provider.allow_login == 1);
+        let allow_registration = external_oidc_registration_available(
+            has_users,
+            settings.allow_external_oidc_registration,
+            provider.allow_registration == 1,
+        );
+        if allow_login || allow_registration {
+            ldap_providers.push(PublicDirectorySummary {
+                slug: provider.slug,
+                display_name: provider.display_name,
+            });
+        }
+    }
     Ok(Json(BootstrapResponse {
         has_users,
         issuer,
@@ -478,6 +530,106 @@ async fn inspect_authorization_code(
     Ok(Json(response))
 }
 
+/// Resolves an OIDC login interaction into the tenant application that owns
+/// its client. `return_to` is validated by the OIDC interaction machinery;
+/// the browser never gets to name an application directly.
+async fn registration_target_application(
+    state: &AppState,
+    headers: &HeaderMap,
+    return_to: Option<&str>,
+) -> AppResult<Option<ApplicationRecord>> {
+    let context =
+        crate::oidc::authorization_login_context_from_return_to(state, headers, return_to).await?;
+    let Some(client) = context.client else {
+        return Ok(None);
+    };
+    state
+        .db
+        .find_application_for_client(&client.id)
+        .await?
+        // An OIDC client must be governed by an application before its login
+        // page can admit a new identity. This is deliberately fail-closed.
+        .ok_or(AppError::Forbidden)
+        .map(Some)
+}
+
+/// New identities are not automatically enterprise members. This makes the
+/// application's registration mode an enforceable admission policy rather
+/// than a management-console hint.
+fn ensure_target_application_allows_new_registration(
+    target: Option<&ApplicationRecord>,
+    authorization: Option<&InvitationRecord>,
+    enrollment_application: Option<&ApplicationRecord>,
+) -> AppResult<()> {
+    let Some(application) = target else {
+        return Ok(());
+    };
+    if application.is_active != 1 {
+        return Err(AppError::Forbidden);
+    }
+    match application.registration_mode.as_str() {
+        crate::applications::REGISTRATION_LEGACY => Ok(()),
+        crate::applications::REGISTRATION_DISABLED => Err(AppError::Forbidden),
+        crate::applications::REGISTRATION_INVITATION => {
+            if enrollment_application.is_some_and(|candidate| candidate.id == application.id) {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden)
+            }
+        }
+        crate::applications::REGISTRATION_ORGANIZATION_MEMBERS => {
+            // For a brand-new identity, the only way to already be an
+            // enterprise member at the authorization boundary is a code that
+            // grants membership in this exact enterprise. Existing active
+            // Signet accounts use the normal application login gate and are
+            // never enrolled into an application-member roster.
+            if authorization
+                .and_then(|code| code.organization_id.as_deref())
+                .is_some_and(|organization_id| organization_id == application.organization_id)
+            {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden)
+            }
+        }
+        _ => Err(AppError::Internal(
+            "application registration mode is invalid".to_string(),
+        )),
+    }
+}
+
+/// External identity sources can be an enterprise's authoritative roster.
+/// They may therefore create a new identity for an
+/// `organization_members` application only when that source belongs to the
+/// same enterprise. Invitation-only applications intentionally require their
+/// own enrollment capability and cannot be bypassed by a federated login.
+fn ensure_target_application_allows_external_oidc_registration(
+    target: Option<&ApplicationRecord>,
+    provider: &ExternalOidcProviderRecord,
+) -> AppResult<()> {
+    let Some(application) = target else {
+        return Ok(());
+    };
+    if application.is_active != 1 {
+        return Err(AppError::Forbidden);
+    }
+    match application.registration_mode.as_str() {
+        crate::applications::REGISTRATION_LEGACY => Ok(()),
+        crate::applications::REGISTRATION_ORGANIZATION_MEMBERS
+            if provider.organization_id.as_deref()
+                == Some(application.organization_id.as_str()) =>
+        {
+            Ok(())
+        }
+        crate::applications::REGISTRATION_DISABLED
+        | crate::applications::REGISTRATION_INVITATION
+        | crate::applications::REGISTRATION_ORGANIZATION_MEMBERS => Err(AppError::Forbidden),
+        _ => Err(AppError::Internal(
+            "application registration mode is invalid".to_string(),
+        )),
+    }
+}
+
 async fn register(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -491,9 +643,23 @@ async fn register(
     let request_ip = state.request_ip(&headers, Some(remote_addr)).await?;
     let authorization_code =
         first_nonempty_code(&payload.authorization_code, &payload.invitation_code);
+    let target_application = if first_user {
+        None
+    } else {
+        registration_target_application(&state, &headers, payload.return_to.as_deref()).await?
+    };
     if !first_user {
         if let Some(code) = authorization_code.as_deref() {
             let authorization = state.db.find_invitation_by_code(code).await?;
+            let enrollment_application = state
+                .db
+                .find_application_for_enrollment_code(&authorization.id)
+                .await?;
+            ensure_target_application_allows_new_registration(
+                target_application.as_ref(),
+                Some(&authorization),
+                enrollment_application.as_ref(),
+            )?;
             return match authorization.authorization_code_type()? {
                 AuthorizationCodeType::Registration => {
                     register_with_registration_authorization_code(
@@ -537,6 +703,7 @@ async fn register(
                 "authorization code is required".to_string(),
             ));
         }
+        ensure_target_application_allows_new_registration(target_application.as_ref(), None, None)?;
     }
     if !first_user && !registration.allow_password_registration {
         return Err(AppError::Forbidden);
@@ -743,6 +910,15 @@ async fn register_with_registration_authorization_code(
     let email_verified = verification_claims
         .iter()
         .any(|claim| claim.channel == "email");
+    // A one-time enterprise invitation is already bound to the exact email
+    // address and is itself an email-possession capability. Avoid forcing the
+    // recipient through a second verification loop before they can join the
+    // enterprise, while leaving ordinary registration-code behavior intact.
+    let invitation_confirms_email = authorization.organization_id.is_some()
+        && authorization
+            .authorized_email
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
     let phone_verified = verification_claims
         .iter()
         .any(|claim| claim.channel == "phone");
@@ -762,7 +938,7 @@ async fn register_with_registration_authorization_code(
                 display_name,
                 phone: phone.clone(),
                 password_hash,
-                email_verified_at: email_verified.then_some(now),
+                email_verified_at: (email_verified || invitation_confirms_email).then_some(now),
                 phone_verified_at: (phone_verified && phone.is_some()).then_some(now),
                 is_admin: false,
                 is_active: registration.default_user_active,
@@ -1289,6 +1465,20 @@ async fn external_oidc_start(
     Query(query): Query<OidcStartQuery>,
 ) -> AppResult<Response> {
     let provider = enabled_provider(&state, &slug).await?;
+    let target_application =
+        registration_target_application(&state, &headers, query.return_to.as_deref()).await?;
+    let target_organization_id = target_application
+        .as_ref()
+        .map(|application| application.organization_id.as_str());
+    if let Some(application) = target_application.as_ref()
+        && !applications::application_login_adapter_enabled(&state, &application.id, &provider.id)
+            .await?
+    {
+        return Err(AppError::NotFound);
+    }
+    if !external_oidc_provider_is_available_to_organization(&provider, target_organization_id) {
+        return Err(AppError::NotFound);
+    }
     let has_users = state.db.user_count().await? > 0;
     let registration = state.db.registration_settings().await?.public();
     let mode = ExternalOidcStartMode::parse(query.mode.as_deref())?;
@@ -1300,6 +1490,12 @@ async fn external_oidc_start(
         provider.allow_registration == 1,
     ) {
         return Err(AppError::Forbidden);
+    }
+    if mode == ExternalOidcStartMode::Register {
+        ensure_target_application_allows_external_oidc_registration(
+            target_application.as_ref(),
+            &provider,
+        )?;
     }
     let state_token = util::random_token(32);
     let nonce = util::random_token(24);
@@ -1365,8 +1561,25 @@ async fn external_oidc_callback(
         return Err(AppError::BadRequest("OIDC provider mismatch".to_string()));
     }
     let provider = enabled_provider(&state, &slug).await?;
+    let return_context = parse_external_oidc_return_context(oidc_state.return_to);
+    let target_application =
+        registration_target_application(&state, &headers, return_context.return_to.as_deref())
+            .await?;
+    let target_organization_id = target_application
+        .as_ref()
+        .map(|application| application.organization_id.as_str());
+    if let Some(application) = target_application.as_ref()
+        && !applications::application_login_adapter_enabled(&state, &application.id, &provider.id)
+            .await?
+    {
+        return Err(AppError::NotFound);
+    }
+    if !external_oidc_provider_is_available_to_organization(&provider, target_organization_id) {
+        return Err(AppError::NotFound);
+    }
     let external_redirect = external_redirect_uri(&state, &headers, &provider).await?;
-    let claims = fetch_external_userinfo(&provider, &code, &external_redirect).await?;
+    let claims =
+        fetch_external_userinfo(&provider, &code, &external_redirect, &oidc_state.nonce).await?;
     let sub = claims
         .get("sub")
         .and_then(|value| value.as_str())
@@ -1398,7 +1611,12 @@ async fn external_oidc_callback(
         ) {
             return Err(AppError::Forbidden);
         }
-        let email = external_oidc_email(&claims, &provider.slug, &sub)?;
+        ensure_target_application_allows_external_oidc_registration(
+            target_application.as_ref(),
+            &provider,
+        )?;
+        let (email, email_verified) =
+            external_oidc_email_with_verification(&claims, &provider.slug, &sub)?;
         auth::assert_registration_allowed(&state, Some(&email), request_ip.as_deref()).await?;
         let username = claims
             .get("preferred_username")
@@ -1421,7 +1639,7 @@ async fn external_oidc_callback(
                     display_name,
                     phone: None,
                     password_hash: util::hash_password(&util::random_token(32))?,
-                    email_verified_at: Some(util::now_ts()),
+                    email_verified_at: email_verified.then_some(util::now_ts()),
                     phone_verified_at: None,
                     is_admin: crate::db::registered_user_is_admin(first_user),
                     is_active: registration.default_user_active || first_user,
@@ -1438,7 +1656,17 @@ async fn external_oidc_callback(
     if user.is_active != 1 || user.archived_at.is_some() {
         return Err(AppError::Unauthorized);
     }
-    let return_context = parse_external_oidc_return_context(oidc_state.return_to);
+    if let Some(application) = target_application.as_ref()
+        && !authorization::check_login_access(&state, application, &user.id)
+            .await?
+            .allowed
+    {
+        // The external provider binding is an input selector, not a bypass
+        // around the website's live account/tenant gate. Re-check it after
+        // resolving the external subject so a disabled application or tenant
+        // cannot still establish a session through a stale callback.
+        return Err(AppError::Forbidden);
+    }
     let jar = auth::issue_session_with_login_event(
         &state,
         jar,
@@ -1486,6 +1714,14 @@ async fn enabled_provider(state: &AppState, slug: &str) -> AppResult<ExternalOid
     } else {
         Err(AppError::NotFound)
     }
+}
+
+fn external_oidc_provider_is_available_to_organization(
+    provider: &ExternalOidcProviderRecord,
+    target_organization_id: Option<&str>,
+) -> bool {
+    provider.organization_id.is_none()
+        || provider.organization_id.as_deref() == target_organization_id
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1663,13 +1899,21 @@ async fn fetch_external_userinfo(
     provider: &ExternalOidcProviderRecord,
     code: &str,
     redirect_uri: &str,
+    expected_nonce: &str,
 ) -> AppResult<serde_json::Value> {
     #[derive(Debug, Deserialize)]
     struct TokenResponse {
         access_token: String,
+        id_token: Option<String>,
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| {
+            AppError::Internal(format!("failed to build external OIDC client: {err}"))
+        })?;
     let mut form = HashMap::new();
     form.insert("grant_type", "authorization_code");
     form.insert("code", code);
@@ -1686,7 +1930,11 @@ async fn fetch_external_userinfo(
         .json::<TokenResponse>()
         .await
         .map_err(|err| AppError::BadRequest(format!("external OIDC token JSON failed: {err}")))?;
-    client
+    let id_token = token.id_token.ok_or_else(|| {
+        AppError::BadRequest("external OIDC token response did not include an ID token".to_string())
+    })?;
+    let id_token_claims = verify_external_id_token(provider, &id_token, expected_nonce).await?;
+    let userinfo = client
         .get(&provider.userinfo_endpoint)
         .bearer_auth(token.access_token)
         .send()
@@ -1698,7 +1946,121 @@ async fn fetch_external_userinfo(
         })?
         .json::<serde_json::Value>()
         .await
-        .map_err(|err| AppError::BadRequest(format!("external OIDC userinfo JSON failed: {err}")))
+        .map_err(|err| {
+            AppError::BadRequest(format!("external OIDC userinfo JSON failed: {err}"))
+        })?;
+    let userinfo_sub = userinfo
+        .get("sub")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("external OIDC userinfo missing sub".to_string()))?;
+    if userinfo_sub != id_token_claims.sub {
+        return Err(AppError::BadRequest(
+            "external OIDC subject mismatch".to_string(),
+        ));
+    }
+    Ok(userinfo)
+}
+
+#[derive(Debug, Clone)]
+struct ExternalIdTokenClaims {
+    sub: String,
+}
+
+async fn verify_external_id_token(
+    provider: &ExternalOidcProviderRecord,
+    id_token: &str,
+    expected_nonce: &str,
+) -> AppResult<ExternalIdTokenClaims> {
+    let header = decode_header(id_token)
+        .map_err(|_| AppError::BadRequest("external OIDC ID token is invalid".to_string()))?;
+    if !matches!(
+        header.alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+    ) {
+        return Err(AppError::BadRequest(
+            "external OIDC ID token algorithm is not allowed".to_string(),
+        ));
+    }
+    let discovery = identity_sources::discover_oidc_provider(&provider.issuer).await?;
+    if normalize_external_issuer(&discovery.issuer) != normalize_external_issuer(&provider.issuer) {
+        return Err(AppError::BadRequest(
+            "external OIDC issuer does not match provider configuration".to_string(),
+        ));
+    }
+    let jwks = identity_sources::fetch_oidc_jwks(&discovery.jwks_uri).await?;
+    let key = match header.kid.as_deref() {
+        Some(kid) => jwks.find(kid),
+        None if jwks.keys.len() == 1 => jwks.keys.first(),
+        None => None,
+    }
+    .ok_or_else(|| AppError::BadRequest("external OIDC signing key was not found".to_string()))?;
+    if key
+        .common
+        .key_algorithm
+        .is_some_and(|algorithm| algorithm.to_string() != format!("{:?}", header.alg))
+    {
+        return Err(AppError::BadRequest(
+            "external OIDC signing key algorithm does not match token".to_string(),
+        ));
+    }
+    let key = DecodingKey::from_jwk(key)
+        .map_err(|_| AppError::BadRequest("external OIDC signing key is invalid".to_string()))?;
+    let issuer = normalize_external_issuer(&provider.issuer);
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer.as_str()]);
+    validation.set_audience(&[provider.client_id.as_str()]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    validation.leeway = 60;
+    let decoded = decode::<Value>(id_token, &key, &validation).map_err(|_| {
+        AppError::BadRequest("external OIDC ID token validation failed".to_string())
+    })?;
+    let claims = decoded.claims;
+    let issuer_claim = claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(normalize_external_issuer)
+        .ok_or_else(|| {
+            AppError::BadRequest("external OIDC ID token issuer is missing".to_string())
+        })?;
+    if issuer_claim != issuer {
+        return Err(AppError::BadRequest(
+            "external OIDC ID token issuer is invalid".to_string(),
+        ));
+    }
+    let sub = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("external OIDC ID token subject is missing".to_string())
+        })?
+        .to_string();
+    let nonce = claims.get("nonce").and_then(Value::as_str).ok_or_else(|| {
+        AppError::BadRequest("external OIDC ID token nonce is missing".to_string())
+    })?;
+    if nonce != expected_nonce {
+        return Err(AppError::BadRequest(
+            "external OIDC ID token nonce is invalid".to_string(),
+        ));
+    }
+    let issued_at = claims
+        .get("iat")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::BadRequest("external OIDC ID token iat is missing".to_string()))?;
+    if issued_at > util::now_ts() + 60 {
+        return Err(AppError::BadRequest(
+            "external OIDC ID token iat is in the future".to_string(),
+        ));
+    }
+    Ok(ExternalIdTokenClaims { sub })
+}
+
+fn normalize_external_issuer(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
 }
 
 fn unique_username(preferred: &str, sub: &str) -> String {
@@ -1711,6 +2073,7 @@ fn unique_username(preferred: &str, sub: &str) -> String {
     format!("{base}-{suffix}")
 }
 
+#[cfg(test)]
 fn external_oidc_email(
     claims: &serde_json::Value,
     provider_slug: &str,
@@ -1728,6 +2091,36 @@ fn external_oidc_email(
         "{}@{}.external",
         external_subject_email_local_part(external_subject),
         provider_slug
+    ))
+}
+
+fn external_oidc_email_with_verification(
+    claims: &serde_json::Value,
+    provider_slug: &str,
+    external_subject: &str,
+) -> AppResult<(String, bool)> {
+    if let Some(value) = claims
+        .get("email")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = normalize_email(value)?;
+        let verified = claims
+            .get("email_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if verified {
+            return Ok((normalized, true));
+        }
+    }
+    Ok((
+        format!(
+            "{}@{}.external",
+            external_subject_email_local_part(external_subject),
+            provider_slug
+        ),
+        false,
     ))
 }
 
@@ -1857,6 +2250,48 @@ mod tests {
             true,
             false,
             true
+        ));
+    }
+
+    #[test]
+    fn tenant_external_oidc_provider_is_not_an_ambient_login_option() {
+        let provider = ExternalOidcProviderRecord {
+            id: "provider".to_string(),
+            slug: "tenant-idp".to_string(),
+            display_name: "Tenant IdP".to_string(),
+            organization_id: Some("tenant-a".to_string()),
+            issuer: "https://issuer.example".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            authorization_endpoint: "https://issuer.example/authorize".to_string(),
+            token_endpoint: "https://issuer.example/token".to_string(),
+            userinfo_endpoint: "https://issuer.example/userinfo".to_string(),
+            redirect_path: "/api/register/oidc/tenant-idp/callback".to_string(),
+            scopes: "[]".to_string(),
+            email_domains: "[]".to_string(),
+            is_active: 1,
+            allow_login: 1,
+            allow_registration: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert!(external_oidc_provider_is_available_to_organization(
+            &provider,
+            Some("tenant-a")
+        ));
+        assert!(!external_oidc_provider_is_available_to_organization(
+            &provider,
+            Some("tenant-b")
+        ));
+        assert!(!external_oidc_provider_is_available_to_organization(
+            &provider, None
+        ));
+
+        let mut platform_provider = provider;
+        platform_provider.organization_id = None;
+        assert!(external_oidc_provider_is_available_to_organization(
+            &platform_provider,
+            Some("tenant-b")
         ));
     }
 

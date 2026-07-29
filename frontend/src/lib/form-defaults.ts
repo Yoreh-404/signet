@@ -84,6 +84,18 @@ export const emptyIapApplicationForm = {
   is_active: true
 };
 
+export const emptyApplicationForm = {
+  id: "",
+  slug: "",
+  name: "",
+  website_url: "",
+  description: "",
+  account_selection_mode: "optional" as "optional" | "required",
+  unique_identity_factors: [] as Array<"email" | "phone">,
+  is_active: true,
+  oidc_client_ids: [] as string[]
+};
+
 export function emptyClaimMapperForm(sortOrder: number): ClientClaimMapperForm {
   return {
     claim_name: "",
@@ -169,6 +181,7 @@ export const emptyLdapProviderForm = {
   id: "",
   slug: "",
   display_name: "",
+  organization_id: "",
   url: "ldap://ldap.example.com",
   starttls: true,
   bind_dn: "",

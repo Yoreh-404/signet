@@ -8,6 +8,7 @@ use argon2::{
 };
 use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use rand_core::RngCore;
 use rsa::{
     Oaep, RsaPrivateKey, RsaPublicKey,
@@ -61,6 +62,19 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 
 pub fn token_hash(token: &str) -> String {
     sha256_base64url(token)
+}
+
+/// Produces a keyed, domain-separated digest for application-local identity
+/// uniqueness checks. Unlike a bare phone/email hash, this cannot be cheaply
+/// enumerated from a database copy without the instance secret.
+pub fn identity_factor_digest(secret: &str, factor_type: &str, value: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts arbitrary key lengths");
+    mac.update(b"signet:application-identity-factor:v1:");
+    mac.update(factor_type.as_bytes());
+    mac.update(b":");
+    mac.update(value.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 /// Domain-separates the short-lived authorization-code display secret from
@@ -329,6 +343,7 @@ pub fn check_pkce(
     method: Option<&str>,
     verifier: Option<&str>,
     required: bool,
+    require_s256: bool,
 ) -> AppResult<()> {
     if challenge.is_none() && !required {
         return Ok(());
@@ -336,7 +351,13 @@ pub fn check_pkce(
     let challenge =
         challenge.ok_or_else(|| AppError::Oidc("missing code challenge".to_string()))?;
     let verifier = verifier.ok_or_else(|| AppError::Oidc("missing code verifier".to_string()))?;
+    if !is_valid_pkce_verifier(verifier) {
+        return Err(AppError::Oidc("invalid code verifier".to_string()));
+    }
     let method = method.unwrap_or("plain");
+    if require_s256 && method != "S256" {
+        return Err(AppError::Oidc("this client requires PKCE S256".to_string()));
+    }
     let candidate = match method {
         "S256" => sha256_base64url(verifier),
         "plain" => verifier.to_string(),
@@ -347,6 +368,16 @@ pub fn check_pkce(
     } else {
         Err(AppError::Oidc("invalid code verifier".to_string()))
     }
+}
+
+/// RFC 7636 section 4.1: a code verifier is 43–128 characters from the
+/// unreserved URI character set. Keep this check at the token boundary so a
+/// malformed verifier can never be accepted by a legacy/plain client.
+pub fn is_valid_pkce_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 pub fn normalize_scopes(requested: Option<&str>, supported: &[String]) -> AppResult<Vec<String>> {
@@ -440,5 +471,33 @@ mod tests {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "bad host".parse().unwrap());
         assert!(forwarded_base_url(&headers, "http://localhost:8080").is_none());
+    }
+
+    #[test]
+    fn pkce_verifier_uses_rfc7636_bounds_and_character_set() {
+        assert!(is_valid_pkce_verifier(&"a".repeat(43)));
+        assert!(is_valid_pkce_verifier(&"~._-A9".repeat(8)[..48]));
+        assert!(!is_valid_pkce_verifier(&"a".repeat(42)));
+        assert!(!is_valid_pkce_verifier(&"a".repeat(129)));
+        assert!(!is_valid_pkce_verifier(&format!("{}=", "a".repeat(42))));
+        assert!(!is_valid_pkce_verifier(&format!("{} ", "a".repeat(42))));
+    }
+
+    #[test]
+    fn check_pkce_enforces_verifier_and_current_s256_policy() {
+        let verifier = "v".repeat(43);
+        let challenge = sha256_base64url(&verifier);
+        assert!(check_pkce(Some(&challenge), Some("S256"), Some(&verifier), true, true,).is_ok());
+        assert!(check_pkce(Some(&verifier), Some("plain"), Some(&verifier), true, true,).is_err());
+        assert!(
+            check_pkce(
+                Some(&"short".to_string()),
+                Some("plain"),
+                Some("short"),
+                true,
+                false,
+            )
+            .is_err()
+        );
     }
 }

@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use jsonwebtoken::jwk::JwkSet;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -22,6 +23,7 @@ pub struct OidcDiscoveryResult {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub userinfo_endpoint: String,
+    pub jwks_uri: String,
     pub scopes: Vec<String>,
 }
 
@@ -31,6 +33,7 @@ struct OpenIdConfiguration {
     authorization_endpoint: String,
     token_endpoint: String,
     userinfo_endpoint: Option<String>,
+    jwks_uri: String,
     scopes_supported: Option<Vec<String>>,
 }
 
@@ -48,11 +51,39 @@ impl HttpOidcDiscoveryClient {
     fn new() -> AppResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECONDS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| {
                 AppError::Internal(format!("failed to build discovery client: {err}"))
             })?;
         Ok(Self { client })
+    }
+
+    async fn fetch_jwks(&self, url: &str) -> AppResult<JwkSet> {
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|err| AppError::BadRequest(format!("OIDC JWKS request failed: {err}")))?;
+        if !response.status().is_success() {
+            return Err(AppError::BadRequest(format!(
+                "OIDC JWKS returned HTTP {}",
+                response.status()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| AppError::BadRequest(format!("OIDC JWKS body failed: {err}")))?;
+        if bytes.len() > MAX_DISCOVERY_BYTES {
+            return Err(AppError::BadRequest(
+                "OIDC JWKS document is too large".to_string(),
+            ));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|err| AppError::BadRequest(format!("OIDC JWKS JSON is invalid: {err}")))
     }
 }
 
@@ -139,6 +170,23 @@ pub async fn discover_oidc_provider(
         .await
 }
 
+/// Fetches the provider's public signing keys after validating the configured
+/// issuer/discovery URL.  Keeping this in the identity-source adapter gives
+/// external login and the admin discovery flow the same URL and payload
+/// bounds, and deliberately disables redirects to avoid turning discovery
+/// into an SSRF hop.
+pub async fn fetch_oidc_jwks(jwks_uri: &str) -> AppResult<JwkSet> {
+    let normalized = normalize_http_url(jwks_uri.to_string(), "jwks_uri", false)?;
+    if normalized.is_empty() {
+        return Err(AppError::BadRequest(
+            "OIDC provider jwks_uri is required".to_string(),
+        ));
+    }
+    HttpOidcDiscoveryClient::new()?
+        .fetch_jwks(&normalized)
+        .await
+}
+
 async fn discover_oidc_provider_with_client<C: OidcDiscoveryClient>(
     issuer_or_discovery_url: &str,
     client: &C,
@@ -177,12 +225,19 @@ fn normalize_discovery_document(document: OpenIdConfiguration) -> AppResult<Oidc
             "OIDC discovery document does not include userinfo_endpoint".to_string(),
         ));
     }
+    let jwks_uri = normalize_http_url(document.jwks_uri, "jwks_uri", false)?;
+    if jwks_uri.is_empty() {
+        return Err(AppError::BadRequest(
+            "OIDC discovery document does not include jwks_uri".to_string(),
+        ));
+    }
     let scopes = normalize_discovered_scopes(document.scopes_supported)?;
     Ok(OidcDiscoveryResult {
         issuer,
         authorization_endpoint,
         token_endpoint,
         userinfo_endpoint,
+        jwks_uri,
         scopes,
     })
 }
@@ -285,6 +340,7 @@ mod tests {
                 authorization_endpoint: "https://idp.example.com/tenant/authorize".to_string(),
                 token_endpoint: "https://idp.example.com/tenant/token".to_string(),
                 userinfo_endpoint: Some("https://idp.example.com/tenant/userinfo".to_string()),
+                jwks_uri: "https://idp.example.com/tenant/jwks".to_string(),
                 scopes_supported: Some(vec![
                     "openid".to_string(),
                     "profile".to_string(),

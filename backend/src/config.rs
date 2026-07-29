@@ -65,10 +65,20 @@ pub struct SecuritySettings {
     pub cookie_domain: String,
     pub cookie_secure: bool,
     pub cookie_same_site: SameSiteSetting,
+    #[serde(default)]
+    pub disable_csrf_origin_check: bool,
     pub session_ttl_seconds: i64,
     pub password_min_length: usize,
     pub rsa_private_key_pem: String,
     pub key_id: String,
+    /// Optional SAML IdP signing key. When empty, the active JWT signing key
+    /// is reused; the certificate must still match the selected private key.
+    #[serde(default)]
+    pub saml_private_key_pem: String,
+    /// X.509 certificate corresponding to `saml_private_key_pem` (or the
+    /// active JWT signing key when that field is empty).
+    #[serde(default)]
+    pub saml_signing_certificate_pem: String,
     pub admin_api_prefix: String,
 }
 
@@ -230,6 +240,12 @@ impl Settings {
                 "1" | "true" | "yes" | "on"
             );
         }
+        if let Ok(value) = env::var("SSO_DISABLE_CSRF_ORIGIN_CHECK") {
+            self.security.disable_csrf_origin_check = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         if let Ok(value) = env::var("SSO_DATABASE_KIND") {
             self.database.kind = match value.to_ascii_lowercase().as_str() {
                 "postgres" | "postgresql" => DatabaseKind::Postgres,
@@ -242,6 +258,12 @@ impl Settings {
         }
         if let Ok(value) = env::var("SSO_RSA_PRIVATE_KEY_PEM") {
             self.security.rsa_private_key_pem = value;
+        }
+        if let Ok(value) = env::var("SSO_SAML_PRIVATE_KEY_PEM") {
+            self.security.saml_private_key_pem = value;
+        }
+        if let Ok(value) = env::var("SSO_SAML_SIGNING_CERTIFICATE_PEM") {
+            self.security.saml_signing_certificate_pem = value;
         }
         if let Ok(value) = env::var("SSO_BOOTSTRAP_ADMIN_PASSWORD") {
             self.bootstrap.admin.password = value;

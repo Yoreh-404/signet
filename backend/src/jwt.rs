@@ -15,6 +15,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
@@ -58,6 +59,11 @@ pub struct TokenClaims {
     pub aud: String,
     pub exp: i64,
     pub iat: i64,
+    /// A stable token identifier for audit and downstream revocation lists.
+    /// Signet access tokens remain short-lived bearer credentials; this field
+    /// is not, by itself, a replay cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
     pub token_use: String,
     pub client_id: String,
     pub scope: String,
@@ -156,12 +162,26 @@ impl JwtManager {
 fn build_key_set(records: Vec<SigningKeyRecord>) -> AppResult<JwtKeySet> {
     let mut keys = Vec::with_capacity(records.len());
     let mut active_key = None;
+    let mut seen_kids = BTreeSet::new();
+    let mut active_count = 0;
     for record in records {
+        if !seen_kids.insert(record.kid.clone()) {
+            return Err(AppError::Configuration(format!(
+                "duplicate signing key id: {}",
+                record.kid
+            )));
+        }
         let material = Arc::new(KeyMaterial::from_record(&record)?);
-        if record.is_active == 1 && active_key.is_none() {
+        if record.is_active == 1 {
+            active_count += 1;
             active_key = Some(material.clone());
         }
         keys.push(material);
+    }
+    if active_count != 1 {
+        return Err(AppError::Configuration(
+            "exactly one active signing key is required".to_string(),
+        ));
     }
     let active_key = active_key
         .ok_or_else(|| AppError::Configuration("no active signing key is available".to_string()))?;
@@ -174,6 +194,14 @@ impl KeyMaterial {
     }
 
     fn from_pem(kid: String, private_key_pem: &str) -> AppResult<Self> {
+        if kid.trim().is_empty()
+            || kid.len() > 128
+            || kid.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(AppError::Configuration(
+                "signing key id must be 1-128 printable characters".to_string(),
+            ));
+        }
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
             .map_err(|err| AppError::Configuration(format!("invalid RSA private key: {err}")))?;
         let public_key = RsaPublicKey::from(&private_key);
@@ -388,6 +416,7 @@ impl JwtManager {
             aud: audience.unwrap_or(&client.client_id).to_string(),
             exp: now + ttl_seconds,
             iat: now,
+            jti: Some(util::random_token(24)),
             token_use: "access_token".to_string(),
             client_id: client.client_id.clone(),
             scope: scope.to_string(),
@@ -423,7 +452,53 @@ impl JwtManager {
         token: &str,
         issuers: &[&str],
     ) -> AppResult<TokenClaims> {
-        self.verify_token_with_issuers(token, issuers, "access_token", true)
+        self.verify_token_with_issuers(token, issuers, "access_token", true, None)
+    }
+
+    /// Verifies an access token for token exchange after issuer/signature
+    /// validation. Token exchange is an issuer-level capability: the subject
+    /// token may have been issued for another resource, while the exchange
+    /// policy separately constrains the requested target audience.
+    pub fn verify_access_token_for_token_exchange(
+        &self,
+        token: &str,
+        issuers: &[&str],
+    ) -> AppResult<TokenClaims> {
+        self.verify_access_token_with_issuers(token, issuers)
+    }
+
+    /// Verifies an access token for RFC 7662 introspection. Introspection is
+    /// not a resource endpoint, so a token's `aud` may be an RFC 8707
+    /// resource. The handler must still bind the result to the authenticated
+    /// introspection client using `claims.client_id`.
+    pub fn verify_access_token_for_introspection(
+        &self,
+        token: &str,
+        issuers: &[&str],
+    ) -> AppResult<TokenClaims> {
+        self.verify_access_token_with_issuers(token, issuers)
+    }
+
+    /// Verifies a bearer token for a caller that has no concrete resource
+    /// context. This is deliberately audience-free and must not be used by a
+    /// protocol/resource endpoint that can name its expected audience.
+    pub fn verify_access_token_for_generic_bearer(
+        &self,
+        token: &str,
+        issuers: &[&str],
+    ) -> AppResult<TokenClaims> {
+        self.verify_access_token_with_issuers(token, issuers)
+    }
+
+    /// Verifies an access token for a concrete resource or client audience.
+    /// Callers that know the resource they protect should use this method.
+    pub fn verify_access_token_with_issuers_and_audiences(
+        &self,
+        token: &str,
+        issuers: &[&str],
+        audiences: &[String],
+    ) -> AppResult<TokenClaims> {
+        self.verify_token_with_issuers(token, issuers, "access_token", true, Some(audiences))
     }
 
     pub fn verify_id_token_hint_with_issuers(
@@ -431,7 +506,28 @@ impl JwtManager {
         token: &str,
         issuers: &[&str],
     ) -> AppResult<TokenClaims> {
-        self.verify_token_with_issuers(token, issuers, "id_token", false)
+        self.verify_token_with_issuers(token, issuers, "id_token", false, None)
+    }
+
+    /// Performs the first, audience-free verification needed by RP-initiated
+    /// logout to discover the client whose ID token was presented. The logout
+    /// handler must immediately repeat verification with that client's
+    /// audience before accepting the hint.
+    pub fn verify_id_token_hint_for_logout_bootstrap(
+        &self,
+        token: &str,
+        issuers: &[&str],
+    ) -> AppResult<TokenClaims> {
+        self.verify_id_token_hint_with_issuers(token, issuers)
+    }
+
+    pub fn verify_id_token_hint_with_issuers_and_audiences(
+        &self,
+        token: &str,
+        issuers: &[&str],
+        audiences: &[String],
+    ) -> AppResult<TokenClaims> {
+        self.verify_token_with_issuers(token, issuers, "id_token", false, Some(audiences))
     }
 
     fn verify_token_with_issuers(
@@ -440,36 +536,48 @@ impl JwtManager {
         issuers: &[&str],
         token_use: &str,
         validate_exp: bool,
+        audiences: Option<&[String]>,
     ) -> AppResult<TokenClaims> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(issuers);
-        validation.validate_aud = false;
+        if let Some(audiences) = audiences {
+            if audiences.is_empty() {
+                return Err(AppError::Unauthorized);
+            }
+            validation.set_audience(audiences);
+        } else {
+            validation.validate_aud = false;
+        }
         validation.validate_exp = validate_exp;
-        let kid = decode_header(token).ok().and_then(|header| header.kid);
+        let header = decode_header(token).map_err(|_| AppError::Unauthorized)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(AppError::Unauthorized);
+        }
         let key_set = self
             .key_set
             .read()
             .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
-        let mut candidate_keys = key_set.keys.iter().collect::<Vec<_>>();
-        if let Some(kid) = kid {
-            candidate_keys.sort_by_key(|key| if key.kid == kid { 0 } else { 1 });
-        }
-        let mut last_error = None;
+        let candidate_keys = if let Some(kid) = header.kid.as_deref() {
+            let matching = key_set
+                .keys
+                .iter()
+                .filter(|key| key.kid == kid)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return Err(AppError::Unauthorized);
+            }
+            matching
+        } else {
+            key_set.keys.iter().collect::<Vec<_>>()
+        };
         let token = candidate_keys
             .into_iter()
-            .find_map(
-                |key| match decode::<TokenClaims>(token, &key.decoding_key, &validation) {
-                    Ok(value) => Some(value),
-                    Err(err) => {
-                        last_error = Some(err);
-                        None
-                    }
-                },
-            )
-            .ok_or_else(|| {
-                let _ = last_error;
-                AppError::Unauthorized
-            })?;
+            .find_map(|key| decode::<TokenClaims>(token, &key.decoding_key, &validation).ok())
+            .ok_or(AppError::Unauthorized)?;
+        let now = util::now_ts();
+        if token.claims.iat > now + 60 || token.claims.exp < token.claims.iat {
+            return Err(AppError::Unauthorized);
+        }
         if token.claims.token_use != token_use {
             return Err(AppError::Unauthorized);
         }
@@ -508,6 +616,7 @@ impl JwtManager {
             aud: subject.audience.unwrap_or(subject.client_id).to_string(),
             exp: now + ttl_seconds,
             iat: now,
+            jti: Some(util::random_token(24)),
             token_use: token_use.to_string(),
             client_id: subject.client_id.to_string(),
             scope: subject.scope.to_string(),
@@ -541,7 +650,10 @@ impl JwtManager {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenClaims;
+    use super::{JwtManager, TokenClaims};
+    use crate::{db::SigningKeyRecord, util};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn legacy_token_claims_without_login_code_level_still_decode() {
@@ -564,5 +676,117 @@ mod tests {
         .expect("legacy claims should remain compatible");
 
         assert_eq!(claims.gpt_sso_login_code_level, None);
+    }
+
+    #[test]
+    fn key_set_rejects_duplicate_kids_and_multiple_active_keys() {
+        let pem = util::generate_rsa_private_key_pem().unwrap();
+        let first = signing_key("key-a", &pem, 1);
+        assert!(super::build_key_set(vec![first.clone(), first]).is_err());
+
+        let second = signing_key("key-b", &pem, 1);
+        assert!(super::build_key_set(vec![second, signing_key("key-c", &pem, 1)]).is_err());
+    }
+
+    #[test]
+    fn token_verification_enforces_audience_and_unknown_kid_is_rejected() {
+        let pem = util::generate_rsa_private_key_pem().unwrap();
+        let key_set = super::build_key_set(vec![signing_key("key-a", &pem, 1)]).unwrap();
+        let manager = JwtManager {
+            default_issuer: "https://issuer.example".to_string(),
+            key_set: Arc::new(RwLock::new(key_set)),
+        };
+        let user = crate::db::UserRecord {
+            id: "user-id".to_string(),
+            email: "user@example.test".to_string(),
+            username: "user".to_string(),
+            display_name: None,
+            phone: None,
+            password_hash: String::new(),
+            email_verified_at: None,
+            phone_verified_at: None,
+            is_admin: 0,
+            is_active: 1,
+            archived_at: None,
+            registration_source: "local".to_string(),
+            last_login_at: None,
+            last_login_ip: None,
+            last_oidc_client_id: None,
+            last_login_method: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let token = manager
+            .sign_access_token_with_issuer(
+                "https://issuer.example",
+                super::TokenSubject {
+                    user: &user,
+                    client_id: "client-a",
+                    audience: Some("https://api.example"),
+                    scope: "openid",
+                    nonce: None,
+                    auth_time: None,
+                },
+                300,
+            )
+            .unwrap();
+        assert!(
+            manager
+                .verify_access_token_with_issuers_and_audiences(
+                    &token,
+                    &["https://issuer.example"],
+                    &["https://api.example".to_string()],
+                )
+                .is_ok()
+        );
+        assert!(
+            manager
+                .verify_access_token_with_issuers_and_audiences(
+                    &token,
+                    &["https://issuer.example"],
+                    &["https://other.example".to_string()],
+                )
+                .is_err()
+        );
+
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "sub": "user-id",
+            "aud": "https://api.example",
+            "exp": util::now_ts() + 300,
+            "iat": util::now_ts(),
+            "jti": "unknown-kid-jti",
+            "token_use": "access_token",
+            "client_id": "client-a",
+            "scope": "openid",
+            "email": "user@example.test",
+            "email_verified": false,
+            "preferred_username": "user"
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("unknown".to_string());
+        let unknown_kid_token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .verify_access_token_with_issuers(&unknown_kid_token, &["https://issuer.example"])
+                .is_err()
+        );
+    }
+
+    fn signing_key(kid: &str, private_key_pem: &str, is_active: i32) -> SigningKeyRecord {
+        SigningKeyRecord {
+            id: kid.to_string(),
+            kid: kid.to_string(),
+            private_key_pem: private_key_pem.to_string(),
+            is_active,
+            created_at: 1,
+            activated_at: (is_active == 1).then_some(1),
+            retired_at: (is_active == 1).then_some(0),
+        }
     }
 }

@@ -4,6 +4,7 @@ const ALL_TABS: Tab[] = [
   "account",
   "overview",
   "users",
+  "applications",
   "clients",
   "iap",
   "organizations",

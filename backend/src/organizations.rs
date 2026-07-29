@@ -8,6 +8,43 @@ use serde::{Deserialize, Serialize};
 pub const ROLE_OWNER: &str = "owner";
 pub const ROLE_ADMIN: &str = "admin";
 pub const ROLE_MEMBER: &str = "member";
+/// Stable identifier for the platform-owned enterprise.  It deliberately is
+/// not derived from a display name or slug: those are tenant-facing data,
+/// while this identifier is used as a migration and authorization anchor.
+pub const SIGNET_ORGANIZATION_ID: &str = "00000000-0000-4000-8000-000000000001";
+pub const SIGNET_ORGANIZATION_SLUG: &str = "signet";
+pub const ORGANIZATION_KIND_TENANT: &str = "tenant";
+pub const ORGANIZATION_KIND_SYSTEM: &str = "system";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationKind {
+    Tenant,
+    System,
+}
+
+impl OrganizationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tenant => ORGANIZATION_KIND_TENANT,
+            Self::System => ORGANIZATION_KIND_SYSTEM,
+        }
+    }
+}
+
+impl TryFrom<&str> for OrganizationKind {
+    type Error = AppError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            ORGANIZATION_KIND_TENANT => Ok(Self::Tenant),
+            ORGANIZATION_KIND_SYSTEM => Ok(Self::System),
+            other => Err(AppError::BadRequest(format!(
+                "unknown organization kind: {other}"
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +154,7 @@ mod tests {
             id: "org-id".to_string(),
             slug: "corp".to_string(),
             name: "Corp".to_string(),
+            kind: ORGANIZATION_KIND_TENANT.to_string(),
             description: None,
             allowed_email_domains: util::to_json(
                 &domains.into_iter().map(str::to_string).collect::<Vec<_>>(),
