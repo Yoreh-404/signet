@@ -6415,18 +6415,76 @@ impl Db {
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE mfa_totp_methods SET last_used_step = {}, updated_at = {} WHERE user_id = {}",
+                "UPDATE mfa_totp_methods SET last_used_step = {}, updated_at = {} WHERE user_id = {} AND (last_used_step IS NULL OR last_used_step < {})",
                 ph(kind, 1),
                 ph(kind, 2),
-                ph(kind, 3)
+                ph(kind, 3),
+                ph(kind, 4)
             );
-            sql_query(sql)
+            let affected = sql_query(sql)
                 .bind::<BigInt, _>(step)
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(user_id)
+                .bind::<BigInt, _>(step)
                 .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+                .map_err(AppError::from)?;
+            if affected == 0 {
+                Err(AppError::Unauthorized)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub async fn complete_mfa_challenge_with_totp(
+        &self,
+        challenge_id: &str,
+        user_id: &str,
+        step: i64,
+    ) -> AppResult<()> {
+        let challenge_id = challenge_id.to_string();
+        let user_id = user_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let challenge_sql = format!(
+                    "UPDATE mfa_challenges SET consumed_at = {} WHERE id = {} AND user_id = {} AND expires_at >= {} AND consumed_at IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let challenge_affected = sql_query(challenge_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&challenge_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if challenge_affected == 0 {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let totp_sql = format!(
+                    "UPDATE mfa_totp_methods SET last_used_step = {}, updated_at = {} WHERE user_id = {} AND (last_used_step IS NULL OR last_used_step < {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let totp_affected = sql_query(totp_sql)
+                    .bind::<BigInt, _>(step)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<BigInt, _>(step)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if totp_affected == 0 {
+                    Err(AppError::Unauthorized)
+                } else {
+                    Ok(())
+                }
+            })
         })
     }
 
@@ -6512,12 +6570,67 @@ impl Db {
                 ph(kind, 1),
                 ph(kind, 2)
             );
-            sql_query(sql)
+            let affected = sql_query(sql)
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(id)
                 .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+                .map_err(AppError::from)?;
+            if affected == 0 {
+                Err(AppError::Unauthorized)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub async fn complete_mfa_challenge_with_recovery_code(
+        &self,
+        challenge_id: &str,
+        user_id: &str,
+        recovery_code_id: &str,
+    ) -> AppResult<()> {
+        let challenge_id = challenge_id.to_string();
+        let user_id = user_id.to_string();
+        let recovery_code_id = recovery_code_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let challenge_sql = format!(
+                    "UPDATE mfa_challenges SET consumed_at = {} WHERE id = {} AND user_id = {} AND expires_at >= {} AND consumed_at IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let challenge_affected = sql_query(challenge_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&challenge_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if challenge_affected == 0 {
+                    return Err(AppError::Unauthorized);
+                }
+
+                let recovery_code_sql = format!(
+                    "UPDATE mfa_recovery_codes SET used_at = {} WHERE id = {} AND user_id = {} AND used_at IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let recovery_code_affected = sql_query(recovery_code_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&recovery_code_id)
+                    .bind::<Text, _>(&user_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if recovery_code_affected == 0 {
+                    Err(AppError::Unauthorized)
+                } else {
+                    Ok(())
+                }
+            })
         })
     }
 
@@ -6844,12 +6957,16 @@ impl Db {
                 ph(kind, 1),
                 ph(kind, 2)
             );
-            sql_query(sql)
+            let affected = sql_query(sql)
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(id)
                 .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+                .map_err(AppError::from)?;
+            if affected == 0 {
+                Err(AppError::Unauthorized)
+            } else {
+                Ok(())
+            }
         })
     }
 
@@ -16260,6 +16377,112 @@ mod tests {
         .unwrap();
         db.migrate().await.unwrap();
         (db, path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mfa_totp_challenge_completion_is_single_use_under_concurrency() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        db.upsert_totp_method("mfa-user", "JBSWY3DPEHPK3PXP".to_string())
+            .await
+            .unwrap();
+        let challenge = db
+            .create_mfa_challenge("mfa-user", "api_login", None, 300)
+            .await
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let challenge_id = challenge.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.complete_mfa_challenge_with_totp(&challenge_id, "mfa-user", 42)
+                    .await
+            }));
+        }
+
+        let mut successful_completions = 0;
+        for task in tasks {
+            if task.await.unwrap().is_ok() {
+                successful_completions += 1;
+            }
+        }
+        assert_eq!(successful_completions, 1);
+        assert!(db
+            .find_mfa_challenge(&challenge.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .consumed_at
+            .is_some());
+        assert_eq!(
+            db.find_totp_method("mfa-user")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_step,
+            Some(42)
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mfa_recovery_code_challenge_completion_is_single_use_under_concurrency() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        db.replace_recovery_codes("mfa-user", vec!["hash".to_string()])
+            .await
+            .unwrap();
+        let recovery_code = db
+            .list_unused_recovery_codes("mfa-user")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let challenge = db
+            .create_mfa_challenge("mfa-user", "api_login", None, 300)
+            .await
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let challenge_id = challenge.id.clone();
+            let recovery_code_id = recovery_code.id.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                db.complete_mfa_challenge_with_recovery_code(
+                    &challenge_id,
+                    "mfa-user",
+                    &recovery_code_id,
+                )
+                .await
+            }));
+        }
+
+        let mut successful_completions = 0;
+        for task in tasks {
+            if task.await.unwrap().is_ok() {
+                successful_completions += 1;
+            }
+        }
+        assert_eq!(successful_completions, 1);
+        assert!(db
+            .list_recovery_codes("mfa-user")
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|code| code.used_at.is_some()));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]

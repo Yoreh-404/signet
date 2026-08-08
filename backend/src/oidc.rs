@@ -2996,6 +2996,7 @@ async fn login_form(
             .await?
             .map(|user| security_policy::normalize_login_subject(&user.email))
             .ok_or(AppError::Unauthorized)?;
+        auth::assert_login_entry_allowed(&state, &subject, request_ip.as_deref()).await?;
         let completion = match mfa::complete_challenge(&state, challenge, code).await {
             Ok(value) => value,
             Err(err) => {

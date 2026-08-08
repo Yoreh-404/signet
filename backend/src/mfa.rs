@@ -150,8 +150,10 @@ pub async fn complete_challenge(
         util::now_ts(),
         method.last_used_step,
     )? {
-        state.db.mark_totp_used(&method.user_id, step).await?;
-        state.db.consume_mfa_challenge(&challenge.id).await?;
+        state
+            .db
+            .complete_mfa_challenge_with_totp(&challenge.id, &method.user_id, step)
+            .await?;
         return Ok(MfaCompletion {
             method: "totp".to_string(),
             consumed_recovery_code: false,
@@ -165,8 +167,14 @@ pub async fn complete_challenge(
             .await?,
         code,
     ) {
-        state.db.mark_recovery_code_used(&recovery_code.id).await?;
-        state.db.consume_mfa_challenge(&challenge.id).await?;
+        state
+            .db
+            .complete_mfa_challenge_with_recovery_code(
+                &challenge.id,
+                &challenge.user_id,
+                &recovery_code.id,
+            )
+            .await?;
         return Ok(MfaCompletion {
             method: "recovery_code".to_string(),
             consumed_recovery_code: true,

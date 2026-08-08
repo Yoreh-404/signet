@@ -25,7 +25,14 @@ access_token_ttl_seconds = 900
 id_token_ttl_seconds = 900
 authorization_code_ttl_seconds = 300
 refresh_token_ttl_seconds = 2592000
-supported_scopes = ["openid", "profile", "email", "offline_access", "scim.read", "scim.write"]
+# Cross-project service scopes are intentionally explicit and still require
+# each client/service account to be granted the scope before it can request a
+# token. They are listed here so Axon, memory-atlas, and axon-code-service can
+# use the same Signet deployment without adding local JWT/HMAC trust roots.
+supported_scopes = [
+  "openid", "profile", "email", "offline_access", "scim.read", "scim.write",
+  "axon.code.service", "memory.service", "memory.code.index", "memory.code.write",
+]
 # If false, users see a consent page before a new client/scope set is authorized.
 skip_consent = true
 allow_dynamic_client_registration = false
