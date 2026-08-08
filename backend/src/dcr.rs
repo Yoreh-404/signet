@@ -232,6 +232,7 @@ impl DynamicClientRegistrar {
                 redirect_uris,
                 post_logout_redirect_uris,
                 scopes,
+                audience: String::new(),
                 grant_types,
                 response_types,
                 token_endpoint_auth_method,
@@ -269,6 +270,7 @@ impl DynamicClientRegistrar {
             self.new_client(metadata, existing.client_secret_hash.clone())?;
         client.client_id = existing.client_id.clone();
         client.organization_id = existing.organization_id.clone();
+        client.audience = existing.audience.clone();
         Ok((client, secret))
     }
 }

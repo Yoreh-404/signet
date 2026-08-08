@@ -4147,6 +4147,8 @@ struct ClientInput {
     redirect_uris: Vec<String>,
     post_logout_redirect_uris: Vec<String>,
     scopes: Vec<String>,
+    #[serde(default)]
+    audience: Option<String>,
     grant_types: Vec<String>,
     response_types: Vec<String>,
     token_endpoint_auth_method: String,
@@ -4216,7 +4218,12 @@ async fn create_client(
     let claim_mappers = client_input_to_claim_mappers(&payload)?;
     let client = state
         .db
-        .insert_client(client_input_to_new(payload, None, organization_id.clone())?)
+        .insert_client(client_input_to_new(
+            payload,
+            None,
+            organization_id.clone(),
+            None,
+        )?)
         .await?;
     let application = state.db.harden_new_client_application(&client.id).await?;
     state
@@ -4276,8 +4283,9 @@ async fn update_client(
             &id,
             client_input_to_new(
                 payload,
-                existing.client_secret_hash,
+                existing.client_secret_hash.clone(),
                 organization_id.clone(),
+                Some(existing.audience.clone()),
             )?,
         )
         .await?;
@@ -7631,6 +7639,14 @@ fn validate_client_input(payload: &ClientInput) -> AppResult<()> {
         &payload.post_logout_redirect_uris,
         "post_logout_redirect_uri",
     )?;
+    if let Some(audience) = payload.audience.as_deref()
+        && !audience.trim().is_empty()
+        && audience.len() > 2048
+    {
+        return Err(AppError::BadRequest(
+            "audience must be between 1 and 2048 characters".to_string(),
+        ));
+    }
     let uses_authorization_code = payload
         .grant_types
         .iter()
@@ -7868,6 +7884,7 @@ fn client_input_to_new(
     payload: ClientInput,
     existing_hash: Option<String>,
     organization_id: Option<String>,
+    existing_audience: Option<String>,
 ) -> AppResult<NewClient> {
     let secret = payload.client_secret.unwrap_or_default();
     let token_auth = payload.token_endpoint_auth_method.as_str();
@@ -7911,6 +7928,12 @@ fn client_input_to_new(
         redirect_uris,
         post_logout_redirect_uris,
         scopes: payload.scopes,
+        audience: payload
+            .audience
+            .or(existing_audience)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         grant_types: payload.grant_types,
         response_types: payload.response_types,
         token_endpoint_auth_method: payload.token_endpoint_auth_method,
@@ -8776,6 +8799,7 @@ mod tests {
             ],
             post_logout_redirect_uris: vec![" https://app.example.com/logout ".to_string()],
             scopes: vec!["openid".to_string(), "profile".to_string()],
+            audience: None,
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],
             token_endpoint_auth_method: "none".to_string(),
@@ -8808,7 +8832,7 @@ mod tests {
         let input = client_input();
         validate_client_input(&input).unwrap();
 
-        let client = client_input_to_new(input, None, None).unwrap();
+        let client = client_input_to_new(input, None, None, None).unwrap();
         assert_eq!(
             client.redirect_uris,
             vec![
@@ -8831,7 +8855,7 @@ mod tests {
         let mut input = client_input();
         input.logo_uri = " https://assets.example.com/signet.svg ".to_string();
         validate_client_input(&input).unwrap();
-        let client = client_input_to_new(input, None, None).unwrap();
+        let client = client_input_to_new(input, None, None, None).unwrap();
         assert_eq!(client.logo_uri, "https://assets.example.com/signet.svg");
 
         for logo_uri in [

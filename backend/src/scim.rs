@@ -2176,6 +2176,7 @@ mod tests {
             redirect_uris: Vec::new(),
             post_logout_redirect_uris: Vec::new(),
             scopes: vec![SCIM_READ_SCOPE.to_string(), SCIM_WRITE_SCOPE.to_string()],
+            audience: String::new(),
             grant_types: vec!["client_credentials".to_string()],
             response_types: Vec::new(),
             token_endpoint_auth_method: "client_secret_basic".to_string(),

@@ -111,6 +111,7 @@ mod tests {
             redirect_uris: serde_json::json!(["https://app.example/callback"]).to_string(),
             post_logout_redirect_uris: "[]".to_string(),
             scopes: "[]".to_string(),
+            audience: String::new(),
             grant_types: "[]".to_string(),
             response_types: "[]".to_string(),
             token_endpoint_auth_method: "none".to_string(),

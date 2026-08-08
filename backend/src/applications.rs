@@ -1276,6 +1276,7 @@ mod tests {
             redirect_uris: vec!["https://binding.example.test/callback".to_string()],
             post_logout_redirect_uris: Vec::new(),
             scopes: vec!["openid".to_string()],
+            audience: String::new(),
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],
             token_endpoint_auth_method: "none".to_string(),

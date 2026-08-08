@@ -2,7 +2,7 @@
 use crate::organizations::ORGANIZATION_KIND_TENANT;
 use crate::{
     access::Permission,
-    config::{DatabaseKind, DatabaseSettings, Settings},
+    config::{BootstrapClient, DatabaseKind, DatabaseSettings, Settings},
     error::{AppError, AppResult},
     organizations::{
         ORGANIZATION_KIND_SYSTEM, OrganizationEmailPolicy, SIGNET_ORGANIZATION_ID,
@@ -536,6 +536,8 @@ pub struct ClientRecord {
     #[diesel(sql_type = Text)]
     pub scopes: String,
     #[diesel(sql_type = Text)]
+    pub audience: String,
+    #[diesel(sql_type = Text)]
     pub grant_types: String,
     #[diesel(sql_type = Text)]
     pub response_types: String,
@@ -666,6 +668,7 @@ pub struct PublicClient {
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
     pub scopes: Vec<String>,
+    pub audience: String,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
@@ -723,6 +726,7 @@ impl ClientRecord {
             redirect_uris: util::from_json(&self.redirect_uris)?,
             post_logout_redirect_uris: util::from_json(&self.post_logout_redirect_uris)?,
             scopes: util::from_json(&self.scopes)?,
+            audience: self.audience,
             grant_types: util::from_json(&self.grant_types)?,
             response_types: util::from_json(&self.response_types)?,
             token_endpoint_auth_method: self.token_endpoint_auth_method,
@@ -806,6 +810,7 @@ pub struct NewClient {
     pub redirect_uris: Vec<String>,
     pub post_logout_redirect_uris: Vec<String>,
     pub scopes: Vec<String>,
+    pub audience: String,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
@@ -3290,7 +3295,7 @@ fn insert_user_sql(kind: DatabaseKind, registration_source: UserRegistrationSour
 }
 
 fn select_client_sql() -> &'static str {
-    "SELECT id, client_id, client_secret_hash, client_name, COALESCE(logo_uri, '') AS logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, COALESCE(require_mfa, 0) AS require_mfa, COALESCE(require_pushed_authorization_requests, 0) AS require_pushed_authorization_requests, COALESCE(require_s256_pkce, 0) AS require_s256_pkce, COALESCE(require_confidential_client, 0) AS require_confidential_client, COALESCE(require_dpop, 0) AS require_dpop, COALESCE(require_account_selection, 0) AS require_account_selection, COALESCE(trust_email_verified, 0) AS trust_email_verified, COALESCE(authorization_details_types, '[]') AS authorization_details_types, subject_type, sector_identifier_uri, COALESCE(jwks_uri, '') AS jwks_uri, COALESCE(jwks, '') AS jwks, COALESCE(backchannel_logout_uri, '') AS backchannel_logout_uri, COALESCE(backchannel_logout_session_required, 0) AS backchannel_logout_session_required, COALESCE(frontchannel_logout_uri, '') AS frontchannel_logout_uri, COALESCE(frontchannel_logout_session_required, 0) AS frontchannel_logout_session_required, COALESCE(service_account_enabled, 0) AS service_account_enabled, COALESCE(service_account_permissions, '[]') AS service_account_permissions, is_active, created_at, updated_at FROM clients"
+    "SELECT id, client_id, client_secret_hash, client_name, COALESCE(logo_uri, '') AS logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, COALESCE(audience, '') AS audience, grant_types, response_types, token_endpoint_auth_method, require_pkce, COALESCE(require_mfa, 0) AS require_mfa, COALESCE(require_pushed_authorization_requests, 0) AS require_pushed_authorization_requests, COALESCE(require_s256_pkce, 0) AS require_s256_pkce, COALESCE(require_confidential_client, 0) AS require_confidential_client, COALESCE(require_dpop, 0) AS require_dpop, COALESCE(require_account_selection, 0) AS require_account_selection, COALESCE(trust_email_verified, 0) AS trust_email_verified, COALESCE(authorization_details_types, '[]') AS authorization_details_types, subject_type, sector_identifier_uri, COALESCE(jwks_uri, '') AS jwks_uri, COALESCE(jwks, '') AS jwks, COALESCE(backchannel_logout_uri, '') AS backchannel_logout_uri, COALESCE(backchannel_logout_session_required, 0) AS backchannel_logout_session_required, COALESCE(frontchannel_logout_uri, '') AS frontchannel_logout_uri, COALESCE(frontchannel_logout_session_required, 0) AS frontchannel_logout_session_required, COALESCE(service_account_enabled, 0) AS service_account_enabled, COALESCE(service_account_permissions, '[]') AS service_account_permissions, is_active, created_at, updated_at FROM clients"
 }
 
 fn select_client_claim_mapper_sql() -> &'static str {
@@ -3545,6 +3550,60 @@ fn normalize_permission_keys(values: Vec<String>) -> AppResult<Vec<String>> {
         keys.insert(Permission::try_from(trimmed)?.as_str().to_string());
     }
     Ok(keys.into_iter().collect())
+}
+
+fn bootstrap_client_secret_hash(
+    client: &BootstrapClient,
+    existing: Option<&ClientRecord>,
+) -> AppResult<Option<String>> {
+    let auth_method = client.token_endpoint_auth_method.as_str();
+    let existing_hash = existing.and_then(|record| record.client_secret_hash.as_deref());
+    if !client.rotate_secret
+        && let Some(existing_hash) = existing_hash
+    {
+        if matches!(
+            auth_method,
+            "none" | crate::client_assertion::PRIVATE_KEY_JWT
+        ) || crate::client_assertion::stored_secret_supports_method(
+            auth_method,
+            Some(existing_hash),
+        ) {
+            return Ok(Some(existing_hash.to_string()));
+        }
+        return Err(AppError::Configuration(format!(
+            "bootstrap client {} has an existing client_secret incompatible with {}, set rotate_secret=true to replace it",
+            client.client_id, auth_method
+        )));
+    }
+    if matches!(
+        auth_method,
+        "none" | crate::client_assertion::PRIVATE_KEY_JWT
+    ) {
+        return Ok(None);
+    }
+
+    let configured_secret = client
+        .client_secret_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|env_name| {
+            std::env::var(env_name).map_err(|err| {
+                AppError::Configuration(format!(
+                    "bootstrap client {} references unusable client_secret_env {env_name}: {err}",
+                    client.client_id
+                ))
+            })
+        })
+        .transpose()?
+        .or_else(|| (!client.client_secret.is_empty()).then(|| client.client_secret.clone()));
+    let Some(configured_secret) = configured_secret.filter(|secret| !secret.is_empty()) else {
+        return Err(AppError::Configuration(format!(
+            "bootstrap client {} requires client_secret or client_secret_env",
+            client.client_id
+        )));
+    };
+    crate::client_assertion::store_client_secret(auth_method, &configured_secret)
 }
 
 fn normalize_application_entitlement_keys(values: Vec<String>) -> AppResult<Vec<String>> {
@@ -3875,6 +3934,86 @@ impl Db {
         ))
     }
 
+    async fn ensure_bootstrap_client(
+        &self,
+        client: &BootstrapClient,
+        system_organization_id: &str,
+    ) -> AppResult<ClientRecord> {
+        let existing = self.find_client_by_client_id(&client.client_id).await?;
+        let permissions = crate::service_accounts::normalize_permissions(
+            client.service_account_permissions.clone(),
+        )?;
+        let client_secret_hash = bootstrap_client_secret_hash(client, existing.as_ref())?;
+        let organization_id = existing
+            .as_ref()
+            .and_then(|record| record.organization_id.clone())
+            .or_else(|| Some(system_organization_id.to_string()));
+        let desired = NewClient {
+            client_id: client.client_id.clone(),
+            client_secret_hash,
+            client_name: client.client_name.clone(),
+            logo_uri: client.logo_uri.clone(),
+            organization_id,
+            redirect_uris: client.redirect_uris.clone(),
+            post_logout_redirect_uris: client.post_logout_redirect_uris.clone(),
+            scopes: client.scopes.clone(),
+            audience: client
+                .audience
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            grant_types: client.grant_types.clone(),
+            response_types: client.response_types.clone(),
+            token_endpoint_auth_method: client.token_endpoint_auth_method.clone(),
+            require_pkce: client.require_pkce,
+            require_mfa: false,
+            require_pushed_authorization_requests: false,
+            require_s256_pkce: false,
+            require_confidential_client: false,
+            require_dpop: false,
+            require_account_selection: false,
+            trust_email_verified: false,
+            authorization_details_types: Vec::new(),
+            subject_type: crate::subject::SUBJECT_TYPE_PUBLIC.to_string(),
+            sector_identifier_uri: String::new(),
+            jwks_uri: String::new(),
+            jwks: String::new(),
+            backchannel_logout_uri: String::new(),
+            backchannel_logout_session_required: false,
+            frontchannel_logout_uri: String::new(),
+            frontchannel_logout_session_required: false,
+            service_account_enabled: client.service_account_enabled,
+            service_account_permissions: permissions,
+            is_active: true,
+        };
+
+        if let Some(existing) = existing {
+            return self.update_client(&existing.id, desired).await;
+        }
+
+        match self.insert_client(desired.clone()).await {
+            Ok(created) => Ok(created),
+            Err(insert_error) => {
+                // A second Signet process may have inserted the unique client_id
+                // between the lookup and insert. Re-read it and apply the same
+                // secret-preserving ensure rather than failing startup.
+                let Some(existing) = self.find_client_by_client_id(&client.client_id).await? else {
+                    return Err(insert_error);
+                };
+                let client_secret_hash = bootstrap_client_secret_hash(client, Some(&existing))?;
+                self.update_client(
+                    &existing.id,
+                    NewClient {
+                        client_secret_hash,
+                        ..desired
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn seed(&self, settings: &Settings) -> AppResult<()> {
         let admin = &settings.bootstrap.admin;
         if admin.create_on_startup && self.find_user_by_email(&admin.email).await?.is_none() {
@@ -3992,54 +4131,8 @@ impl Db {
         }
 
         for client in &settings.bootstrap.clients {
-            if self
-                .find_client_by_client_id(&client.client_id)
-                .await?
-                .is_none()
-            {
-                let client_secret_hash = if client.client_secret.is_empty() {
-                    None
-                } else {
-                    crate::client_assertion::store_client_secret(
-                        &client.token_endpoint_auth_method,
-                        &client.client_secret,
-                    )?
-                };
-                self.insert_client(NewClient {
-                    client_id: client.client_id.clone(),
-                    client_secret_hash,
-                    client_name: client.client_name.clone(),
-                    logo_uri: client.logo_uri.clone(),
-                    organization_id: Some(system_organization.id.clone()),
-                    redirect_uris: client.redirect_uris.clone(),
-                    post_logout_redirect_uris: client.post_logout_redirect_uris.clone(),
-                    scopes: client.scopes.clone(),
-                    grant_types: client.grant_types.clone(),
-                    response_types: client.response_types.clone(),
-                    token_endpoint_auth_method: client.token_endpoint_auth_method.clone(),
-                    require_pkce: client.require_pkce,
-                    require_mfa: false,
-                    require_pushed_authorization_requests: false,
-                    require_s256_pkce: false,
-                    require_confidential_client: false,
-                    require_dpop: false,
-                    require_account_selection: false,
-                    trust_email_verified: false,
-                    authorization_details_types: Vec::new(),
-                    subject_type: crate::subject::SUBJECT_TYPE_PUBLIC.to_string(),
-                    sector_identifier_uri: String::new(),
-                    jwks_uri: String::new(),
-                    jwks: String::new(),
-                    backchannel_logout_uri: String::new(),
-                    backchannel_logout_session_required: false,
-                    frontchannel_logout_uri: String::new(),
-                    frontchannel_logout_session_required: false,
-                    service_account_enabled: false,
-                    service_account_permissions: Vec::new(),
-                    is_active: true,
-                })
+            self.ensure_bootstrap_client(client, &system_organization.id)
                 .await?;
-            }
         }
         // Bootstrap clients are inserted after `migrate` has run. Give them
         // an application aggregate in the same startup rather than waiting
@@ -4816,13 +4909,14 @@ impl Db {
         let redirect_uris = util::to_json(&client.redirect_uris)?;
         let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
         let scopes = util::to_json(&client.scopes)?;
+        let audience = client.audience.trim().to_string();
         let grant_types = util::to_json(&client.grant_types)?;
         let response_types = util::to_json(&client.response_types)?;
         let authorization_details_types = util::to_json(&client.authorization_details_types)?;
         let service_account_permissions = util::to_json(&client.service_account_permissions)?;
         let created = with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO clients (id, client_id, client_secret_hash, client_name, logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO clients (id, client_id, client_secret_hash, client_name, logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, audience, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -4856,7 +4950,8 @@ impl Db {
                 ph(kind, 31),
                 ph(kind, 32),
                 ph(kind, 33),
-                ph(kind, 34)
+                ph(kind, 34),
+                ph(kind, 35)
             );
             sql_query(sql)
                 .bind::<Text, _>(&id)
@@ -4868,6 +4963,7 @@ impl Db {
                 .bind::<Text, _>(redirect_uris)
                 .bind::<Text, _>(post_logout_redirect_uris)
                 .bind::<Text, _>(scopes)
+                .bind::<Text, _>(audience)
                 .bind::<Text, _>(grant_types)
                 .bind::<Text, _>(response_types)
                 .bind::<Text, _>(client.token_endpoint_auth_method)
@@ -4914,13 +5010,14 @@ impl Db {
         let redirect_uris = util::to_json(&client.redirect_uris)?;
         let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
         let scopes = util::to_json(&client.scopes)?;
+        let audience = client.audience.trim().to_string();
         let grant_types = util::to_json(&client.grant_types)?;
         let response_types = util::to_json(&client.response_types)?;
         let authorization_details_types = util::to_json(&client.authorization_details_types)?;
         let service_account_permissions = util::to_json(&client.service_account_permissions)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, logo_uri = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
+                "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, logo_uri = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, audience = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -4953,7 +5050,8 @@ impl Db {
                 ph(kind, 30),
                 ph(kind, 31),
                 ph(kind, 32),
-                ph(kind, 33)
+                ph(kind, 33),
+                ph(kind, 34)
             );
             sql_query(sql)
                 .bind::<Text, _>(client.client_id)
@@ -4964,6 +5062,7 @@ impl Db {
                 .bind::<Text, _>(redirect_uris)
                 .bind::<Text, _>(post_logout_redirect_uris)
                 .bind::<Text, _>(scopes)
+                .bind::<Text, _>(audience)
                 .bind::<Text, _>(grant_types)
                 .bind::<Text, _>(response_types)
                 .bind::<Text, _>(client.token_endpoint_auth_method)
@@ -15915,6 +16014,20 @@ mod tests {
     }
 
     #[test]
+    fn client_audience_migrations_cover_all_database_engines() {
+        assert!(
+            SQLITE_MIGRATIONS
+                .contains(&"ALTER TABLE clients ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
+        );
+        assert!(POSTGRES_MIGRATIONS.contains(
+            &"ALTER TABLE clients ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT ''"
+        ));
+        assert!(MYSQL_MIGRATIONS.contains(
+            &"ALTER TABLE clients ADD COLUMN audience VARCHAR(2048) NOT NULL DEFAULT ''"
+        ));
+    }
+
+    #[test]
     fn application_jwt_migrations_cover_clients_secrets_and_bound_codes() {
         for (kind, migrations) in [
             (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
@@ -16381,6 +16494,86 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn bootstrap_client_ensure_is_idempotent_and_secret_safe() {
+        let (db, path) = sqlite_test_db().await;
+        let mut settings: Settings =
+            toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        settings.bootstrap.admin.create_on_startup = false;
+        settings.external_oidc_providers.clear();
+        settings.bootstrap.clients = vec![BootstrapClient {
+            client_id: "ensure-worker".to_string(),
+            client_name: "Ensure worker".to_string(),
+            logo_uri: String::new(),
+            client_secret: "first-secret".to_string(),
+            client_secret_env: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            scopes: vec!["memory.service".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            response_types: Vec::new(),
+            token_endpoint_auth_method: "client_secret_basic".to_string(),
+            require_pkce: false,
+            service_account_enabled: true,
+            service_account_permissions: vec!["users.read".to_string(), " users.read ".to_string()],
+            audience: Some("memory-atlas".to_string()),
+            rotate_secret: false,
+        }];
+
+        db.seed(&settings).await.unwrap();
+        let first = db
+            .find_client_by_client_id("ensure-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_hash = first.client_secret_hash.clone().unwrap();
+        assert!(util::verify_password(&first_hash, "first-secret"));
+        assert_eq!(first.audience, "memory-atlas");
+        assert_eq!(first.service_account_enabled, 1);
+        assert_eq!(
+            util::from_json::<Vec<String>>(&first.service_account_permissions).unwrap(),
+            vec!["users.read".to_string()]
+        );
+
+        settings.bootstrap.clients[0].client_name = "Updated worker".to_string();
+        settings.bootstrap.clients[0].client_secret = "second-secret".to_string();
+        settings.bootstrap.clients[0].audience = Some("memory-atlas-v2".to_string());
+        db.seed(&settings).await.unwrap();
+        let preserved = db
+            .find_client_by_client_id("ensure-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.client_name, "Updated worker");
+        assert_eq!(preserved.audience, "memory-atlas-v2");
+        assert_eq!(preserved.client_secret_hash, Some(first_hash.clone()));
+        assert!(util::verify_password(
+            preserved.client_secret_hash.as_deref().unwrap(),
+            "first-secret"
+        ));
+        assert!(!util::verify_password(
+            preserved.client_secret_hash.as_deref().unwrap(),
+            "second-secret"
+        ));
+
+        settings.bootstrap.clients[0].rotate_secret = true;
+        db.seed(&settings).await.unwrap();
+        let rotated = db
+            .find_client_by_client_id("ensure-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(rotated.client_secret_hash, Some(first_hash));
+        assert!(util::verify_password(
+            rotated.client_secret_hash.as_deref().unwrap(),
+            "second-secret"
+        ));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn mfa_totp_challenge_completion_is_single_use_under_concurrency() {
         let (db, path) = sqlite_test_db_with_pool_size(4).await;
         db.upsert_totp_method("mfa-user", "JBSWY3DPEHPK3PXP".to_string())
@@ -16411,13 +16604,14 @@ mod tests {
             }
         }
         assert_eq!(successful_completions, 1);
-        assert!(db
-            .find_mfa_challenge(&challenge.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .consumed_at
-            .is_some());
+        assert!(
+            db.find_mfa_challenge(&challenge.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .consumed_at
+                .is_some()
+        );
         assert_eq!(
             db.find_totp_method("mfa-user")
                 .await
@@ -16474,12 +16668,13 @@ mod tests {
             }
         }
         assert_eq!(successful_completions, 1);
-        assert!(db
-            .list_recovery_codes("mfa-user")
-            .await
-            .unwrap()
-            .into_iter()
-            .all(|code| code.used_at.is_some()));
+        assert!(
+            db.list_recovery_codes("mfa-user")
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|code| code.used_at.is_some())
+        );
 
         drop(db);
         let _ = std::fs::remove_file(path);
@@ -16845,6 +17040,7 @@ mod tests {
             redirect_uris: vec!["https://example.test/callback".to_string()],
             post_logout_redirect_uris: Vec::new(),
             scopes: vec!["openid".to_string()],
+            audience: String::new(),
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],
             token_endpoint_auth_method: "none".to_string(),
@@ -16869,6 +17065,54 @@ mod tests {
             service_account_permissions: Vec::new(),
             is_active: true,
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn bootstrap_client(secret: &str) -> BootstrapClient {
+        BootstrapClient {
+            client_id: "bootstrap-worker".to_string(),
+            client_name: "Bootstrap worker".to_string(),
+            logo_uri: String::new(),
+            client_secret: secret.to_string(),
+            client_secret_env: None,
+            redirect_uris: Vec::new(),
+            post_logout_redirect_uris: Vec::new(),
+            scopes: vec!["memory.service".to_string()],
+            grant_types: vec!["client_credentials".to_string()],
+            response_types: Vec::new(),
+            token_endpoint_auth_method: "client_secret_basic".to_string(),
+            require_pkce: false,
+            service_account_enabled: false,
+            service_account_permissions: Vec::new(),
+            audience: None,
+            rotate_secret: false,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bootstrap_client_ensure_reads_secret_from_environment() {
+        let (db, path) = sqlite_test_db().await;
+        let system = db.system_organization().await.unwrap();
+        let env_name = format!("SIGNET_BOOTSTRAP_TEST_SECRET_{}", uuid::Uuid::new_v4());
+        // Rust 2024 makes process-environment mutation explicit because tests
+        // may otherwise race with unrelated environment readers.
+        unsafe { std::env::set_var(&env_name, "environment-secret") };
+
+        let mut client = bootstrap_client("");
+        client.client_secret_env = Some(env_name.clone());
+        let record = db
+            .ensure_bootstrap_client(&client, &system.id)
+            .await
+            .unwrap();
+        assert!(util::verify_password(
+            record.client_secret_hash.as_deref().unwrap(),
+            "environment-secret"
+        ));
+
+        unsafe { std::env::remove_var(&env_name) };
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -21021,6 +21265,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
         scopes TEXT NOT NULL,
+        audience TEXT NOT NULL DEFAULT '',
         grant_types TEXT NOT NULL,
         response_types TEXT NOT NULL,
         token_endpoint_auth_method TEXT NOT NULL,
@@ -21065,6 +21310,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN frontchannel_logout_session_required INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_permissions TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE clients ADD COLUMN audience TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN logo_uri TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN organization_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization_id, is_active)",
@@ -21939,6 +22185,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
         scopes TEXT NOT NULL,
+        audience TEXT NOT NULL DEFAULT '',
         grant_types TEXT NOT NULL,
         response_types TEXT NOT NULL,
         token_endpoint_auth_method TEXT NOT NULL,
@@ -21983,6 +22230,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS frontchannel_logout_session_required INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS service_account_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS service_account_permissions TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE clients ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS logo_uri TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS organization_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_clients_organization ON clients(organization_id, is_active)",
@@ -22857,6 +23105,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         redirect_uris TEXT NOT NULL,
         post_logout_redirect_uris TEXT NOT NULL,
         scopes TEXT NOT NULL,
+        audience VARCHAR(2048) NOT NULL DEFAULT '',
         grant_types TEXT NOT NULL,
         response_types TEXT NOT NULL,
         token_endpoint_auth_method VARCHAR(64) NOT NULL,
@@ -22901,6 +23150,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE clients ADD COLUMN frontchannel_logout_session_required INT NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_enabled INT NOT NULL DEFAULT 0",
     "ALTER TABLE clients ADD COLUMN service_account_permissions TEXT NULL",
+    "ALTER TABLE clients ADD COLUMN audience VARCHAR(2048) NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN logo_uri VARCHAR(2048) NOT NULL DEFAULT ''",
     "ALTER TABLE clients ADD COLUMN organization_id VARCHAR(64) NULL",
     "CREATE INDEX idx_clients_organization ON clients(organization_id, is_active)",

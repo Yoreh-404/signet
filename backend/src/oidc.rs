@@ -1738,7 +1738,10 @@ async fn token_from_client_credentials(
         ));
     }
     let scope = normalize_client_credentials_scope(&client, payload.scope.as_deref())?;
-    let resource = normalize_resource(payload.resource.as_deref())?;
+    let resource = resolve_client_credentials_audience(
+        &client,
+        normalize_resource(payload.resource.as_deref())?,
+    )?;
     let authorization_details = authorization_details::normalize_authorization_details_for_client(
         &client,
         payload.authorization_details.as_deref(),
@@ -3343,6 +3346,22 @@ pub(crate) fn normalize_resource(resource: Option<&str>) -> AppResult<Option<Str
         ));
     }
     Ok(Some(resource.to_string()))
+}
+
+fn resolve_client_credentials_audience(
+    client: &ClientRecord,
+    requested_resource: Option<String>,
+) -> AppResult<Option<String>> {
+    let configured =
+        (!client.audience.trim().is_empty()).then(|| client.audience.trim().to_string());
+    if let (Some(expected), Some(requested)) = (&configured, &requested_resource)
+        && expected != requested
+    {
+        return Err(AppError::Oidc(
+            "resource parameter does not match configured client audience".to_string(),
+        ));
+    }
+    Ok(requested_resource.or(configured))
 }
 
 fn merge_token_resource(
@@ -5814,6 +5833,34 @@ mod tests {
     }
 
     #[test]
+    fn client_credentials_use_and_enforce_configured_audience() {
+        let mut client = test_client();
+        client.audience = "https://memory.example/api".to_string();
+
+        assert_eq!(
+            resolve_client_credentials_audience(&client, None).unwrap(),
+            Some("https://memory.example/api".to_string())
+        );
+        assert_eq!(
+            resolve_client_credentials_audience(
+                &client,
+                Some("https://other.example/api".to_string())
+            )
+            .unwrap_err()
+            .to_string(),
+            "oidc error: resource parameter does not match configured client audience"
+        );
+        assert_eq!(
+            resolve_client_credentials_audience(
+                &client,
+                Some("https://memory.example/api".to_string())
+            )
+            .unwrap(),
+            Some("https://memory.example/api".to_string())
+        );
+    }
+
+    #[test]
     fn token_resource_cannot_change_issued_resource() {
         assert_eq!(
             merge_token_resource(
@@ -6534,6 +6581,7 @@ mod tests {
                     "profile".to_string(),
                     "offline_access".to_string(),
                 ],
+                audience: String::new(),
                 grant_types: vec!["authorization_code".to_string()],
                 response_types: vec!["code".to_string()],
                 token_endpoint_auth_method: "none".to_string(),
@@ -6592,6 +6640,7 @@ mod tests {
             redirect_uris: serde_json::json!(["https://app.example/callback"]).to_string(),
             post_logout_redirect_uris: "[]".to_string(),
             scopes: serde_json::json!(["openid", "profile"]).to_string(),
+            audience: String::new(),
             grant_types: serde_json::json!(["authorization_code"]).to_string(),
             response_types: serde_json::json!(["code"]).to_string(),
             token_endpoint_auth_method: "none".to_string(),

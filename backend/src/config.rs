@@ -197,14 +197,29 @@ pub struct BootstrapClient {
     pub client_name: String,
     #[serde(default)]
     pub logo_uri: String,
+    #[serde(default)]
     pub client_secret: String,
+    #[serde(default, alias = "secret_env")]
+    pub client_secret_env: Option<String>,
+    #[serde(default)]
     pub redirect_uris: Vec<String>,
+    #[serde(default)]
     pub post_logout_redirect_uris: Vec<String>,
     pub scopes: Vec<String>,
     pub grant_types: Vec<String>,
+    #[serde(default)]
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
+    #[serde(default)]
     pub require_pkce: bool,
+    #[serde(default, alias = "service_account")]
+    pub service_account_enabled: bool,
+    #[serde(default, alias = "permissions")]
+    pub service_account_permissions: Vec<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default, alias = "rotate_client_secret", alias = "rotate")]
+    pub rotate_secret: bool,
 }
 
 impl Settings {
@@ -214,7 +229,7 @@ impl Settings {
             .with_context(|| format!("failed to read configuration file: {path}"))?;
         let mut settings: Settings = toml::from_str(&raw)
             .with_context(|| format!("failed to parse configuration file: {path}"))?;
-        settings.apply_env_overrides();
+        settings.apply_env_overrides()?;
         settings.validate()?;
         Ok(settings)
     }
@@ -224,7 +239,7 @@ impl Settings {
             .context("invalid server host/port")
     }
 
-    fn apply_env_overrides(&mut self) {
+    fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(value) = env::var("SSO_PUBLIC_BASE_URL") {
             self.server.public_base_url = value;
             if env::var("SSO_ISSUER").is_err() {
@@ -268,6 +283,19 @@ impl Settings {
         if let Ok(value) = env::var("SSO_BOOTSTRAP_ADMIN_PASSWORD") {
             self.bootstrap.admin.password = value;
         }
+        for client in &mut self.bootstrap.clients {
+            let Some(env_name) = client
+                .client_secret_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            resolve_bootstrap_client_secret(client, env::var(&env_name))?;
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -330,6 +358,9 @@ impl Settings {
         validate_verification_channel("phone", &self.verification.phone)?;
         for client in &self.bootstrap.clients {
             validate_bootstrap_client_logo_uri(&client.client_id, &client.logo_uri)?;
+            if client.client_id.trim().is_empty() {
+                anyhow::bail!("bootstrap client_id cannot be empty");
+            }
             if !matches!(
                 client.token_endpoint_auth_method.as_str(),
                 "client_secret_basic"
@@ -343,32 +374,80 @@ impl Settings {
                     client.client_id
                 );
             }
-            if matches!(
-                client.token_endpoint_auth_method.as_str(),
-                "client_secret_basic" | "client_secret_post" | "client_secret_jwt"
-            ) && client.client_secret.is_empty()
-            {
-                anyhow::bail!(
-                    "bootstrap client {} requires client_secret for secret-based authentication",
-                    client.client_id
-                );
-            }
-            if !client.scopes.iter().any(|scope| scope == "openid") {
+            let uses_authorization_code = client
+                .grant_types
+                .iter()
+                .any(|value| value == "authorization_code");
+            if uses_authorization_code && !client.scopes.iter().any(|scope| scope == "openid") {
                 anyhow::bail!(
                     "bootstrap client {} must include openid scope",
                     client.client_id
                 );
             }
-            let uses_authorization_code = client
-                .grant_types
-                .iter()
-                .any(|value| value == "authorization_code");
             if uses_authorization_code && !client.response_types.iter().any(|value| value == "code")
             {
                 anyhow::bail!(
                     "bootstrap client {} must support code response type",
                     client.client_id
                 );
+            }
+            if client.service_account_enabled
+                && !client
+                    .grant_types
+                    .iter()
+                    .any(|value| value == "client_credentials")
+            {
+                anyhow::bail!(
+                    "bootstrap client {} service accounts require client_credentials grant",
+                    client.client_id
+                );
+            }
+            crate::service_accounts::normalize_permissions(
+                client.service_account_permissions.clone(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "bootstrap client {} has invalid service_account_permissions: {error}",
+                    client.client_id
+                )
+            })?;
+            if let Some(audience) = client.audience.as_deref()
+                && !audience.trim().is_empty()
+            {
+                if audience.len() > 2048 {
+                    anyhow::bail!(
+                        "bootstrap client {} audience must be at most 2048 characters",
+                        client.client_id
+                    );
+                }
+                if audience.chars().any(char::is_whitespace) {
+                    anyhow::bail!(
+                        "bootstrap client {} audience cannot contain whitespace",
+                        client.client_id
+                    );
+                }
+            }
+            if client.rotate_secret {
+                if !matches!(
+                    client.token_endpoint_auth_method.as_str(),
+                    "client_secret_basic" | "client_secret_post" | "client_secret_jwt"
+                ) {
+                    anyhow::bail!(
+                        "bootstrap client {} rotate_secret requires secret-based authentication",
+                        client.client_id
+                    );
+                }
+                if client.client_secret.is_empty()
+                    && !client
+                        .client_secret_env
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    anyhow::bail!(
+                        "bootstrap client {} rotate_secret requires client_secret or client_secret_env",
+                        client.client_id
+                    );
+                }
             }
         }
         for provider in &self.external_oidc_providers {
@@ -499,6 +578,22 @@ fn validate_bootstrap_client_logo_uri(client_id: &str, value: &str) -> Result<()
     Ok(())
 }
 
+fn resolve_bootstrap_client_secret(
+    client: &mut BootstrapClient,
+    value: std::result::Result<String, env::VarError>,
+) -> Result<()> {
+    if client.client_secret_env.is_none() {
+        return Ok(());
+    }
+    client.client_secret = value.with_context(|| {
+        format!(
+            "bootstrap client {} references missing client_secret_env",
+            client.client_id
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +664,79 @@ mod tests {
 
         settings.cors.allowed_origins = vec!["https://console.example".to_string()];
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_client_supports_service_accounts_without_openid_scope() {
+        let mut settings = default_settings();
+        {
+            let client = settings.bootstrap.clients.first_mut().unwrap();
+            client.scopes = vec!["memory.service".to_string()];
+            client.grant_types = vec!["client_credentials".to_string()];
+            client.response_types.clear();
+            client.service_account_enabled = true;
+            client.service_account_permissions = vec![" users.read ".to_string()];
+            client.audience = Some("memory-atlas".to_string());
+        }
+
+        assert!(settings.validate().is_ok());
+
+        settings.bootstrap.clients[0].service_account_permissions =
+            vec!["not-a-permission".to_string()];
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_client_secret_env_replaces_literal_secret() {
+        let mut settings = default_settings();
+        let client = settings.bootstrap.clients.first_mut().unwrap();
+        client.client_secret = "literal-secret".to_string();
+        client.client_secret_env = Some("SIGNET_TEST_CLIENT_SECRET".to_string());
+
+        resolve_bootstrap_client_secret(client, Ok("env-secret".to_string())).unwrap();
+        assert_eq!(client.client_secret, "env-secret");
+    }
+
+    #[test]
+    fn bootstrap_client_secret_can_be_omitted_for_existing_clients() {
+        let mut settings = default_settings();
+        settings.bootstrap.clients[0].client_secret.clear();
+        assert!(settings.validate().is_ok());
+
+        settings.bootstrap.clients[0].rotate_secret = true;
+        assert!(settings.validate().is_err());
+
+        settings.bootstrap.clients[0].client_secret = "secret".to_string();
+        settings.bootstrap.clients[0].token_endpoint_auth_method = "none".to_string();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_client_aliases_support_secret_env_and_rotate() {
+        let client: BootstrapClient = toml::from_str(
+            r#"
+            client_id = "worker"
+            client_name = "Worker"
+            secret_env = "WORKER_SECRET"
+            scopes = ["memory.service"]
+            grant_types = ["client_credentials"]
+            token_endpoint_auth_method = "client_secret_basic"
+            service_account = true
+            permissions = ["users.read"]
+            audience = "memory-atlas-api"
+            rotate_client_secret = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(client.client_secret_env.as_deref(), Some("WORKER_SECRET"));
+        assert!(client.redirect_uris.is_empty());
+        assert!(client.post_logout_redirect_uris.is_empty());
+        assert!(client.response_types.is_empty());
+        assert!(!client.require_pkce);
+        assert!(client.service_account_enabled);
+        assert_eq!(client.service_account_permissions, vec!["users.read"]);
+        assert_eq!(client.audience.as_deref(), Some("memory-atlas-api"));
+        assert!(client.rotate_secret);
     }
 }
