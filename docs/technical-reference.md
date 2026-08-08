@@ -1,4 +1,19 @@
+<!-- anchordocs-lifecycle: DONE -->
+<!-- anchordocs-owner: Signet maintainers -->
+<!-- anchordocs-updated: 2026-08-06 -->
+<!-- anchordocs-acceptance: 本地离线技术参考保留完整协议细节，并明确 AnchorDocs 模块文档是状态权威来源 -->
+<!-- anchordocs-evidence: commit=f2a9a62500b078980a6c7efbfa1cc63ffbcc8e71; path=backend/src/server.rs; lines=1-220 -->
+
 # Signet 技术参考
+
+> 本文是可离线检索的集中式兼容参考。模块边界、实现状态和未完成项以 AnchorDocs developer/user 文档为准；新增能力应优先写入对应模块文章，不要继续把互不相关的设计堆到本文。
+
+AI 读取本地参考时，先根据任务选择远端行为合同：身份/Session 读
+`architecture-session-and-data-model`，授权协议读
+`oidc-protocol-and-client-security`，浏览器安全和 MFA 读
+`browser-security-mfa-passkeys`，组织/目录/外部协议读
+`admin-directory-and-integration-protocols`，部署和密钥读
+`deployment-database-and-key-rotation`。本文用于核对具体协议细节，不是默认的设计入口，也不应被整理成阶段计划。
 
 本文保留 Signet 的完整技术说明、协议示例和开发验证信息。若你是首次部署或接入应用，请先阅读 [文档导航](README.md) 和 [项目首页](../README.md)。
 

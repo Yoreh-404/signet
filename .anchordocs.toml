@@ -1,0 +1,6 @@
+version = 1
+project = "signet"
+developer_document_set = "developer"
+user_document_set = "user"
+default_branch = "internal"
+default_locale = "zh-CN"
