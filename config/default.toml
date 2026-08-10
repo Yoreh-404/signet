@@ -21,7 +21,7 @@ token_endpoint = "/oauth2/token"
 userinfo_endpoint = "/oauth2/userinfo"
 jwks_uri = "/oauth2/jwks"
 end_session_endpoint = "/oauth2/logout"
-access_token_ttl_seconds = 900
+access_token_ttl_seconds = 600
 id_token_ttl_seconds = 900
 authorization_code_ttl_seconds = 300
 refresh_token_ttl_seconds = 2592000
@@ -31,11 +31,53 @@ refresh_token_ttl_seconds = 2592000
 # use the same Signet deployment without adding local JWT/HMAC trust roots.
 supported_scopes = [
   "openid", "profile", "email", "offline_access", "scim.read", "scim.write",
-  "axon.code.service", "memory.service", "memory.code.index", "memory.code.write",
+  "axon.code.service", "axon.agent.invoke:memory", "axon.hub.read", "axon.hub.submit",
+  "anchordocs.service", "ocr.service", "memory.service", "memory.agent.callback",
+  "memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent",
+  "anchordocs.read", "anchordocs.write",
+  "ocr.extract", "ocr.read",
 ]
 # If false, users see a consent page before a new client/scope set is authorized.
-skip_consent = true
+skip_consent = false
 allow_dynamic_client_registration = false
+
+# User delegation is narrower than a client's ordinary scope grant.  Every
+# RFC 8693 exchange must match one of these actor/target/source rules, and
+# every listed scope must also be present in the user's live consent.
+[[oidc.delegated_allowlist]]
+client_id = "axon"
+audience = "axon"
+subject_client_id = "axon"
+scopes = ["axon.agent.invoke:memory"]
+
+[[oidc.delegated_allowlist]]
+client_id = "axon"
+audience = "memory-atlas"
+subject_client_id = "axon"
+scopes = ["memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent"]
+
+[[oidc.delegated_allowlist]]
+client_id = "axon"
+audience = "anchordocs"
+subject_client_id = "axon"
+scopes = ["anchordocs.read", "anchordocs.write"]
+
+[[oidc.delegated_allowlist]]
+client_id = "axon"
+audience = "axon-hub"
+subject_client_id = "axon"
+scopes = ["axon.hub.read", "axon.hub.submit"]
+
+[[oidc.delegated_allowlist]]
+client_id = "axon"
+audience = "ocr"
+subject_client_id = "axon"
+scopes = ["ocr.extract", "ocr.read"]
+
+[[oidc.delegated_allowlist]]
+client_id = "memory-atlas-to-axon"
+audience = "axon"
+scopes = ["axon.agent.invoke:memory"]
 
 [security]
 cookie_name = "gpt_sso_session"
@@ -125,7 +167,12 @@ allow_login = true
 allow_registration = true
 
 [cors]
-allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"]
+allowed_origins = [
+  "http://localhost:5173", "http://127.0.0.1:5173",
+  "http://localhost:8080", "http://127.0.0.1:8080",
+  "http://localhost:18081", "http://127.0.0.1:18081",
+  "http://localhost:18085", "http://127.0.0.1:18085",
+]
 allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 allowed_headers = ["authorization", "content-type", "x-csrf-token"]
 allow_credentials = true
@@ -149,3 +196,200 @@ grant_types = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:gra
 response_types = ["code"]
 token_endpoint_auth_method = "client_secret_basic"
 require_pkce = false
+
+# Cross-project service identities.  These local values make a fresh
+# development deployment immediately bootstrap-able; production deployments
+# must replace them in a deployment-specific config/secret workflow before
+# exposing Signet outside the local network.
+[[bootstrap.clients]]
+client_id = "memory-atlas-to-axon"
+client_name = "Memory Atlas -> Axon Agent Webhook"
+client_secret = "local-memory-atlas-to-axon-change-me"
+scopes = ["axon.agent.invoke:memory"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "axon"
+
+[[bootstrap.clients]]
+client_id = "axon-to-memory-atlas"
+client_name = "Axon -> Memory Atlas Service"
+client_secret = "local-axon-to-memory-atlas-change-me"
+scopes = ["memory.service", "memory.agent.callback", "memory.code.index", "memory.code.write"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "memory-atlas"
+
+[[bootstrap.clients]]
+client_id = "axon-to-axon-hub"
+client_name = "Axon -> Axon Hub Registry"
+client_secret = "local-axon-to-axon-hub-change-me"
+scopes = ["axon.hub.read", "axon.hub.submit"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "axon-hub"
+
+[[bootstrap.clients]]
+client_id = "anchordocs-service"
+client_name = "AnchorDocs Service"
+client_secret = "local-anchordocs-service-change-me"
+scopes = ["anchordocs.service"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "anchordocs"
+
+[[bootstrap.clients]]
+client_id = "ocr-service"
+client_name = "OCR MCP Service"
+client_secret = "local-ocr-service-change-me"
+scopes = ["ocr.service"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "ocr"
+
+[[bootstrap.clients]]
+client_id = "axon-uniapp"
+client_name = "Axon UniApp"
+redirect_uris = ["http://localhost:3000/callback", "http://localhost:5173/callback"]
+post_logout_redirect_uris = ["http://localhost:3000/", "http://localhost:5173/"]
+scopes = ["openid", "profile", "email", "offline_access"]
+grant_types = ["authorization_code", "refresh_token"]
+response_types = ["code"]
+token_endpoint_auth_method = "none"
+require_pkce = true
+
+[[bootstrap.clients]]
+client_id = "anchordocs-web"
+client_name = "AnchorDocs Web"
+redirect_uris = [
+  "https://docs.test.com/",
+  "http://localhost:18085/",
+  "http://127.0.0.1:18085/",
+  "http://localhost:5173/",
+  "http://127.0.0.1:5173/",
+]
+post_logout_redirect_uris = [
+  "https://docs.test.com/",
+  "http://localhost:18085/",
+  "http://127.0.0.1:18085/",
+  "http://localhost:5173/",
+  "http://127.0.0.1:5173/",
+]
+scopes = ["openid", "profile", "email", "anchordocs.read", "anchordocs.write"]
+grant_types = ["authorization_code"]
+response_types = ["code"]
+token_endpoint_auth_method = "none"
+require_pkce = true
+audience = "anchordocs"
+
+[[bootstrap.clients]]
+client_id = "axon-hub-web"
+client_name = "Axon Hub Web"
+redirect_uris = [
+  "https://hub.test.com/",
+  "http://localhost:18081/",
+  "http://127.0.0.1:18081/",
+  "http://localhost:5173/",
+  "http://127.0.0.1:5173/",
+]
+post_logout_redirect_uris = [
+  "https://hub.test.com/",
+  "http://localhost:18081/",
+  "http://127.0.0.1:18081/",
+  "http://localhost:5173/",
+  "http://127.0.0.1:5173/",
+]
+scopes = ["openid", "profile", "email", "axon.hub.read", "axon.hub.submit"]
+grant_types = ["authorization_code"]
+response_types = ["code"]
+token_endpoint_auth_method = "none"
+require_pkce = true
+audience = "axon-hub"
+
+[[bootstrap.clients]]
+client_id = "axon"
+client_name = "Axon OIDC confidential client"
+client_secret = "local-axon-oidc-change-me"
+redirect_uris = [
+  "http://localhost:15000/admin/api/auth/signet/callback",
+  "http://127.0.0.1:15000/admin/api/auth/signet/callback",
+  "http://axon:5000/admin/api/auth/signet/callback",
+  "http://localhost:15000/oauth2/callback",
+]
+post_logout_redirect_uris = ["http://localhost:15000/", "http://127.0.0.1:15000/"]
+scopes = [
+  "openid", "profile", "email", "offline_access", "axon.agent.invoke:memory",
+  "memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent",
+  "anchordocs.read", "anchordocs.write",
+  "axon.hub.read", "axon.hub.submit", "ocr.extract", "ocr.read",
+]
+grant_types = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"]
+response_types = ["code"]
+token_endpoint_auth_method = "client_secret_basic"
+require_pkce = true
+require_confidential_client = true
+audience = "axon"
+
+# Resource-bound RFC 7662 clients. Each resource server gets its own
+# credential and can introspect only tokens whose audience is its resource.
+[[bootstrap.clients]]
+client_id = "memory-atlas-introspection"
+client_name = "Memory Atlas Introspection"
+client_secret = "local-memory-atlas-introspection-change-me"
+scopes = ["openid"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "memory-atlas"
+
+[[bootstrap.clients]]
+client_id = "anchordocs-introspection"
+client_name = "AnchorDocs Introspection"
+client_secret = "local-anchordocs-introspection-change-me"
+scopes = ["openid"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "anchordocs"
+
+[[bootstrap.clients]]
+client_id = "axon-hub-introspection"
+client_name = "Axon Hub Introspection"
+client_secret = "local-axon-hub-introspection-change-me"
+scopes = ["openid"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "axon-hub"
+
+[[bootstrap.clients]]
+client_id = "ocr-introspection"
+client_name = "OCR Introspection"
+client_secret = "local-ocr-introspection-change-me"
+scopes = ["openid"]
+grant_types = ["client_credentials"]
+response_types = []
+token_endpoint_auth_method = "client_secret_basic"
+require_confidential_client = true
+service_account_enabled = true
+audience = "ocr"

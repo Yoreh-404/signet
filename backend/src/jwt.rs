@@ -79,6 +79,15 @@ pub struct TokenClaims {
     pub cnf: Option<ConfirmationClaim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_details: Option<Value>,
+    /// RFC 8693 actor chain.  The value is kept as JSON because the claim is
+    /// an object and a later exchange may add another actor layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Value>,
+    /// Opaque reference to the authorization grant/consent lineage.  It is
+    /// deliberately distinct from jti: exchanged tokens retain the grant
+    /// reference while receiving a fresh jti.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpt_sso_login_code_level: Option<String>,
 }
@@ -406,6 +415,7 @@ impl JwtManager {
         extra_claims: Map<String, Value>,
     ) -> AppResult<String> {
         let now = util::now_ts();
+        let jti = util::random_token(24);
         let key_set = self
             .key_set
             .read()
@@ -416,7 +426,7 @@ impl JwtManager {
             aud: audience.unwrap_or(&client.client_id).to_string(),
             exp: now + ttl_seconds,
             iat: now,
-            jti: Some(util::random_token(24)),
+            jti: Some(jti.clone()),
             token_use: "access_token".to_string(),
             client_id: client.client_id.clone(),
             scope: scope.to_string(),
@@ -429,6 +439,8 @@ impl JwtManager {
             sid: None,
             cnf: None,
             authorization_details: None,
+            act: None,
+            grant_id: Some(jti),
             gpt_sso_login_code_level: None,
         };
         let mut claims_value = serde_json::to_value(claims)
@@ -604,6 +616,7 @@ impl JwtManager {
         subject_identifier: Option<&str>,
     ) -> AppResult<String> {
         let now = util::now_ts();
+        let jti = util::random_token(24);
         let key_set = self
             .key_set
             .read()
@@ -616,7 +629,7 @@ impl JwtManager {
             aud: subject.audience.unwrap_or(subject.client_id).to_string(),
             exp: now + ttl_seconds,
             iat: now,
-            jti: Some(util::random_token(24)),
+            jti: Some(jti.clone()),
             token_use: token_use.to_string(),
             client_id: subject.client_id.to_string(),
             scope: subject.scope.to_string(),
@@ -633,6 +646,8 @@ impl JwtManager {
             sid: None,
             cnf: None,
             authorization_details: None,
+            act: None,
+            grant_id: Some(jti),
             gpt_sso_login_code_level: None,
         };
         let mut claims_value = serde_json::to_value(claims)

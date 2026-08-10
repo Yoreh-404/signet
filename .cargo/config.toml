@@ -1,0 +1,14 @@
+# OpenSponge Rust toolchain and native linker contract.
+
+[build]
+target-dir = "target"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[env]
+CC_x86_64_unknown_linux_gnu = "clang"
+CXX_x86_64_unknown_linux_gnu = "clang++"
+AR_x86_64_unknown_linux_gnu = "llvm-ar"
+RANLIB_x86_64_unknown_linux_gnu = "llvm-ranlib"

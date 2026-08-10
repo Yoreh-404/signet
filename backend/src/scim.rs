@@ -1995,6 +1995,8 @@ mod tests {
             sid: None,
             cnf: None,
             authorization_details: None,
+            act: None,
+            grant_id: None,
             gpt_sso_login_code_level: None,
         }
     }

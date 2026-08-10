@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeSet, env, fs, net::SocketAddr, str::FromStr};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Settings {
@@ -43,6 +43,47 @@ pub enum DatabaseKind {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DelegatedAllowlistEntry {
+    /// The confidential OAuth client that is allowed to perform the
+    /// delegation.  Omitting this field is a wildcard, but production
+    /// configuration should always bind a rule to a concrete client.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// RFC 8707 resource or RFC 8693 audience accepted by the rule.
+    #[serde(default, alias = "resource")]
+    pub audience: Option<String>,
+    /// Optional source client binding.  This is useful when a single
+    /// delegating client accepts subject tokens issued to more than one RP.
+    #[serde(default)]
+    pub subject_client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Accept the singular spelling as well as the more convenient TOML
+    /// array form.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl DelegatedAllowlistEntry {
+    pub fn normalized_scopes(&self) -> Vec<String> {
+        let mut scopes = BTreeSet::new();
+        scopes.extend(
+            self.scopes
+                .iter()
+                .map(String::as_str)
+                .filter(|scope| !scope.trim().is_empty())
+                .map(|scope| scope.trim().to_string()),
+        );
+        if let Some(scope) = self.scope.as_deref().map(str::trim) {
+            if !scope.is_empty() {
+                scopes.insert(scope.to_string());
+            }
+        }
+        scopes.into_iter().collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OidcSettings {
     pub issuer: String,
     pub authorization_endpoint: String,
@@ -57,6 +98,12 @@ pub struct OidcSettings {
     pub supported_scopes: Vec<String>,
     pub skip_consent: bool,
     pub allow_dynamic_client_registration: bool,
+    /// Explicit resource-owner delegation policy for RFC 8693 token
+    /// exchange.  This is intentionally separate from a client's ordinary
+    /// scope list: a user token can only be delegated where an operator has
+    /// declared both the target audience and the delegated scope.
+    #[serde(default, alias = "delegated_scope_allowlist")]
+    pub delegated_allowlist: Vec<DelegatedAllowlistEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -212,6 +259,8 @@ pub struct BootstrapClient {
     pub token_endpoint_auth_method: String,
     #[serde(default)]
     pub require_pkce: bool,
+    #[serde(default)]
+    pub require_confidential_client: bool,
     #[serde(default, alias = "service_account")]
     pub service_account_enabled: bool,
     #[serde(default, alias = "permissions")]
@@ -333,6 +382,11 @@ impl Settings {
                 self.security.password_min_length
             );
         }
+        if !(300..=600).contains(&self.oidc.access_token_ttl_seconds) {
+            anyhow::bail!(
+                "oidc.access_token_ttl_seconds must be between 300 and 600 seconds"
+            );
+        }
         if !self
             .i18n
             .supported_locales
@@ -402,6 +456,14 @@ impl Settings {
                     client.client_id
                 );
             }
+            if client.require_confidential_client
+                && client.token_endpoint_auth_method == "none"
+            {
+                anyhow::bail!(
+                    "bootstrap client {} cannot require confidentiality with token_endpoint_auth_method=none",
+                    client.client_id
+                );
+            }
             crate::service_accounts::normalize_permissions(
                 client.service_account_permissions.clone(),
             )
@@ -446,6 +508,37 @@ impl Settings {
                     anyhow::bail!(
                         "bootstrap client {} rotate_secret requires client_secret or client_secret_env",
                         client.client_id
+                    );
+                }
+            }
+        }
+        for (index, entry) in self.oidc.delegated_allowlist.iter().enumerate() {
+            for (label, value) in [
+                ("client_id", entry.client_id.as_deref()),
+                ("audience", entry.audience.as_deref()),
+                ("subject_client_id", entry.subject_client_id.as_deref()),
+            ] {
+                if value.is_some_and(|value| value.trim().is_empty()) {
+                    anyhow::bail!(
+                        "oidc.delegated_allowlist[{index}].{label} cannot be empty"
+                    );
+                }
+            }
+            let scopes = entry.normalized_scopes();
+            if scopes.is_empty() {
+                anyhow::bail!(
+                    "oidc.delegated_allowlist[{index}] must contain at least one scope"
+                );
+            }
+            for scope in scopes {
+                if scope.ends_with(".service") {
+                    anyhow::bail!(
+                        "oidc.delegated_allowlist[{index}] cannot delegate service scope {scope}"
+                    );
+                }
+                if scope.len() > 256 || scope.chars().any(char::is_whitespace) {
+                    anyhow::bail!(
+                        "oidc.delegated_allowlist[{index}] contains an invalid scope"
                     );
                 }
             }

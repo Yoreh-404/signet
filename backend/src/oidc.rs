@@ -18,7 +18,7 @@ use crate::{
     directory,
     dpop::{self, DpopBinding},
     error::{AppError, AppResult},
-    jwt::TokenSubject,
+    jwt::{TokenClaims, TokenSubject},
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
@@ -1741,6 +1741,7 @@ async fn token_from_client_credentials(
     let resource = resolve_client_credentials_audience(
         &client,
         normalize_resource(payload.resource.as_deref())?,
+        payload.audience.as_deref(),
     )?;
     let authorization_details = authorization_details::normalize_authorization_details_for_client(
         &client,
@@ -1944,6 +1945,7 @@ async fn token_from_token_exchange(
             .ok_or_else(|| AppError::Oidc("subject_token_type is required".to_string()))?,
         requested_token_type: payload.requested_token_type,
         scope: payload.scope,
+        resource: payload.resource,
         audience: payload.audience,
         actor_token: payload.actor_token,
     };
@@ -1957,7 +1959,7 @@ async fn token_from_token_exchange(
         id_token: None,
         refresh_token: None,
         scope: exchanged.scope,
-        authorization_details: None,
+        authorization_details: exchanged.authorization_details,
     }))
 }
 
@@ -2027,12 +2029,15 @@ async fn token_from_refresh_token(
     .await?;
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
+    let token_audience = resource.as_deref().or_else(|| {
+        (!client.audience.trim().is_empty()).then_some(client.audience.as_str())
+    });
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         &issuer,
         TokenSubject {
             user: &user,
             client_id: &client.client_id,
-            audience: resource.as_deref(),
+            audience: token_audience,
             scope: &scope,
             nonce: None,
             auth_time: None,
@@ -2163,12 +2168,15 @@ async fn issue_tokens_for_user(
             serde_json::Value::String(level.as_str().to_string()),
         );
     }
+    let token_audience = resource.as_deref().or_else(|| {
+        (!client.audience.trim().is_empty()).then_some(client.audience.as_str())
+    });
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         issuer,
         TokenSubject {
             user: &user,
             client_id: &client.client_id,
-            audience: resource.as_deref(),
+            audience: token_audience,
             scope: &scope,
             nonce: None,
             auth_time,
@@ -2427,36 +2435,52 @@ async fn introspect(
     Form(payload): Form<IntrospectionRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let client = authenticate_client_at(&state, &headers, &payload, "/oauth2/introspect").await?;
+    if client.token_endpoint_auth_method == "none" {
+        return Err(AppError::Unauthorized);
+    }
     let _hint = payload.token_type_hint.as_deref();
     let issuers = state.accepted_issuers(&headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    // Introspection is an issuer-level endpoint rather than the resource
-    // represented by the token's `aud`. Resource Indicators therefore remain
-    // valid here; `claims.client_id == client.client_id` below is the
-    // authorization boundary that prevents one client from introspecting
-    // another client's token.
+    let expected_audience = introspection_audience(&client);
     if let Ok(claims) = state
         .jwt
         .verify_access_token_for_introspection(&payload.token, &issuer_refs)
     {
-        let mut active = claims.exp > util::now_ts() && claims.client_id == client.client_id;
-        if active && claims.sub != claims.client_id {
-            active = load_oidc_user(&state, &claims.sub).await.is_ok();
-        }
+        let source_client = state.db.find_client_by_client_id(&claims.client_id).await?;
+        let active = claims.exp > util::now_ts()
+            && claims.aud == expected_audience
+            && source_client
+                .as_ref()
+                .is_some_and(|source_client| source_client.is_active == 1)
+            && introspected_access_token_is_live(&state, source_client.as_ref(), &claims).await?;
         if active {
             let cnf = claims
                 .cnf
+                .clone()
                 .map(|claim| serde_json::json!({ "jkt": claim.jkt }));
+            let subject_type = if claims.sub.starts_with("service-account:") {
+                "service".to_string()
+            } else {
+                source_client
+                    .as_ref()
+                    .map(|source_client| source_client.subject_type.clone())
+                    .unwrap_or_else(|| subject::SUBJECT_TYPE_PUBLIC.to_string())
+            };
             return Ok(Json(serde_json::json!({
                 "active": true,
                 "scope": claims.scope,
                 "client_id": claims.client_id,
                 "sub": claims.sub,
+                "subject_type": subject_type,
                 "token_type": "Bearer",
                 "exp": claims.exp,
                 "iat": claims.iat,
                 "iss": claims.iss,
                 "aud": claims.aud,
+                "jti": claims.jti,
+                "act": claims.act,
+                "grant_id": claims.grant_id,
+                "grant_reference": claims.grant_id,
                 "username": claims.preferred_username,
                 "cnf": cnf,
                 "authorization_details": claims.authorization_details,
@@ -2465,10 +2489,43 @@ async fn introspect(
     }
     let hash = util::token_hash(&payload.token);
     if let Some(record) = state.db.find_refresh_token(&hash).await?
-        && record.client_id == client.client_id
         && record.revoked_at.is_none()
         && record.expires_at > util::now_ts()
+        && record
+            .resource
+            .as_deref()
+            .unwrap_or(record.client_id.as_str())
+            == expected_audience
     {
+        let source_client = state
+            .db
+            .find_client_by_client_id(&record.client_id)
+            .await?;
+        let user = source_client
+            .as_ref()
+            .filter(|source_client| source_client.is_active == 1)
+            .and_then(|_| Some(record.user_id.clone()));
+        let user_active = if let Some(user_id) = user {
+            load_oidc_user(&state, &user_id).await.is_ok()
+        } else {
+            false
+        };
+        let consent_active = if user_active {
+            introspected_refresh_grant_is_live(&state, &record.user_id, &record.client_id).await?
+        } else {
+            false
+        };
+        if !consent_active {
+            return Ok(Json(serde_json::json!({ "active": false })));
+        }
+        let subject_type = if record.user_id.starts_with("service-account:") {
+            "service".to_string()
+        } else {
+            source_client
+                .as_ref()
+                .map(|source_client| source_client.subject_type.clone())
+                .unwrap_or_else(|| subject::SUBJECT_TYPE_PUBLIC.to_string())
+        };
         let audience = record
             .resource
             .clone()
@@ -2481,14 +2538,110 @@ async fn introspect(
             "scope": record.scope,
             "client_id": record.client_id,
             "sub": record.user_id,
+            "subject_type": subject_type,
             "token_type": "refresh_token",
             "exp": record.expires_at,
             "iat": record.created_at,
             "aud": audience,
+            "jti": serde_json::Value::Null,
+            "act": serde_json::Value::Null,
+            "grant_id": serde_json::Value::Null,
+            "grant_reference": serde_json::Value::Null,
             "authorization_details": authorization_details,
         })));
     }
     Ok(Json(serde_json::json!({ "active": false })))
+}
+
+fn introspection_audience(client: &ClientRecord) -> String {
+    if client.audience.trim().is_empty() {
+        client.client_id.clone()
+    } else {
+        client.audience.trim().to_string()
+    }
+}
+
+async fn introspected_access_token_is_live(
+    state: &AppState,
+    source_client: Option<&ClientRecord>,
+    claims: &TokenClaims,
+) -> AppResult<bool> {
+    if claims.sub == claims.client_id || claims.sub.starts_with("service-account:") {
+        return Ok(true);
+    }
+    let Some(source_client) = source_client else {
+        return Ok(false);
+    };
+    let user = match load_oidc_user(state, &claims.sub).await {
+        Ok(user) => user,
+        Err(_) => return Ok(false),
+    };
+    if ensure_application_client_allowed_for_user(state, &user, source_client)
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    introspected_user_grant_is_live(
+        state,
+        &user.id,
+        &claims.client_id,
+        &claims.scope,
+        claims.grant_id.as_deref(),
+    )
+    .await
+}
+
+async fn introspected_user_grant_is_live(
+    state: &AppState,
+    user_id: &str,
+    client_id: &str,
+    scope: &str,
+    grant_id: Option<&str>,
+) -> AppResult<bool> {
+    if let Some(grant_id) = grant_id
+        && let Some(reference) = grant_id.strip_prefix("consent:")
+        && let Some((grant_client_id, version)) = reference.rsplit_once(':')
+    {
+        let Ok(version) = version.parse::<i64>() else {
+            return Ok(false);
+        };
+        let Some(consent) = state
+            .db
+            .find_user_consent(user_id, grant_client_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        return Ok(consent.revoked_at.is_none()
+            && consent.updated_at == version
+            && grants_all_scopes(&consent.granted_scopes, scope));
+    }
+    let Some(consent) = state.db.find_user_consent(user_id, client_id).await? else {
+        // `skip_consent` creates an implicit authorization grant for ordinary
+        // browser flows. Delegated exchanges never take this branch because
+        // they always carry a consent:* grant reference.
+        return Ok(true);
+    };
+    Ok(consent.revoked_at.is_none() && grants_all_scopes(&consent.granted_scopes, scope))
+}
+
+async fn introspected_refresh_grant_is_live(
+    state: &AppState,
+    user_id: &str,
+    client_id: &str,
+) -> AppResult<bool> {
+    let Some(consent) = state.db.find_user_consent(user_id, client_id).await? else {
+        return Ok(true);
+    };
+    Ok(consent.revoked_at.is_none())
+}
+
+fn grants_all_scopes(granted_scopes: &str, requested_scope: &str) -> bool {
+    let granted = granted_scopes.split_whitespace().collect::<std::collections::BTreeSet<_>>();
+    requested_scope
+        .split_whitespace()
+        .all(|scope| granted.contains(scope))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3181,6 +3334,11 @@ pub(crate) async fn authenticate_client_at<T: ClientAuthFields>(
     applications::authorize_client_for_protocol(state, &client, "oauth2_oidc")
         .await
         .map_err(|_| AppError::Unauthorized)?;
+    if client.require_confidential_client == 1
+        && client.token_endpoint_auth_method == "none"
+    {
+        return Err(AppError::Unauthorized);
+    }
     match client.token_endpoint_auth_method.as_str() {
         "none" => Ok(client),
         "client_secret_post" | "client_secret_basic" => {
@@ -3351,17 +3509,38 @@ pub(crate) fn normalize_resource(resource: Option<&str>) -> AppResult<Option<Str
 fn resolve_client_credentials_audience(
     client: &ClientRecord,
     requested_resource: Option<String>,
+    requested_audience: Option<&str>,
 ) -> AppResult<Option<String>> {
+    let requested_audience = requested_audience
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_audience)
+        .transpose()?;
+    if let (Some(resource), Some(audience)) = (&requested_resource, &requested_audience)
+        && resource != audience
+    {
+        return Err(AppError::Oidc(
+            "resource and audience identify different targets".to_string(),
+        ));
+    }
     let configured =
         (!client.audience.trim().is_empty()).then(|| client.audience.trim().to_string());
-    if let (Some(expected), Some(requested)) = (&configured, &requested_resource)
+    let requested = requested_resource.or(requested_audience);
+    if let (Some(expected), Some(requested)) = (&configured, &requested)
         && expected != requested
     {
         return Err(AppError::Oidc(
             "resource parameter does not match configured client audience".to_string(),
         ));
     }
-    Ok(requested_resource.or(configured))
+    Ok(requested.or(configured))
+}
+
+fn normalize_audience(audience: &str) -> AppResult<String> {
+    if audience.len() > 2048 || audience.chars().any(char::is_whitespace) {
+        return Err(AppError::Oidc("invalid audience parameter".to_string()));
+    }
+    Ok(audience.to_string())
 }
 
 fn merge_token_resource(
@@ -5838,13 +6017,14 @@ mod tests {
         client.audience = "https://memory.example/api".to_string();
 
         assert_eq!(
-            resolve_client_credentials_audience(&client, None).unwrap(),
+            resolve_client_credentials_audience(&client, None, None).unwrap(),
             Some("https://memory.example/api".to_string())
         );
         assert_eq!(
             resolve_client_credentials_audience(
                 &client,
-                Some("https://other.example/api".to_string())
+                Some("https://other.example/api".to_string()),
+                None,
             )
             .unwrap_err()
             .to_string(),
@@ -5853,7 +6033,8 @@ mod tests {
         assert_eq!(
             resolve_client_credentials_audience(
                 &client,
-                Some("https://memory.example/api".to_string())
+                Some("https://memory.example/api".to_string()),
+                None,
             )
             .unwrap(),
             Some("https://memory.example/api".to_string())
@@ -6614,6 +6795,12 @@ mod tests {
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/default.toml");
         let raw = std::fs::read_to_string(config_path).unwrap();
         let mut settings: crate::Settings = toml::from_str(&raw).unwrap();
+        // The production profile now requires explicit consent before a
+        // delegated scope is granted. These fixture-based HTTP tests exercise
+        // the post-login protocol path and historically assume the browser
+        // consent page is skipped; consent-specific behavior is covered by
+        // dedicated tests below.
+        settings.oidc.skip_consent = true;
         let path = std::env::temp_dir().join(format!(
             "gpt-sso-oidc-test-{}.sqlite3",
             uuid::Uuid::new_v4()
