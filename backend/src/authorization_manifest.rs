@@ -150,7 +150,7 @@ pub async fn discover_profile(
 ) -> AppResult<Option<VerifiedManifest>> {
     let manifest_url = validate_fetch_url(manifest_url)?;
     let expected_issuer = website_origin(expected_issuer)?;
-    let body = Client::builder()
+    let mut response = Client::builder()
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -161,14 +161,27 @@ pub async fn discover_profile(
         .await
         .map_err(|err| AppError::BadRequest(format!("authorization manifest request failed: {err}")))?
         .error_for_status()
-        .map_err(|err| AppError::BadRequest(format!("authorization manifest returned an error: {err}")))?
-        .bytes()
-        .await
-        .map_err(|err| AppError::BadRequest(format!("authorization manifest body failed: {err}")))?;
-    if body.len() > MAX_MANIFEST_BYTES {
+        .map_err(|err| AppError::BadRequest(format!("authorization manifest returned an error: {err}")))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MANIFEST_BYTES as u64)
+    {
         return Err(AppError::BadRequest(
             "authorization manifest is too large".to_string(),
         ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| AppError::BadRequest(format!("authorization manifest body failed: {err}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
+            return Err(AppError::BadRequest(
+                "authorization manifest is too large".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
     }
     let token = manifest_token(&body)?;
     let claims = client_assertion::verify_signed_jwt_for_issuer::<ManifestClaims>(

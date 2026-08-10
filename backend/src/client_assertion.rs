@@ -253,7 +253,7 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
         return Err(AppError::Unauthorized);
     }
     validate_jwks_uri(jwks_uri).map_err(|_| AppError::Unauthorized)?;
-    let response = reqwest::Client::builder()
+    let mut response = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -265,12 +265,18 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     if !response.status().is_success() {
         return Err(AppError::Unauthorized);
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|_| AppError::Unauthorized)?;
-    if body.len() > MAX_JWKS_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JWKS_BYTES as u64)
+    {
         return Err(AppError::Unauthorized);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| AppError::Unauthorized)? {
+        if body.len().saturating_add(chunk.len()) > MAX_JWKS_BYTES {
+            return Err(AppError::Unauthorized);
+        }
+        body.extend_from_slice(&chunk);
     }
     let jwks = serde_json::from_slice::<ClientJwks>(&body)
         .map_err(|_| AppError::Unauthorized)?;
