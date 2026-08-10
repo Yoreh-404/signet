@@ -3771,7 +3771,12 @@ fn normalize_application_entitlement_keys(values: Vec<String>) -> AppResult<Vec<
         if value.is_empty() {
             continue;
         }
-        if value.len() > 256 || value.chars().any(|ch| ch.is_control()) {
+        if value.len() > 256
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+            || value.split(':').any(str::is_empty)
+        {
             return Err(AppError::BadRequest(
                 "application permission key is invalid".to_string(),
             ));

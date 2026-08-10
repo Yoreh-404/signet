@@ -1803,7 +1803,7 @@ export function ApplicationWorkspace({
             <div className="application-role-editor">
               <div className="subsection-heading"><strong>{roleDraft.id ? c.editRole : c.addRole}</strong><span>{roleDraft.id ?? c.notConfigured}</span></div>
               <div className="form-grid-2 compact-form-grid">
-                <Input label={c.roleKey} value={roleDraft.role_key} disabled={roleDraft.source === "manifest"} onChange={(value) => updateRoleDraft({ role_key: value })} />
+                <Input label={c.roleKey} value={roleDraft.role_key} disabled={roleDraft.source === "manifest" || !!roleDraft.id} onChange={(value) => updateRoleDraft({ role_key: value })} />
                 <Input label={c.roleName} value={roleDraft.name} onChange={(value) => updateRoleDraft({ name: value })} />
                 <Input label={c.roleDescription} value={roleDraft.description} onChange={(value) => updateRoleDraft({ description: value })} />
               </div>

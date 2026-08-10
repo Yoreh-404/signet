@@ -256,6 +256,14 @@ pub async fn resolve_entitlements_for_profile(
         .filter(|role| role.is_active == 1)
         .map(|role| (role.id.clone(), role))
         .collect::<BTreeMap<_, _>>();
+    let application_membership = state
+        .db
+        .list_user_organizations(&user.id)
+        .await?
+        .into_iter()
+        .find(|membership| {
+            membership.id == application.organization_id && membership.is_active == 1
+        });
 
     for role in profile_roles
         .iter()
@@ -263,29 +271,31 @@ pub async fn resolve_entitlements_for_profile(
     {
         add_profile_role(role, &mut roles, &mut permissions)?;
     }
-    for role_id in state
-        .db
-        .list_application_profile_user_role_ids(&profile.id, &user.id)
-        .await?
-    {
-        if let Some(role) = active_roles.get(&role_id) {
-            add_profile_role(role, &mut roles, &mut permissions)?;
-        }
-    }
-    for group in state.db.list_user_groups(&user.id).await? {
-        groups.insert(group.name.clone());
+    if application_membership.is_some() {
         for role_id in state
             .db
-            .list_application_profile_group_role_ids(&profile.id, &group.id)
+            .list_application_profile_user_role_ids(&profile.id, &user.id)
             .await?
         {
             if let Some(role) = active_roles.get(&role_id) {
                 add_profile_role(role, &mut roles, &mut permissions)?;
             }
         }
-    }
-    for membership in state.db.list_user_organizations(&user.id).await? {
-        if membership.id == application.organization_id && membership.is_active == 1 {
+
+        for group in state.db.list_user_groups(&user.id).await? {
+            groups.insert(group.name.clone());
+            for role_id in state
+                .db
+                .list_application_profile_group_role_ids(&profile.id, &group.id)
+                .await?
+            {
+                if let Some(role) = active_roles.get(&role_id) {
+                    add_profile_role(role, &mut roles, &mut permissions)?;
+                }
+            }
+        }
+
+        if let Some(membership) = application_membership.as_ref() {
             organization_role = Some(membership.role.clone());
             for role_id in state
                 .db
@@ -296,7 +306,6 @@ pub async fn resolve_entitlements_for_profile(
                     add_profile_role(role, &mut roles, &mut permissions)?;
                 }
             }
-            break;
         }
     }
 
