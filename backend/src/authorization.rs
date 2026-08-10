@@ -8,7 +8,7 @@
 
 use crate::{
     AppState, applications,
-    db::{ApplicationRecord, UserRecord},
+    db::{ApplicationAuthorizationProfileRecord, ApplicationRecord, ClientRecord, UserRecord},
     error::{AppError, AppResult},
     util,
 };
@@ -211,12 +211,163 @@ pub async fn resolve_entitlements(
     })
 }
 
+/// Resolves the policy attached to one OIDC connection.  A website may have
+/// several clients under the same Application; profile-scoped roles keep
+/// their permission vocabularies and assignments independent.  Applications
+/// created before profiles existed retain the application-wide compatibility
+/// resolver above.
+pub async fn resolve_entitlements_for_client(
+    state: &AppState,
+    application: &ApplicationRecord,
+    client: &ClientRecord,
+    user: &UserRecord,
+) -> AppResult<ApplicationEntitlements> {
+    let Some(profile) = state
+        .db
+        .find_application_authorization_profile(&application.id, &client.client_id)
+        .await?
+    else {
+        return resolve_entitlements(state, application, user).await;
+    };
+    resolve_entitlements_for_profile(state, application, &profile, user).await
+}
+
+pub async fn resolve_entitlements_for_profile(
+    state: &AppState,
+    application: &ApplicationRecord,
+    profile: &ApplicationAuthorizationProfileRecord,
+    user: &UserRecord,
+) -> AppResult<ApplicationEntitlements> {
+    let decision = check_login_access(state, application, &user.id).await?;
+    if !decision.allowed {
+        return Err(AppError::Forbidden);
+    }
+
+    let mut roles = BTreeSet::new();
+    let mut permissions = BTreeSet::new();
+    let mut groups = BTreeSet::new();
+    let mut organization_role = None;
+    let profile_roles = state
+        .db
+        .list_application_profile_roles(&profile.id)
+        .await?;
+    let active_roles = profile_roles
+        .iter()
+        .filter(|role| role.is_active == 1)
+        .map(|role| (role.id.clone(), role))
+        .collect::<BTreeMap<_, _>>();
+
+    for role in profile_roles
+        .iter()
+        .filter(|role| role.is_active == 1 && role.is_default == 1)
+    {
+        add_profile_role(role, &mut roles, &mut permissions)?;
+    }
+    for role_id in state
+        .db
+        .list_application_profile_user_role_ids(&profile.id, &user.id)
+        .await?
+    {
+        if let Some(role) = active_roles.get(&role_id) {
+            add_profile_role(role, &mut roles, &mut permissions)?;
+        }
+    }
+    for group in state.db.list_user_groups(&user.id).await? {
+        groups.insert(group.name.clone());
+        for role_id in state
+            .db
+            .list_application_profile_group_role_ids(&profile.id, &group.id)
+            .await?
+        {
+            if let Some(role) = active_roles.get(&role_id) {
+                add_profile_role(role, &mut roles, &mut permissions)?;
+            }
+        }
+    }
+    for membership in state.db.list_user_organizations(&user.id).await? {
+        if membership.id == application.organization_id && membership.is_active == 1 {
+            organization_role = Some(membership.role.clone());
+            for role_id in state
+                .db
+                .list_application_profile_organization_role_ids(&profile.id, &membership.role)
+                .await?
+            {
+                if let Some(role) = active_roles.get(&role_id) {
+                    add_profile_role(role, &mut roles, &mut permissions)?;
+                }
+            }
+            break;
+        }
+    }
+
+    let mut denied = BTreeSet::new();
+    for override_record in state
+        .db
+        .list_application_profile_user_permission_overrides(&profile.id, &user.id)
+        .await?
+    {
+        if override_record.effect == "deny" {
+            denied.insert(override_record.permission);
+        } else if override_record.effect == "allow" {
+            permissions.insert(override_record.permission);
+        }
+    }
+    permissions.retain(|permission| !denied.contains(permission));
+
+    let roles_vec = roles.into_iter().collect::<Vec<_>>();
+    let permissions_vec = permissions.into_iter().collect::<Vec<_>>();
+    let groups_vec = groups.into_iter().collect::<Vec<_>>();
+    let policy_version = util::sha256_base64url(&format!(
+        "signet:application-profile-entitlements:v1:{}:{}:{}:{}:{}:{}",
+        application.id,
+        profile.id,
+        profile.updated_at,
+        profile.remote_digest.as_deref().unwrap_or_default(),
+        serde_json::to_string(&roles_vec).unwrap_or_default(),
+        serde_json::to_string(&permissions_vec).unwrap_or_default(),
+    ));
+    let config = applications::enabled_module_config(state, &application.id, "authorization")
+        .await?
+        .unwrap_or_default();
+    let mut claims = build_claims(
+        application,
+        &roles_vec,
+        &permissions_vec,
+        &groups_vec,
+        organization_role.as_deref(),
+        &config,
+    );
+    claims.insert(
+        "authorization_profile".to_string(),
+        Value::String(profile.profile_key.clone()),
+    );
+
+    Ok(ApplicationEntitlements {
+        roles: roles_vec,
+        permissions: permissions_vec,
+        groups: groups_vec,
+        organization_role,
+        policy_version,
+        claims,
+    })
+}
+
 fn add_application_role(
     role: &crate::db::ApplicationRoleRecord,
     roles: &mut BTreeSet<String>,
     permissions: &mut BTreeSet<String>,
 ) -> AppResult<()> {
     roles.insert(role.name.clone());
+    permissions.extend(role.permission_keys()?);
+    Ok(())
+}
+
+fn add_profile_role(
+    role: &crate::db::ApplicationProfileRoleRecord,
+    roles: &mut BTreeSet<String>,
+    permissions: &mut BTreeSet<String>,
+) -> AppResult<()> {
+    roles.insert(role.role_key.clone());
     permissions.extend(role.permission_keys()?);
     Ok(())
 }
@@ -423,6 +574,33 @@ fn json_string_array(values: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_permissions_are_exact_strings() {
+        let role = crate::db::ApplicationProfileRoleRecord {
+            id: "role-1".to_string(),
+            profile_id: "profile-1".to_string(),
+            role_key: "invoice-admin".to_string(),
+            name: "Invoice admin".to_string(),
+            description: None,
+            permissions: serde_json::json!([
+                "admin:billing:invoice:read",
+                "admin:billing:invoice:approve"
+            ])
+            .to_string(),
+            source: "manual".to_string(),
+            is_default: 0,
+            is_active: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut roles = BTreeSet::new();
+        let mut permissions = BTreeSet::new();
+        add_profile_role(&role, &mut roles, &mut permissions).unwrap();
+        assert!(permissions.contains("admin:billing:invoice:read"));
+        assert!(permissions.contains("admin:billing:invoice:approve"));
+        assert!(!permissions.contains("admin:billing"));
+    }
 
     #[test]
     fn application_role_config_merges_default_group_and_explicit_permissions() {

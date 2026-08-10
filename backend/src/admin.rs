@@ -4,14 +4,19 @@ use crate::{
     applications, archived_accounts,
     audit::{self, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization, backchannel_logout, claim_mapper, client_assertion, client_policy,
+    auth_flow, authorization, authorization_manifest, backchannel_logout, claim_mapper,
+    client_assertion, client_policy,
     csrf,
     db::{
-        ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationRecord,
-        ApplicationRoleRecord, ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
+        ApplicationAuthorizationProfileRecord, ApplicationJwtClientRecord,
+        ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
+        ApplicationProfileRoleRecord, ApplicationRecord, ApplicationRoleRecord,
+        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
         GroupRecord, InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel,
-        LoginEventRecord, NewApplication, NewApplicationJwtClient, NewApplicationRole,
-        NewApplicationScimToken, NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
+        LoginEventRecord, NewApplication, NewApplicationAuthorizationProfile,
+        NewApplicationJwtClient,
+        NewApplicationProfileRole, NewApplicationRole, NewApplicationScimToken,
+        NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
         NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation, NewLdapProvider,
         NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole, NewRuntimeSettings,
         NewSecurityPolicy, NewUser, OrganizationMemberInput, OrganizationMemberWithUserRecord,
@@ -170,6 +175,53 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/admin/applications/{id}/authorization/catalog",
             get(application_permission_catalog),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles",
+            get(list_application_authorization_profiles),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}",
+            get(get_application_authorization_profile)
+                .put(update_application_authorization_profile),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/refresh",
+            post(refresh_application_authorization_profile),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/catalog",
+            get(application_profile_permission_catalog),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/roles",
+            get(list_application_profile_roles).post(create_application_profile_role),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/roles/{role_id}",
+            put(update_application_profile_role).delete(delete_application_profile_role),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/users/{user_id}/roles",
+            get(list_application_profile_user_roles).put(update_application_profile_user_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/groups/{group_id}/roles",
+            get(list_application_profile_group_roles).put(update_application_profile_group_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/organization-roles/{organization_role}/roles",
+            get(list_application_profile_organization_role_roles)
+                .put(update_application_profile_organization_role_roles),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/users/{user_id}/permission-overrides",
+            get(list_application_profile_user_permission_overrides)
+                .put(update_application_profile_user_permission_overrides),
+        )
+        .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/{user_id}",
+            get(application_profile_authorization_preview),
         )
         .route(
             "/api/admin/applications/{id}/authorization/subjects",
@@ -4384,6 +4436,36 @@ struct ApplicationModuleResponse {
     updated_at: i64,
 }
 
+#[derive(Debug, Serialize)]
+struct ApplicationAuthorizationProfileResponse {
+    id: String,
+    profile_key: String,
+    connection_kind: String,
+    connection_id: Option<String>,
+    source_mode: String,
+    manifest_url: String,
+    signer_client_id: Option<String>,
+    remote_version: Option<String>,
+    remote_digest: Option<String>,
+    sync_status: String,
+    last_synced_at: Option<i64>,
+    last_error: Option<String>,
+    permission_count: usize,
+    role_count: usize,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationAuthorizationProfileInput {
+    #[serde(default)]
+    manifest_url: Option<String>,
+    #[serde(default)]
+    signer_client_id: Option<String>,
+    #[serde(default = "default_true")]
+    signed_manifest_enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApplicationModuleInput {
     #[serde(default)]
@@ -4461,6 +4543,35 @@ struct ApplicationRoleResponse {
     updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationProfileRoleResponse {
+    id: String,
+    profile_id: String,
+    role_key: String,
+    name: String,
+    description: Option<String>,
+    permissions: Vec<String>,
+    source: String,
+    is_default: bool,
+    is_active: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationProfileRoleInput {
+    role_key: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default = "default_true")]
+    is_active: bool,
+    #[serde(default)]
+    is_default: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApplicationRoleInput {
     name: String,
@@ -4496,6 +4607,15 @@ struct ApplicationPermissionOverrideInput {
     effect: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationPermissionDefinitionResponse {
+    key: String,
+    label: String,
+    description: Option<String>,
+    source: String,
+    is_active: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ApplicationAuthorizationGroupResponse {
     id: String,
@@ -4510,6 +4630,37 @@ struct ApplicationAuthorizationSubjectsResponse {
     users: Vec<OrganizationMemberResponse>,
     groups: Vec<ApplicationAuthorizationGroupResponse>,
     organization_roles: Vec<String>,
+}
+
+fn application_profile_role_response(
+    role: ApplicationProfileRoleRecord,
+) -> AppResult<ApplicationProfileRoleResponse> {
+    let permissions = role.permission_keys()?;
+    Ok(ApplicationProfileRoleResponse {
+        id: role.id,
+        profile_id: role.profile_id,
+        role_key: role.role_key,
+        name: role.name,
+        description: role.description,
+        permissions,
+        source: role.source,
+        is_default: role.is_default == 1,
+        is_active: role.is_active == 1,
+        created_at: role.created_at,
+        updated_at: role.updated_at,
+    })
+}
+
+fn application_permission_definition_response(
+    definition: ApplicationPermissionDefinitionRecord,
+) -> ApplicationPermissionDefinitionResponse {
+    ApplicationPermissionDefinitionResponse {
+        key: definition.permission_key,
+        label: definition.label,
+        description: definition.description,
+        source: definition.source,
+        is_active: definition.is_active == 1,
+    }
 }
 
 fn application_role_response(role: ApplicationRoleRecord) -> AppResult<ApplicationRoleResponse> {
@@ -4592,6 +4743,7 @@ struct ApplicationResponse {
     is_active: bool,
     oidc_clients: Vec<PublicClient>,
     modules: Vec<ApplicationModuleResponse>,
+    authorization_profiles: Vec<ApplicationAuthorizationProfileResponse>,
     created_at: i64,
     updated_at: i64,
 }
@@ -4632,6 +4784,89 @@ fn application_input_to_new(
     })
 }
 
+async fn ensure_application_authorization_profiles(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<Vec<ApplicationAuthorizationProfileRecord>> {
+    let website_url = applications::application_website_url(state, &application.id)
+        .await?
+        .unwrap_or_default();
+    let manifest_url = if website_url.trim().is_empty() {
+        String::new()
+    } else {
+        authorization_manifest::default_manifest_url(&website_url)?
+    };
+    let mut profiles = Vec::new();
+    for client_id in state.db.list_application_oidc_client_ids(&application.id).await? {
+        let client = state
+            .db
+            .find_client_by_id(&client_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let existing = state
+            .db
+            .find_application_authorization_profile(&application.id, &client.client_id)
+            .await?;
+        let profile = if let Some(existing) = existing {
+            if existing.manifest_url.is_empty() && !manifest_url.is_empty() {
+                state
+                    .db
+                    .upsert_application_authorization_profile(
+                        NewApplicationAuthorizationProfile {
+                            id: existing.id.clone(),
+                            application_id: application.id.clone(),
+                            profile_key: existing.profile_key.clone(),
+                            connection_kind: existing.connection_kind.clone(),
+                            connection_id: existing.connection_id.clone(),
+                            source_mode: existing.source_mode.clone(),
+                            manifest_url: manifest_url.clone(),
+                            signer_client_id: existing.signer_client_id.clone(),
+                            remote_version: existing.remote_version.clone(),
+                            remote_digest: existing.remote_digest.clone(),
+                            sync_status: existing.sync_status.clone(),
+                            last_synced_at: existing.last_synced_at,
+                            last_error: existing.last_error.clone(),
+                        },
+                    )
+                    .await?
+            } else {
+                existing
+            }
+        } else {
+            let manifest_capable = !manifest_url.is_empty()
+                && (!client.jwks.trim().is_empty() || !client.jwks_uri.trim().is_empty());
+            state
+                .db
+                .upsert_application_authorization_profile(
+                    NewApplicationAuthorizationProfile {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        application_id: application.id.clone(),
+                        profile_key: client.client_id.clone(),
+                        connection_kind: "oidc".to_string(),
+                        connection_id: Some(client.id.clone()),
+                        source_mode: if manifest_capable {
+                            authorization_manifest::SOURCE_MODE_SIGNED.to_string()
+                        } else {
+                            authorization_manifest::SOURCE_MODE_MANUAL.to_string()
+                        },
+                        manifest_url: manifest_url.clone(),
+                        signer_client_id: (!client.jwks.trim().is_empty()
+                            || !client.jwks_uri.trim().is_empty())
+                            .then(|| client.client_id.clone()),
+                        remote_version: None,
+                        remote_digest: None,
+                        sync_status: authorization_manifest::SYNC_STATUS_MANUAL.to_string(),
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                )
+                .await?
+        };
+        profiles.push(profile);
+    }
+    Ok(profiles)
+}
+
 async fn application_response(
     state: &AppState,
     application: ApplicationRecord,
@@ -4654,6 +4889,33 @@ async fn application_response(
         .into_iter()
         .map(application_module_response)
         .collect::<AppResult<Vec<_>>>()?;
+    let profiles = ensure_application_authorization_profiles(&state, &application).await?;
+    let mut authorization_profiles = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let definitions = state
+            .db
+            .list_application_permission_definitions(&profile.id)
+            .await?;
+        let roles = state.db.list_application_profile_roles(&profile.id).await?;
+        authorization_profiles.push(ApplicationAuthorizationProfileResponse {
+                id: profile.id.clone(),
+                profile_key: profile.profile_key.clone(),
+                connection_kind: profile.connection_kind.clone(),
+                connection_id: profile.connection_id.clone(),
+                source_mode: profile.source_mode.clone(),
+                manifest_url: profile.manifest_url.clone(),
+                signer_client_id: profile.signer_client_id.clone(),
+                remote_version: profile.remote_version.clone(),
+                remote_digest: profile.remote_digest.clone(),
+                sync_status: profile.sync_status.clone(),
+                last_synced_at: profile.last_synced_at,
+                last_error: profile.last_error.clone(),
+                permission_count: definitions.iter().filter(|item| item.is_active == 1).count(),
+                role_count: roles.iter().filter(|item| item.is_active == 1).count(),
+                created_at: profile.created_at,
+                updated_at: profile.updated_at,
+        });
+    }
     Ok(ApplicationResponse {
         id: application.id,
         organization_id: application.organization_id,
@@ -4665,6 +4927,7 @@ async fn application_response(
         is_active: application.is_active == 1,
         oidc_clients,
         modules,
+        authorization_profiles,
         created_at: application.created_at,
         updated_at: application.updated_at,
     })
@@ -5454,6 +5717,791 @@ async fn delete_application_role(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn managed_authorization_profile(
+    state: &AppState,
+    jar: &CookieJar,
+    application_id: &str,
+    profile_id: &str,
+) -> AppResult<(
+    auth::CurrentUser,
+    ApplicationRecord,
+    ApplicationAuthorizationProfileRecord,
+)> {
+    let current = auth::require_current_user(state, jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(application_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(state, &current, &application.organization_id).await?;
+    let profile = state
+        .db
+        .find_application_authorization_profile_by_id(profile_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if profile.application_id != application.id {
+        return Err(AppError::NotFound);
+    }
+    Ok((current, application, profile))
+}
+
+async fn authorization_profile_response(
+    state: &AppState,
+    profile: ApplicationAuthorizationProfileRecord,
+) -> AppResult<ApplicationAuthorizationProfileResponse> {
+    let definitions = state
+        .db
+        .list_application_permission_definitions(&profile.id)
+        .await?;
+    let roles = state.db.list_application_profile_roles(&profile.id).await?;
+    Ok(ApplicationAuthorizationProfileResponse {
+        id: profile.id,
+        profile_key: profile.profile_key,
+        connection_kind: profile.connection_kind,
+        connection_id: profile.connection_id,
+        source_mode: profile.source_mode,
+        manifest_url: profile.manifest_url,
+        signer_client_id: profile.signer_client_id,
+        remote_version: profile.remote_version,
+        remote_digest: profile.remote_digest,
+        sync_status: profile.sync_status,
+        last_synced_at: profile.last_synced_at,
+        last_error: profile.last_error,
+        permission_count: definitions.iter().filter(|item| item.is_active == 1).count(),
+        role_count: roles.iter().filter(|item| item.is_active == 1).count(),
+        created_at: profile.created_at,
+        updated_at: profile.updated_at,
+    })
+}
+
+async fn list_application_authorization_profiles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<ApplicationAuthorizationProfileResponse>>> {
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
+    auto_refresh_application_authorization_profiles(&state, &application).await?;
+    let profiles = ensure_application_authorization_profiles(&state, &application).await?;
+    let mut response = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        response.push(authorization_profile_response(&state, profile).await?);
+    }
+    Ok(Json(response))
+}
+
+async fn get_application_authorization_profile(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
+    let (_current, _application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    Ok(Json(authorization_profile_response(&state, profile).await?))
+}
+
+async fn update_application_authorization_profile(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationAuthorizationProfileInput>,
+) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
+    let (current, application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let manifest_url = payload
+        .manifest_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| profile.manifest_url.clone());
+    let signer_client_id = payload
+        .signer_client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(profile.signer_client_id.clone());
+    let source_mode = if payload.signed_manifest_enabled {
+        if manifest_url.is_empty() || signer_client_id.is_none() {
+            return Err(AppError::BadRequest(
+                "signed authorization profiles require a manifest URL and signer client"
+                    .to_string(),
+            ));
+        }
+        authorization_manifest::SOURCE_MODE_SIGNED.to_string()
+    } else {
+        authorization_manifest::SOURCE_MODE_MANUAL.to_string()
+    };
+    if let Some(signer_client_id) = signer_client_id.as_deref() {
+        let signer = state
+            .db
+            .find_client_by_client_id(signer_client_id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("manifest signer client does not exist".to_string()))?;
+        if signer.organization_id.as_deref() != Some(application.organization_id.as_str())
+            || !state
+                .db
+                .list_application_oidc_client_ids(&application.id)
+                .await?
+                .contains(&signer.id)
+        {
+            return Err(AppError::Forbidden);
+        }
+        if signer.jwks.trim().is_empty() && signer.jwks_uri.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "manifest signer client must have a public JWKS".to_string(),
+            ));
+        }
+    }
+    let updated = state
+        .db
+        .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+            id: profile.id.clone(),
+            application_id: application.id.clone(),
+            profile_key: profile.profile_key.clone(),
+            connection_kind: profile.connection_kind.clone(),
+            connection_id: profile.connection_id.clone(),
+            source_mode,
+            manifest_url,
+            signer_client_id,
+            remote_version: profile.remote_version.clone(),
+            remote_digest: profile.remote_digest.clone(),
+            sync_status: if payload.signed_manifest_enabled {
+                profile.sync_status.clone()
+            } else {
+                authorization_manifest::SYNC_STATUS_MANUAL.to_string()
+            },
+            last_synced_at: profile.last_synced_at,
+            last_error: None,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile.update",
+            "application_authorization_profile",
+            Some(updated.id.clone()),
+            serde_json::json!({
+                "application_id": application.id,
+                "profile_key": updated.profile_key,
+                "source_mode": updated.source_mode,
+            }),
+        ))
+        .await?;
+    Ok(Json(authorization_profile_response(&state, updated).await?))
+}
+
+async fn synchronize_authorization_profile(
+    state: &AppState,
+    application: &ApplicationRecord,
+    profile: &ApplicationAuthorizationProfileRecord,
+) -> AppResult<ApplicationAuthorizationProfileRecord> {
+    if profile.source_mode != authorization_manifest::SOURCE_MODE_SIGNED {
+        return Err(AppError::BadRequest(
+            "enable signed manifest mode before refreshing this profile".to_string(),
+        ));
+    }
+    let website_url = applications::application_website_url(state, &application.id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("website URL is required for manifest discovery".to_string()))?;
+    let signer_client_id = profile
+        .signer_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("manifest signer client is not configured".to_string()))?;
+    let signer = state
+        .db
+        .find_client_by_client_id(signer_client_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("manifest signer client does not exist".to_string()))?;
+    let result = authorization_manifest::discover_profile(
+        state,
+        &signer,
+        &profile.manifest_url,
+        &website_url,
+        &application.id,
+        &profile.profile_key,
+        &profile.id,
+    )
+    .await;
+    let verified = match result {
+        Ok(value) => value,
+        Err(error) => {
+            state
+                .db
+                .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+                    id: profile.id.clone(),
+                    application_id: profile.application_id.clone(),
+                    profile_key: profile.profile_key.clone(),
+                    connection_kind: profile.connection_kind.clone(),
+                    connection_id: profile.connection_id.clone(),
+                    source_mode: profile.source_mode.clone(),
+                    manifest_url: profile.manifest_url.clone(),
+                    signer_client_id: profile.signer_client_id.clone(),
+                    remote_version: profile.remote_version.clone(),
+                    remote_digest: profile.remote_digest.clone(),
+                    sync_status: authorization_manifest::SYNC_STATUS_ERROR.to_string(),
+                    last_synced_at: profile.last_synced_at,
+                    last_error: Some(error.to_string().chars().take(512).collect()),
+                })
+                .await?;
+            return Err(error);
+        }
+    };
+    let Some(verified) = verified else {
+        let no_profile = state
+            .db
+            .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+                id: profile.id.clone(),
+                application_id: profile.application_id.clone(),
+                profile_key: profile.profile_key.clone(),
+                connection_kind: profile.connection_kind.clone(),
+                connection_id: profile.connection_id.clone(),
+                source_mode: authorization_manifest::SOURCE_MODE_MANUAL.to_string(),
+                manifest_url: profile.manifest_url.clone(),
+                signer_client_id: profile.signer_client_id.clone(),
+                remote_version: profile.remote_version.clone(),
+                remote_digest: profile.remote_digest.clone(),
+                sync_status: authorization_manifest::SYNC_STATUS_NO_PROFILE.to_string(),
+                last_synced_at: profile.last_synced_at,
+                last_error: None,
+            })
+            .await?;
+        return Ok(no_profile);
+    };
+
+    state
+        .db
+        .replace_application_permission_definitions(&profile.id, verified.permissions)
+        .await?;
+    let existing_roles = state.db.list_application_profile_roles(&profile.id).await?;
+    let incoming_keys = verified
+        .roles
+        .iter()
+        .map(|role| role.role_key.as_str())
+        .collect::<BTreeSet<_>>();
+    for role in existing_roles
+        .into_iter()
+        .filter(|role| role.source == authorization_manifest::SOURCE_MANIFEST)
+        .filter(|role| !incoming_keys.contains(role.role_key.as_str()))
+    {
+        let permissions = role.permission_keys()?;
+        state
+            .db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some(role.id),
+                profile_id: profile.id.clone(),
+                role_key: role.role_key,
+                name: role.name,
+                description: role.description,
+                permissions,
+                source: authorization_manifest::SOURCE_MANIFEST.to_string(),
+                is_default: false,
+                is_active: false,
+            })
+            .await?;
+    }
+    for role in verified.roles {
+        state.db.upsert_application_profile_role(role).await?;
+    }
+    let synced = state
+        .db
+        .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+            id: profile.id.clone(),
+            application_id: profile.application_id.clone(),
+            profile_key: profile.profile_key.clone(),
+            connection_kind: profile.connection_kind.clone(),
+            connection_id: profile.connection_id.clone(),
+            source_mode: authorization_manifest::SOURCE_MODE_SIGNED.to_string(),
+            manifest_url: profile.manifest_url.clone(),
+            signer_client_id: profile.signer_client_id.clone(),
+            remote_version: Some(verified.version),
+            remote_digest: Some(verified.digest),
+            sync_status: authorization_manifest::SYNC_STATUS_SYNCED.to_string(),
+            last_synced_at: Some(util::now_ts()),
+            last_error: None,
+        })
+        .await?;
+    Ok(synced)
+}
+
+async fn auto_refresh_application_authorization_profiles(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<()> {
+    let profiles = ensure_application_authorization_profiles(state, application).await?;
+    for profile in profiles.into_iter().filter(|profile| {
+        profile.source_mode == authorization_manifest::SOURCE_MODE_SIGNED
+            && profile.remote_digest.is_none()
+            && profile.sync_status == authorization_manifest::SYNC_STATUS_MANUAL
+    }) {
+        if let Err(error) = synchronize_authorization_profile(state, application, &profile).await {
+            tracing::warn!(
+                application_id = %application.id,
+                profile_id = %profile.id,
+                error = %error,
+                "initial authorization manifest refresh failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_application_authorization_profile(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
+    let (current, application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let synced = synchronize_authorization_profile(&state, &application, &profile).await;
+    match synced {
+        Ok(synced) => {
+            state
+                .db
+                .record_audit_event(audit::management_event(
+                    current.user.id,
+                    "application.authorization_profile.refresh",
+                    "application_authorization_profile",
+                    Some(profile.id.clone()),
+                    serde_json::json!({ "status": "synced", "profile_key": profile.profile_key }),
+                ))
+                .await?;
+            Ok(Json(authorization_profile_response(&state, synced).await?))
+        }
+        Err(error) => {
+            let _ = state
+                .db
+                .record_audit_event(audit::management_event(
+                    current.user.id,
+                    "application.authorization_profile.refresh",
+                    "application_authorization_profile",
+                    Some(profile.id),
+                    serde_json::json!({ "status": "error" }),
+                ))
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn application_profile_permission_catalog(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<ApplicationPermissionDefinitionResponse>>> {
+    let (_current, _application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let mut definitions = Vec::new();
+    if profile.source_mode == authorization_manifest::SOURCE_MODE_MANUAL {
+        definitions.extend(permission_catalog().into_iter().map(|item| {
+            ApplicationPermissionDefinitionResponse {
+                key: item.key.to_string(),
+                label: item.label.to_string(),
+                description: Some(item.category.to_string()),
+                source: "signet_compat".to_string(),
+                is_active: true,
+            }
+        }));
+    }
+    definitions.extend(
+        state
+            .db
+            .list_application_permission_definitions(&profile.id)
+            .await?
+            .into_iter()
+            .map(application_permission_definition_response),
+    );
+    definitions.sort_by(|left, right| left.key.cmp(&right.key));
+    definitions.dedup_by(|left, right| left.key == right.key);
+    Ok(Json(definitions))
+}
+
+async fn list_application_profile_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<ApplicationProfileRoleResponse>>> {
+    let (_current, _application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_roles(&profile_id)
+            .await?
+            .into_iter()
+            .map(application_profile_role_response)
+            .collect::<AppResult<Vec<_>>>()?,
+    ))
+}
+
+async fn create_application_profile_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationProfileRoleInput>,
+) -> AppResult<Json<ApplicationProfileRoleResponse>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let role = state
+        .db
+        .upsert_application_profile_role(NewApplicationProfileRole {
+            id: None,
+            profile_id: profile_id.clone(),
+            role_key: payload.role_key,
+            name: payload.name,
+            description: payload.description,
+            permissions: payload.permissions,
+            source: authorization_manifest::SOURCE_MANUAL.to_string(),
+            is_default: payload.is_default,
+            is_active: payload.is_active,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile_role.create",
+            "application_profile_role",
+            Some(role.id.clone()),
+            serde_json::json!({ "application_id": application.id, "profile_id": profile_id }),
+        ))
+        .await?;
+    Ok(Json(application_profile_role_response(role)?))
+}
+
+async fn update_application_profile_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, role_id)): Path<(String, String, String)>,
+    Json(payload): Json<ApplicationProfileRoleInput>,
+) -> AppResult<Json<ApplicationProfileRoleResponse>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let current_role = state
+        .db
+        .list_application_profile_roles(&profile_id)
+        .await?
+        .into_iter()
+        .find(|role| role.id == role_id)
+        .ok_or(AppError::NotFound)?;
+    if current_role.source == authorization_manifest::SOURCE_MANIFEST
+        && payload.role_key != current_role.role_key
+    {
+        return Err(AppError::BadRequest(
+            "manifest role keys cannot be renamed locally".to_string(),
+        ));
+    }
+    let role = state
+        .db
+        .upsert_application_profile_role(NewApplicationProfileRole {
+            id: Some(role_id),
+            profile_id: profile_id.clone(),
+            role_key: current_role.role_key,
+            name: payload.name,
+            description: payload.description,
+            permissions: payload.permissions,
+            source: current_role.source,
+            is_default: payload.is_default,
+            is_active: payload.is_active,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile_role.update",
+            "application_profile_role",
+            Some(role.id.clone()),
+            serde_json::json!({ "application_id": application.id, "profile_id": profile_id }),
+        ))
+        .await?;
+    Ok(Json(application_profile_role_response(role)?))
+}
+
+async fn delete_application_profile_role(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, role_id)): Path<(String, String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    state
+        .db
+        .delete_application_profile_role(&profile_id, &role_id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile_role.delete",
+            "application_profile_role",
+            Some(role_id.clone()),
+            serde_json::json!({ "application_id": application.id, "profile_id": profile_id }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn list_application_profile_user_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, user_id)): Path<(String, String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_user_role_ids(&profile_id, &user_id)
+            .await?,
+    ))
+}
+
+async fn update_application_profile_user_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, user_id)): Path<(String, String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let user = state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_profile_user_role_ids(&profile_id, &user.id, payload.role_ids)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile.user_roles.update",
+            "application_authorization_profile",
+            Some(profile_id.clone()),
+            serde_json::json!({ "application_id": application.id, "user_id": user.id }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_user_role_ids(&profile_id, &user_id)
+            .await?,
+    ))
+}
+
+async fn list_application_profile_group_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, group_id)): Path<(String, String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    state
+        .db
+        .find_group_by_id(&group_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_group_role_ids(&profile_id, &group_id)
+            .await?,
+    ))
+}
+
+async fn update_application_profile_group_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, group_id)): Path<(String, String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    state
+        .db
+        .find_group_by_id(&group_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_profile_group_role_ids(&profile_id, &group_id, payload.role_ids)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile.group_roles.update",
+            "application_authorization_profile",
+            Some(profile_id.clone()),
+            serde_json::json!({ "application_id": application.id, "group_id": group_id }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_group_role_ids(&profile_id, &group_id)
+            .await?,
+    ))
+}
+
+async fn list_application_profile_organization_role_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, organization_role)): Path<(String, String, String)>,
+) -> AppResult<Json<Vec<String>>> {
+    let (_current, _application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let organization_role = organizations::normalize_role(&organization_role)?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_organization_role_ids(&profile_id, &organization_role)
+            .await?,
+    ))
+}
+
+async fn update_application_profile_organization_role_roles(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, organization_role)): Path<(String, String, String)>,
+    Json(payload): Json<ApplicationRoleIdsInput>,
+) -> AppResult<Json<Vec<String>>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let organization_role = organizations::normalize_role(&organization_role)?;
+    state
+        .db
+        .replace_application_profile_organization_role_ids(
+            &profile_id,
+            &organization_role,
+            payload.role_ids,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile.organization_roles.update",
+            "application_authorization_profile",
+            Some(profile_id.clone()),
+            serde_json::json!({
+                "application_id": application.id,
+                "organization_role": organization_role,
+            }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_organization_role_ids(
+                &profile_id,
+                &organization_role,
+            )
+            .await?,
+    ))
+}
+
+async fn list_application_profile_user_permission_overrides(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, user_id)): Path<(String, String, String)>,
+) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
+    let (_current, _application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_user_permission_overrides(&profile_id, &user_id)
+            .await?
+            .into_iter()
+            .map(|value| ApplicationPermissionOverrideResponse {
+                permission: value.permission,
+                effect: value.effect,
+            })
+            .collect(),
+    ))
+}
+
+async fn update_application_profile_user_permission_overrides(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, user_id)): Path<(String, String, String)>,
+    Json(payload): Json<ApplicationPermissionOverridesInput>,
+) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
+    let (current, application, _profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .replace_application_profile_user_permission_overrides(
+            &profile_id,
+            &user_id,
+            payload
+                .overrides
+                .into_iter()
+                .map(|item| (item.permission, item.effect))
+                .collect(),
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.authorization_profile.user_permission_overrides.update",
+            "application_authorization_profile",
+            Some(profile_id.clone()),
+            serde_json::json!({ "application_id": application.id, "user_id": user_id }),
+        ))
+        .await?;
+    Ok(Json(
+        state
+            .db
+            .list_application_profile_user_permission_overrides(&profile_id, &user_id)
+            .await?
+            .into_iter()
+            .map(|value| ApplicationPermissionOverrideResponse {
+                permission: value.permission,
+                effect: value.effect,
+            })
+            .collect(),
+    ))
+}
+
+async fn application_profile_authorization_preview(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id, user_id)): Path<(String, String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (_current, application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let user = state
+        .db
+        .find_user_by_id(&user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let decision = authorization::check_login_access(&state, &application, &user.id).await?;
+    let entitlements = if decision.allowed {
+        Some(
+            authorization::resolve_entitlements_for_profile(&state, &application, &profile, &user)
+                .await?,
+        )
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "decision": decision,
+        "entitlements": entitlements,
+    })))
+}
+
 async fn list_application_user_roles(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -5866,6 +6914,7 @@ async fn replace_application_oidc_clients(
             .link_oidc_client_to_application(&id, client_id)
             .await?;
     }
+    auto_refresh_application_authorization_profiles(&state, &application).await?;
     state
         .db
         .record_audit_event(audit::management_event(

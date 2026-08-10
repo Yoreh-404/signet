@@ -23,18 +23,19 @@ import { api } from "../../lib/api";
 import type {
   ApplicationModule,
   ApplicationModuleKey,
+  ApplicationAuthorizationProfile,
   ApplicationJwtClient,
   ApplicationDirectorySyncRun,
   ApplicationAuthorizationPreview,
   ApplicationAuthorizationSubjects,
+  ApplicationPermissionDefinition,
   ApplicationPermissionOverride,
-  ApplicationRole,
+  ApplicationProfileRole,
   ApplicationScimToken,
   Client,
   ExternalProvider,
   LdapProvider,
   Locale,
-  PermissionInfo,
   TenantApplication
 } from "../../types";
 
@@ -158,6 +159,20 @@ type Copy = {
   revoked: string;
   tokenOnlyOnce: string;
   authorizationHint: string;
+  authorizationProfile: string;
+  authorizationProfileHint: string;
+  noAuthorizationProfile: string;
+  profileManual: string;
+  profileSigned: string;
+  profileManifestUrl: string;
+  profileSigner: string;
+  profileMode: string;
+  refreshProfile: string;
+  profileSynced: string;
+  profileManualStatus: string;
+  profileNoDefinition: string;
+  permissionTree: string;
+  roleKey: string;
   inheritEnterprise: string;
   inheritEnterpriseHint: string;
   defaultRole: string;
@@ -341,6 +356,20 @@ const ZH: Copy = {
   revoked: "已撤销",
   tokenOnlyOnce: "完整令牌只显示这一次，请立即复制并安全保存。",
   authorizationHint: "权限采用两层合并：继承企业默认角色，再叠加这个网站的专属角色和 Claim。",
+  authorizationProfile: "OIDC 权限 Profile",
+  authorizationProfileHint: "每个 OIDC 客户端独立维护一套权限定义、角色和用户映射。网站可以通过签名 manifest 提供定义，也可以在 Signet 手工维护。",
+  noAuthorizationProfile: "请先为网站绑定一个 OIDC 客户端",
+  profileManual: "手工配置",
+  profileSigned: "签名 Manifest",
+  profileManifestUrl: "Manifest 地址",
+  profileSigner: "Manifest 签名客户端",
+  profileMode: "权限来源",
+  refreshProfile: "刷新权限定义",
+  profileSynced: "已同步",
+  profileManualStatus: "手工模式",
+  profileNoDefinition: "目标网站没有提供权限定义；请在下方手工创建角色并填写权限字符串。",
+  permissionTree: "权限树",
+  roleKey: "角色键",
   inheritEnterprise: "继承企业默认权限",
   inheritEnterpriseHint: "企业管理员调整默认角色后，这个网站自动获得变更。",
   defaultRole: "默认应用角色",
@@ -524,6 +553,20 @@ const EN: Copy = {
   revoked: "Revoked",
   tokenOnlyOnce: "The complete token is shown only once. Copy it now and store it securely.",
   authorizationHint: "Authorization is merged in two layers: inherit enterprise defaults, then add website-specific roles and claims.",
+  authorizationProfile: "OIDC authorization profile",
+  authorizationProfileHint: "Each OIDC client has an independent permission vocabulary, role catalog, and subject mappings. A website can publish a signed manifest or be configured manually in Signet.",
+  noAuthorizationProfile: "Attach an OIDC client to this website first",
+  profileManual: "Manual configuration",
+  profileSigned: "Signed manifest",
+  profileManifestUrl: "Manifest URL",
+  profileSigner: "Manifest signing client",
+  profileMode: "Permission source",
+  refreshProfile: "Refresh permission definitions",
+  profileSynced: "Synced",
+  profileManualStatus: "Manual mode",
+  profileNoDefinition: "The website did not publish permission definitions. Create roles below and enter permission strings manually.",
+  permissionTree: "Permission tree",
+  roleKey: "Role key",
   inheritEnterprise: "Inherit enterprise defaults",
   inheritEnterpriseHint: "Enterprise role changes automatically flow into this website.",
   defaultRole: "Default application role",
@@ -609,26 +652,76 @@ function stringList(value: unknown): string[] {
 
 type ApplicationRoleDraft = {
   id: string | null;
+  role_key: string;
   name: string;
   description: string;
   permissions: string[];
   is_default: boolean;
   is_active: boolean;
+  source: string;
 };
 
-function applicationRoleDraft(role: ApplicationRole): ApplicationRoleDraft {
+function applicationRoleDraft(role: ApplicationProfileRole): ApplicationRoleDraft {
   return {
     id: role.id,
+    role_key: role.role_key,
     name: role.name,
     description: role.description ?? "",
     permissions: [...role.permissions],
     is_default: role.is_default,
-    is_active: role.is_active
+    is_active: role.is_active,
+    source: role.source
   };
 }
 
 function normalizedPermissionList(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+type PermissionTreeNode = {
+  label: string;
+  children: Map<string, PermissionTreeNode>;
+  definition?: ApplicationPermissionDefinition;
+};
+
+function permissionTree(definitions: ApplicationPermissionDefinition[]): PermissionTreeNode[] {
+  const root: PermissionTreeNode = { label: "", children: new Map() };
+  for (const definition of definitions.filter((item) => item.is_active)) {
+    const segments = definition.key.split(":");
+    let current = root;
+    segments.forEach((segment, index) => {
+      let next = current.children.get(segment);
+      if (!next) {
+        next = { label: segment, children: new Map() };
+        current.children.set(segment, next);
+      }
+      if (index === segments.length - 1) next.definition = definition;
+      current = next;
+    });
+  }
+  return Array.from(root.children.values()).sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function PermissionTree({
+  definitions,
+  renderLeaf
+}: {
+  definitions: ApplicationPermissionDefinition[];
+  renderLeaf: (definition: ApplicationPermissionDefinition) => React.ReactNode;
+}) {
+  function renderNode(node: PermissionTreeNode, depth: number): React.ReactNode {
+    const children = Array.from(node.children.values()).sort((left, right) => left.label.localeCompare(right.label));
+    return (
+      <div className="permission-tree-node" key={`${node.definition?.key ?? node.label}-${depth}`}>
+        {node.definition && renderLeaf(node.definition)}
+        {!node.definition && <div className="permission-tree-branch"><ChevronRight size={13} /><strong>{node.label}</strong></div>}
+        {children.length > 0 && <div className="permission-tree-children">{children.map((child) => renderNode(child, depth + 1))}</div>}
+      </div>
+    );
+  }
+
+  const nodes = permissionTree(definitions);
+  return <div className="permission-tree">{nodes.length > 0 ? nodes.map((node) => renderNode(node, 0)) : <p className="muted">{"—"}</p>}</div>;
 }
 
 function formatScimTokenTime(value: number | null, locale: Locale): string {
@@ -742,8 +835,16 @@ export function ApplicationWorkspace({
   const [createdScimToken, setCreatedScimToken] = useState("");
   const [syncRuns, setSyncRuns] = useState<ApplicationDirectorySyncRun[]>([]);
   const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
-  const [applicationRoles, setApplicationRoles] = useState<ApplicationRole[]>([]);
-  const [applicationPermissionCatalog, setApplicationPermissionCatalog] = useState<PermissionInfo[]>([]);
+  const [authorizationProfiles, setAuthorizationProfiles] = useState<ApplicationAuthorizationProfile[]>([]);
+  const [selectedAuthorizationProfileId, setSelectedAuthorizationProfileId] = useState("");
+  const [profileManifestUrl, setProfileManifestUrl] = useState("");
+  const [profileSignerClientId, setProfileSignerClientId] = useState("");
+  const [profileSignedEnabled, setProfileSignedEnabled] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileRefreshing, setProfileRefreshing] = useState(false);
+  const [profileFeedback, setProfileFeedback] = useState("");
+  const [applicationRoles, setApplicationRoles] = useState<ApplicationProfileRole[]>([]);
+  const [applicationPermissionCatalog, setApplicationPermissionCatalog] = useState<ApplicationPermissionDefinition[]>([]);
   const [roleDraft, setRoleDraft] = useState<ApplicationRoleDraft | null>(null);
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleFeedback, setRoleFeedback] = useState("");
@@ -759,6 +860,7 @@ export function ApplicationWorkspace({
   const [authorizationSaving, setAuthorizationSaving] = useState(false);
   const [authorizationFeedback, setAuthorizationFeedback] = useState("");
   const selected = applications.find((item) => item.id === selectedId) ?? null;
+  const selectedAuthorizationProfile = authorizationProfiles.find((profile) => profile.id === selectedAuthorizationProfileId) ?? null;
 
   useEffect(() => {
     if (applications.length === 0) {
@@ -785,6 +887,12 @@ export function ApplicationWorkspace({
     setCreatedScimToken("");
     setSyncRuns([]);
     setRunningProviderId(null);
+    setAuthorizationProfiles([]);
+    setSelectedAuthorizationProfileId("");
+    setProfileManifestUrl("");
+    setProfileSignerClientId("");
+    setProfileSignedEnabled(false);
+    setProfileFeedback("");
     setApplicationRoles([]);
     setApplicationPermissionCatalog([]);
     setRoleDraft(null);
@@ -815,15 +923,15 @@ export function ApplicationWorkspace({
 
   useEffect(() => {
     let cancelled = false;
-    if (!selected || !selectedAuthorizationUserId) {
+    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationUserId) {
       setUserRoleIds([]);
       setUserPermissionOverrides([]);
       return () => { cancelled = true; };
     }
     setAuthorizationLoading(true);
     void Promise.all([
-      api<string[]>(`/api/admin/applications/${selected.id}/users/${selectedAuthorizationUserId}/roles`),
-      api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/users/${selectedAuthorizationUserId}/permission-overrides`)
+      api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/roles`),
+      api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/permission-overrides`)
     ])
       .then(([roles, overrides]) => {
         if (cancelled) return;
@@ -841,15 +949,15 @@ export function ApplicationWorkspace({
         if (!cancelled) setAuthorizationLoading(false);
       });
     return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationUserId]);
+  }, [selected, selectedAuthorizationProfileId, selectedAuthorizationUserId]);
 
   useEffect(() => {
     let cancelled = false;
-    if (!selected || !selectedAuthorizationGroupId) {
+    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationGroupId) {
       setGroupRoleIds([]);
       return () => { cancelled = true; };
     }
-    void api<string[]>(`/api/admin/applications/${selected.id}/groups/${selectedAuthorizationGroupId}/roles`)
+    void api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/groups/${selectedAuthorizationGroupId}/roles`)
       .then((roles) => {
         if (!cancelled) setGroupRoleIds(roles);
       })
@@ -860,17 +968,17 @@ export function ApplicationWorkspace({
         }
       });
     return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationGroupId]);
+  }, [selected, selectedAuthorizationProfileId, selectedAuthorizationGroupId]);
 
   useEffect(() => {
     let cancelled = false;
     const organizationRoles = authorizationSubjects?.organization_roles ?? [];
-    if (!selected || organizationRoles.length === 0) {
+    if (!selected || !selectedAuthorizationProfileId || organizationRoles.length === 0) {
       setOrganizationRoleIds({});
       return () => { cancelled = true; };
     }
     void Promise.all(organizationRoles.map(async (organizationRole) => {
-      const roleIds = await api<string[]>(`/api/admin/applications/${selected.id}/organization-roles/${encodeURIComponent(organizationRole)}/roles`);
+      const roleIds = await api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/organization-roles/${encodeURIComponent(organizationRole)}/roles`);
       return [organizationRole, roleIds] as const;
     }))
       .then((entries) => {
@@ -883,32 +991,66 @@ export function ApplicationWorkspace({
         }
       });
     return () => { cancelled = true; };
-  }, [selected, authorizationSubjects]);
+  }, [selected, selectedAuthorizationProfileId, authorizationSubjects]);
 
   useEffect(() => {
     let cancelled = false;
     if (!selected) return () => { cancelled = true; };
     void Promise.all([
-      api<ApplicationRole[]>(`/api/admin/applications/${selected.id}/roles`),
-      api<PermissionInfo[]>(`/api/admin/applications/${selected.id}/authorization/catalog`),
+      api<ApplicationAuthorizationProfile[]>(`/api/admin/applications/${selected.id}/authorization/profiles`),
       api<ApplicationAuthorizationSubjects>(`/api/admin/applications/${selected.id}/authorization/subjects`)
     ])
-      .then(([roles, catalog, subjects]) => {
+      .then(([profiles, subjects]) => {
         if (cancelled) return;
-        setApplicationRoles(roles);
-        setApplicationPermissionCatalog(catalog);
+        setAuthorizationProfiles(profiles);
+        setSelectedAuthorizationProfileId((current) => current && profiles.some((profile) => profile.id === current)
+          ? current
+          : profiles[0]?.id ?? "");
         setAuthorizationSubjects(subjects);
         setSelectedAuthorizationUserId(subjects.users[0]?.user_id ?? "");
         setSelectedAuthorizationGroupId(subjects.groups[0]?.id ?? "");
       })
       .catch(() => {
         if (cancelled) return;
+        setAuthorizationProfiles([]);
+        setSelectedAuthorizationProfileId("");
         setApplicationRoles([]);
         setApplicationPermissionCatalog([]);
         setAuthorizationSubjects(null);
       });
     return () => { cancelled = true; };
   }, [selected]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selected || !selectedAuthorizationProfileId) {
+      setApplicationRoles([]);
+      setApplicationPermissionCatalog([]);
+      return () => { cancelled = true; };
+    }
+    const profile = authorizationProfiles.find((item) => item.id === selectedAuthorizationProfileId);
+    if (profile) {
+      setProfileManifestUrl(profile.manifest_url);
+      setProfileSignerClientId(profile.signer_client_id ?? "");
+      setProfileSignedEnabled(profile.source_mode === "signed_manifest");
+    }
+    void Promise.all([
+      api<ApplicationProfileRole[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`),
+      api<ApplicationPermissionDefinition[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/catalog`)
+    ])
+      .then(([roles, catalog]) => {
+        if (cancelled) return;
+        setApplicationRoles(roles);
+        setApplicationPermissionCatalog(catalog);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setApplicationRoles([]);
+        setApplicationPermissionCatalog([]);
+        setAuthorizationFeedback(c.saveFailed);
+      });
+    return () => { cancelled = true; };
+  }, [selected, selectedAuthorizationProfileId, authorizationProfiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1003,7 +1145,53 @@ export function ApplicationWorkspace({
     }
   }
 
-  function startApplicationRole(role?: ApplicationRole) {
+  async function saveAuthorizationProfile() {
+    if (!selected || !selectedAuthorizationProfileId) return;
+    setProfileSaving(true);
+    setProfileFeedback("");
+    try {
+      const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          manifest_url: profileManifestUrl.trim() || null,
+          signer_client_id: profileSignerClientId.trim() || null,
+          signed_manifest_enabled: profileSignedEnabled
+        })
+      });
+      setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
+      setProfileManifestUrl(profile.manifest_url);
+      setProfileSignerClientId(profile.signer_client_id ?? "");
+      setProfileSignedEnabled(profile.source_mode === "signed_manifest");
+      setProfileFeedback(c.saved);
+    } catch {
+      setProfileFeedback(c.saveFailed);
+    } finally {
+      setProfileSaving(false);
+    }
+  }
+
+  async function refreshAuthorizationProfile() {
+    if (!selected || !selectedAuthorizationProfileId || !profileSignedEnabled) return;
+    setProfileRefreshing(true);
+    setProfileFeedback("");
+    try {
+      const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/refresh`, { method: "POST" });
+      setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
+      setProfileFeedback(profile.sync_status === "synced" ? c.profileSynced : c.profileManualStatus);
+    } catch {
+      setProfileFeedback(c.saveFailed);
+      try {
+        const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}`);
+        setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
+      } catch {
+        // Keep the refresh error visible when the status request also fails.
+      }
+    } finally {
+      setProfileRefreshing(false);
+    }
+  }
+
+  function startApplicationRole(role?: ApplicationProfileRole) {
     setRoleFeedback("");
     if (role) {
       setRoleDraft(applicationRoleDraft(role));
@@ -1011,11 +1199,13 @@ export function ApplicationWorkspace({
     }
     setRoleDraft({
       id: null,
+      role_key: "",
       name: "",
       description: "",
       permissions: [],
       is_default: !applicationRoles.some((item) => item.is_default && item.is_active),
-      is_active: true
+      is_active: true,
+      source: "manual"
     });
   }
 
@@ -1032,9 +1222,10 @@ export function ApplicationWorkspace({
   }
 
   async function saveApplicationRole() {
-    if (!selected || !roleDraft) return;
+    if (!selected || !selectedAuthorizationProfileId || !roleDraft) return;
     const name = roleDraft.name.trim();
-    if (!name) {
+    const roleKey = roleDraft.role_key.trim();
+    if (!name || !roleKey) {
       setRoleFeedback(c.saveFailed);
       return;
     }
@@ -1042,6 +1233,7 @@ export function ApplicationWorkspace({
     setRoleFeedback("");
     try {
       const payload = JSON.stringify({
+        role_key: roleKey,
         name,
         description: roleDraft.description.trim() || null,
         permissions: normalizedPermissionList(roleDraft.permissions),
@@ -1049,13 +1241,13 @@ export function ApplicationWorkspace({
         is_active: roleDraft.is_active
       });
       const path = roleDraft.id
-        ? `/api/admin/applications/${selected.id}/roles/${roleDraft.id}`
-        : `/api/admin/applications/${selected.id}/roles`;
-      await api<ApplicationRole>(path, {
+        ? `/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles/${roleDraft.id}`
+        : `/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`;
+      await api<ApplicationProfileRole>(path, {
         method: roleDraft.id ? "PUT" : "POST",
         body: payload
       });
-      const roles = await api<ApplicationRole[]>(`/api/admin/applications/${selected.id}/roles`);
+      const roles = await api<ApplicationProfileRole[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`);
       setApplicationRoles(roles);
       setRoleDraft(null);
       setRoleFeedback(c.saved);
@@ -1066,8 +1258,8 @@ export function ApplicationWorkspace({
     }
   }
 
-  async function deleteApplicationRole(role: ApplicationRole) {
-    if (!selected || role.is_default) {
+  async function deleteApplicationRole(role: ApplicationProfileRole) {
+    if (!selected || !selectedAuthorizationProfileId || role.is_default) {
       setRoleFeedback(c.defaultRoleDeleteHint);
       return;
     }
@@ -1075,7 +1267,7 @@ export function ApplicationWorkspace({
     setRoleSaving(true);
     setRoleFeedback("");
     try {
-      await api(`/api/admin/applications/${selected.id}/roles/${role.id}`, { method: "DELETE" });
+      await api(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles/${role.id}`, { method: "DELETE" });
       setApplicationRoles((current) => current.filter((item) => item.id !== role.id));
       if (roleDraft?.id === role.id) setRoleDraft(null);
       setRoleFeedback(c.saved);
@@ -1120,29 +1312,29 @@ export function ApplicationWorkspace({
   }
 
   async function saveAuthorizationBindings() {
-    if (!selected) return;
+    if (!selected || !selectedAuthorizationProfileId) return;
     setAuthorizationSaving(true);
     setAuthorizationFeedback("");
     try {
       const requests: Promise<unknown>[] = [];
       if (selectedAuthorizationUserId) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/users/${selectedAuthorizationUserId}/roles`, {
+        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/roles`, {
           method: "PUT",
           body: JSON.stringify({ role_ids: userRoleIds })
         }));
-        requests.push(api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/users/${selectedAuthorizationUserId}/permission-overrides`, {
+        requests.push(api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/permission-overrides`, {
           method: "PUT",
           body: JSON.stringify({ overrides: userPermissionOverrides })
         }));
       }
       if (selectedAuthorizationGroupId) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/groups/${selectedAuthorizationGroupId}/roles`, {
+        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/groups/${selectedAuthorizationGroupId}/roles`, {
           method: "PUT",
           body: JSON.stringify({ role_ids: groupRoleIds })
         }));
       }
       for (const organizationRole of authorizationSubjects?.organization_roles ?? []) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/organization-roles/${encodeURIComponent(organizationRole)}/roles`, {
+        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/organization-roles/${encodeURIComponent(organizationRole)}/roles`, {
           method: "PUT",
           body: JSON.stringify({ role_ids: organizationRoleIds[organizationRole] ?? [] })
         }));
@@ -1158,11 +1350,11 @@ export function ApplicationWorkspace({
   }
 
   async function runAuthorizationPreview() {
-    if (!selected || !selectedAuthorizationUserId) return;
+    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationUserId) return;
     setAuthorizationLoading(true);
     setAuthorizationFeedback("");
     try {
-      const preview = await api<ApplicationAuthorizationPreview>(`/api/admin/applications/${selected.id}/authorization/${selectedAuthorizationUserId}`);
+      const preview = await api<ApplicationAuthorizationPreview>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/${selectedAuthorizationUserId}`);
       setAuthorizationPreview(preview);
     } catch {
       setAuthorizationFeedback(c.saveFailed);
@@ -1534,8 +1726,50 @@ export function ApplicationWorkspace({
     return (
       <div className="application-module-content">
         <ModuleHeader icon={<ShieldCheck size={19} />} title={c.permissions} description={c.authorizationHint} />
-        <div className="module-setting-card">
-          <Toggle label={c.inheritEnterprise} hint={c.inheritEnterpriseHint} checked={booleanValue(config.inherit_enterprise_roles, true)} onChange={(value) => updateDraft("authorization", { ...config, inherit_enterprise_roles: value })} />
+        {authorizationProfiles.length === 0 ? (
+          <div className="module-setting-card authorization-empty-profile">
+            <strong>{c.noAuthorizationProfile}</strong>
+            <p className="muted">{c.setupNextHint}</p>
+          </div>
+        ) : <div className="module-setting-card">
+          <div className="authorization-profile-panel">
+            <div className="subsection-heading">
+              <div><strong>{c.authorizationProfile}</strong><p className="muted">{c.authorizationProfileHint}</p></div>
+              <span>{authorizationProfiles.length}</span>
+            </div>
+            <label className="application-input">
+              <span>{c.authorizationProfile}</span>
+              <select value={selectedAuthorizationProfileId} onChange={(event) => setSelectedAuthorizationProfileId(event.target.value)}>
+                {authorizationProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.profile_key}</option>)}
+              </select>
+            </label>
+            {selectedAuthorizationProfile && <>
+              <div className="form-grid-2 compact-form-grid">
+                <Input label={c.profileManifestUrl} value={profileManifestUrl} onChange={setProfileManifestUrl} />
+                <label className="application-input"><span>{c.profileSigner}</span><select value={profileSignerClientId} onChange={(event) => setProfileSignerClientId(event.target.value)}>
+                  <option value="">{c.notConfigured}</option>
+                  {selected.oidc_clients.map((client) => <option value={client.client_id} key={client.id}>{client.client_name} · {client.client_id}</option>)}
+                </select></label>
+              </div>
+              <div className="authorization-profile-mode-row">
+                <Toggle label={c.profileMode} hint={profileSignedEnabled ? c.profileSigned : c.profileManual} checked={profileSignedEnabled} onChange={setProfileSignedEnabled} />
+                <span className={`application-role-badge ${selectedAuthorizationProfile.sync_status === "synced" ? "default" : ""}`}>
+                  {selectedAuthorizationProfile.sync_status === "synced" ? c.profileSynced : selectedAuthorizationProfile.source_mode === "manual" ? c.profileManualStatus : selectedAuthorizationProfile.sync_status}
+                </span>
+              </div>
+              <div className="application-role-editor-actions">
+                <span className={profileFeedback === c.saveFailed ? "module-save-error" : "module-save-feedback"} role="status">{profileFeedback}</span>
+                {canManage && <>
+                  <button type="button" className="secondary-button" onClick={() => void refreshAuthorizationProfile()} disabled={profileRefreshing || profileSaving || !profileSignedEnabled}><RefreshCw size={14} />{profileRefreshing ? c.saving : c.refreshProfile}</button>
+                  <button type="button" className="primary-action" onClick={() => void saveAuthorizationProfile()} disabled={profileSaving || profileRefreshing}>{profileSaving ? c.saving : c.save}<ArrowRight size={15} /></button>
+                </>}
+              </div>
+              {selectedAuthorizationProfile.last_error && <p className="module-save-error" role="alert">{selectedAuthorizationProfile.last_error}</p>}
+              {selectedAuthorizationProfile.source_mode === "manual" && <p className="module-note"><Circle size={11} />{c.profileNoDefinition}</p>}
+            </>}
+          </div>
+          <div className="module-divider" />
+          <p className="module-note"><Circle size={11} />{c.loginBoundaryNote}</p>
           <div className="module-divider" />
           <div className="subsection-heading">
             <div><strong>{c.customRoles}</strong><p className="muted">{c.customRolesHint}</p></div>
@@ -1546,7 +1780,7 @@ export function ApplicationWorkspace({
               <article className={`application-role-record${role.is_active ? "" : " inactive"}`} key={role.id}>
                 <div className="application-role-record-main">
                   <strong>{role.name}</strong>
-                  <small>{role.description || c.noModuleConfig}</small>
+                  <small><code>{role.role_key}</code> · {role.description || c.noModuleConfig}</small>
                   <div className="application-role-permission-summary">
                     {role.permissions.length > 0
                       ? role.permissions.map((permission) => <span key={permission}>{permission}</span>)
@@ -1569,6 +1803,7 @@ export function ApplicationWorkspace({
             <div className="application-role-editor">
               <div className="subsection-heading"><strong>{roleDraft.id ? c.editRole : c.addRole}</strong><span>{roleDraft.id ?? c.notConfigured}</span></div>
               <div className="form-grid-2 compact-form-grid">
+                <Input label={c.roleKey} value={roleDraft.role_key} disabled={roleDraft.source === "manifest"} onChange={(value) => updateRoleDraft({ role_key: value })} />
                 <Input label={c.roleName} value={roleDraft.name} onChange={(value) => updateRoleDraft({ name: value })} />
                 <Input label={c.roleDescription} value={roleDraft.description} onChange={(value) => updateRoleDraft({ description: value })} />
               </div>
@@ -1577,15 +1812,14 @@ export function ApplicationWorkspace({
               <div className="module-divider" />
               <div><strong>{c.rolePermissions}</strong><p className="muted">{c.rolePermissionsHint}</p></div>
               {applicationPermissionCatalog.length > 0 && <>
-                <span className="application-permission-label">{c.standardPermissions}</span>
-                <div className="application-permission-grid">
-                  {applicationPermissionCatalog.map((permission) => (
-                    <label className="application-choice" key={permission.key}>
-                      <input type="checkbox" checked={roleDraft.permissions.includes(permission.key)} onChange={() => toggleRolePermission(permission.key)} />
-                      <span><strong>{permission.key}</strong><small>{permission.category} · {permission.label}</small></span>
-                    </label>
-                  ))}
-                </div>
+                <span className="application-permission-label">{c.permissionTree}</span>
+                <PermissionTree
+                  definitions={applicationPermissionCatalog}
+                  renderLeaf={(permission) => <label className="application-choice permission-tree-choice" key={permission.key}>
+                    <input type="checkbox" checked={roleDraft.permissions.includes(permission.key)} onChange={() => toggleRolePermission(permission.key)} />
+                    <span><strong>{permission.label}</strong><small><code>{permission.key}</code>{permission.description ? ` · ${permission.description}` : ""}</small></span>
+                  </label>}
+                />
               </>}
               <Input
                 label={c.customPermissions}
@@ -1599,7 +1833,7 @@ export function ApplicationWorkspace({
               />
               <div className="application-role-editor-actions">
                 <button type="button" className="secondary-button" onClick={() => setRoleDraft(null)} disabled={roleSaving}>{c.removeRole}</button>
-                <button type="button" className="primary-action" onClick={() => void saveApplicationRole()} disabled={roleSaving || !roleDraft.name.trim()}>{roleSaving ? c.saving : c.save}<ArrowRight size={15} /></button>
+                <button type="button" className="primary-action" onClick={() => void saveApplicationRole()} disabled={roleSaving || !roleDraft.name.trim() || !roleDraft.role_key.trim()}>{roleSaving ? c.saving : c.save}<ArrowRight size={15} /></button>
               </div>
             </div>
           )}
@@ -1660,12 +1894,13 @@ export function ApplicationWorkspace({
           <div className="authorization-subsection">
             <div className="subsection-heading"><div><strong>{c.permissionOverrides}</strong><p className="muted">{c.permissionOverridesHint}</p></div><span>{selectedAuthorizationUserId ? userPermissionOverrides.length : 0}</span></div>
             {selectedAuthorizationUserId ? <>
-              <div className="application-override-grid">
-                {applicationPermissionCatalog.map((permission) => {
+              <PermissionTree
+                definitions={applicationPermissionCatalog}
+                renderLeaf={(permission) => {
                   const effect = userPermissionOverrides.find((override) => override.permission === permission.key)?.effect ?? "";
-                  return <label className="application-input" key={permission.key}><span>{permission.key}</span><select value={effect} disabled={authorizationSaving} onChange={(event) => updatePermissionOverride(permission.key, event.target.value as "" | "allow" | "deny")}><option value="">{c.inheritPermission}</option><option value="allow">{c.allowPermission}</option><option value="deny">{c.denyPermission}</option></select></label>;
-                })}
-              </div>
+                  return <label className="application-input permission-tree-override" key={permission.key}><span>{permission.label}<small><code>{permission.key}</code></small></span><select value={effect} disabled={authorizationSaving} onChange={(event) => updatePermissionOverride(permission.key, event.target.value as "" | "allow" | "deny")}><option value="">{c.inheritPermission}</option><option value="allow">{c.allowPermission}</option><option value="deny">{c.denyPermission}</option></select></label>;
+                }}
+              />
               <Input label={c.customOverrides} hint={c.customOverridesHint} value={customOverrideLines} textarea onChange={updateCustomPermissionOverrides} />
             </> : <p className="muted">{c.noAuthorizationUsers}</p>}
           </div>
@@ -1684,7 +1919,7 @@ export function ApplicationWorkspace({
           <div className="module-divider" />
           <p className="module-note">{c.loginBoundaryNote}</p>
           <Input label={c.claims} hint={c.claimsHint} value={claims.join("\n")} textarea onChange={(value) => updateDraft("authorization", { ...config, claims: value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) })} />
-        </div>
+        </div>}
         <ModuleSave saving={savingKey === "authorization"} feedback={feedback} copy={c} onSave={() => void saveModule("authorization")} />
       </div>
     );
@@ -1796,8 +2031,8 @@ function Toggle({ label, hint, checked, onChange, compact = false, disabled = fa
   return <label className={`application-toggle${compact ? " compact" : ""}`}><span className="toggle-copy">{label && <strong>{label}</strong>}{hint && <small>{hint}</small>}</span><input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span></label>;
 }
 
-function Input({ label, hint, value, onChange, type = "text", textarea = false }: { label: string; hint?: string; value: string; onChange: (value: string) => void; type?: string; textarea?: boolean }) {
-  return <label className="application-input"><span>{label}</span>{textarea ? <textarea value={value} onChange={(event) => onChange(event.target.value)} /> : <input type={type} value={value} onChange={(event) => onChange(event.target.value)} />}{hint && <small>{hint}</small>}</label>;
+function Input({ label, hint, value, onChange, type = "text", textarea = false, disabled = false }: { label: string; hint?: string; value: string; onChange: (value: string) => void; type?: string; textarea?: boolean; disabled?: boolean }) {
+  return <label className="application-input"><span>{label}</span>{textarea ? <textarea value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} /> : <input type={type} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />}{hint && <small>{hint}</small>}</label>;
 }
 
 function TicketIcon() {

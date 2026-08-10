@@ -2489,6 +2489,148 @@ pub struct ApplicationModuleRecord {
     pub updated_at: i64,
 }
 
+/// An application authorization profile is the policy boundary for one
+/// protocol connection.  OIDC clients attached to the same website may
+/// therefore expose different permission vocabularies without sharing role
+/// assignments accidentally.
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationAuthorizationProfileRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub application_id: String,
+    #[diesel(sql_type = Text)]
+    pub profile_key: String,
+    #[diesel(sql_type = Text)]
+    pub connection_kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub connection_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub source_mode: String,
+    #[diesel(sql_type = Text)]
+    pub manifest_url: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub signer_client_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub remote_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub remote_digest: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub sync_status: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_synced_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_error: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationAuthorizationProfile {
+    pub id: String,
+    pub application_id: String,
+    pub profile_key: String,
+    pub connection_kind: String,
+    pub connection_id: Option<String>,
+    pub source_mode: String,
+    pub manifest_url: String,
+    pub signer_client_id: Option<String>,
+    pub remote_version: Option<String>,
+    pub remote_digest: Option<String>,
+    pub sync_status: String,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationPermissionDefinitionRecord {
+    #[diesel(sql_type = Text)]
+    pub profile_id: String,
+    #[diesel(sql_type = Text)]
+    pub permission_key: String,
+    #[diesel(sql_type = Text)]
+    pub label: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub description: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub source: String,
+    #[diesel(sql_type = Integer)]
+    pub is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationPermissionDefinition {
+    pub profile_id: String,
+    pub permission_key: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationProfileRoleRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub profile_id: String,
+    #[diesel(sql_type = Text)]
+    pub role_key: String,
+    #[diesel(sql_type = Text)]
+    pub name: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub description: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub permissions: String,
+    #[diesel(sql_type = Text)]
+    pub source: String,
+    #[diesel(sql_type = Integer)]
+    pub is_default: i32,
+    #[diesel(sql_type = Integer)]
+    pub is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+impl ApplicationProfileRoleRecord {
+    pub fn permission_keys(&self) -> AppResult<Vec<String>> {
+        util::from_json(&self.permissions)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationProfileRole {
+    pub id: Option<String>,
+    pub profile_id: String,
+    pub role_key: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Vec<String>,
+    pub source: String,
+    pub is_default: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct ApplicationProfilePermissionOverrideRecord {
+    #[diesel(sql_type = Text)]
+    pub profile_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub permission: String,
+    #[diesel(sql_type = Text)]
+    pub effect: String,
+}
+
 #[derive(Debug, Clone, diesel::QueryableByName)]
 pub struct ApplicationJwtCodeRecord {
     #[diesel(sql_type = Text)]
@@ -3480,6 +3622,22 @@ fn select_application_identity_binding_sql() -> &'static str {
 
 fn select_application_module_sql() -> &'static str {
     "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules"
+}
+
+fn select_application_authorization_profile_sql() -> &'static str {
+    "SELECT id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at FROM application_authorization_profiles"
+}
+
+fn select_application_permission_definition_sql() -> &'static str {
+    "SELECT profile_id, permission_key, label, description, source, is_active, created_at, updated_at FROM application_permission_definitions"
+}
+
+fn select_application_profile_role_sql() -> &'static str {
+    "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles"
+}
+
+fn select_application_profile_permission_override_sql() -> &'static str {
+    "SELECT profile_id, user_id, permission, effect FROM application_profile_permission_overrides"
 }
 
 fn select_application_role_sql() -> &'static str {
@@ -11969,6 +12127,675 @@ impl Db {
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_application_authorization_profiles(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Vec<ApplicationAuthorizationProfileRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE application_id = {} ORDER BY profile_key ASC",
+                select_application_authorization_profile_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .load::<ApplicationAuthorizationProfileRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_authorization_profile(
+        &self,
+        application_id: &str,
+        profile_key: &str,
+    ) -> AppResult<Option<ApplicationAuthorizationProfileRecord>> {
+        let application_id = application_id.to_string();
+        let profile_key = profile_key.trim().to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE application_id = {} AND profile_key = {}",
+                select_application_authorization_profile_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(profile_key)
+                .get_result::<ApplicationAuthorizationProfileRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_authorization_profile_by_id(
+        &self,
+        profile_id: &str,
+    ) -> AppResult<Option<ApplicationAuthorizationProfileRecord>> {
+        let profile_id = profile_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE id = {}",
+                select_application_authorization_profile_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(profile_id)
+                .get_result::<ApplicationAuthorizationProfileRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn upsert_application_authorization_profile(
+        &self,
+        profile: NewApplicationAuthorizationProfile,
+    ) -> AppResult<ApplicationAuthorizationProfileRecord> {
+        let profile_key = profile.profile_key.trim().to_string();
+        if profile_key.is_empty()
+            || profile_key.len() > 255
+            || profile_key.chars().any(|ch| ch.is_control())
+        {
+            return Err(AppError::BadRequest(
+                "authorization profile key is invalid".to_string(),
+            ));
+        }
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let existing_sql = format!(
+                "{} WHERE application_id = {} AND profile_key = {}",
+                select_application_authorization_profile_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            let existing = sql_query(existing_sql)
+                .bind::<Text, _>(&profile.application_id)
+                .bind::<Text, _>(&profile_key)
+                .get_result::<ApplicationAuthorizationProfileRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)?;
+            let id = existing
+                .as_ref()
+                .map(|value| value.id.clone())
+                .unwrap_or(profile.id);
+            if existing.is_some() {
+                let sql = format!(
+                    "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, manifest_url = {}, signer_client_id = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&profile.connection_kind)
+                    .bind::<Nullable<Text>, _>(&profile.connection_id)
+                    .bind::<Text, _>(&profile.source_mode)
+                    .bind::<Text, _>(&profile.manifest_url)
+                    .bind::<Nullable<Text>, _>(&profile.signer_client_id)
+                    .bind::<Nullable<Text>, _>(&profile.remote_version)
+                    .bind::<Nullable<Text>, _>(&profile.remote_digest)
+                    .bind::<Text, _>(&profile.sync_status)
+                    .bind::<Nullable<BigInt>, _>(&profile.last_synced_at)
+                    .bind::<Nullable<Text>, _>(&profile.last_error)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            } else {
+                let sql = format!(
+                    "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12), ph(kind, 13), ph(kind, 14), ph(kind, 15)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(&profile.application_id)
+                    .bind::<Text, _>(&profile_key)
+                    .bind::<Text, _>(&profile.connection_kind)
+                    .bind::<Nullable<Text>, _>(&profile.connection_id)
+                    .bind::<Text, _>(&profile.source_mode)
+                    .bind::<Text, _>(&profile.manifest_url)
+                    .bind::<Nullable<Text>, _>(&profile.signer_client_id)
+                    .bind::<Nullable<Text>, _>(&profile.remote_version)
+                    .bind::<Nullable<Text>, _>(&profile.remote_digest)
+                    .bind::<Text, _>(&profile.sync_status)
+                    .bind::<Nullable<BigInt>, _>(&profile.last_synced_at)
+                    .bind::<Nullable<Text>, _>(&profile.last_error)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            }
+            let sql = format!(
+                "{} WHERE id = {}",
+                select_application_authorization_profile_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(id)
+                .get_result::<ApplicationAuthorizationProfileRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_application_permission_definitions(
+        &self,
+        profile_id: &str,
+    ) -> AppResult<Vec<ApplicationPermissionDefinitionRecord>> {
+        let profile_id = profile_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE profile_id = {} ORDER BY permission_key ASC",
+                select_application_permission_definition_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(profile_id)
+                .load::<ApplicationPermissionDefinitionRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn replace_application_permission_definitions(
+        &self,
+        profile_id: &str,
+        definitions: Vec<NewApplicationPermissionDefinition>,
+    ) -> AppResult<()> {
+        let profile_id = profile_id.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let delete_sql = format!(
+                    "DELETE FROM application_permission_definitions WHERE profile_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(delete_sql)
+                    .bind::<Text, _>(&profile_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let now = util::now_ts();
+                for definition in definitions {
+                    let key = normalize_application_entitlement_keys(vec![definition.permission_key])?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AppError::BadRequest("permission key is required".to_string()))?;
+                    let label = definition.label.trim().to_string();
+                    if label.is_empty() || label.len() > 160 {
+                        return Err(AppError::BadRequest("permission label is invalid".to_string()));
+                    }
+                    let sql = format!(
+                        "INSERT INTO application_permission_definitions (profile_id, permission_key, label, description, source, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&profile_id)
+                        .bind::<Text, _>(&key)
+                        .bind::<Text, _>(&label)
+                        .bind::<Nullable<Text>, _>(&definition.description)
+                        .bind::<Text, _>(&definition.source)
+                        .bind::<Integer, _>(i32::from(definition.is_active))
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub async fn list_application_profile_roles(
+        &self,
+        profile_id: &str,
+    ) -> AppResult<Vec<ApplicationProfileRoleRecord>> {
+        let profile_id = profile_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC",
+                select_application_profile_role_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(profile_id)
+                .load::<ApplicationProfileRoleRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn upsert_application_profile_role(
+        &self,
+        role: NewApplicationProfileRole,
+    ) -> AppResult<ApplicationProfileRoleRecord> {
+        let role_key = role.role_key.trim().to_string();
+        let name = role.name.trim().to_string();
+        if role_key.is_empty() || role_key.len() > 128 || role_key.chars().any(|ch| ch.is_control()) {
+            return Err(AppError::BadRequest("application role key is invalid".to_string()));
+        }
+        if name.is_empty() || name.len() > 160 || name.chars().any(|ch| ch.is_control()) {
+            return Err(AppError::BadRequest("application role name is invalid".to_string()));
+        }
+        if role.is_default && !role.is_active {
+            return Err(AppError::BadRequest(
+                "an inactive application role cannot be the default role".to_string(),
+            ));
+        }
+        let permissions = util::to_json(&normalize_application_entitlement_keys(role.permissions)?)?;
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<ApplicationProfileRoleRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE profile_id = {} AND role_key = {}",
+                    select_application_profile_role_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&role.profile_id)
+                    .bind::<Text, _>(&role_key)
+                    .get_result::<ApplicationProfileRoleRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?;
+                let id = existing
+                    .as_ref()
+                    .map(|value| value.id.clone())
+                    .or(role.id)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                if role.is_default {
+                    let clear_sql = format!(
+                        "UPDATE application_profile_roles SET is_default = 0, updated_at = {} WHERE profile_id = {} AND id <> {}",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                    );
+                    sql_query(clear_sql)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&role.profile_id)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                if existing.is_some() {
+                    let sql = format!(
+                        "UPDATE application_profile_roles SET name = {}, description = {}, permissions = {}, source = {}, is_default = {}, is_active = {}, updated_at = {} WHERE profile_id = {} AND id = {}",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&name)
+                        .bind::<Nullable<Text>, _>(&role.description)
+                        .bind::<Text, _>(&permissions)
+                        .bind::<Text, _>(&role.source)
+                        .bind::<Integer, _>(i32::from(role.is_default))
+                        .bind::<Integer, _>(i32::from(role.is_active))
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&role.profile_id)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                } else {
+                    let sql = format!(
+                        "INSERT INTO application_profile_roles (id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .bind::<Text, _>(&role.profile_id)
+                        .bind::<Text, _>(&role_key)
+                        .bind::<Text, _>(&name)
+                        .bind::<Nullable<Text>, _>(&role.description)
+                        .bind::<Text, _>(&permissions)
+                        .bind::<Text, _>(&role.source)
+                        .bind::<Integer, _>(i32::from(role.is_default))
+                        .bind::<Integer, _>(i32::from(role.is_active))
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!(
+                    "{} WHERE profile_id = {} AND id = {}",
+                    select_application_profile_role_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&role.profile_id)
+                    .bind::<Text, _>(&id)
+                    .get_result::<ApplicationProfileRoleRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn delete_application_profile_role(
+        &self,
+        profile_id: &str,
+        role_id: &str,
+    ) -> AppResult<()> {
+        let profile_id = profile_id.to_string();
+        let role_id = role_id.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let role_sql = format!(
+                    "{} WHERE profile_id = {} AND id = {}",
+                    select_application_profile_role_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let role = sql_query(role_sql)
+                    .bind::<Text, _>(&profile_id)
+                    .bind::<Text, _>(&role_id)
+                    .get_result::<ApplicationProfileRoleRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                if role.is_default == 1 {
+                    return Err(AppError::BadRequest(
+                        "set another application role as default before deleting this role"
+                            .to_string(),
+                    ));
+                }
+                for table in [
+                    "application_profile_user_roles",
+                    "application_profile_group_roles",
+                    "application_profile_organization_roles",
+                ] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE profile_id = {} AND role_id = {}",
+                        ph(kind, 1), ph(kind, 2)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&profile_id)
+                        .bind::<Text, _>(&role_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!(
+                    "DELETE FROM application_profile_roles WHERE profile_id = {} AND id = {}",
+                    ph(kind, 1), ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&profile_id)
+                    .bind::<Text, _>(&role_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(())
+            })
+        })
+    }
+
+    async fn replace_application_profile_role_assignments(
+        &self,
+        table: &str,
+        subject_column: &str,
+        profile_id: &str,
+        subject_id: &str,
+        role_ids: Vec<String>,
+    ) -> AppResult<()> {
+        if !matches!(
+            table,
+            "application_profile_user_roles"
+                | "application_profile_group_roles"
+                | "application_profile_organization_roles"
+        ) || !matches!(subject_column, "user_id" | "group_id" | "organization_role")
+        {
+            return Err(AppError::Internal(
+                "invalid application profile role assignment table".to_string(),
+            ));
+        }
+        let table = table.to_string();
+        let subject_column = subject_column.to_string();
+        let profile_id = profile_id.to_string();
+        let subject_id = subject_id.to_string();
+        let role_ids = dedupe_nonempty(role_ids);
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                for role_id in &role_ids {
+                    let sql = format!(
+                        "SELECT COUNT(*) AS count FROM application_profile_roles WHERE profile_id = {} AND id = {} AND is_active = 1",
+                        ph(kind, 1), ph(kind, 2)
+                    );
+                    if sql_query(sql)
+                        .bind::<Text, _>(&profile_id)
+                        .bind::<Text, _>(role_id)
+                        .get_result::<CountRow>(conn)
+                        .map_err(AppError::from)?
+                        .count
+                        == 0
+                    {
+                        return Err(AppError::BadRequest(format!(
+                            "unknown application profile role: {role_id}"
+                        )));
+                    }
+                }
+                let delete_sql = format!(
+                    "DELETE FROM {table} WHERE profile_id = {} AND {subject_column} = {}",
+                    ph(kind, 1), ph(kind, 2)
+                );
+                sql_query(delete_sql)
+                    .bind::<Text, _>(&profile_id)
+                    .bind::<Text, _>(&subject_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let now = util::now_ts();
+                for role_id in role_ids {
+                    let insert_sql = format!(
+                        "INSERT INTO {table} (profile_id, {subject_column}, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
+                    );
+                    sql_query(insert_sql)
+                        .bind::<Text, _>(&profile_id)
+                        .bind::<Text, _>(&subject_id)
+                        .bind::<Text, _>(role_id)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    pub async fn list_application_profile_user_role_ids(
+        &self,
+        profile_id: &str,
+        user_id: &str,
+    ) -> AppResult<Vec<String>> {
+        self.list_application_profile_role_ids(
+            "application_profile_user_roles",
+            "user_id",
+            profile_id,
+            user_id,
+        )
+        .await
+    }
+
+    pub async fn replace_application_profile_user_role_ids(
+        &self,
+        profile_id: &str,
+        user_id: &str,
+        role_ids: Vec<String>,
+    ) -> AppResult<()> {
+        self.replace_application_profile_role_assignments(
+            "application_profile_user_roles",
+            "user_id",
+            profile_id,
+            user_id,
+            role_ids,
+        )
+        .await
+    }
+
+    pub async fn list_application_profile_group_role_ids(
+        &self,
+        profile_id: &str,
+        group_id: &str,
+    ) -> AppResult<Vec<String>> {
+        self.list_application_profile_role_ids(
+            "application_profile_group_roles",
+            "group_id",
+            profile_id,
+            group_id,
+        )
+        .await
+    }
+
+    pub async fn replace_application_profile_group_role_ids(
+        &self,
+        profile_id: &str,
+        group_id: &str,
+        role_ids: Vec<String>,
+    ) -> AppResult<()> {
+        self.replace_application_profile_role_assignments(
+            "application_profile_group_roles",
+            "group_id",
+            profile_id,
+            group_id,
+            role_ids,
+        )
+        .await
+    }
+
+    pub async fn list_application_profile_organization_role_ids(
+        &self,
+        profile_id: &str,
+        organization_role: &str,
+    ) -> AppResult<Vec<String>> {
+        self.list_application_profile_role_ids(
+            "application_profile_organization_roles",
+            "organization_role",
+            profile_id,
+            organization_role,
+        )
+        .await
+    }
+
+    pub async fn replace_application_profile_organization_role_ids(
+        &self,
+        profile_id: &str,
+        organization_role: &str,
+        role_ids: Vec<String>,
+    ) -> AppResult<()> {
+        self.replace_application_profile_role_assignments(
+            "application_profile_organization_roles",
+            "organization_role",
+            profile_id,
+            organization_role,
+            role_ids,
+        )
+        .await
+    }
+
+    async fn list_application_profile_role_ids(
+        &self,
+        table: &str,
+        subject_column: &str,
+        profile_id: &str,
+        subject_id: &str,
+    ) -> AppResult<Vec<String>> {
+        if !matches!(
+            table,
+            "application_profile_user_roles"
+                | "application_profile_group_roles"
+                | "application_profile_organization_roles"
+        ) || !matches!(subject_column, "user_id" | "group_id" | "organization_role")
+        {
+            return Err(AppError::Internal(
+                "invalid application profile role lookup".to_string(),
+            ));
+        }
+        let table = table.to_string();
+        let subject_column = subject_column.to_string();
+        let profile_id = profile_id.to_string();
+        let subject_id = subject_id.to_string();
+        #[derive(Debug, diesel::QueryableByName)]
+        struct RoleIdRow {
+            #[diesel(sql_type = Text)]
+            role_id: String,
+        }
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT role_id FROM {table} WHERE profile_id = {} AND {subject_column} = {} AND is_active = 1 ORDER BY role_id ASC",
+                ph(kind, 1), ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile_id)
+                .bind::<Text, _>(&subject_id)
+                .load::<RoleIdRow>(&mut conn)
+                .map(|rows| rows.into_iter().map(|row| row.role_id).collect())
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_application_profile_user_permission_overrides(
+        &self,
+        profile_id: &str,
+        user_id: &str,
+    ) -> AppResult<Vec<ApplicationProfilePermissionOverrideRecord>> {
+        let profile_id = profile_id.to_string();
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE profile_id = {} AND user_id = {} ORDER BY permission ASC",
+                select_application_profile_permission_override_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile_id)
+                .bind::<Text, _>(&user_id)
+                .load::<ApplicationProfilePermissionOverrideRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn replace_application_profile_user_permission_overrides(
+        &self,
+        profile_id: &str,
+        user_id: &str,
+        overrides: Vec<(String, String)>,
+    ) -> AppResult<()> {
+        let profile_id = profile_id.to_string();
+        let user_id = user_id.to_string();
+        let mut normalized = BTreeMap::new();
+        for (permission, effect) in overrides {
+            let permission = normalize_application_entitlement_keys(vec![permission])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::BadRequest("permission is required".to_string()))?;
+            let effect = effect.trim().to_ascii_lowercase();
+            if effect != "allow" && effect != "deny" {
+                return Err(AppError::BadRequest(
+                    "permission effect must be allow or deny".to_string(),
+                ));
+            }
+            normalized.insert(permission, effect);
+        }
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let delete_sql = format!(
+                    "DELETE FROM application_profile_permission_overrides WHERE profile_id = {} AND user_id = {}",
+                    ph(kind, 1), ph(kind, 2)
+                );
+                sql_query(delete_sql)
+                    .bind::<Text, _>(&profile_id)
+                    .bind::<Text, _>(&user_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let now = util::now_ts();
+                for (permission, effect) in normalized {
+                    let sql = format!(
+                        "INSERT INTO application_profile_permission_overrides (profile_id, user_id, permission, effect, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&profile_id)
+                        .bind::<Text, _>(&user_id)
+                        .bind::<Text, _>(permission)
+                        .bind::<Text, _>(effect)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -21980,6 +22807,92 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (application_id, user_id, permission)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_permission_overrides_user ON application_user_permission_overrides(application_id, user_id, effect)",
+    "CREATE TABLE IF NOT EXISTS application_authorization_profiles (
+        id TEXT PRIMARY KEY,
+        application_id TEXT NOT NULL,
+        profile_key TEXT NOT NULL,
+        connection_kind TEXT NOT NULL,
+        connection_id TEXT,
+        source_mode TEXT NOT NULL,
+        manifest_url TEXT NOT NULL DEFAULT '',
+        signer_client_id TEXT,
+        remote_version TEXT,
+        remote_digest TEXT,
+        sync_status TEXT NOT NULL DEFAULT 'manual',
+        last_synced_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(application_id, profile_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_profiles_application ON application_authorization_profiles(application_id, profile_key)",
+    "CREATE TABLE IF NOT EXISTS application_permission_definitions (
+        profile_id TEXT NOT NULL,
+        permission_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        description TEXT,
+        source TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (profile_id, permission_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_permission_definitions_profile ON application_permission_definitions(profile_id, is_active, permission_key)",
+    "CREATE TABLE IF NOT EXISTS application_profile_roles (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        role_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        permissions TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(profile_id, role_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_roles_profile ON application_profile_roles(profile_id, is_active, role_key)",
+    "CREATE TABLE IF NOT EXISTS application_profile_user_roles (
+        profile_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (profile_id, user_id, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_user_roles_user ON application_profile_user_roles(profile_id, user_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_group_roles (
+        profile_id TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (profile_id, group_id, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_group_roles_group ON application_profile_group_roles(profile_id, group_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_organization_roles (
+        profile_id TEXT NOT NULL,
+        organization_role TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (profile_id, organization_role, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_org_roles_role ON application_profile_organization_roles(profile_id, organization_role, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_permission_overrides (
+        profile_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        permission TEXT NOT NULL,
+        effect TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (profile_id, user_id, permission)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_permission_overrides_user ON application_profile_permission_overrides(profile_id, user_id, effect)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -22900,6 +23813,92 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (application_id, user_id, permission)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_permission_overrides_user ON application_user_permission_overrides(application_id, user_id, effect)",
+    "CREATE TABLE IF NOT EXISTS application_authorization_profiles (
+        id TEXT PRIMARY KEY,
+        application_id TEXT NOT NULL,
+        profile_key TEXT NOT NULL,
+        connection_kind TEXT NOT NULL,
+        connection_id TEXT,
+        source_mode TEXT NOT NULL,
+        manifest_url TEXT NOT NULL DEFAULT '',
+        signer_client_id TEXT,
+        remote_version TEXT,
+        remote_digest TEXT,
+        sync_status TEXT NOT NULL DEFAULT 'manual',
+        last_synced_at BIGINT,
+        last_error TEXT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(application_id, profile_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_profiles_application ON application_authorization_profiles(application_id, profile_key)",
+    "CREATE TABLE IF NOT EXISTS application_permission_definitions (
+        profile_id TEXT NOT NULL,
+        permission_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        description TEXT,
+        source TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, permission_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_permission_definitions_profile ON application_permission_definitions(profile_id, is_active, permission_key)",
+    "CREATE TABLE IF NOT EXISTS application_profile_roles (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        role_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        permissions TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(profile_id, role_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_roles_profile ON application_profile_roles(profile_id, is_active, role_key)",
+    "CREATE TABLE IF NOT EXISTS application_profile_user_roles (
+        profile_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, user_id, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_user_roles_user ON application_profile_user_roles(profile_id, user_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_group_roles (
+        profile_id TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, group_id, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_group_roles_group ON application_profile_group_roles(profile_id, group_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_organization_roles (
+        profile_id TEXT NOT NULL,
+        organization_role TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, organization_role, role_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_org_roles_role ON application_profile_organization_roles(profile_id, organization_role, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_profile_permission_overrides (
+        profile_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        permission TEXT NOT NULL,
+        effect TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, user_id, permission)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_permission_overrides_user ON application_profile_permission_overrides(profile_id, user_id, effect)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -23822,6 +24821,92 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (application_id, user_id, permission),
         INDEX idx_application_permission_overrides_user (application_id, user_id, effect)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_authorization_profiles (
+        id VARCHAR(64) PRIMARY KEY,
+        application_id VARCHAR(64) NOT NULL,
+        profile_key VARCHAR(255) NOT NULL,
+        connection_kind VARCHAR(32) NOT NULL,
+        connection_id VARCHAR(255) NULL,
+        source_mode VARCHAR(32) NOT NULL,
+        manifest_url VARCHAR(2048) NOT NULL DEFAULT '',
+        signer_client_id VARCHAR(255) NULL,
+        remote_version VARCHAR(255) NULL,
+        remote_digest VARCHAR(128) NULL,
+        sync_status VARCHAR(32) NOT NULL DEFAULT 'manual',
+        last_synced_at BIGINT NULL,
+        last_error TEXT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE KEY uq_application_auth_profile (application_id, profile_key),
+        INDEX idx_application_auth_profiles_application (application_id, profile_key)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_permission_definitions (
+        profile_id VARCHAR(64) NOT NULL,
+        permission_key VARCHAR(256) NOT NULL,
+        label VARCHAR(160) NOT NULL,
+        description TEXT NULL,
+        source VARCHAR(32) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, permission_key),
+        INDEX idx_application_permission_definitions_profile (profile_id, is_active, permission_key)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_profile_roles (
+        id VARCHAR(64) PRIMARY KEY,
+        profile_id VARCHAR(64) NOT NULL,
+        role_key VARCHAR(128) NOT NULL,
+        name VARCHAR(160) NOT NULL,
+        description TEXT NULL,
+        permissions TEXT NOT NULL,
+        source VARCHAR(32) NOT NULL,
+        is_default INT NOT NULL DEFAULT 0,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE KEY uq_application_profile_role (profile_id, role_key),
+        INDEX idx_application_profile_roles_profile (profile_id, is_active, role_key)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_profile_user_roles (
+        profile_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        role_id VARCHAR(64) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, user_id, role_id),
+        INDEX idx_application_profile_user_roles_user (profile_id, user_id, is_active)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_profile_group_roles (
+        profile_id VARCHAR(64) NOT NULL,
+        group_id VARCHAR(64) NOT NULL,
+        role_id VARCHAR(64) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, group_id, role_id),
+        INDEX idx_application_profile_group_roles_group (profile_id, group_id, is_active)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_profile_organization_roles (
+        profile_id VARCHAR(64) NOT NULL,
+        organization_role VARCHAR(64) NOT NULL,
+        role_id VARCHAR(64) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, organization_role, role_id),
+        INDEX idx_application_profile_org_roles_role (profile_id, organization_role, is_active)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_profile_permission_overrides (
+        profile_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        permission VARCHAR(256) NOT NULL,
+        effect VARCHAR(16) NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (profile_id, user_id, permission),
+        INDEX idx_application_profile_permission_overrides_user (profile_id, user_id, effect)
     )",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id VARCHAR(64) PRIMARY KEY,

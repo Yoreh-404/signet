@@ -6083,6 +6083,90 @@ tbody tr:hover {
   background: var(--surface-solid);
 }
 
+.authorization-profile-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.authorization-profile-mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.authorization-empty-profile {
+  gap: 8px;
+}
+
+.permission-tree {
+  display: grid;
+  gap: 3px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-solid);
+}
+
+.permission-tree-node {
+  display: grid;
+  gap: 3px;
+}
+
+.permission-tree-branch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.permission-tree-branch svg {
+  color: var(--brand);
+}
+
+.permission-tree-children {
+  display: grid;
+  gap: 3px;
+  margin-left: 13px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+.permission-tree-choice {
+  margin: 0;
+  padding: 7px 8px;
+}
+
+.permission-tree-choice code,
+.permission-tree-override code {
+  color: var(--brand);
+  font-family: inherit;
+  font-size: 10px;
+}
+
+.permission-tree-override {
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 0.65fr);
+  margin: 0;
+  padding: 7px 8px;
+}
+
+.permission-tree-override > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.permission-tree-override > span > small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
 .application-role-editor-actions {
   display: flex;
   justify-content: flex-end;

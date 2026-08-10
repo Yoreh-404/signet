@@ -161,6 +161,7 @@ export type TenantApplication = {
   is_active: boolean;
   oidc_clients: Client[];
   modules?: ApplicationModule[];
+  authorization_profiles?: ApplicationAuthorizationProfile[];
   created_at: number;
   updated_at: number;
 };
@@ -171,6 +172,47 @@ export type ApplicationModule = {
   module_key: ApplicationModuleKey;
   config: Record<string, unknown>;
   is_enabled: boolean;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationAuthorizationProfile = {
+  id: string;
+  profile_key: string;
+  connection_kind: string;
+  connection_id: string | null;
+  source_mode: "manual" | "signed_manifest" | string;
+  manifest_url: string;
+  signer_client_id: string | null;
+  remote_version: string | null;
+  remote_digest: string | null;
+  sync_status: "manual" | "synced" | "no_profile" | "error" | string;
+  last_synced_at: number | null;
+  last_error: string | null;
+  permission_count: number;
+  role_count: number;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ApplicationPermissionDefinition = {
+  key: string;
+  label: string;
+  description: string | null;
+  source: string;
+  is_active: boolean;
+};
+
+export type ApplicationProfileRole = {
+  id: string;
+  profile_id: string;
+  role_key: string;
+  name: string;
+  description: string | null;
+  permissions: string[];
+  source: string;
+  is_default: boolean;
+  is_active: boolean;
   created_at: number;
   updated_at: number;
 };

@@ -19,6 +19,7 @@ pub const SUPPORTED_SIGNING_ALGS: &[&str] = &["RS256"];
 pub const TOKEN_ENDPOINT_AUTH_SIGNING_ALGS: &[&str] = &["RS256", "HS256"];
 
 const MAX_ASSERTION_BYTES: usize = 16 * 1024;
+const MAX_JWKS_BYTES: usize = 512 * 1024;
 const MAX_ASSERTION_TTL_SECONDS: i64 = 600;
 const CLIENT_SECRET_JWT_MATERIAL_PREFIX: &str = "client_secret_jwt:v1:";
 
@@ -215,6 +216,31 @@ where
     )
 }
 
+/// Verifies a signed integration document with a client's registered public
+/// JWKS while using an issuer chosen by the integration protocol.  Client
+/// assertions bind `iss` to the OAuth client id; signed website manifests
+/// instead bind it to the website origin, so they need this separate context.
+pub async fn verify_signed_jwt_for_issuer<T>(
+    client: &ClientRecord,
+    token: &str,
+    accepted_audiences: &[String],
+    issuer: &str,
+    required_spec_claims: &[&str],
+) -> AppResult<T>
+where
+    T: DeserializeOwned,
+{
+    let jwks = load_client_jwks(client).await?;
+    verify_signed_jwt_with_jwks(
+        token,
+        accepted_audiences,
+        issuer,
+        required_spec_claims,
+        true,
+        &jwks,
+    )
+}
+
 async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     if !client.jwks.trim().is_empty() {
         let jwks =
@@ -229,6 +255,7 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     validate_jwks_uri(jwks_uri).map_err(|_| AppError::Unauthorized)?;
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| AppError::Internal(format!("failed to build jwks client: {err}")))?
         .get(jwks_uri)
@@ -238,9 +265,14 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     if !response.status().is_success() {
         return Err(AppError::Unauthorized);
     }
-    let jwks = response
-        .json::<ClientJwks>()
+    let body = response
+        .bytes()
         .await
+        .map_err(|_| AppError::Unauthorized)?;
+    if body.len() > MAX_JWKS_BYTES {
+        return Err(AppError::Unauthorized);
+    }
+    let jwks = serde_json::from_slice::<ClientJwks>(&body)
         .map_err(|_| AppError::Unauthorized)?;
     validate_jwks(&jwks).map_err(|_| AppError::Unauthorized)?;
     Ok(jwks)
@@ -257,8 +289,29 @@ fn verify_signed_client_jwt_with_jwks<T>(
 where
     T: DeserializeOwned,
 {
+    verify_signed_jwt_with_jwks(
+        token,
+        accepted_audiences,
+        client_id,
+        required_spec_claims,
+        validate_nbf,
+        jwks,
+    )
+}
+
+fn verify_signed_jwt_with_jwks<T>(
+    token: &str,
+    accepted_audiences: &[String],
+    issuer: &str,
+    required_spec_claims: &[&str],
+    validate_nbf: bool,
+    jwks: &ClientJwks,
+) -> AppResult<T>
+where
+    T: DeserializeOwned,
+{
     ensure_assertion_size(token)?;
-    if accepted_audiences.is_empty() {
+    if accepted_audiences.is_empty() || issuer.trim().is_empty() {
         return Err(AppError::Unauthorized);
     }
     let header = decode_header(token).map_err(|_| AppError::Unauthorized)?;
@@ -268,7 +321,7 @@ where
     let key = select_decoding_key(jwks, header.kid.as_deref())?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_required_spec_claims(required_spec_claims);
-    validation.set_issuer(&[client_id]);
+    validation.set_issuer(&[issuer]);
     validation.set_audience(accepted_audiences);
     validation.validate_nbf = validate_nbf;
     let claims = decode::<T>(token, &key, &validation)

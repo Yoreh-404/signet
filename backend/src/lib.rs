@@ -7,6 +7,7 @@ pub mod audit;
 pub mod auth;
 pub mod auth_flow;
 pub mod authorization;
+pub mod authorization_manifest;
 pub mod authorization_details;
 pub mod backchannel_logout;
 pub mod browser_accounts;

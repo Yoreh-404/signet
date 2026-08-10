@@ -2288,7 +2288,9 @@ async fn mapped_claims_for_user(
     // visible on the next token or UserInfo request and cannot be hidden by a
     // stale mapper configuration.
     if let Some(application) = state.db.find_application_for_client(&client.id).await? {
-        let entitlements = authorization::resolve_entitlements(state, &application, user).await?;
+        let entitlements =
+            authorization::resolve_entitlements_for_client(state, &application, client, user)
+                .await?;
         claims.extend(entitlements.claims);
         claims.insert(
             "policy_version".to_string(),
