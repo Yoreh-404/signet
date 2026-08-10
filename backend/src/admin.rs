@@ -5572,10 +5572,16 @@ async fn application_authorization_subjects(
     Path(id): Path<String>,
 ) -> AppResult<Json<ApplicationAuthorizationSubjectsResponse>> {
     let (_current, application) = managed_application(&state, &jar, &id).await?;
-    let users = state
+    let organization_members = state
         .db
         .list_organization_members(&application.organization_id)
-        .await?
+        .await?;
+    let organization_user_ids = organization_members
+        .iter()
+        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
+        .map(|member| member.user_id.clone())
+        .collect::<BTreeSet<_>>();
+    let users = organization_members
         .into_iter()
         .filter(|member| member.is_active == 1 && member.archived_at.is_none())
         .map(|member| OrganizationMemberResponse {
@@ -5591,19 +5597,24 @@ async fn application_authorization_subjects(
             updated_at: member.membership_updated_at,
         })
         .collect();
-    let groups = state
-        .db
-        .list_groups()
-        .await?
-        .into_iter()
-        .map(|group| ApplicationAuthorizationGroupResponse {
-            id: group.id,
-            name: group.name,
-            description: group.description,
-            created_at: group.created_at,
-            updated_at: group.updated_at,
-        })
-        .collect();
+    let mut groups = Vec::new();
+    for group in state.db.list_groups().await? {
+        let has_organization_member = state
+            .db
+            .list_group_members(&group.id)
+            .await?
+            .iter()
+            .any(|member| organization_user_ids.contains(&member.id));
+        if has_organization_member {
+            groups.push(ApplicationAuthorizationGroupResponse {
+                id: group.id,
+                name: group.name,
+                description: group.description,
+                created_at: group.created_at,
+                updated_at: group.updated_at,
+            });
+        }
+    }
     Ok(Json(ApplicationAuthorizationSubjectsResponse {
         users,
         groups,
@@ -5743,6 +5754,58 @@ async fn managed_authorization_profile(
         return Err(AppError::NotFound);
     }
     Ok((current, application, profile))
+}
+
+async fn application_authorization_user(
+    state: &AppState,
+    application: &ApplicationRecord,
+    user_id: &str,
+) -> AppResult<crate::db::UserRecord> {
+    let user = state
+        .db
+        .find_user_by_id(user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let belongs_to_application = state
+        .db
+        .list_organization_members(&application.organization_id)
+        .await?
+        .into_iter()
+        .any(|member| member.user_id == user.id && member.is_active == 1 && member.archived_at.is_none());
+    if !belongs_to_application {
+        return Err(AppError::NotFound);
+    }
+    Ok(user)
+}
+
+async fn application_authorization_group(
+    state: &AppState,
+    application: &ApplicationRecord,
+    group_id: &str,
+) -> AppResult<GroupRecord> {
+    let group = state
+        .db
+        .find_group_by_id(group_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let organization_user_ids = state
+        .db
+        .list_organization_members(&application.organization_id)
+        .await?
+        .into_iter()
+        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
+        .map(|member| member.user_id)
+        .collect::<BTreeSet<_>>();
+    let belongs_to_application = state
+        .db
+        .list_group_members(&group.id)
+        .await?
+        .into_iter()
+        .any(|member| organization_user_ids.contains(&member.id));
+    if !belongs_to_application {
+        return Err(AppError::NotFound);
+    }
+    Ok(group)
 }
 
 async fn authorization_profile_response(
@@ -6248,8 +6311,9 @@ async fn list_application_profile_user_roles(
     jar: CookieJar,
     Path((id, profile_id, user_id)): Path<(String, String, String)>,
 ) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application, _profile) =
+    let (_current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    application_authorization_user(&state, &application, &user_id).await?;
     Ok(Json(
         state
             .db
@@ -6266,11 +6330,7 @@ async fn update_application_profile_user_roles(
 ) -> AppResult<Json<Vec<String>>> {
     let (current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let user = state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let user = application_authorization_user(&state, &application, &user_id).await?;
     state
         .db
         .replace_application_profile_user_role_ids(&profile_id, &user.id, payload.role_ids)
@@ -6298,13 +6358,9 @@ async fn list_application_profile_group_roles(
     jar: CookieJar,
     Path((id, profile_id, group_id)): Path<(String, String, String)>,
 ) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application, _profile) =
+    let (_current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    state
-        .db
-        .find_group_by_id(&group_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    application_authorization_group(&state, &application, &group_id).await?;
     Ok(Json(
         state
             .db
@@ -6321,11 +6377,7 @@ async fn update_application_profile_group_roles(
 ) -> AppResult<Json<Vec<String>>> {
     let (current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    state
-        .db
-        .find_group_by_id(&group_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    application_authorization_group(&state, &application, &group_id).await?;
     state
         .db
         .replace_application_profile_group_role_ids(&profile_id, &group_id, payload.role_ids)
@@ -6410,8 +6462,9 @@ async fn list_application_profile_user_permission_overrides(
     jar: CookieJar,
     Path((id, profile_id, user_id)): Path<(String, String, String)>,
 ) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
-    let (_current, _application, _profile) =
+    let (_current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    application_authorization_user(&state, &application, &user_id).await?;
     Ok(Json(
         state
             .db
@@ -6434,11 +6487,7 @@ async fn update_application_profile_user_permission_overrides(
 ) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
     let (current, application, _profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    application_authorization_user(&state, &application, &user_id).await?;
     state
         .db
         .replace_application_profile_user_permission_overrides(
@@ -6482,11 +6531,7 @@ async fn application_profile_authorization_preview(
 ) -> AppResult<Json<serde_json::Value>> {
     let (_current, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let user = state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let user = application_authorization_user(&state, &application, &user_id).await?;
     let decision = authorization::check_login_access(&state, &application, &user.id).await?;
     let entitlements = if decision.allowed {
         Some(
