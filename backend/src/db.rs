@@ -16855,6 +16855,33 @@ mod tests {
     }
 
     #[test]
+    fn application_authorization_profile_migrations_cover_all_database_engines() {
+        let required_tables = [
+            "application_authorization_profiles",
+            "application_permission_definitions",
+            "application_profile_roles",
+            "application_profile_user_roles",
+            "application_profile_group_roles",
+            "application_profile_organization_roles",
+            "application_profile_permission_overrides",
+        ];
+        for (kind, migrations) in [
+            (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
+            (DatabaseKind::Postgres, POSTGRES_MIGRATIONS),
+            (DatabaseKind::Mysql, MYSQL_MIGRATIONS),
+        ] {
+            for table in required_tables {
+                assert!(
+                    migrations.iter().any(|statement| {
+                        statement.contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+                    }),
+                    "{kind:?} is missing {table}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn application_jwt_migrations_cover_clients_secrets_and_bound_codes() {
         for (kind, migrations) in [
             (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
