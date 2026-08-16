@@ -2,6 +2,7 @@ use crate::{
     config::Settings,
     error::{AppError, AppResult},
 };
+use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
@@ -82,6 +83,88 @@ pub fn identity_factor_digest(secret: &str, factor_type: &str, value: &str) -> S
 /// sent in a list response; it is only decrypted for an authorized, audited
 /// management request.
 const AUTHORIZATION_CODE_REVEAL_LABEL: &str = "gpt-sso:authorization-code-reveal:v1";
+
+const DISCOVERY_SECRET_CIPHERTEXT_PREFIX: &str = "signet-discovery-secret:v1";
+const DISCOVERY_SECRET_AAD: &[u8] = b"signet:discovery-fetch-secret:v1";
+
+fn decode_discovery_key(value: &str) -> AppResult<[u8; 32]> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .or_else(|_| STANDARD.decode(value.trim()))
+        .map_err(|_| AppError::Configuration("discovery encryption key is invalid".to_string()))?;
+    decoded.try_into().map_err(|_| {
+        AppError::Configuration("discovery encryption key must be exactly 32 bytes".to_string())
+    })
+}
+
+/// Encrypts a website Discovery fetch secret for database storage. The
+/// plaintext is intentionally never returned after this function completes.
+pub fn encrypt_discovery_secret(key: &str, secret: &str) -> AppResult<String> {
+    if secret.is_empty() {
+        return Err(AppError::BadRequest("discovery fetch secret cannot be empty".to_string()));
+    }
+    let key = decode_discovery_key(key)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| AppError::Configuration("discovery encryption key is invalid".to_string()))?;
+    let mut nonce_bytes = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: secret.as_bytes(),
+                aad: DISCOVERY_SECRET_AAD,
+            },
+        )
+        .map_err(|_| AppError::Internal("failed to encrypt discovery fetch secret".to_string()))?;
+    Ok(format!(
+        "{DISCOVERY_SECRET_CIPHERTEXT_PREFIX}.{}.{}",
+        URL_SAFE_NO_PAD.encode(nonce_bytes),
+        URL_SAFE_NO_PAD.encode(ciphertext)
+    ))
+}
+
+/// Decrypts a Discovery fetch secret only immediately before an outbound
+/// request. Ciphertext and authentication failures intentionally share the
+/// same error so they cannot become an oracle.
+pub fn decrypt_discovery_secret(key: &str, ciphertext: &str) -> AppResult<String> {
+    let mut parts = ciphertext.split('.');
+    let prefix = parts.next();
+    let nonce_part = parts.next();
+    let ciphertext_part = parts.next();
+    if prefix != Some(DISCOVERY_SECRET_CIPHERTEXT_PREFIX)
+        || nonce_part.is_none()
+        || ciphertext_part.is_none()
+        || parts.next().is_some()
+    {
+        return Err(AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()));
+    }
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(nonce_part.unwrap_or_default())
+        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
+    let ciphertext_bytes = URL_SAFE_NO_PAD
+        .decode(ciphertext_part.unwrap_or_default())
+        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
+    let nonce: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
+        AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+    })?;
+    let key = decode_discovery_key(key)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| AppError::Configuration("discovery encryption key is invalid".to_string()))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: &ciphertext_bytes,
+                aad: DISCOVERY_SECRET_AAD,
+            },
+        )
+        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))
+}
 
 /// Encrypts an administrator-visible authorization code at rest with RSA-OAEP
 /// (SHA-256).  The signing-key record is used as protected server key material:

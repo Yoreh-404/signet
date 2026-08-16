@@ -1248,6 +1248,17 @@ header p,
   line-height: 1.45;
 }
 
+.field-error {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.check .field-error {
+  flex-basis: 100%;
+  margin-left: 25px;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -4884,6 +4895,162 @@ tbody tr:hover {
   }
 }
 
+/* Recent workspaces use explicit state labels and a compact mobile control so
+   status is not communicated by color or a second horizontal scroller alone. */
+.application-mobile-picker {
+  display: none;
+}
+
+.billing-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.billing-workspace .section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.billing-wallet-grid,
+.billing-actions-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.billing-wallet-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.billing-wallet-grid > .empty-state {
+  grid-column: 1 / -1;
+}
+
+.billing-wallet-card {
+  display: grid;
+  gap: 7px;
+  min-height: 112px;
+  padding: 16px;
+}
+
+.billing-wallet-card strong {
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.billing-wallet-card small {
+  color: var(--muted);
+}
+
+.billing-actions-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.billing-actions-grid > .card,
+.billing-workspace > .card {
+  min-width: 0;
+  padding: 18px;
+}
+
+.billing-actions-grid form {
+  display: grid;
+  gap: 12px;
+}
+
+.billing-checkout,
+.billing-returned-order {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--brand) 32%, var(--border));
+  border-radius: 10px;
+  background: var(--brand-soft);
+}
+
+.billing-checkout code {
+  overflow-wrap: anywhere;
+}
+
+.billing-returned-order {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.billing-returned-order > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.billing-returned-order > div span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.billing-returned-order p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.billing-workspace .table-scroll {
+  overflow-x: auto;
+}
+
+.auth-secondary-actions button {
+  min-height: 32px;
+  padding: 5px 4px;
+}
+
+.unified-auth-title h1:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 6px;
+}
+
+@media (max-width: 720px) {
+  .application-mobile-picker {
+    display: block;
+    padding: 10px 14px;
+  }
+
+  .application-mobile-picker select {
+    width: 100%;
+    min-height: 42px;
+  }
+
+  .application-picker-list {
+    display: none;
+  }
+
+  .billing-workspace .section-heading {
+    flex-direction: column;
+  }
+
+  .billing-workspace .section-heading > button {
+    width: 100%;
+  }
+
+  .billing-actions-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .billing-returned-order {
+    grid-template-columns: 1fr;
+  }
+
+  .billing-returned-order > .status-badge {
+    justify-self: start;
+  }
+
+  .billing-workspace table {
+    min-width: 620px;
+  }
+}
+
 /* Website application workspace */
 .application-workspace {
   display: grid;
@@ -6530,6 +6697,26 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.current-enterprise-context {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-soft);
+  font-weight: 650;
+}
+
+.authorization-code-purpose {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0;
+  line-height: 1.45;
+}
+
+.authorization-code-purpose p,
+.authorization-code-purpose small {
+  margin: 0;
+}
+
 .page-heading-hint {
   max-width: 640px;
   color: var(--muted);
@@ -6771,5 +6958,40 @@ tbody tr:hover {
   .form-grid-2,
   .check-grid-inline {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Final responsive overrides for the application and billing workspaces. */
+.application-detail-tabs .tab-status {
+  width: auto;
+  height: auto;
+  min-height: 18px;
+  padding: 0 5px;
+  border-radius: 99px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  font-size: 10px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.application-detail-tabs .tab-status.on {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, var(--surface-solid));
+}
+
+@media (max-width: 720px) {
+  .application-mobile-picker {
+    display: block;
+    padding: 10px 14px;
+  }
+
+  .application-mobile-picker select {
+    width: 100%;
+    min-height: 42px;
+  }
+
+  .application-picker-list {
+    display: none;
   }
 }

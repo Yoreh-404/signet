@@ -1,28 +1,26 @@
 use crate::{
     AppState,
     access::{Authorizer, Permission, PermissionInfo, permission_catalog},
-    applications, archived_accounts,
+    application_discovery, applications, archived_accounts,
     audit::{self, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization, authorization_manifest, backchannel_logout, claim_mapper,
-    client_assertion, client_policy,
-    csrf,
+    auth_flow, authorization, authorization_manifest, backchannel_logout, billing, claim_mapper,
+    client_assertion, client_policy, csrf,
     db::{
-        ApplicationAuthorizationProfileRecord, ApplicationJwtClientRecord,
-        ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
+        ApplicationAuthorizationProfileRecord, ApplicationDiscoveryRecord,
+        ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
         ApplicationProfileRoleRecord, ApplicationRecord, ApplicationRoleRecord,
-        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
-        GroupRecord, InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel,
-        LoginEventRecord, NewApplication, NewApplicationAuthorizationProfile,
-        NewApplicationJwtClient,
-        NewApplicationProfileRole, NewApplicationRole, NewApplicationScimToken,
-        NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
-        NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation, NewLdapProvider,
-        NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole, NewRuntimeSettings,
-        NewSecurityPolicy, NewUser, OrganizationMemberInput, OrganizationMemberWithUserRecord,
-        OrganizationRecord, PublicAuditWebhook, PublicClient, PublicClientClaimMapper,
-        PublicExternalOidcProvider, PublicIapApplication, PublicInvitation,
-        PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
+        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType, GroupRecord,
+        InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord,
+        NewApplication, NewApplicationAuthorizationProfile, NewApplicationBillingSettings,
+        NewApplicationDiscovery, NewApplicationJwtClient, NewApplicationProfileRole,
+        NewApplicationRole, NewApplicationScimToken, NewBulkProvisionedUser, NewClient,
+        NewClientClaimMapper, NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation,
+        NewLdapProvider, NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole,
+        NewRuntimeSettings, NewSecurityPolicy, NewUser, OrganizationMemberInput,
+        OrganizationMemberWithUserRecord, OrganizationRecord, PublicAuditWebhook, PublicClient,
+        PublicClientClaimMapper, PublicExternalOidcProvider, PublicIapApplication,
+        PublicInvitation, PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
         PublicRegistrationSettings, PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord,
         SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserConsentWithClientRecord,
         UserListScope, UserOrganizationRecord, UserUpdate,
@@ -129,6 +127,14 @@ pub fn routes() -> Router<AppState> {
             put(update_application).delete(delete_application),
         )
         .route(
+            "/api/admin/applications/{id}/discovery",
+            get(get_application_discovery).put(update_application_discovery),
+        )
+        .route(
+            "/api/admin/applications/{id}/discovery/sync",
+            post(sync_application_discovery),
+        )
+        .route(
             "/api/admin/applications/{id}/oidc-clients",
             get(list_application_oidc_clients).put(replace_application_oidc_clients),
         )
@@ -139,6 +145,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/admin/applications/{id}/modules/{module_key}",
             put(update_application_module).delete(delete_application_module),
+        )
+        .route(
+            "/api/admin/applications/{id}/billing-settings",
+            get(get_application_billing_settings).put(update_application_billing_settings),
         )
         .route(
             "/api/admin/applications/{id}/directory-sync/runs",
@@ -420,6 +430,18 @@ async fn login(
     let subject = security_policy::normalize_login_subject(&payload.email);
     let request_ip = state.request_ip(&headers, Some(remote_addr)).await?;
     auth::assert_login_entry_allowed(&state, &subject, request_ip.as_deref()).await?;
+    let login_context = crate::oidc::authorization_login_context_from_return_to(
+        &state,
+        &headers,
+        payload.return_to.as_deref(),
+    )
+    .await?;
+    let local_password_allowed = match login_context.application.as_ref() {
+        Some(application) => {
+            applications::application_signet_password_enabled(&state, &application.id).await?
+        }
+        None => true,
+    };
     if let Some(captcha) = auth::login_captcha_prompt_if_required(
         &state,
         &subject,
@@ -452,22 +474,25 @@ async fn login(
     let mut login_method = "password".to_string();
     let mut external_provider = None;
     let mut user = local_user.filter(|candidate| {
-        candidate.is_active == 1
+        local_password_allowed
+            && candidate.is_active == 1
             && candidate.archived_at.is_none()
             && util::verify_password(&candidate.password_hash, &payload.password)
     });
     if user.is_none() {
-        let directory_login = match directory::authenticate_with_configured_directories(
-            &state,
-            &subject,
-            &payload.password,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(AppError::Unauthorized | AppError::Forbidden) => None,
-            Err(err) => return Err(err),
-        };
+        let directory_login =
+            match directory::authenticate_with_configured_directories_for_application(
+                &state,
+                &subject,
+                &payload.password,
+                login_context.application.as_ref(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(AppError::Unauthorized | AppError::Forbidden) => None,
+                Err(err) => return Err(err),
+            };
         if let Some(login) = directory_login {
             login_method = "ldap".to_string();
             external_provider = Some(login.provider_key);
@@ -485,12 +510,6 @@ async fn login(
         .await?;
         return Err(AppError::Unauthorized);
     };
-    let login_context = crate::oidc::authorization_login_context_from_return_to(
-        &state,
-        &headers,
-        payload.return_to.as_deref(),
-    )
-    .await?;
     let has_totp = state.db.find_totp_method(&user.id).await?.is_some();
     let policy = state.db.security_policy().await?;
     let policy_requires_mfa =
@@ -4748,6 +4767,74 @@ struct ApplicationResponse {
     updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ApplicationDiscoveryResponse {
+    application_id: String,
+    management_mode: String,
+    website_url: String,
+    discovery_url: Option<String>,
+    fetch_secret_configured: bool,
+    signing_key_configured: bool,
+    last_verified_revision: Option<i64>,
+    last_verified_version: Option<String>,
+    last_verified_digest: Option<String>,
+    last_verified_expires_at: Option<i64>,
+    sync_status: String,
+    last_fetched_at: Option<i64>,
+    last_success_at: Option<i64>,
+    last_error: Option<String>,
+    snapshot_available: bool,
+    operator_disabled: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationDiscoveryInput {
+    #[serde(default)]
+    management_mode: Option<String>,
+    #[serde(default)]
+    website_url: Option<String>,
+    /// A new fetch secret is accepted only over the authenticated admin API;
+    /// the response never returns it, and the database stores only ciphertext.
+    #[serde(default)]
+    fetch_secret: Option<String>,
+    #[serde(default)]
+    signing_public_jwks: Option<String>,
+    #[serde(default)]
+    operator_disabled: Option<bool>,
+}
+
+fn application_discovery_response(
+    record: ApplicationDiscoveryRecord,
+) -> ApplicationDiscoveryResponse {
+    let discovery_url = if record.website_url.trim().is_empty() {
+        None
+    } else {
+        application_discovery::default_discovery_url(&record.website_url).ok()
+    };
+    ApplicationDiscoveryResponse {
+        application_id: record.application_id,
+        management_mode: record.management_mode,
+        website_url: record.website_url,
+        discovery_url,
+        fetch_secret_configured: !record.fetch_secret_ciphertext.trim().is_empty(),
+        signing_key_configured: !record.signing_public_jwks.trim().is_empty(),
+        last_verified_revision: record.last_verified_revision,
+        last_verified_version: record.last_verified_version,
+        last_verified_digest: record.last_verified_digest,
+        last_verified_expires_at: record.last_verified_expires_at,
+        sync_status: record.sync_status,
+        last_fetched_at: record.last_fetched_at,
+        last_success_at: record.last_success_at,
+        last_error: record.last_error,
+        snapshot_available: record.snapshot_json.is_some(),
+        operator_disabled: record.operator_disabled != 0,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
 fn default_organization_role() -> String {
     "member".to_string()
 }
@@ -4788,6 +4875,23 @@ async fn ensure_application_authorization_profiles(
     state: &AppState,
     application: &ApplicationRecord,
 ) -> AppResult<Vec<ApplicationAuthorizationProfileRecord>> {
+    // Website-managed applications publish the canonical profile catalog in
+    // the v2 application manifest. Do not manufacture one legacy profile per
+    // OIDC client here; that would make the old admin model compete with the
+    // website-owned snapshot and would reintroduce the v1/v2 URL collision.
+    if state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        })
+    {
+        return state
+            .db
+            .list_application_authorization_profiles(&application.id)
+            .await;
+    }
     let website_url = applications::application_website_url(state, &application.id)
         .await?
         .unwrap_or_default();
@@ -4797,7 +4901,11 @@ async fn ensure_application_authorization_profiles(
         authorization_manifest::default_manifest_url(&website_url)?
     };
     let mut profiles = Vec::new();
-    for client_id in state.db.list_application_oidc_client_ids(&application.id).await? {
+    for client_id in state
+        .db
+        .list_application_oidc_client_ids(&application.id)
+        .await?
+    {
         let client = state
             .db
             .find_client_by_id(&client_id)
@@ -4811,23 +4919,21 @@ async fn ensure_application_authorization_profiles(
             if existing.manifest_url.is_empty() && !manifest_url.is_empty() {
                 state
                     .db
-                    .upsert_application_authorization_profile(
-                        NewApplicationAuthorizationProfile {
-                            id: existing.id.clone(),
-                            application_id: application.id.clone(),
-                            profile_key: existing.profile_key.clone(),
-                            connection_kind: existing.connection_kind.clone(),
-                            connection_id: existing.connection_id.clone(),
-                            source_mode: existing.source_mode.clone(),
-                            manifest_url: manifest_url.clone(),
-                            signer_client_id: existing.signer_client_id.clone(),
-                            remote_version: existing.remote_version.clone(),
-                            remote_digest: existing.remote_digest.clone(),
-                            sync_status: existing.sync_status.clone(),
-                            last_synced_at: existing.last_synced_at,
-                            last_error: existing.last_error.clone(),
-                        },
-                    )
+                    .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+                        id: existing.id.clone(),
+                        application_id: application.id.clone(),
+                        profile_key: existing.profile_key.clone(),
+                        connection_kind: existing.connection_kind.clone(),
+                        connection_id: existing.connection_id.clone(),
+                        source_mode: existing.source_mode.clone(),
+                        manifest_url: manifest_url.clone(),
+                        signer_client_id: existing.signer_client_id.clone(),
+                        remote_version: existing.remote_version.clone(),
+                        remote_digest: existing.remote_digest.clone(),
+                        sync_status: existing.sync_status.clone(),
+                        last_synced_at: existing.last_synced_at,
+                        last_error: existing.last_error.clone(),
+                    })
                     .await?
             } else {
                 existing
@@ -4837,29 +4943,27 @@ async fn ensure_application_authorization_profiles(
                 && (!client.jwks.trim().is_empty() || !client.jwks_uri.trim().is_empty());
             state
                 .db
-                .upsert_application_authorization_profile(
-                    NewApplicationAuthorizationProfile {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        application_id: application.id.clone(),
-                        profile_key: client.client_id.clone(),
-                        connection_kind: "oidc".to_string(),
-                        connection_id: Some(client.id.clone()),
-                        source_mode: if manifest_capable {
-                            authorization_manifest::SOURCE_MODE_SIGNED.to_string()
-                        } else {
-                            authorization_manifest::SOURCE_MODE_MANUAL.to_string()
-                        },
-                        manifest_url: manifest_url.clone(),
-                        signer_client_id: (!client.jwks.trim().is_empty()
-                            || !client.jwks_uri.trim().is_empty())
-                            .then(|| client.client_id.clone()),
-                        remote_version: None,
-                        remote_digest: None,
-                        sync_status: authorization_manifest::SYNC_STATUS_MANUAL.to_string(),
-                        last_synced_at: None,
-                        last_error: None,
+                .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    application_id: application.id.clone(),
+                    profile_key: client.client_id.clone(),
+                    connection_kind: "oidc".to_string(),
+                    connection_id: Some(client.id.clone()),
+                    source_mode: if manifest_capable {
+                        authorization_manifest::SOURCE_MODE_SIGNED.to_string()
+                    } else {
+                        authorization_manifest::SOURCE_MODE_MANUAL.to_string()
                     },
-                )
+                    manifest_url: manifest_url.clone(),
+                    signer_client_id: (!client.jwks.trim().is_empty()
+                        || !client.jwks_uri.trim().is_empty())
+                    .then(|| client.client_id.clone()),
+                    remote_version: None,
+                    remote_digest: None,
+                    sync_status: authorization_manifest::SYNC_STATUS_MANUAL.to_string(),
+                    last_synced_at: None,
+                    last_error: None,
+                })
                 .await?
         };
         profiles.push(profile);
@@ -4898,22 +5002,25 @@ async fn application_response(
             .await?;
         let roles = state.db.list_application_profile_roles(&profile.id).await?;
         authorization_profiles.push(ApplicationAuthorizationProfileResponse {
-                id: profile.id.clone(),
-                profile_key: profile.profile_key.clone(),
-                connection_kind: profile.connection_kind.clone(),
-                connection_id: profile.connection_id.clone(),
-                source_mode: profile.source_mode.clone(),
-                manifest_url: profile.manifest_url.clone(),
-                signer_client_id: profile.signer_client_id.clone(),
-                remote_version: profile.remote_version.clone(),
-                remote_digest: profile.remote_digest.clone(),
-                sync_status: profile.sync_status.clone(),
-                last_synced_at: profile.last_synced_at,
-                last_error: profile.last_error.clone(),
-                permission_count: definitions.iter().filter(|item| item.is_active == 1).count(),
-                role_count: roles.iter().filter(|item| item.is_active == 1).count(),
-                created_at: profile.created_at,
-                updated_at: profile.updated_at,
+            id: profile.id.clone(),
+            profile_key: profile.profile_key.clone(),
+            connection_kind: profile.connection_kind.clone(),
+            connection_id: profile.connection_id.clone(),
+            source_mode: profile.source_mode.clone(),
+            manifest_url: profile.manifest_url.clone(),
+            signer_client_id: profile.signer_client_id.clone(),
+            remote_version: profile.remote_version.clone(),
+            remote_digest: profile.remote_digest.clone(),
+            sync_status: profile.sync_status.clone(),
+            last_synced_at: profile.last_synced_at,
+            last_error: profile.last_error.clone(),
+            permission_count: definitions
+                .iter()
+                .filter(|item| item.is_active == 1)
+                .count(),
+            role_count: roles.iter().filter(|item| item.is_active == 1).count(),
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
         });
     }
     Ok(ApplicationResponse {
@@ -4953,7 +5060,7 @@ async fn current_organization_context(
     Ok((current, organization))
 }
 
-async fn require_organization_manager_for(
+pub(crate) async fn require_organization_manager_for(
     state: &AppState,
     current: &auth::CurrentUser,
     organization_id: &str,
@@ -5050,6 +5157,68 @@ async fn list_application_modules(
     Ok(Json(modules))
 }
 
+async fn get_application_billing_settings(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let settings = state.db.ensure_application_billing_settings(&id).await?;
+    Ok(Json(billing::application_billing_settings_response(
+        settings,
+    )?))
+}
+
+async fn update_application_billing_settings(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<billing::ApplicationBillingSettingsInput>,
+) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
+        .db
+        .find_application_by_id(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (accept_signet_balance, wallet_mode, supported_currencies) =
+        billing::normalize_application_billing_input(&state.settings, payload)?;
+    let settings = state
+        .db
+        .upsert_application_billing_settings(NewApplicationBillingSettings {
+            application_id: id.clone(),
+            accept_signet_balance,
+            wallet_mode,
+            supported_currencies,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.billing_settings.update",
+            "application",
+            Some(id),
+            serde_json::json!({
+                "organization_id": application.organization_id,
+                "accept_signet_balance": settings.accept_signet_balance == 1,
+                "wallet_mode": settings.wallet_mode,
+                "supported_currencies": util::from_json::<Vec<String>>(&settings.supported_currencies)?,
+            }),
+        ))
+        .await?;
+    Ok(Json(billing::application_billing_settings_response(
+        settings,
+    )?))
+}
+
 async fn list_application_directory_sync_runs(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -5124,6 +5293,7 @@ async fn update_application_module(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
     let config = applications::normalize_module_config(&module_key, payload.config)?;
     applications::validate_module_bindings(
@@ -5503,6 +5673,7 @@ async fn delete_application_module(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
     state.db.delete_application_module(&id, &module_key).await?;
     state
@@ -5534,6 +5705,258 @@ async fn managed_application(
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(state, &current, &application.organization_id).await?;
     Ok((current, application))
+}
+
+async fn ensure_website_application_modules_editable(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<()> {
+    if state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        })
+    {
+        return Err(AppError::BadRequest(
+            "website-managed application modules are read-only; update the website manifest"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn get_application_discovery(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<ApplicationDiscoveryResponse>> {
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
+    let record = state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(application_discovery_response(record)))
+}
+
+async fn update_application_discovery(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ApplicationDiscoveryInput>,
+) -> AppResult<Json<ApplicationDiscoveryResponse>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let existing = state.db.find_application_discovery(&id).await?;
+    let current_mode = existing
+        .as_ref()
+        .map(|record| record.management_mode.as_str())
+        .unwrap_or(application_discovery::MANAGEMENT_MODE_SIGNET);
+    let management_mode = payload
+        .management_mode
+        .as_deref()
+        .unwrap_or(current_mode)
+        .trim()
+        .to_string();
+    if !matches!(
+        management_mode.as_str(),
+        application_discovery::MANAGEMENT_MODE_SIGNET
+            | application_discovery::MANAGEMENT_MODE_WEBSITE
+    ) {
+        return Err(AppError::BadRequest(
+            "unsupported application discovery management mode".to_string(),
+        ));
+    }
+
+    let current_website_url = existing
+        .as_ref()
+        .map(|record| record.website_url.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or(applications::application_website_url(&state, &id).await?);
+    let website_url = payload
+        .website_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(current_website_url)
+        .unwrap_or_default();
+    let website_url = if website_url.is_empty() {
+        if management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE {
+            return Err(AppError::BadRequest(
+                "website-managed applications require website_url".to_string(),
+            ));
+        }
+        String::new()
+    } else {
+        application_discovery::website_origin(&website_url)?
+    };
+
+    let fetch_secret_ciphertext = match payload.fetch_secret {
+        None => existing
+            .as_ref()
+            .map(|record| record.fetch_secret_ciphertext.clone())
+            .unwrap_or_default(),
+        Some(secret) if secret.trim().is_empty() => String::new(),
+        Some(secret) => {
+            if state.settings.discovery.encryption_key.trim().is_empty() {
+                return Err(AppError::Configuration(
+                    "discovery encryption key is not configured".to_string(),
+                ));
+            }
+            util::encrypt_discovery_secret(&state.settings.discovery.encryption_key, secret.trim())?
+        }
+    };
+    let signing_public_jwks = match payload.signing_public_jwks {
+        None => existing
+            .as_ref()
+            .map(|record| record.signing_public_jwks.clone())
+            .unwrap_or_default(),
+        Some(value) => {
+            let value = value.trim().to_string();
+            if value.len() > 128 * 1024 {
+                return Err(AppError::BadRequest(
+                    "signing public JWKS is too large".to_string(),
+                ));
+            }
+            value
+        }
+    };
+    let operator_disabled = payload
+        .operator_disabled
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|record| record.operator_disabled != 0)
+        })
+        .unwrap_or(false);
+    let trust_changed = existing.as_ref().is_some_and(|record| {
+        record.website_url != website_url
+            || record.fetch_secret_ciphertext != fetch_secret_ciphertext
+            || record.signing_public_jwks != signing_public_jwks
+    });
+    let has_trust = !fetch_secret_ciphertext.is_empty() && !signing_public_jwks.is_empty();
+    let sync_status = if management_mode == application_discovery::MANAGEMENT_MODE_SIGNET {
+        application_discovery::SYNC_DISABLED.to_string()
+    } else if !has_trust {
+        application_discovery::SYNC_UNCONFIGURED.to_string()
+    } else if trust_changed
+        || existing
+            .as_ref()
+            .and_then(|record| record.last_verified_revision)
+            .is_none()
+    {
+        application_discovery::SYNC_PENDING.to_string()
+    } else {
+        existing
+            .as_ref()
+            .map(|record| record.sync_status.clone())
+            .unwrap_or_else(|| application_discovery::SYNC_PENDING.to_string())
+    };
+    let reset_snapshot = trust_changed
+        || management_mode != current_mode
+        || existing
+            .as_ref()
+            .is_none_or(|record| record.management_mode != management_mode);
+    let record = state
+        .db
+        .upsert_application_discovery(NewApplicationDiscovery {
+            application_id: id.clone(),
+            management_mode: management_mode.clone(),
+            website_url,
+            fetch_secret_ciphertext,
+            signing_public_jwks,
+            last_verified_revision: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.last_verified_revision)
+                })
+                .flatten(),
+            last_verified_version: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.last_verified_version.clone())
+                })
+                .flatten(),
+            last_verified_digest: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.last_verified_digest.clone())
+                })
+                .flatten(),
+            last_verified_expires_at: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.last_verified_expires_at)
+                })
+                .flatten(),
+            sync_status,
+            last_fetched_at: (!reset_snapshot)
+                .then(|| existing.as_ref().and_then(|record| record.last_fetched_at))
+                .flatten(),
+            last_success_at: (!reset_snapshot)
+                .then(|| existing.as_ref().and_then(|record| record.last_success_at))
+                .flatten(),
+            last_error: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.last_error.clone())
+                })
+                .flatten(),
+            snapshot_json: (!reset_snapshot)
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|record| record.snapshot_json.clone())
+                })
+                .flatten(),
+            operator_disabled,
+        })
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.discovery.update",
+            "application_discovery",
+            Some(id),
+            serde_json::json!({
+                "application_id": application.id,
+                "management_mode": management_mode,
+                "trust_changed": trust_changed,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_discovery_response(record)))
+}
+
+async fn sync_application_discovery(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+) -> AppResult<Json<ApplicationDiscoveryResponse>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    let record = application_discovery::sync_application(&state, &id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.discovery.sync",
+            "application_discovery",
+            Some(id),
+            serde_json::json!({
+                "application_id": application.id,
+                "revision": record.last_verified_revision,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_discovery_response(record)))
 }
 
 async fn list_application_roles(
@@ -5756,6 +6179,26 @@ async fn managed_authorization_profile(
     Ok((current, application, profile))
 }
 
+async fn ensure_local_profile_catalog_editable(
+    state: &AppState,
+    application: &ApplicationRecord,
+    _profile: &ApplicationAuthorizationProfileRecord,
+) -> AppResult<()> {
+    if state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        })
+    {
+        return Err(AppError::BadRequest(
+            "website-managed role catalogs are read-only; update the website manifest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn application_authorization_user(
     state: &AppState,
     application: &ApplicationRecord,
@@ -5771,7 +6214,9 @@ async fn application_authorization_user(
         .list_organization_members(&application.organization_id)
         .await?
         .into_iter()
-        .any(|member| member.user_id == user.id && member.is_active == 1 && member.archived_at.is_none());
+        .any(|member| {
+            member.user_id == user.id && member.is_active == 1 && member.archived_at.is_none()
+        });
     if !belongs_to_application {
         return Err(AppError::NotFound);
     }
@@ -5830,7 +6275,10 @@ async fn authorization_profile_response(
         sync_status: profile.sync_status,
         last_synced_at: profile.last_synced_at,
         last_error: profile.last_error,
-        permission_count: definitions.iter().filter(|item| item.is_active == 1).count(),
+        permission_count: definitions
+            .iter()
+            .filter(|item| item.is_active == 1)
+            .count(),
         role_count: roles.iter().filter(|item| item.is_active == 1).count(),
         created_at: profile.created_at,
         updated_at: profile.updated_at,
@@ -5870,6 +6318,19 @@ async fn update_application_authorization_profile(
 ) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
     let (current, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    if state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        })
+    {
+        return Err(AppError::BadRequest(
+            "website-managed authorization profiles are read-only; update the website manifest"
+                .to_string(),
+        ));
+    }
     let manifest_url = payload
         .manifest_url
         .as_deref()
@@ -5900,7 +6361,9 @@ async fn update_application_authorization_profile(
             .db
             .find_client_by_client_id(signer_client_id)
             .await?
-            .ok_or_else(|| AppError::BadRequest("manifest signer client does not exist".to_string()))?;
+            .ok_or_else(|| {
+                AppError::BadRequest("manifest signer client does not exist".to_string())
+            })?;
         if signer.organization_id.as_deref() != Some(application.organization_id.as_str())
             || !state
                 .db
@@ -5960,6 +6423,31 @@ async fn synchronize_authorization_profile(
     application: &ApplicationRecord,
     profile: &ApplicationAuthorizationProfileRecord,
 ) -> AppResult<ApplicationAuthorizationProfileRecord> {
+    if state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        })
+    {
+        application_discovery::sync_application(state, &application.id).await?;
+        let profiles = state
+            .db
+            .list_application_authorization_profiles(&application.id)
+            .await?;
+        if let Some(matching) = profiles
+            .into_iter()
+            .find(|candidate| candidate.profile_key == profile.profile_key)
+        {
+            return Ok(matching);
+        }
+        return state
+            .db
+            .find_application_authorization_profile(&application.id, "default")
+            .await?
+            .ok_or(AppError::NotFound);
+    }
     if profile.source_mode != authorization_manifest::SOURCE_MODE_SIGNED {
         return Err(AppError::BadRequest(
             "enable signed manifest mode before refreshing this profile".to_string(),
@@ -5967,11 +6455,12 @@ async fn synchronize_authorization_profile(
     }
     let website_url = applications::application_website_url(state, &application.id)
         .await?
-        .ok_or_else(|| AppError::BadRequest("website URL is required for manifest discovery".to_string()))?;
-    let signer_client_id = profile
-        .signer_client_id
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("manifest signer client is not configured".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("website URL is required for manifest discovery".to_string())
+        })?;
+    let signer_client_id = profile.signer_client_id.as_deref().ok_or_else(|| {
+        AppError::BadRequest("manifest signer client is not configured".to_string())
+    })?;
     let signer = state
         .db
         .find_client_by_client_id(signer_client_id)
@@ -6092,6 +6581,27 @@ async fn auto_refresh_application_authorization_profiles(
     state: &AppState,
     application: &ApplicationRecord,
 ) -> AppResult<()> {
+    if let Some(discovery) = state.db.find_application_discovery(&application.id).await?
+        && discovery.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+    {
+        let refresh_required = discovery.snapshot_json.is_none()
+            || discovery
+                .last_verified_expires_at
+                .is_some_and(|expires_at| expires_at <= util::now_ts())
+            || discovery.sync_status == application_discovery::SYNC_PENDING;
+        if refresh_required {
+            if let Err(error) =
+                application_discovery::sync_application(state, &application.id).await
+            {
+                tracing::warn!(
+                    application_id = %application.id,
+                    error = %error,
+                    "initial application discovery refresh failed"
+                );
+            }
+        }
+        return Ok(());
+    }
     let profiles = ensure_application_authorization_profiles(state, application).await?;
     for profile in profiles.into_iter().filter(|profile| {
         profile.source_mode == authorization_manifest::SOURCE_MODE_SIGNED
@@ -6204,8 +6714,9 @@ async fn create_application_profile_role(
     Path((id, profile_id)): Path<(String, String)>,
     Json(payload): Json<ApplicationProfileRoleInput>,
 ) -> AppResult<Json<ApplicationProfileRoleResponse>> {
-    let (current, application, _profile) =
+    let (current, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    ensure_local_profile_catalog_editable(&state, &application, &profile).await?;
     let role = state
         .db
         .upsert_application_profile_role(NewApplicationProfileRole {
@@ -6239,8 +6750,9 @@ async fn update_application_profile_role(
     Path((id, profile_id, role_id)): Path<(String, String, String)>,
     Json(payload): Json<ApplicationProfileRoleInput>,
 ) -> AppResult<Json<ApplicationProfileRoleResponse>> {
-    let (current, application, _profile) =
+    let (current, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    ensure_local_profile_catalog_editable(&state, &application, &profile).await?;
     let current_role = state
         .db
         .list_application_profile_roles(&profile_id)
@@ -6287,8 +6799,9 @@ async fn delete_application_profile_role(
     jar: CookieJar,
     Path((id, profile_id, role_id)): Path<(String, String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (current, application, _profile) =
+    let (current, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    ensure_local_profile_catalog_editable(&state, &application, &profile).await?;
     state
         .db
         .delete_application_profile_role(&profile_id, &role_id)
@@ -6449,10 +6962,7 @@ async fn update_application_profile_organization_role_roles(
     Ok(Json(
         state
             .db
-            .list_application_profile_organization_role_ids(
-                &profile_id,
-                &organization_role,
-            )
+            .list_application_profile_organization_role_ids(&profile_id, &organization_role)
             .await?,
     ))
 }
@@ -6926,6 +7436,7 @@ async fn replace_application_oidc_clients(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
     let requested_ids = payload
         .client_ids
         .into_iter()

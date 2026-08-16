@@ -599,6 +599,23 @@ pub async fn ensure_application_runtime_active(
     if organization.is_active != 1 {
         return Err(AppError::Forbidden);
     }
+    if let Some(discovery) = state.db.find_application_discovery(&application.id).await?
+        && discovery.management_mode == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+    {
+        // A website-managed application is fail-closed until Signet has one
+        // complete, verified snapshot.  Once a snapshot exists, a later
+        // fetch/signature error does not interrupt runtime authorization; the
+        // snapshot is local and remains authoritative until its signed expiry.
+        if discovery.operator_disabled != 0
+            || discovery.last_verified_revision.is_none()
+            || discovery.snapshot_json.is_none()
+            || discovery
+                .last_verified_expires_at
+                .is_some_and(|expires_at| expires_at <= crate::util::now_ts())
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
     Ok(())
 }
 
@@ -813,6 +830,30 @@ pub async fn application_login_adapter_enabled(
         &application.organization_id,
         provider.organization_id.as_deref(),
     ))
+}
+
+/// Returns whether the website allows Signet's local password adapter for a
+/// login interaction. A missing module preserves the compatibility behavior
+/// for applications created before website-owned discovery existed. Once a
+/// website publishes the module, its enabled flag and explicit boolean are
+/// the runtime boundary; the admin login endpoint must not silently fall back
+/// to a global password policy for that application.
+pub async fn application_signet_password_enabled(
+    state: &AppState,
+    application_id: &str,
+) -> AppResult<bool> {
+    let Some(module) = application_module(state, application_id, "login_adapters").await? else {
+        return Ok(true);
+    };
+    if module.is_enabled != 1 {
+        return Ok(false);
+    }
+    let config = module_config(&module)?;
+    let config = normalize_module_config("login_adapters", Value::Object(config))?;
+    Ok(config
+        .get("allow_signet_password")
+        .and_then(Value::as_bool)
+        .unwrap_or(true))
 }
 
 /// Returns whether an LDAP/AD source is bound to the website's directory

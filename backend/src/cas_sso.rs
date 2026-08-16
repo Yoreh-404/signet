@@ -442,6 +442,7 @@ async fn load_application(
         .find_active_application_by_slug(app_slug)
         .await?
         .ok_or(AppError::NotFound)?;
+    applications::ensure_application_runtime_active(state, &application).await?;
     let protocol = applications::enabled_protocol_config(state, &application.id, "cas")
         .await?
         .ok_or(AppError::NotFound)?;

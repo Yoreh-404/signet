@@ -4,12 +4,25 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "tarball+https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    cargo2nix = {
+      url = "tarball+https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, cargo2nix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ cargo2nix.overlays.default ];
+        };
         lib = pkgs.lib;
         source = lib.cleanSourceWith {
           src = ./.;
@@ -27,6 +40,136 @@
             in name != "node_modules" && name != "dist";
         };
 
+        # The image target is x86_64-linux. Keep the lockfile portable in
+        # git, but avoid fetching native optional packages for Android,
+        # Darwin, Windows, and other Linux architectures in the Nix cache.
+        # The selected GNU x86_64 packages are the only native artifacts
+        # needed by this build.
+        lockPatch = ''
+          jq '
+            def remove_platform($prefix; $keep):
+              .packages |= with_entries(
+                select(
+                  ((.key | startswith($prefix)) and (.key != $keep)) | not
+                )
+              );
+            remove_platform(
+              "node_modules/@rolldown/binding-";
+              "node_modules/@rolldown/binding-linux-x64-gnu"
+            )
+            | remove_platform(
+                "node_modules/lightningcss-";
+                "node_modules/lightningcss-linux-x64-gnu"
+              )
+            | del(.packages["node_modules/fsevents"])
+            | .packages["node_modules/rolldown"].optionalDependencies |=
+                with_entries(select(.key == "@rolldown/binding-linux-x64-gnu"))
+            | .packages["node_modules/lightningcss"].optionalDependencies |=
+                with_entries(select(.key == "lightningcss-linux-x64-gnu"))
+            | del(.packages["node_modules/vite"].optionalDependencies.fsevents)
+          ' package-lock.json > package-lock.json.tmp
+          mv package-lock.json.tmp package-lock.json
+        '';
+
+        frontendNpmDeps = pkgs.fetchNpmDeps {
+          name = "signet-frontend-0.1.0-npm-deps";
+          src = frontendSource;
+          nativeBuildInputs = [ pkgs.jq ];
+          postPatch = lockPatch;
+          hash = "sha256-mhjQzbivyvbwROle+PreGiHBl9Gc8kMZ/wSKnZmT/4E=";
+        };
+
+        frontend = pkgs.buildNpmPackage {
+          pname = "signet-frontend";
+          version = "0.1.0";
+          src = frontendSource;
+          nativeBuildInputs = [ pkgs.jq ];
+          postPatch = lockPatch;
+          npmDeps = frontendNpmDeps;
+          npmBuildScript = "build";
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r dist $out/
+            runHook postInstall
+          '';
+        };
+
+        signetSource = pkgs.runCommand "signet-cargo-source" {} ''
+          mkdir -p $out/frontend
+          cp -r ${source}/. $out/
+          cp -r ${frontend}/dist $out/frontend/dist
+        '';
+
+        rustPkgs = pkgs.rustBuilder.makePackageSet {
+          rustVersion = "1.97.1";
+          rootFeatures = [
+            "sso-backend/default"
+            "sso-backend/sqlite"
+            "sso-backend/postgres"
+            "sso-backend/mysql"
+          ];
+          packageFun = import ./Cargo.nix;
+          workspaceSrc = "${signetSource}";
+          # The source tree is augmented with the built frontend before Cargo
+          # runs, so Cargo.nix cannot hash it during pure evaluation.
+          ignoreLockHash = true;
+          packageOverrides = pkgs:
+            let
+              inherit (pkgs.rustBuilder) overrides rustLib;
+              nativeArchiveTools = drv: {
+                nativeBuildInputs = (drv.nativeBuildInputs or []) ++ [
+                  pkgs.llvmPackages_21.clang
+                  pkgs.llvmPackages_21.llvm
+                ];
+                CC = "${pkgs.llvmPackages_21.clang}/bin/clang";
+                CXX = "${pkgs.llvmPackages_21.clang}/bin/clang++";
+                AR = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ar";
+                RANLIB = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
+                "CC_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_21.clang}/bin/clang";
+                "CXX_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_21.clang}/bin/clang++";
+                "AR_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ar";
+                "RANLIB_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
+              };
+              sqliteNativeTools = rustLib.makeOverride {
+                name = "libsqlite3-sys";
+                overrideAttrs = drv: nativeArchiveTools drv;
+              };
+              ringNativeTools = rustLib.makeOverride {
+                name = "ring";
+                overrideAttrs = drv: nativeArchiveTools drv;
+              };
+              zstdNativeTools = rustLib.makeOverride {
+                name = "zstd-sys";
+                overrideAttrs = drv: nativeArchiveTools drv;
+              };
+              pqSys = rustLib.makeOverride {
+                name = "pq-sys";
+                overrideAttrs = drv: {
+                  propagatedBuildInputs = (drv.propagatedBuildInputs or []) ++ [ pkgs.postgresql ];
+                };
+              };
+              mysqlclientSys = rustLib.makeOverride {
+                name = "mysqlclient-sys";
+                overrideAttrs = drv: {
+                  propagatedBuildInputs = (drv.propagatedBuildInputs or []) ++ [ pkgs.mariadb-connector-c ];
+                };
+              };
+            in
+              with overrides; [
+                capLints
+                cc
+                sqliteNativeTools
+                ringNativeTools
+                zstdNativeTools
+                openssl-sys
+                pkg-config
+                pqSys
+                mysqlclientSys
+              ];
+        };
+
         rustNativeEnv =
           if pkgs.stdenv.hostPlatform.rust.rustcTarget == "x86_64-unknown-linux-gnu" then {
             RUSTFLAGS = "-C linker=${pkgs.llvmPackages_21.clang}/bin/clang -C link-arg=-fuse-ld=lld";
@@ -38,55 +181,27 @@
             RANLIB_x86_64_unknown_linux_gnu = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
           } else {};
 
-        frontend = pkgs.buildNpmPackage {
-          pname = "signet-frontend";
-          version = "0.1.0";
-          src = frontendSource;
-          npmDepsHash = "sha256-ehCn5rQPuTtIUpjVU1SdmyZ5qxT0I6m6EHkDEC1sgUE=";
-          npmBuildScript = "build";
-
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out
-            cp -r dist $out/
-            runHook postInstall
-          '';
-        };
-
-        signet = pkgs.rustPlatform.buildRustPackage ({
-          pname = "signet";
-          version = "0.1.0";
-          src = source;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = [ "-p" "sso-backend" "--bin" "sso-backend" ];
-          doCheck = false;
-          nativeBuildInputs = with pkgs; [
+        signetBinary = (rustPkgs.workspace.sso-backend {}).overrideAttrs (old: {
+          # frontend/dist is produced by frontendNpmDeps above; do not make
+          # the Rust sandbox invoke npm a second time.
+          SSO_SKIP_FRONTEND_BUILD = "1";
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ (with pkgs; [
             llvmPackages_21.clang
             llvmPackages_21.lld
             llvmPackages_21.llvm
             pkg-config
-          ];
-          buildInputs = with pkgs; [
+          ]);
+          buildInputs = (old.buildInputs or []) ++ (with pkgs; [
             openssl
             sqlite
             postgresql
             mariadb-connector-c
-          ];
-          LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
-          SSO_SKIP_FRONTEND_BUILD = "1";
-
-          preBuild = ''
-            mkdir -p frontend
-            cp -r ${frontend}/dist frontend/dist
-          '';
-
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/bin
-            cp "$(find target -type f -path '*/release/sso-backend' -perm -0100 -print -quit)" $out/bin/signet
-            runHook postInstall
-          '';
+          ]);
         } // rustNativeEnv);
+        signet = pkgs.runCommand "signet-runtime" {} ''
+          mkdir -p $out/bin
+          ln -s ${signetBinary}/bin/sso-backend $out/bin/signet
+        '';
 
         runtimeConfig = pkgs.runCommand "signet-runtime-config" {} ''
           mkdir -p $out/app/config
@@ -120,7 +235,7 @@
             # libraries already included in the image.
             Env = [
               "SSO_CONFIG=/app/config/default.toml"
-              "LD_LIBRARY_PATH=${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite ]}"
+              "LD_LIBRARY_PATH=${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite pkgs.postgresql pkgs.mariadb-connector-c ]}"
             ];
             ExposedPorts = { "8080/tcp" = {}; };
             Volumes = { "/app/data" = {}; };

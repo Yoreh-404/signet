@@ -261,6 +261,7 @@ async fn load_application(
         .find_active_application_by_slug(slug)
         .await?
         .ok_or(AppError::NotFound)?;
+    applications::ensure_application_runtime_active(state, &application).await?;
     let config = applications::enabled_protocol_config(state, &application.id, "jwt")
         .await?
         .ok_or(AppError::NotFound)?;

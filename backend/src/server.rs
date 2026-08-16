@@ -1,6 +1,6 @@
 use crate::{
-    AppState, Settings, admin, browser_accounts, cas_sso, csrf, frontend, health, iap, jwt_sso,
-    oidc, passkeys, registration, saml_sso, scim,
+    AppState, Settings, admin, application_discovery, billing, browser_accounts, cas_sso, csrf,
+    frontend, health, iap, jwt_sso, oidc, passkeys, registration, saml_sso, scim,
 };
 use anyhow::Context;
 use axum::{
@@ -26,6 +26,7 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
     let app = Router::new()
         .merge(health::routes())
         .merge(admin::routes())
+        .merge(billing::routes())
         .merge(browser_accounts::routes())
         .merge(oidc::routes())
         .merge(iap::routes())
@@ -67,6 +68,7 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
 }
 
 pub async fn serve(state: AppState, settings: &Settings) -> anyhow::Result<()> {
+    application_discovery::spawn_periodic_sync(state.clone());
     let app = router(state, settings)?;
     let addr = settings.socket_addr()?;
     let listener = TcpListener::bind(addr)

@@ -20,6 +20,8 @@ pub enum Permission {
     OrganizationsManage,
     AuthorizationCodesManage,
     ProvidersManage,
+    BillingRead,
+    BillingManage,
     AuditRead,
     SecurityManage,
 }
@@ -45,6 +47,8 @@ impl Permission {
         Permission::OrganizationsManage,
         Permission::AuthorizationCodesManage,
         Permission::ProvidersManage,
+        Permission::BillingRead,
+        Permission::BillingManage,
         Permission::AuditRead,
         Permission::SecurityManage,
     ];
@@ -63,6 +67,8 @@ impl Permission {
             Permission::OrganizationsManage => "organizations.manage",
             Permission::AuthorizationCodesManage => "authorization_codes.manage",
             Permission::ProvidersManage => "providers.manage",
+            Permission::BillingRead => "billing.read",
+            Permission::BillingManage => "billing.manage",
             Permission::AuditRead => "audit.read",
             Permission::SecurityManage => "security.manage",
         }
@@ -78,6 +84,7 @@ impl Permission {
             Permission::OrganizationsRead | Permission::OrganizationsManage => "organizations",
             Permission::AuthorizationCodesManage => "authorization_codes",
             Permission::ProvidersManage => "providers",
+            Permission::BillingRead | Permission::BillingManage => "billing",
             Permission::AuditRead => "audit",
             Permission::SecurityManage => "security",
         }
@@ -97,6 +104,8 @@ impl Permission {
             Permission::OrganizationsManage => "Manage organizations",
             Permission::AuthorizationCodesManage => "Manage authorization codes",
             Permission::ProvidersManage => "Manage external OIDC providers",
+            Permission::BillingRead => "Read billing orders",
+            Permission::BillingManage => "Manage billing and adjustments",
             Permission::AuditRead => "Read audit events",
             Permission::SecurityManage => "Manage roles and groups",
         }
@@ -140,6 +149,8 @@ impl TryFrom<&str> for Permission {
             "organizations.manage" => Ok(Permission::OrganizationsManage),
             "authorization_codes.manage" => Ok(Permission::AuthorizationCodesManage),
             "providers.manage" => Ok(Permission::ProvidersManage),
+            "billing.read" => Ok(Permission::BillingRead),
+            "billing.manage" => Ok(Permission::BillingManage),
             "audit.read" => Ok(Permission::AuditRead),
             "security.manage" => Ok(Permission::SecurityManage),
             other => Err(AppError::BadRequest(format!("unknown permission: {other}"))),

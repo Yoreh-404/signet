@@ -6,11 +6,10 @@
 //! depend on the website being reachable.
 
 use crate::{
-    AppState,
-    client_assertion,
+    AppState, client_assertion,
     db::{
-        ApplicationPermissionDefinitionRecord, ApplicationProfileRoleRecord,
-        ClientRecord, NewApplicationPermissionDefinition, NewApplicationProfileRole,
+        ApplicationPermissionDefinitionRecord, ApplicationProfileRoleRecord, ClientRecord,
+        NewApplicationPermissionDefinition, NewApplicationProfileRole,
     },
     error::{AppError, AppResult},
     util,
@@ -26,7 +25,10 @@ use std::{
 use url::Url;
 
 pub const MANIFEST_FORMAT: &str = "signet-authorization/v1";
-pub const DEFAULT_MANIFEST_PATH: &str = "/.well-known/signet-authorization.json";
+// v2 owns the canonical well-known URL. Keep the old profile-level format on
+// an explicit compatibility URL so a legacy refresh cannot accidentally parse
+// a website's v2 application manifest with the wrong trust model.
+pub const DEFAULT_MANIFEST_PATH: &str = "/.well-known/signet-authorization-v1.json";
 pub const SOURCE_MANIFEST: &str = "manifest";
 pub const SOURCE_MANUAL: &str = "manual";
 pub const SOURCE_MODE_MANUAL: &str = "manual";
@@ -159,9 +161,13 @@ pub async fn discover_profile(
         .header(reqwest::header::ACCEPT, "application/json, application/jwt")
         .send()
         .await
-        .map_err(|err| AppError::BadRequest(format!("authorization manifest request failed: {err}")))?
+        .map_err(|err| {
+            AppError::BadRequest(format!("authorization manifest request failed: {err}"))
+        })?
         .error_for_status()
-        .map_err(|err| AppError::BadRequest(format!("authorization manifest returned an error: {err}")))?;
+        .map_err(|err| {
+            AppError::BadRequest(format!("authorization manifest returned an error: {err}"))
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MANIFEST_BYTES as u64)
@@ -337,7 +343,9 @@ fn normalize_permission_key(value: &str) -> AppResult<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > MAX_PERMISSION_KEY_LENGTH
-        || value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
         || value.split(':').any(str::is_empty)
     {
         return Err(AppError::BadRequest(
@@ -351,7 +359,9 @@ fn normalize_role_key(value: &str) -> AppResult<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > MAX_ROLE_KEY_LENGTH
-        || value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
     {
         return Err(AppError::BadRequest(
             "authorization role key is invalid".to_string(),
@@ -425,7 +435,10 @@ pub fn profile_status(
         sync_status: profile.sync_status.clone(),
         last_synced_at: profile.last_synced_at,
         last_error: profile.last_error.clone(),
-        permission_count: definitions.iter().filter(|item| item.is_active == 1).count(),
+        permission_count: definitions
+            .iter()
+            .filter(|item| item.is_active == 1)
+            .count(),
         role_count: roles.iter().filter(|item| item.is_active == 1).count(),
     }
 }
@@ -436,7 +449,10 @@ mod tests {
 
     #[test]
     fn permission_keys_keep_colon_segments_without_prefix_semantics() {
-        assert_eq!(normalize_permission_key("admin:billing:invoice:approve").unwrap(), "admin:billing:invoice:approve");
+        assert_eq!(
+            normalize_permission_key("admin:billing:invoice:approve").unwrap(),
+            "admin:billing:invoice:approve"
+        );
         assert!(normalize_permission_key("admin:billing:").is_err());
         assert!(normalize_permission_key("admin billing").is_err());
     }
@@ -460,14 +476,22 @@ mod tests {
         assert_eq!(roles[0].permissions, vec!["admin:billing:invoice"]);
 
         let mut invalid = profile;
-        invalid.roles[0].permissions.push("admin:billing".to_string());
+        invalid.roles[0]
+            .permissions
+            .push("admin:billing".to_string());
         assert!(normalize_profile(&invalid, "profile-1").is_err());
     }
 
     #[test]
     fn manifest_fetch_rejects_insecure_public_urls_and_private_addresses() {
-        assert!(validate_fetch_url("http://example.com/.well-known/signet-authorization.json").is_err());
-        assert!(validate_fetch_url("https://127.0.0.1/.well-known/signet-authorization.json").is_err());
-        assert!(validate_fetch_url("https://example.com/.well-known/signet-authorization.json").is_ok());
+        assert!(
+            validate_fetch_url("http://example.com/.well-known/signet-authorization.json").is_err()
+        );
+        assert!(
+            validate_fetch_url("https://127.0.0.1/.well-known/signet-authorization.json").is_err()
+        );
+        assert!(
+            validate_fetch_url("https://example.com/.well-known/signet-authorization.json").is_ok()
+        );
     }
 }

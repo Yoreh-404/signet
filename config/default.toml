@@ -36,10 +36,64 @@ supported_scopes = [
   "memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent",
   "anchordocs.read", "anchordocs.write",
   "ocr.extract", "ocr.read",
+  "axon.mcp", "axon.mcp.session.read", "axon.mcp.session.write",
+  "axon.mcp.environment.read", "axon.mcp.environment.write", "axon.mcp.environment.exec",
+  "axon.mcp.provider.call", "axon.mcp.skill.read", "axon.mcp.knowledge.read",
+  "axon.mcp.code.read", "axon.mcp.operation.read", "axon.mcp.operation.write",
+  "billing.read", "billing.reserve", "billing.commit", "billing.release", "billing.refund",
 ]
 # If false, users see a consent page before a new client/scope set is authorized.
 skip_consent = false
 allow_dynamic_client_registration = false
+
+[discovery]
+# Website-managed application trust is configured from deployment secrets. The
+# fetch secret is encrypted before persistence; the website signing key is
+# pinned as public JWKS. Keep the private-network escape hatch false outside a
+# local Compose edge.
+sync_interval_seconds = 300
+allow_private_networks = false
+encryption_key = ""
+
+[billing]
+enabled = true
+default_currency = "CNY"
+reservation_ttl_seconds = 900
+
+[[billing.supported_currencies]]
+code = "CNY"
+minor_unit = 2
+
+# Payment credentials should be supplied through *_env in production. The
+# adapters are disabled until each merchant configuration is complete.
+[[billing.providers]]
+slug = "epay"
+kind = "epay_v1"
+enabled = false
+gateway_url = "https://pay.example.com/submit.php"
+merchant_id = ""
+payment_channel = "alipay"
+merchant_secret_env = "SIGNET_EPAY_KEY"
+
+[[billing.providers]]
+slug = "alipay"
+kind = "alipay_page"
+enabled = false
+gateway_url = "https://openapi.alipay.com/gateway.do"
+app_id = ""
+private_key_env = "SIGNET_ALIPAY_PRIVATE_KEY_PEM"
+alipay_public_key_env = "SIGNET_ALIPAY_PUBLIC_KEY_PEM"
+
+[[billing.providers]]
+slug = "wechat"
+kind = "wechat_native"
+enabled = false
+gateway_url = "https://api.mch.weixin.qq.com"
+app_id = ""
+merchant_id = ""
+certificate_serial_no = ""
+private_key_env = "SIGNET_WECHAT_PRIVATE_KEY_PEM"
+api_v3_key_env = "SIGNET_WECHAT_API_V3_KEY"
 
 # User delegation is narrower than a client's ordinary scope grant.  Every
 # RFC 8693 exchange must match one of these actor/target/source rules, and
@@ -184,212 +238,56 @@ username = "admin"
 display_name = "SSO Admin"
 password = "ChangeMe123!"
 
-[[bootstrap.clients]]
-client_id = "demo-web"
-client_name = "Demo Web App"
-logo_uri = ""
-client_secret = "demo-secret-change-me"
-redirect_uris = ["http://localhost:3000/callback", "http://localhost:5173/callback"]
-post_logout_redirect_uris = ["http://localhost:3000/"]
-scopes = ["openid", "profile", "email", "offline_access"]
-grant_types = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code", "urn:ietf:params:oauth:grant-type:token-exchange"]
-response_types = ["code"]
-token_endpoint_auth_method = "client_secret_basic"
-require_pkce = false
+# Signet deploys the application boundary, while Axon publishes the clients,
+# protocol adapters, and entitlement catalog at its signed well-known URL.
+# No client, provider, protocol, or role is embedded in this deployment
+# profile; website-managed details are reconciled from the Axon manifest.
+[[bootstrap.applications]]
+application_id = "axon"
+name = "Axon"
+website_url = "https://axon-admin.test.com"
+management_mode = "website_managed"
+is_active = true
+fetch_secret_env = "SIGNET_AXON_DISCOVERY_FETCH_SECRET"
+signing_public_jwks_env = "SIGNET_AXON_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
-# Cross-project service identities.  These local values make a fresh
-# development deployment immediately bootstrap-able; production deployments
-# must replace them in a deployment-specific config/secret workflow before
-# exposing Signet outside the local network.
-[[bootstrap.clients]]
-client_id = "memory-atlas-to-axon"
-client_name = "Memory Atlas -> Axon Agent Webhook"
-client_secret = "local-memory-atlas-to-axon-change-me"
-scopes = ["axon.agent.invoke:memory"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "axon"
+[[bootstrap.applications]]
+application_id = "axon-hub"
+name = "Axon Hub"
+website_url = "https://hub.test.com"
+management_mode = "website_managed"
+is_active = true
+fetch_secret_env = "SIGNET_AXON_HUB_DISCOVERY_FETCH_SECRET"
+signing_public_jwks_env = "SIGNET_AXON_HUB_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
-[[bootstrap.clients]]
-client_id = "axon-to-memory-atlas"
-client_name = "Axon -> Memory Atlas Service"
-client_secret = "local-axon-to-memory-atlas-change-me"
-scopes = ["memory.service", "memory.agent.callback", "memory.code.index", "memory.code.write"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "memory-atlas"
+[[bootstrap.applications]]
+application_id = "memory-atlas"
+name = "Memory Atlas"
+website_url = "https://mem.test.com"
+management_mode = "website_managed"
+is_active = true
+fetch_secret_env = "SIGNET_MEMORY_ATLAS_DISCOVERY_FETCH_SECRET"
+signing_public_jwks_env = "SIGNET_MEMORY_ATLAS_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
-[[bootstrap.clients]]
-client_id = "axon-to-axon-hub"
-client_name = "Axon -> Axon Hub Registry"
-client_secret = "local-axon-to-axon-hub-change-me"
-scopes = ["axon.hub.read", "axon.hub.submit"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "axon-hub"
+[[bootstrap.applications]]
+application_id = "anchordocs"
+name = "AnchorDocs"
+website_url = "https://docs.test.com"
+management_mode = "website_managed"
+is_active = true
+fetch_secret_env = "SIGNET_ANCHORDOCS_DISCOVERY_FETCH_SECRET"
+signing_public_jwks_env = "SIGNET_ANCHORDOCS_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
-[[bootstrap.clients]]
-client_id = "anchordocs-service"
-client_name = "AnchorDocs Service"
-client_secret = "local-anchordocs-service-change-me"
-scopes = ["anchordocs.service"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "anchordocs"
+[[bootstrap.applications]]
+application_id = "ocr"
+name = "OCR"
+website_url = "https://ocr.test.com"
+management_mode = "website_managed"
+is_active = true
+fetch_secret_env = "SIGNET_OCR_DISCOVERY_FETCH_SECRET"
+signing_public_jwks_env = "SIGNET_OCR_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
-[[bootstrap.clients]]
-client_id = "ocr-service"
-client_name = "OCR MCP Service"
-client_secret = "local-ocr-service-change-me"
-scopes = ["ocr.service"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "ocr"
-
-[[bootstrap.clients]]
-client_id = "axon-uniapp"
-client_name = "Axon UniApp"
-redirect_uris = ["http://localhost:3000/callback", "http://localhost:5173/callback"]
-post_logout_redirect_uris = ["http://localhost:3000/", "http://localhost:5173/"]
-scopes = ["openid", "profile", "email", "offline_access"]
-grant_types = ["authorization_code", "refresh_token"]
-response_types = ["code"]
-token_endpoint_auth_method = "none"
-require_pkce = true
-
-[[bootstrap.clients]]
-client_id = "anchordocs-web"
-client_name = "AnchorDocs Web"
-redirect_uris = [
-  "https://docs.test.com/",
-  "http://localhost:18085/",
-  "http://127.0.0.1:18085/",
-  "http://localhost:5173/",
-  "http://127.0.0.1:5173/",
-]
-post_logout_redirect_uris = [
-  "https://docs.test.com/",
-  "http://localhost:18085/",
-  "http://127.0.0.1:18085/",
-  "http://localhost:5173/",
-  "http://127.0.0.1:5173/",
-]
-scopes = ["openid", "profile", "email", "anchordocs.read", "anchordocs.write"]
-grant_types = ["authorization_code"]
-response_types = ["code"]
-token_endpoint_auth_method = "none"
-require_pkce = true
-audience = "anchordocs"
-
-[[bootstrap.clients]]
-client_id = "axon-hub-web"
-client_name = "Axon Hub Web"
-redirect_uris = [
-  "https://hub.test.com/",
-  "http://localhost:18081/",
-  "http://127.0.0.1:18081/",
-  "http://localhost:5173/",
-  "http://127.0.0.1:5173/",
-]
-post_logout_redirect_uris = [
-  "https://hub.test.com/",
-  "http://localhost:18081/",
-  "http://127.0.0.1:18081/",
-  "http://localhost:5173/",
-  "http://127.0.0.1:5173/",
-]
-scopes = ["openid", "profile", "email", "axon.hub.read", "axon.hub.submit"]
-grant_types = ["authorization_code"]
-response_types = ["code"]
-token_endpoint_auth_method = "none"
-require_pkce = true
-audience = "axon-hub"
-
-[[bootstrap.clients]]
-client_id = "axon"
-client_name = "Axon OIDC confidential client"
-client_secret = "local-axon-oidc-change-me"
-redirect_uris = [
-  "http://localhost:15000/admin/api/auth/signet/callback",
-  "http://127.0.0.1:15000/admin/api/auth/signet/callback",
-  "http://axon:5000/admin/api/auth/signet/callback",
-  "http://localhost:15000/oauth2/callback",
-]
-post_logout_redirect_uris = ["http://localhost:15000/", "http://127.0.0.1:15000/"]
-scopes = [
-  "openid", "profile", "email", "offline_access", "axon.agent.invoke:memory",
-  "memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent",
-  "anchordocs.read", "anchordocs.write",
-  "axon.hub.read", "axon.hub.submit", "ocr.extract", "ocr.read",
-]
-grant_types = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"]
-response_types = ["code"]
-token_endpoint_auth_method = "client_secret_basic"
-require_pkce = true
-require_confidential_client = true
-audience = "axon"
-
-# Resource-bound RFC 7662 clients. Each resource server gets its own
-# credential and can introspect only tokens whose audience is its resource.
-[[bootstrap.clients]]
-client_id = "memory-atlas-introspection"
-client_name = "Memory Atlas Introspection"
-client_secret = "local-memory-atlas-introspection-change-me"
-scopes = ["openid"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "memory-atlas"
-
-[[bootstrap.clients]]
-client_id = "anchordocs-introspection"
-client_name = "AnchorDocs Introspection"
-client_secret = "local-anchordocs-introspection-change-me"
-scopes = ["openid"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "anchordocs"
-
-[[bootstrap.clients]]
-client_id = "axon-hub-introspection"
-client_name = "Axon Hub Introspection"
-client_secret = "local-axon-hub-introspection-change-me"
-scopes = ["openid"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "axon-hub"
-
-[[bootstrap.clients]]
-client_id = "ocr-introspection"
-client_name = "OCR Introspection"
-client_secret = "local-ocr-introspection-change-me"
-scopes = ["openid"]
-grant_types = ["client_credentials"]
-response_types = []
-token_endpoint_auth_method = "client_secret_basic"
-require_confidential_client = true
-service_account_enabled = true
-audience = "ocr"
+# Authentication clients, protocol adapters, directory connectors, and role
+# catalogs are intentionally not bootstrapped here. Each website publishes
+# its signed signet-application/v2 manifest; Signet only enrolls the
+# application boundary and reconciles that verified snapshot.

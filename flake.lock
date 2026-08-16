@@ -1,5 +1,45 @@
 {
   "nodes": {
+    "cargo2nix": {
+      "inputs": {
+        "flake-compat": "flake-compat",
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": [
+          "rust-overlay"
+        ]
+      },
+      "locked": {
+        "lastModified": 1750364353,
+        "narHash": "sha256-l06DIwnB4JHwP1isUUXk85F+AHQkUSUyAWnAmRxXICg=",
+        "type": "tarball",
+        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12"
+      }
+    },
+    "flake-compat": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1696426674,
+        "narHash": "sha256-kvjfFW7WAETZlt09AgDn1MrtKzP7t90Vf7vypd3OL1U=",
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "rev": "0f9255e01c2351cc7d116c072cb317785dd33b33",
+        "type": "github"
+      },
+      "original": {
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,8 +76,27 @@
     },
     "root": {
       "inputs": {
+        "cargo2nix": "cargo2nix",
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1786680812,
+        "narHash": "sha256-5lDFwethgqSULdupYl3Eu5n80jfcbb85gSJX/jb58GQ=",
+        "type": "tarball",
+        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable"
       }
     },
     "systems": {

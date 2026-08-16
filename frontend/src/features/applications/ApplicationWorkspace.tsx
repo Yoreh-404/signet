@@ -9,6 +9,7 @@ import {
   Eye,
   Globe2,
   KeyRound,
+  Coins,
   LockKeyhole,
   Pencil,
   Plus,
@@ -18,9 +19,11 @@ import {
   SlidersHorizontal,
   Trash2
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type {
+  ApplicationBillingSettings,
+  ApplicationSection,
   ApplicationModule,
   ApplicationModuleKey,
   ApplicationAuthorizationProfile,
@@ -56,6 +59,16 @@ type Copy = {
   identity: string;
   directory: string;
   permissions: string;
+  billing: string;
+  billingHint: string;
+  acceptSignetBalance: string;
+  acceptSignetBalanceHint: string;
+  walletMode: string;
+  sharedWallet: string;
+  isolatedWallet: string;
+  walletModeLocked: string;
+  billingCurrencies: string;
+  billingCurrenciesHint: string;
   accessBundle: string;
   accessBundleHint: string;
   websiteUrl: string;
@@ -66,6 +79,8 @@ type Copy = {
   saving: string;
   saved: string;
   saveFailed: string;
+  loadFailed: string;
+  retry: string;
   protocolHint: string;
   protocolRuntimeHint: string;
   oauth: string;
@@ -106,6 +121,7 @@ type Copy = {
   rotateSecret: string;
   secretOnlyOnce: string;
   revokeSecrets: string;
+  revokeSecretsHint: string;
   loginAdapters: string;
   loginAdaptersHint: string;
   noLoginAdapters: string;
@@ -156,8 +172,11 @@ type Copy = {
   copyToken: string;
   copied: string;
   revokeToken: string;
+  revokeTokenHint: string;
   revoked: string;
   tokenOnlyOnce: string;
+  unsavedChanges: string;
+  discardChanges: string;
   authorizationHint: string;
   authorizationProfile: string;
   authorizationProfileHint: string;
@@ -253,6 +272,16 @@ const ZH: Copy = {
   identity: "登录适配器",
   directory: "目录同步",
   permissions: "权限",
+  billing: "余额接入",
+  billingHint: "决定这个网站是否接受 Signet 余额，以及用户是否需要先把总账户余额划转到应用账户。",
+  acceptSignetBalance: "接受 Signet 余额",
+  acceptSignetBalanceHint: "关闭后，网站可以继续使用自己的支付系统；Signet 不会为它执行余额扣费。",
+  walletMode: "账户模式",
+  sharedWallet: "共享总账户",
+  isolatedWallet: "独立应用账户",
+  walletModeLocked: "首次发生账务交易后账户模式会锁定。",
+  billingCurrencies: "支持币种",
+  billingCurrenciesHint: "留空表示使用 Signet 全局启用的币种；多个币种用逗号分隔。",
   accessBundle: "网站接入包",
   accessBundleHint: "应用把网站需要的接入能力绑定在一起；模块可以独立配置和启停。",
   websiteUrl: "网站地址",
@@ -263,6 +292,8 @@ const ZH: Copy = {
   saving: "保存中…",
   saved: "配置已保存",
   saveFailed: "配置保存失败",
+  loadFailed: "配置加载失败",
+  retry: "重试",
   protocolHint: "选择这个网站接受的标准协议。OAuth 2.0 / OIDC 使用下方的客户端连接；其他协议保留独立的端点和签名配置。",
   protocolRuntimeHint: "协议配置属于应用，不再散落在全局客户端列表中。",
   oauth: "OAuth 2.0 / OIDC",
@@ -303,6 +334,7 @@ const ZH: Copy = {
   rotateSecret: "轮换 Secret",
   secretOnlyOnce: "Secret 只显示这一次，请立即复制并安全保存。",
   revokeSecrets: "撤销所有 Secret",
+  revokeSecretsHint: "这会立即使当前应用的所有 JWT Secret 失效，可能中断网站或 API。",
   loginAdapters: "第三方登录适配器",
   loginAdaptersHint: "选择允许从哪些企业身份源进入这个网站；用户仍会落到同一个 Signet 账户。",
   noLoginAdapters: "暂无可用的第三方 OIDC 适配器",
@@ -353,8 +385,11 @@ const ZH: Copy = {
   copyToken: "复制令牌",
   copied: "已复制",
   revokeToken: "撤销令牌",
+  revokeTokenHint: "撤销后，使用此令牌的目录同步会立即停止，且无法恢复。",
   revoked: "已撤销",
   tokenOnlyOnce: "完整令牌只显示这一次，请立即复制并安全保存。",
+  unsavedChanges: "有未保存的更改",
+  discardChanges: "放弃更改",
   authorizationHint: "权限采用两层合并：继承企业默认角色，再叠加这个网站的专属角色和 Claim。",
   authorizationProfile: "OIDC 权限 Profile",
   authorizationProfileHint: "每个 OIDC 客户端独立维护一套权限定义、角色和用户映射。网站可以通过签名 manifest 提供定义，也可以在 Signet 手工维护。",
@@ -450,6 +485,16 @@ const EN: Copy = {
   identity: "Login adapters",
   directory: "Directory sync",
   permissions: "Permissions",
+  billing: "Billing",
+  billingHint: "Choose whether this website accepts Signet balance and whether users must transfer funds into an application wallet first.",
+  acceptSignetBalance: "Accept Signet balance",
+  acceptSignetBalanceHint: "When disabled, the website may use its own payment system and Signet will not authorize wallet charges for it.",
+  walletMode: "Wallet mode",
+  sharedWallet: "Shared global wallet",
+  isolatedWallet: "Isolated application wallet",
+  walletModeLocked: "Wallet mode is locked after the first billing transaction.",
+  billingCurrencies: "Supported currencies",
+  billingCurrenciesHint: "Leave empty to accept all currencies enabled globally; separate multiple currencies with commas.",
   accessBundle: "Website access bundle",
   accessBundleHint: "An application binds the capabilities a website needs; each module can be configured and enabled independently.",
   websiteUrl: "Website URL",
@@ -460,6 +505,8 @@ const EN: Copy = {
   saving: "Saving…",
   saved: "Configuration saved",
   saveFailed: "Failed to save configuration",
+  loadFailed: "Failed to load configuration",
+  retry: "Retry",
   protocolHint: "Choose the standards this website accepts. OAuth 2.0 / OIDC uses the client connections below; other protocols keep independent endpoint and signing settings.",
   protocolRuntimeHint: "Protocol settings belong to the application instead of being scattered across a global client list.",
   oauth: "OAuth 2.0 / OIDC",
@@ -500,6 +547,7 @@ const EN: Copy = {
   rotateSecret: "Rotate secret",
   secretOnlyOnce: "This secret is shown only once. Copy it now and store it securely.",
   revokeSecrets: "Revoke all secrets",
+  revokeSecretsHint: "All JWT secrets for this application become invalid immediately. This may interrupt the website or API.",
   loginAdapters: "Third-party login adapters",
   loginAdaptersHint: "Choose which enterprise identity sources may enter this website; users still resolve to one Signet account.",
   noLoginAdapters: "No external OIDC adapters are available",
@@ -550,8 +598,11 @@ const EN: Copy = {
   copyToken: "Copy token",
   copied: "Copied",
   revokeToken: "Revoke token",
+  revokeTokenHint: "The directory sync using this token stops immediately and cannot be restored.",
   revoked: "Revoked",
   tokenOnlyOnce: "The complete token is shown only once. Copy it now and store it securely.",
+  unsavedChanges: "Unsaved changes",
+  discardChanges: "Discard changes",
   authorizationHint: "Authorization is merged in two layers: inherit enterprise defaults, then add website-specific roles and claims.",
   authorizationProfile: "OIDC authorization profile",
   authorizationProfileHint: "Each OIDC client has an independent permission vocabulary, role catalog, and subject mappings. A website can publish a signed manifest or be configured manually in Signet.",
@@ -803,10 +854,15 @@ export function ApplicationWorkspace({
   ldapProviders,
   locale,
   canManage,
+  initialApplicationId,
+  initialSection,
   onCreateApplication,
   onEditApplication,
   onDeleteApplication,
-  onApplicationModuleChanged
+  onApplicationModuleChanged,
+  onNavigationChange,
+  onDirtyChange,
+  onRequestConfirmation
 }: {
   applications: TenantApplication[];
   clients: Client[];
@@ -814,14 +870,23 @@ export function ApplicationWorkspace({
   ldapProviders: LdapProvider[];
   locale: Locale;
   canManage: boolean;
+  initialApplicationId?: string | null;
+  initialSection?: ApplicationSection | null;
   onCreateApplication: () => void;
   onEditApplication: (application: TenantApplication) => void;
   onDeleteApplication: (id: string) => void;
   onApplicationModuleChanged: (applicationId: string, module: ApplicationModule, oidcClients?: Client[]) => void;
+  onNavigationChange?: (applicationId: string, section: ApplicationSection) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  onRequestConfirmation?: (
+    action: () => Promise<void> | void,
+    title: string,
+    description: string
+  ) => void;
 }) {
   const c = locale === "zh-CN" ? ZH : EN;
-  const [selectedId, setSelectedId] = useState<string | null>(applications[0]?.id ?? null);
-  const [section, setSection] = useState<"overview" | ApplicationModuleKey>("overview");
+  const [selectedId, setSelectedId] = useState<string | null>(initialApplicationId ?? applications[0]?.id ?? null);
+  const [section, setSection] = useState<ApplicationSection>(initialSection ?? "overview");
   const [drafts, setDrafts] = useState<Partial<Record<ApplicationModuleKey, Record<string, unknown>>>>({});
   const [savingKey, setSavingKey] = useState<ApplicationModuleKey | null>(null);
   const [feedback, setFeedback] = useState("");
@@ -859,21 +924,36 @@ export function ApplicationWorkspace({
   const [authorizationLoading, setAuthorizationLoading] = useState(false);
   const [authorizationSaving, setAuthorizationSaving] = useState(false);
   const [authorizationFeedback, setAuthorizationFeedback] = useState("");
+  const [billingSettings, setBillingSettings] = useState<ApplicationBillingSettings | null>(null);
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [billingError, setBillingError] = useState("");
+  const [billingReloadToken, setBillingReloadToken] = useState(0);
+  const [billingSaving, setBillingSaving] = useState(false);
+  const selectedIdRef = useRef(selectedId);
   const selected = applications.find((item) => item.id === selectedId) ?? null;
   const selectedAuthorizationProfile = authorizationProfiles.find((profile) => profile.id === selectedAuthorizationProfileId) ?? null;
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   useEffect(() => {
     if (applications.length === 0) {
       setSelectedId(null);
       return;
     }
-    if (!selectedId || !applications.some((item) => item.id === selectedId)) {
+    if (initialApplicationId && applications.some((item) => item.id === initialApplicationId)) {
+      if (selectedId !== initialApplicationId) setSelectedId(initialApplicationId);
+    } else if (!selectedId || !applications.some((item) => item.id === selectedId)) {
       setSelectedId(applications[0].id);
     }
-  }, [applications, selectedId]);
+  }, [applications, initialApplicationId, selectedId]);
 
   useEffect(() => {
-    setSection("overview");
+    if (initialSection) setSection(initialSection);
+  }, [initialSection]);
+
+  useEffect(() => {
     setFeedback("");
     // Drafts are scoped to the selected website. Keeping them across a
     // selection change can silently show (and later save) one website's
@@ -906,7 +986,23 @@ export function ApplicationWorkspace({
     setUserPermissionOverrides([]);
     setAuthorizationPreview(null);
     setAuthorizationFeedback("");
+    setBillingSettings(null);
+    setBillingLoading(false);
+    setBillingError("");
+    setBillingSaving(false);
   }, [selectedId]);
+
+  function hasUnsavedDrafts(): boolean {
+    if (!selected) return false;
+    return Object.entries(drafts).some(([key, draft]) => (
+      draft !== undefined
+      && JSON.stringify(draft) !== JSON.stringify(moduleConfig(selected, key as ApplicationModuleKey))
+    ));
+  }
+
+  useEffect(() => {
+    onDirtyChange?.(hasUnsavedDrafts());
+  }, [drafts, selected, onDirtyChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -920,6 +1016,31 @@ export function ApplicationWorkspace({
       });
     return () => { cancelled = true; };
   }, [selected]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selected) {
+      setBillingSettings(null);
+      setBillingLoading(false);
+      return () => { cancelled = true; };
+    }
+    setBillingLoading(true);
+    setBillingError("");
+    void api<ApplicationBillingSettings>(`/api/admin/applications/${selected.id}/billing-settings`)
+      .then((settings) => {
+        if (!cancelled) setBillingSettings(settings);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBillingSettings(null);
+          setBillingError(c.loadFailed);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setBillingLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [selected, billingReloadToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1095,6 +1216,7 @@ export function ApplicationWorkspace({
 
   async function saveModule(key: ApplicationModuleKey) {
     if (!selected) return;
+    const selectedIdAtStart = selected.id;
     setSavingKey(key);
     setFeedback("");
     try {
@@ -1120,10 +1242,11 @@ export function ApplicationWorkspace({
         method: "PUT",
         body: JSON.stringify({ config, is_enabled: isEnabled })
       });
+      if (selectedIdRef.current !== selectedIdAtStart) return;
       if (key === "protocols") {
         const jwt = record(record(config).jwt);
         const jwtEnabled = booleanValue(jwt.enabled);
-        if (jwtEnabled) {
+        if (jwtEnabled && selectedIdRef.current === selectedIdAtStart) {
           const configuredClient = await api<ApplicationJwtClient>(`/api/admin/applications/${selected.id}/jwt-client`, {
             method: "PUT",
             body: JSON.stringify({
@@ -1135,6 +1258,7 @@ export function ApplicationWorkspace({
           setJwtClient(configuredClient);
         }
       }
+      if (selectedIdRef.current !== selectedIdAtStart) return;
       onApplicationModuleChanged(selected.id, module, attachedClients);
       setDrafts((current) => ({ ...current, [key]: config }));
       setFeedback(c.saved);
@@ -1142,6 +1266,28 @@ export function ApplicationWorkspace({
       setFeedback(c.saveFailed);
     } finally {
       setSavingKey(null);
+    }
+  }
+
+  async function saveBillingSettings() {
+    if (!selected || !billingSettings || !canManage) return;
+    setBillingSaving(true);
+    setFeedback("");
+    try {
+      const settings = await api<ApplicationBillingSettings>(`/api/admin/applications/${selected.id}/billing-settings`, {
+        method: "PUT",
+        body: JSON.stringify({
+          accept_signet_balance: billingSettings.accept_signet_balance,
+          wallet_mode: billingSettings.wallet_mode,
+          supported_currencies: billingSettings.supported_currencies
+        })
+      });
+      setBillingSettings(settings);
+      setFeedback(c.saved);
+    } catch {
+      setFeedback(c.saveFailed);
+    } finally {
+      setBillingSaving(false);
     }
   }
 
@@ -1398,6 +1544,14 @@ export function ApplicationWorkspace({
     }
   }
 
+  function selectApplication(nextId: string) {
+    if (nextId === selectedId) return;
+    if (hasUnsavedDrafts() && !window.confirm(`${c.unsavedChanges}\n${c.discardChanges}?`)) return;
+    setSelectedId(nextId);
+    setSection("overview");
+    onNavigationChange?.(nextId, "overview");
+  }
+
   function toggleScimTokenScope(scope: string) {
     setScimTokenScopes((current) => current.includes(scope)
       ? current.filter((item) => item !== scope)
@@ -1485,10 +1639,11 @@ export function ApplicationWorkspace({
     }
   }
 
-  function openSection(next: "overview" | ApplicationModuleKey) {
+  function openSection(next: "overview" | ApplicationModuleKey | "billing") {
     setFeedback("");
     setSection(next);
-    if (next !== "overview") {
+    if (selected) onNavigationChange?.(selected.id, next);
+    if (next !== "overview" && next !== "billing") {
       setDrafts((current) => current[next] ? current : { ...current, [next]: selected ? moduleConfig(selected, next) : {} });
     }
   }
@@ -1501,6 +1656,23 @@ export function ApplicationWorkspace({
     const current = draftFor("protocols");
     const nextProtocol = { ...record(current[protocol]), [field]: value };
     updateDraft("protocols", { ...current, [protocol]: nextProtocol });
+  }
+
+  function renderBillingEditor() {
+    if (billingLoading) return <div className="loading-state" role="status">{c.saving}</div>;
+    if (billingError) return <div className="error" role="alert">{billingError}<button type="button" onClick={() => setBillingReloadToken((current) => current + 1)}>{c.retry}</button></div>;
+    if (!selected || !billingSettings) return <p className="muted">{c.noModuleConfig}</p>;
+    return (
+      <div className="application-module-content">
+        <ModuleHeader icon={<Coins size={19} />} title={c.billing} description={c.billingHint} />
+        <div className="authorization-subsection">
+          <Toggle label={c.acceptSignetBalance} hint={c.acceptSignetBalanceHint} checked={billingSettings.accept_signet_balance} onChange={(value) => setBillingSettings((current) => current ? { ...current, accept_signet_balance: value } : current)} disabled={!canManage} />
+          <label className="application-input"><span>{c.walletMode}</span><select value={billingSettings.wallet_mode} disabled={!canManage || billingSettings.mode_locked_at !== null} onChange={(event) => setBillingSettings((current) => current ? { ...current, wallet_mode: event.target.value as ApplicationBillingSettings["wallet_mode"] } : current)}><option value="shared">{c.sharedWallet}</option><option value="isolated">{c.isolatedWallet}</option></select><small>{billingSettings.mode_locked_at !== null ? c.walletModeLocked : c.billingHint}</small></label>
+          <Input label={c.billingCurrencies} hint={c.billingCurrenciesHint} value={billingSettings.supported_currencies.join(", ")} disabled={!canManage} onChange={(value) => setBillingSettings((current) => current ? { ...current, supported_currencies: Array.from(new Set(value.split(",").map((item) => item.trim().toUpperCase()).filter(Boolean))) } : current)} />
+        </div>
+        {canManage && <ModuleSave saving={billingSaving} feedback={feedback} copy={c} onSave={() => void saveBillingSettings()} />}
+      </div>
+    );
   }
 
   function toggleId(key: "client_ids" | "provider_ids" | "ldap_provider_ids", id: string) {
@@ -1583,7 +1755,7 @@ export function ApplicationWorkspace({
               <label className="application-input"><span>{c.jwtClientType}</span><select value={stringValue(jwt.client_type, "public")} onChange={(event) => updateProtocol("jwt", "client_type", event.target.value)}><option value="public">{c.publicClient}</option><option value="confidential">{c.confidentialClient}</option></select></label>
             </div>
             <Input label={c.redirect} hint={locale === "zh-CN" ? "每行一个精确回调地址；生产环境必须使用 HTTPS。" : "One exact redirect URI per line; production deployments must use HTTPS."} value={stringList(jwt.redirect_uris).join("\n")} textarea onChange={(value) => updateProtocol("jwt", "redirect_uris", value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))} />
-            {jwtClient?.client_type === "confidential" && <div className="module-secret-panel"><div><strong>{c.confidentialClient}</strong><small>{jwtClient.active_secret_count} active secret(s)</small></div><div className="module-secret-actions"><button type="button" className="text-button" onClick={() => void rotateJwtSecret()} disabled={secretSaving}>{secretSaving ? c.saving : c.rotateSecret}</button><button type="button" className="text-danger-button" onClick={() => void revokeJwtSecrets()} disabled={secretSaving || jwtClient.active_secret_count === 0}>{c.revokeSecrets}</button></div>{rotatedSecret && <div className="module-secret-value"><code>{rotatedSecret}</code><small>{c.secretOnlyOnce}</small></div>}</div>}
+            {jwtClient?.client_type === "confidential" && <div className="module-secret-panel"><div><strong>{c.confidentialClient}</strong><small>{jwtClient.active_secret_count} active secret(s)</small></div><div className="module-secret-actions"><button type="button" className="text-button" onClick={() => void rotateJwtSecret()} disabled={secretSaving}>{secretSaving ? c.saving : c.rotateSecret}</button><button type="button" className="text-danger-button" onClick={() => onRequestConfirmation ? onRequestConfirmation(() => revokeJwtSecrets(), c.revokeSecrets, c.revokeSecretsHint) : void revokeJwtSecrets()} disabled={secretSaving || jwtClient.active_secret_count === 0}>{c.revokeSecrets}</button></div>{rotatedSecret && <div className="module-secret-value"><code>{rotatedSecret}</code><small>{c.secretOnlyOnce}</small></div>}</div>}
           </ProtocolCard>
         </div>
         <ModuleSave saving={savingKey === "protocols"} feedback={feedback} copy={c} onSave={() => void saveModule("protocols")} />
@@ -1698,7 +1870,7 @@ export function ApplicationWorkspace({
               <div className={`scim-token-row${token.revoked_at ? " revoked" : ""}`} key={token.id}>
                 <div className="scim-token-main"><strong>{token.token_prefix}…</strong><small>{token.scopes.join(" · ")}</small></div>
                 <div className="scim-token-meta"><span>{token.revoked_at ? c.revoked : `${c.tokenExpires}: ${token.expires_at ? formatScimTokenTime(token.expires_at, locale) : c.tokenNeverExpires}`}</span><span>{c.tokenLastUsed}: {token.last_used_at ? formatScimTokenTime(token.last_used_at, locale) : c.tokenNeverUsed}</span><small>{c.tokenCreated}: {formatScimTokenTime(token.created_at, locale)}</small></div>
-                {!token.revoked_at && <button type="button" className="text-danger-button" onClick={() => void revokeScimToken(token.id)} disabled={scimTokenSaving}>{c.revokeToken}</button>}
+                {!token.revoked_at && <button type="button" className="text-danger-button" onClick={() => onRequestConfirmation ? onRequestConfirmation(() => revokeScimToken(token.id), c.revokeToken, c.revokeTokenHint) : void revokeScimToken(token.id)} disabled={scimTokenSaving}>{c.revokeToken}</button>}
               </div>
             ))}
             {scimTokens.length === 0 && <p className="muted">{c.noScimTokens}</p>}
@@ -1961,11 +2133,17 @@ export function ApplicationWorkspace({
       <div className="application-workspace-layout">
         <aside className="application-picker" aria-label={c.selectWebsite}>
           <div className="application-picker-heading"><span>{c.selectWebsite}</span><strong>{applications.length}</strong></div>
+          <label className="application-mobile-picker">
+            <span className="sr-only">{c.selectWebsite}</span>
+            <select value={selected?.id ?? ""} onChange={(event) => selectApplication(event.target.value)}>
+              {applications.map((application) => <option value={application.id} key={application.id}>{application.name} · {application.slug}</option>)}
+            </select>
+          </label>
           <div className="application-picker-list">
             {applications.map((application) => (
-              <button type="button" key={application.id} className={application.id === selected?.id ? "selected" : ""} onClick={() => setSelectedId(application.id)}>
+              <button type="button" key={application.id} className={application.id === selected?.id ? "selected" : ""} onClick={() => selectApplication(application.id)}>
                 <span className="application-avatar">{Array.from(application.name)[0]?.toUpperCase() ?? "W"}</span>
-                <span className="application-picker-copy"><strong>{application.name}</strong><small>{application.slug}</small><em><span className="status-dot" />{application.is_active ? c.active : c.disabled}</em></span>
+                <span className="application-picker-copy"><strong>{application.name}</strong><small>{application.slug}</small><em><span className="status-dot" aria-hidden="true" />{application.is_active ? c.active : c.disabled}</em></span>
                 <ChevronRight size={16} />
               </button>
             ))}
@@ -1978,9 +2156,14 @@ export function ApplicationWorkspace({
               <div className="application-hero-actions">{canManage && <button type="button" className="icon-button" onClick={() => onEditApplication(selected)} title={c.edit} aria-label={c.edit}><Pencil size={16} /></button>}</div>
             </div>
             <nav className="application-detail-tabs" aria-label={c.accessBundle}>
-              {(["overview", ...MODULE_KEYS] as const).map((item) => {
-                const label = item === "overview" ? c.overview : item === "protocols" ? c.protocols : item === "login_adapters" ? c.identity : item === "directory_sync" ? c.directory : c.permissions;
-                return <button type="button" className={section === item ? "active" : ""} key={item} onClick={() => openSection(item)}><ModuleTabIcon item={item} /><span>{label}</span>{item !== "overview" && <span className={`tab-status ${moduleEnabled(selected, item) ? "on" : ""}`} />}</button>;
+              {(["overview", ...MODULE_KEYS, "billing"] as const).map((item) => {
+                const label = item === "overview" ? c.overview : item === "protocols" ? c.protocols : item === "login_adapters" ? c.identity : item === "directory_sync" ? c.directory : item === "authorization" ? c.permissions : c.billing;
+                const enabled = item === "billing"
+                  ? billingSettings?.accept_signet_balance === true
+                  : item === "overview"
+                    ? false
+                    : moduleEnabled(selected, item);
+                return <button type="button" className={section === item ? "active" : ""} key={item} onClick={() => openSection(item)} aria-current={section === item ? "page" : undefined}>{item === "billing" ? <Coins size={16} aria-hidden="true" /> : <ModuleTabIcon item={item} />}<span>{label}</span>{item !== "overview" && <span className={`tab-status ${enabled ? "on" : ""}`} aria-label={enabled ? c.active : c.disabled}>{enabled ? c.active : c.disabled}</span>}</button>;
               })}
             </nav>
             {section === "overview" && (
@@ -1998,6 +2181,7 @@ export function ApplicationWorkspace({
             {section === "login_adapters" && renderIdentityEditor()}
             {section === "directory_sync" && renderDirectoryEditor()}
             {section === "authorization" && renderAuthorizationEditor()}
+            {section === "billing" && renderBillingEditor()}
             {canManage && <div className="application-danger-zone"><button type="button" className="text-danger-button" onClick={() => onDeleteApplication(selected.id)}><Trash2 size={14} />{c.delete}</button></div>}
           </div>
         )}

@@ -166,7 +166,81 @@ export type TenantApplication = {
   updated_at: number;
 };
 
+export type BillingWallet = {
+  id: string;
+  account_kind: "user_global" | "user_application" | "application_settlement" | string;
+  application_id: string | null;
+  currency: string;
+  minor_unit?: number;
+  available_minor: number;
+  reserved_minor: number;
+};
+
+export type BillingTransaction = {
+  id: string;
+  kind: string;
+  status: string;
+  user_id: string | null;
+  application_id: string | null;
+  currency: string;
+  amount_minor: number;
+  minor_unit?: number;
+  source_wallet_id: string | null;
+  destination_wallet_id: string | null;
+  hold_id: string | null;
+  idempotency_key: string;
+  external_provider: string | null;
+  external_order_id: string | null;
+  metadata: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type BillingRecharge = {
+  id: string;
+  user_id: string;
+  provider_slug: string;
+  merchant_order_no: string;
+  provider_trade_id: string | null;
+  amount: { amount_minor: number; currency: string; minor_unit?: number };
+  subject: string;
+  status: string;
+  checkout_kind: string;
+  checkout_value: string;
+  expires_at: number;
+  paid_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type BillingCheckout = {
+  order_id: string;
+  provider_slug: string;
+  status: string;
+  amount: { amount_minor: number; currency: string; minor_unit?: number };
+  checkout_kind: string;
+  checkout_value: string;
+  expires_at: number;
+};
+
+export type BillingProvider = {
+  slug: string;
+  kind: string;
+};
+
+export type ApplicationBillingSettings = {
+  application_id: string;
+  accept_signet_balance: boolean;
+  wallet_mode: "shared" | "isolated";
+  supported_currencies: string[];
+  mode_locked_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
 export type ApplicationModuleKey = "protocols" | "login_adapters" | "directory_sync" | "authorization";
+export type ApplicationSection = "overview" | ApplicationModuleKey | "billing";
 
 export type ApplicationModule = {
   module_key: ApplicationModuleKey;
@@ -783,7 +857,7 @@ export type RuntimeSettings = {
   updated_at: number;
 };
 
-export type Tab = "account" | "overview" | "users" | "applications" | "clients" | "iap" | "organizations" | "invitations" | "registration" | "providers" | "portal" | "security" | "settings";
+export type Tab = "account" | "overview" | "users" | "applications" | "clients" | "iap" | "organizations" | "invitations" | "billing" | "registration" | "providers" | "portal" | "security" | "settings";
 export type UserFilter = "live" | "active" | "disabled" | "archived" | "authorization_code" | "all";
 export type Theme = "light" | "dark";
 

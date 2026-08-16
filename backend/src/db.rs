@@ -2,7 +2,7 @@
 use crate::organizations::ORGANIZATION_KIND_TENANT;
 use crate::{
     access::Permission,
-    config::{BootstrapClient, DatabaseKind, DatabaseSettings, Settings},
+    config::{BootstrapApplication, BootstrapClient, DatabaseKind, DatabaseSettings, Settings},
     error::{AppError, AppResult},
     organizations::{
         ORGANIZATION_KIND_SYSTEM, OrganizationEmailPolicy, SIGNET_ORGANIZATION_ID,
@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::Duration,
 };
+use tracing::warn;
 
 #[cfg(feature = "mysql")]
 use diesel::MysqlConnection;
@@ -2489,6 +2491,214 @@ pub struct ApplicationModuleRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationBillingSettingsRecord {
+    #[diesel(sql_type = Text)]
+    pub application_id: String,
+    #[diesel(sql_type = Integer)]
+    pub accept_signet_balance: i32,
+    #[diesel(sql_type = Text)]
+    pub wallet_mode: String,
+    #[diesel(sql_type = Text)]
+    pub supported_currencies: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub mode_locked_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct WalletAccountRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub account_kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub currency: String,
+    #[diesel(sql_type = BigInt)]
+    pub available_minor: i64,
+    #[diesel(sql_type = BigInt)]
+    pub reserved_minor: i64,
+    #[diesel(sql_type = BigInt)]
+    pub version: i64,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct WalletHoldRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub hold_kind: String,
+    #[diesel(sql_type = Text)]
+    pub wallet_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub currency: String,
+    #[diesel(sql_type = BigInt)]
+    pub amount_minor: i64,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Text)]
+    pub reference: String,
+    #[diesel(sql_type = Text)]
+    pub idempotency_key: String,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct WalletTransactionRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub kind: String,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub currency: String,
+    #[diesel(sql_type = BigInt)]
+    pub amount_minor: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub source_wallet_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub destination_wallet_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub hold_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub idempotency_key: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub external_provider: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub external_order_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub metadata: String,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct PaymentOrderRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub provider_slug: String,
+    #[diesel(sql_type = Text)]
+    pub merchant_order_no: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub idempotency_key: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub provider_trade_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub currency: String,
+    #[diesel(sql_type = BigInt)]
+    pub amount_minor: i64,
+    #[diesel(sql_type = Text)]
+    pub subject: String,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Text)]
+    pub checkout_kind: String,
+    #[diesel(sql_type = Text)]
+    pub checkout_value: String,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub paid_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_error: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct PaymentRefundRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub payment_order_id: String,
+    #[diesel(sql_type = BigInt)]
+    pub amount_minor: i64,
+    #[diesel(sql_type = Text)]
+    pub status: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub provider_refund_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub requested_by: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub reason: String,
+    #[diesel(sql_type = Text)]
+    pub idempotency_key: String,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationBillingSettings {
+    pub application_id: String,
+    pub accept_signet_balance: bool,
+    pub wallet_mode: String,
+    pub supported_currencies: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPaymentOrder {
+    pub user_id: String,
+    pub provider_slug: String,
+    pub merchant_order_no: String,
+    pub idempotency_key: Option<String>,
+    pub currency: String,
+    pub amount_minor: i64,
+    pub subject: String,
+    pub checkout_kind: String,
+    pub checkout_value: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWalletOperation {
+    pub kind: String,
+    pub user_id: Option<String>,
+    pub application_id: Option<String>,
+    pub currency: String,
+    pub amount_minor: i64,
+    pub source_wallet_id: Option<String>,
+    pub destination_wallet_id: Option<String>,
+    pub hold_id: Option<String>,
+    pub idempotency_key: String,
+    pub external_provider: Option<String>,
+    pub external_order_id: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
 /// An application authorization profile is the policy boundary for one
 /// protocol connection.  OIDC clients attached to the same website may
 /// therefore expose different permission vocabularies without sharing role
@@ -2542,6 +2752,63 @@ pub struct NewApplicationAuthorizationProfile {
     pub sync_status: String,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationDiscoveryRecord {
+    #[diesel(sql_type = Text)]
+    pub application_id: String,
+    #[diesel(sql_type = Text)]
+    pub management_mode: String,
+    #[diesel(sql_type = Text)]
+    pub website_url: String,
+    #[diesel(sql_type = Text)]
+    pub fetch_secret_ciphertext: String,
+    #[diesel(sql_type = Text)]
+    pub signing_public_jwks: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_verified_revision: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_verified_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_verified_digest: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_verified_expires_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    pub sync_status: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_fetched_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub last_success_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_error: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub snapshot_json: Option<String>,
+    #[diesel(sql_type = Integer)]
+    pub operator_disabled: i32,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationDiscovery {
+    pub application_id: String,
+    pub management_mode: String,
+    pub website_url: String,
+    pub fetch_secret_ciphertext: String,
+    pub signing_public_jwks: String,
+    pub last_verified_revision: Option<i64>,
+    pub last_verified_version: Option<String>,
+    pub last_verified_digest: Option<String>,
+    pub last_verified_expires_at: Option<i64>,
+    pub sync_status: String,
+    pub last_fetched_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub snapshot_json: Option<String>,
+    pub operator_disabled: bool,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -3624,8 +3891,49 @@ fn select_application_module_sql() -> &'static str {
     "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules"
 }
 
+fn select_application_billing_settings_sql() -> &'static str {
+    "SELECT application_id, accept_signet_balance, wallet_mode, COALESCE(supported_currencies, '[]') AS supported_currencies, mode_locked_at, created_at, updated_at FROM application_billing_settings"
+}
+
+fn select_wallet_account_sql() -> &'static str {
+    "SELECT id, account_kind, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at FROM wallet_accounts"
+}
+
+fn select_wallet_hold_sql() -> &'static str {
+    "SELECT id, hold_kind, wallet_id, user_id, application_id, currency, amount_minor, status, reference, idempotency_key, expires_at, created_at, updated_at FROM wallet_holds"
+}
+
+fn select_wallet_transaction_sql() -> &'static str {
+    "SELECT id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at FROM wallet_transactions"
+}
+
+fn select_payment_order_sql() -> &'static str {
+    "SELECT id, user_id, provider_slug, merchant_order_no, idempotency_key, provider_trade_id, currency, amount_minor, subject, status, checkout_kind, checkout_value, expires_at, paid_at, last_error, created_at, updated_at FROM payment_orders"
+}
+
+fn select_payment_refund_sql() -> &'static str {
+    "SELECT id, payment_order_id, amount_minor, status, provider_refund_id, requested_by, reason, COALESCE(idempotency_key, '') AS idempotency_key, created_at, updated_at FROM payment_refunds"
+}
+
+fn wallet_account_scope_key(
+    account_kind: &str,
+    user_id: Option<&str>,
+    application_id: Option<&str>,
+    currency: &str,
+) -> String {
+    format!(
+        "{account_kind}:{}:{}:{currency}",
+        user_id.unwrap_or("-"),
+        application_id.unwrap_or("-")
+    )
+}
+
 fn select_application_authorization_profile_sql() -> &'static str {
     "SELECT id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at FROM application_authorization_profiles"
+}
+
+fn select_application_discovery_sql() -> &'static str {
+    "SELECT application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at FROM application_discovery"
 }
 
 fn select_application_permission_definition_sql() -> &'static str {
@@ -3795,6 +4103,38 @@ impl Db {
         }
     }
 
+    /// Connect and verify the selected database while the shared database
+    /// service may still be starting. The conductor intentionally leaves
+    /// Compose services unordered, so a transient database error must not
+    /// permanently terminate Signet during a normal bootstrap race.
+    pub async fn connect_with_retry(settings: &Settings) -> AppResult<Self> {
+        let mut retry_delay = Duration::from_secs(1);
+        loop {
+            match Self::connect(settings) {
+                Ok(db) => match db.ping().await {
+                    Ok(()) => return Ok(db),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            retry_in_seconds = retry_delay.as_secs(),
+                            "Signet database is unavailable; retrying"
+                        );
+                    }
+                },
+                Err(error @ AppError::Configuration(_)) => return Err(error),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        retry_in_seconds = retry_delay.as_secs(),
+                        "Signet database pool could not be created; retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = std::cmp::min(retry_delay + retry_delay, Duration::from_secs(30));
+        }
+    }
+
     pub async fn ping(&self) -> AppResult<()> {
         with_conn!(self, |conn, _kind| {
             conn.batch_execute("SELECT 1")
@@ -3899,6 +4239,55 @@ impl Db {
             self.ensure_application_for_client(&client).await?;
         }
         self.normalize_application_login_boundary().await?;
+        // Every application gets an explicit discovery ownership record. The
+        // migration default is Signet-managed, so existing installations keep
+        // their current behavior until an operator opts a website into the
+        // website-managed mode through bootstrap or the admin API.
+        for application in self.list_applications(None).await? {
+            if self
+                .find_application_discovery(&application.id)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let website_url = self
+                .list_application_modules(&application.id)
+                .await?
+                .into_iter()
+                .find(|module| module.module_key == "protocols")
+                .and_then(|module| {
+                    serde_json::from_str::<serde_json::Value>(&module.config_json)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("website_url")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(ToOwned::to_owned)
+                        })
+                })
+                .unwrap_or_default();
+            self.upsert_application_discovery(NewApplicationDiscovery {
+                application_id: application.id,
+                management_mode: crate::application_discovery::MANAGEMENT_MODE_SIGNET.to_string(),
+                website_url,
+                fetch_secret_ciphertext: String::new(),
+                signing_public_jwks: String::new(),
+                last_verified_revision: None,
+                last_verified_version: None,
+                last_verified_digest: None,
+                last_verified_expires_at: None,
+                sync_status: crate::application_discovery::SYNC_DISABLED.to_string(),
+                last_fetched_at: None,
+                last_success_at: None,
+                last_error: None,
+                snapshot_json: None,
+                operator_disabled: false,
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -3940,6 +4329,28 @@ impl Db {
                 system_organization.id
             }
         };
+        // A deployment bootstrap may create the website application before it
+        // creates the first client. Reuse that stable application slug instead
+        // of manufacturing a legacy `axon-2` aggregate, otherwise the signed
+        // website manifest would be unable to attach its client without
+        // taking ownership away from another application.
+        if let Some(existing_application) = self
+            .find_application_by_slug_in_organization(&organization_id, &client.client_id)
+            .await?
+        {
+            let is_website_managed = self
+                .find_application_discovery(&existing_application.id)
+                .await?
+                .is_some_and(|discovery| {
+                    discovery.management_mode
+                        == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+                });
+            if is_website_managed {
+                return self
+                    .link_oidc_client_to_application(&existing_application.id, &client.id)
+                    .await;
+            }
+        }
         let slug = self
             .next_legacy_application_slug(&organization_id, &client.client_id)
             .await?;
@@ -4177,6 +4588,157 @@ impl Db {
         }
     }
 
+    async fn ensure_bootstrap_application(
+        &self,
+        application: &BootstrapApplication,
+        system_organization_id: &str,
+        settings: &Settings,
+    ) -> AppResult<ApplicationRecord> {
+        let existing = self
+            .find_application_by_slug_in_organization(
+                system_organization_id,
+                application.application_id.trim(),
+            )
+            .await?;
+        let application_record = if let Some(existing) = existing {
+            self.update_application(
+                &existing.id,
+                NewApplication {
+                    organization_id: existing.organization_id.clone(),
+                    slug: existing.slug.clone(),
+                    name: application.name.trim().to_string(),
+                    description: existing.description.clone(),
+                    access_mode: crate::applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+                    registration_mode: crate::applications::REGISTRATION_DISABLED.to_string(),
+                    account_selection_mode: existing.account_selection_mode.clone(),
+                    unique_identity_factors: existing.unique_identity_factors()?,
+                    is_active: application.is_active,
+                },
+            )
+            .await?
+        } else {
+            self.insert_application(NewApplication {
+                organization_id: system_organization_id.to_string(),
+                slug: application.application_id.trim().to_string(),
+                name: application.name.trim().to_string(),
+                description: Some(
+                    "Application registered by Signet deployment bootstrap.".to_string(),
+                ),
+                access_mode: crate::applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+                registration_mode: crate::applications::REGISTRATION_DISABLED.to_string(),
+                account_selection_mode: crate::applications::ACCOUNT_SELECTION_OPTIONAL.to_string(),
+                unique_identity_factors: Vec::new(),
+                is_active: application.is_active,
+            })
+            .await?
+        };
+        let existing_discovery = self
+            .find_application_discovery(&application_record.id)
+            .await?;
+        if let Some(existing_discovery) = existing_discovery.as_ref()
+            && existing_discovery.management_mode != application.management_mode
+            && existing_discovery.last_verified_revision.is_some()
+        {
+            return Err(AppError::Configuration(format!(
+                "bootstrap application {} changes management_mode after a verified Discovery snapshot; switch it through the admin API",
+                application.application_id
+            )));
+        }
+        let fetch_secret_ciphertext = if application.fetch_secret.trim().is_empty() {
+            existing_discovery
+                .as_ref()
+                .map(|value| value.fetch_secret_ciphertext.clone())
+                .unwrap_or_default()
+        } else {
+            if settings.discovery.encryption_key.trim().is_empty() {
+                return Err(AppError::Configuration(
+                    "discovery encryption key is required to enroll a fetch secret".to_string(),
+                ));
+            }
+            util::encrypt_discovery_secret(
+                &settings.discovery.encryption_key,
+                application.fetch_secret.trim(),
+            )?
+        };
+        let signing_public_jwks = if application.signing_public_jwks.trim().is_empty() {
+            existing_discovery
+                .as_ref()
+                .map(|value| value.signing_public_jwks.clone())
+                .unwrap_or_default()
+        } else {
+            application.signing_public_jwks.trim().to_string()
+        };
+        let website_url = application
+            .website_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let reset_snapshot = existing_discovery.as_ref().is_some_and(|value| {
+            value.management_mode != application.management_mode
+                || value.website_url != website_url
+                || value.fetch_secret_ciphertext != fetch_secret_ciphertext
+                || value.signing_public_jwks != signing_public_jwks
+        });
+        let sync_status = if application.management_mode
+            == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+        {
+            if fetch_secret_ciphertext.is_empty() || signing_public_jwks.is_empty() {
+                crate::application_discovery::SYNC_UNCONFIGURED.to_string()
+            } else if reset_snapshot {
+                crate::application_discovery::SYNC_PENDING.to_string()
+            } else {
+                existing_discovery
+                    .as_ref()
+                    .map(|value| value.sync_status.clone())
+                    .unwrap_or_else(|| crate::application_discovery::SYNC_PENDING.to_string())
+            }
+        } else {
+            crate::application_discovery::SYNC_DISABLED.to_string()
+        };
+        self.upsert_application_discovery(NewApplicationDiscovery {
+            application_id: application_record.id.clone(),
+            management_mode: application.management_mode.clone(),
+            website_url,
+            fetch_secret_ciphertext,
+            signing_public_jwks,
+            last_verified_revision: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_verified_revision),
+            last_verified_version: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_verified_version.clone()),
+            last_verified_digest: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_verified_digest.clone()),
+            last_verified_expires_at: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_verified_expires_at),
+            sync_status,
+            last_fetched_at: existing_discovery
+                .as_ref()
+                .and_then(|value| value.last_fetched_at),
+            last_success_at: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_success_at),
+            last_error: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.last_error.clone()),
+            snapshot_json: existing_discovery
+                .as_ref()
+                .filter(|_| !reset_snapshot)
+                .and_then(|value| value.snapshot_json.clone()),
+            operator_disabled: existing_discovery.is_some_and(|value| value.operator_disabled == 1),
+        })
+        .await?;
+        Ok(application_record)
+    }
+
     pub async fn seed(&self, settings: &Settings) -> AppResult<()> {
         let admin = &settings.bootstrap.admin;
         if admin.create_on_startup && self.find_user_by_email(&admin.email).await?.is_none() {
@@ -4291,6 +4853,11 @@ impl Db {
                 })
                 .await?;
             }
+        }
+
+        for application in &settings.bootstrap.applications {
+            self.ensure_bootstrap_application(application, &system_organization.id, settings)
+                .await?;
         }
 
         for client in &settings.bootstrap.clients {
@@ -12135,6 +12702,1772 @@ impl Db {
         })
     }
 
+    pub async fn find_application_billing_settings(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Option<ApplicationBillingSettingsRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE application_id = {}",
+                select_application_billing_settings_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .get_result::<ApplicationBillingSettingsRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn ensure_application_billing_settings(
+        &self,
+        application_id: &str,
+    ) -> AppResult<ApplicationBillingSettingsRecord> {
+        if let Some(settings) = self
+            .find_application_billing_settings(application_id)
+            .await?
+        {
+            return Ok(settings);
+        }
+        self.upsert_application_billing_settings(NewApplicationBillingSettings {
+            application_id: application_id.to_string(),
+            accept_signet_balance: false,
+            wallet_mode: "shared".to_string(),
+            supported_currencies: Vec::new(),
+        })
+        .await
+    }
+
+    pub async fn upsert_application_billing_settings(
+        &self,
+        settings: NewApplicationBillingSettings,
+    ) -> AppResult<ApplicationBillingSettingsRecord> {
+        let currencies = util::to_json(&settings.supported_currencies)?;
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<ApplicationBillingSettingsRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE application_id = {}",
+                    select_application_billing_settings_sql(),
+                    ph(kind, 1)
+                );
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&settings.application_id)
+                    .get_result::<ApplicationBillingSettingsRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?;
+                let activity_count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM wallet_transactions WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                let activity_count = sql_query(activity_count_sql)
+                    .bind::<Text, _>(&settings.application_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count;
+                let mode_locked_at = existing
+                    .as_ref()
+                    .and_then(|value| value.mode_locked_at)
+                    .or_else(|| (activity_count > 0).then_some(now));
+                if existing
+                    .as_ref()
+                    .is_some_and(|value| value.wallet_mode != settings.wallet_mode)
+                    && mode_locked_at.is_some()
+                {
+                    return Err(AppError::BadRequest(
+                        "application wallet mode is locked after the first billing transaction"
+                            .to_string(),
+                    ));
+                }
+                if existing.is_some() {
+                    let update_sql = format!(
+                        "UPDATE application_billing_settings SET accept_signet_balance = {}, wallet_mode = {}, supported_currencies = {}, mode_locked_at = {}, updated_at = {} WHERE application_id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6)
+                    );
+                    sql_query(update_sql)
+                        .bind::<Integer, _>(i32::from(settings.accept_signet_balance))
+                        .bind::<Text, _>(&settings.wallet_mode)
+                        .bind::<Text, _>(&currencies)
+                        .bind::<Nullable<BigInt>, _>(mode_locked_at)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&settings.application_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                } else {
+                    let insert_sql = format!(
+                        "INSERT INTO application_billing_settings (application_id, accept_signet_balance, wallet_mode, supported_currencies, mode_locked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6),
+                        ph(kind, 7)
+                    );
+                    sql_query(insert_sql)
+                        .bind::<Text, _>(&settings.application_id)
+                        .bind::<Integer, _>(i32::from(settings.accept_signet_balance))
+                        .bind::<Text, _>(&settings.wallet_mode)
+                        .bind::<Text, _>(&currencies)
+                        .bind::<Nullable<BigInt>, _>(mode_locked_at)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let select_sql = format!(
+                    "{} WHERE application_id = {}",
+                    select_application_billing_settings_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(&settings.application_id)
+                    .get_result::<ApplicationBillingSettingsRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    async fn ensure_wallet_account(
+        &self,
+        account_kind: &str,
+        user_id: Option<&str>,
+        application_id: Option<&str>,
+        currency: &str,
+    ) -> AppResult<WalletAccountRecord> {
+        let account_kind = account_kind.to_string();
+        let user_id = user_id.map(ToOwned::to_owned);
+        let application_id = application_id.map(ToOwned::to_owned);
+        let currency = currency.to_string();
+        let scope_key = wallet_account_scope_key(
+            &account_kind,
+            user_id.as_deref(),
+            application_id.as_deref(),
+            &currency,
+        );
+        with_conn!(self, |conn, kind| {
+            let existing_sql = format!(
+                "{} WHERE scope_key = {}",
+                select_wallet_account_sql(),
+                ph(kind, 1)
+            );
+            if let Some(existing) = sql_query(existing_sql)
+                .bind::<Text, _>(&scope_key)
+                .get_result::<WalletAccountRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)?
+            {
+                return Ok(existing);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = util::now_ts();
+            let insert_sql = format!(
+                "INSERT INTO wallet_accounts (id, account_kind, scope_key, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7),
+                ph(kind, 8)
+            );
+            if let Err(error) = sql_query(insert_sql)
+                .bind::<Text, _>(&id)
+                .bind::<Text, _>(&account_kind)
+                .bind::<Text, _>(&scope_key)
+                .bind::<Nullable<Text>, _>(&user_id)
+                .bind::<Nullable<Text>, _>(&application_id)
+                .bind::<Text, _>(&currency)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+            {
+                // A concurrent account creation may have won the unique
+                // scope_key race. Re-read it before surfacing the database
+                // error so callers remain idempotent.
+                let retry_sql = format!(
+                    "{} WHERE scope_key = {}",
+                    select_wallet_account_sql(),
+                    ph(kind, 1)
+                );
+                if let Some(existing) = sql_query(retry_sql)
+                    .bind::<Text, _>(&scope_key)
+                    .get_result::<WalletAccountRecord>(&mut conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    return Ok(existing);
+                }
+                return Err(AppError::from(error));
+            }
+            let select_sql = format!("{} WHERE id = {}", select_wallet_account_sql(), ph(kind, 1));
+            sql_query(select_sql)
+                .bind::<Text, _>(id)
+                .get_result::<WalletAccountRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn ensure_user_wallet_account(
+        &self,
+        user_id: &str,
+        currency: &str,
+    ) -> AppResult<WalletAccountRecord> {
+        self.ensure_wallet_account("user_global", Some(user_id), None, currency)
+            .await
+    }
+
+    pub async fn ensure_application_wallet_account(
+        &self,
+        user_id: &str,
+        application_id: &str,
+        currency: &str,
+    ) -> AppResult<WalletAccountRecord> {
+        self.ensure_wallet_account(
+            "user_application",
+            Some(user_id),
+            Some(application_id),
+            currency,
+        )
+        .await
+    }
+
+    pub async fn ensure_settlement_wallet_account(
+        &self,
+        application_id: &str,
+        currency: &str,
+    ) -> AppResult<WalletAccountRecord> {
+        self.ensure_wallet_account(
+            "application_settlement",
+            None,
+            Some(application_id),
+            currency,
+        )
+        .await
+    }
+
+    pub async fn find_wallet_account_by_id(
+        &self,
+        wallet_id: &str,
+    ) -> AppResult<Option<WalletAccountRecord>> {
+        let wallet_id = wallet_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!("{} WHERE id = {}", select_wallet_account_sql(), ph(kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>(wallet_id)
+                .get_result::<WalletAccountRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_user_wallet_accounts(
+        &self,
+        user_id: &str,
+        currency: Option<&str>,
+    ) -> AppResult<Vec<WalletAccountRecord>> {
+        let user_id = user_id.to_string();
+        let currency = currency.map(ToOwned::to_owned);
+        with_conn!(self, |conn, kind| {
+            let mut sql = format!(
+                "{} WHERE user_id = {}",
+                select_wallet_account_sql(),
+                ph(kind, 1)
+            );
+            if currency.is_some() {
+                sql.push_str(&format!(" AND currency = {}", ph(kind, 2)));
+            }
+            sql.push_str(" ORDER BY currency ASC, account_kind ASC, created_at ASC");
+            if let Some(currency) = currency {
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<Text, _>(currency)
+                    .load::<WalletAccountRecord>(&mut conn)
+                    .map_err(AppError::from)
+            } else {
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .load::<WalletAccountRecord>(&mut conn)
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
+    pub async fn list_wallet_transactions_for_user(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> AppResult<Vec<WalletTransactionRecord>> {
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE user_id = {} ORDER BY created_at DESC LIMIT {}",
+                select_wallet_transaction_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<BigInt, _>(limit.clamp(1, 500))
+                .load::<WalletTransactionRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn insert_payment_order(
+        &self,
+        order: NewPaymentOrder,
+    ) -> AppResult<PaymentOrderRecord> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "INSERT INTO payment_orders (id, user_id, provider_slug, merchant_order_no, idempotency_key, provider_trade_id, currency, amount_minor, subject, status, checkout_kind, checkout_value, expires_at, paid_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7),
+                ph(kind, 8),
+                ph(kind, 9),
+                ph(kind, 10),
+                ph(kind, 11),
+                ph(kind, 12),
+                ph(kind, 13),
+                ph(kind, 14),
+                ph(kind, 15),
+                ph(kind, 16),
+                ph(kind, 17)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&id)
+                .bind::<Text, _>(order.user_id)
+                .bind::<Text, _>(order.provider_slug)
+                .bind::<Text, _>(order.merchant_order_no)
+                .bind::<Nullable<Text>, _>(order.idempotency_key)
+                .bind::<Nullable<Text>, _>(None::<String>)
+                .bind::<Text, _>(order.currency)
+                .bind::<BigInt, _>(order.amount_minor)
+                .bind::<Text, _>(order.subject)
+                .bind::<Text, _>("pending")
+                .bind::<Text, _>(order.checkout_kind)
+                .bind::<Text, _>(order.checkout_value)
+                .bind::<BigInt, _>(order.expires_at)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<Nullable<Text>, _>(None::<String>)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            let select_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
+            sql_query(select_sql)
+                .bind::<Text, _>(id)
+                .get_result::<PaymentOrderRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_payment_order(&self, id: &str) -> AppResult<Option<PaymentOrderRecord>> {
+        let id = id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>(id)
+                .get_result::<PaymentOrderRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_payment_order_by_merchant_order_no(
+        &self,
+        provider_slug: &str,
+        merchant_order_no: &str,
+    ) -> AppResult<Option<PaymentOrderRecord>> {
+        let provider_slug = provider_slug.to_string();
+        let merchant_order_no = merchant_order_no.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE provider_slug = {} AND merchant_order_no = {}",
+                select_payment_order_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(provider_slug)
+                .bind::<Text, _>(merchant_order_no)
+                .get_result::<PaymentOrderRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_payment_order_by_idempotency_key(
+        &self,
+        user_id: &str,
+        provider_slug: &str,
+        idempotency_key: &str,
+    ) -> AppResult<Option<PaymentOrderRecord>> {
+        let user_id = user_id.to_string();
+        let provider_slug = provider_slug.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE user_id = {} AND provider_slug = {} AND idempotency_key = {}",
+                select_payment_order_sql(),
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<Text, _>(provider_slug)
+                .bind::<Text, _>(idempotency_key)
+                .get_result::<PaymentOrderRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_payment_refunds(
+        &self,
+        payment_order_id: &str,
+    ) -> AppResult<Vec<PaymentRefundRecord>> {
+        let payment_order_id = payment_order_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE payment_order_id = {} ORDER BY created_at DESC",
+                select_payment_refund_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(payment_order_id)
+                .load::<PaymentRefundRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_payment_refund_by_idempotency_key(
+        &self,
+        payment_order_id: &str,
+        idempotency_key: &str,
+    ) -> AppResult<Option<PaymentRefundRecord>> {
+        let payment_order_id = payment_order_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE payment_order_id = {} AND idempotency_key = {}",
+                select_payment_refund_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(payment_order_id)
+                .bind::<Text, _>(idempotency_key)
+                .get_result::<PaymentRefundRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_payment_orders(
+        &self,
+        user_id: Option<&str>,
+        limit: i64,
+    ) -> AppResult<Vec<PaymentOrderRecord>> {
+        let user_id = user_id.map(ToOwned::to_owned);
+        with_conn!(self, |conn, kind| {
+            let mut sql = select_payment_order_sql().to_string();
+            if user_id.is_some() {
+                sql.push_str(&format!(" WHERE user_id = {}", ph(kind, 1)));
+            }
+            sql.push_str(&format!(
+                " ORDER BY created_at DESC LIMIT {}",
+                ph(kind, if user_id.is_some() { 2 } else { 1 })
+            ));
+            if let Some(user_id) = user_id {
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<BigInt, _>(limit.clamp(1, 500))
+                    .load::<PaymentOrderRecord>(&mut conn)
+                    .map_err(AppError::from)
+            } else {
+                sql_query(sql)
+                    .bind::<BigInt, _>(limit.clamp(1, 500))
+                    .load::<PaymentOrderRecord>(&mut conn)
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
+    pub async fn find_wallet_transaction_by_id(
+        &self,
+        transaction_id: &str,
+    ) -> AppResult<Option<WalletTransactionRecord>> {
+        let transaction_id = transaction_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE id = {}",
+                select_wallet_transaction_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(transaction_id)
+                .get_result::<WalletTransactionRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_wallet_transaction_by_operation(
+        &self,
+        kind_name: &str,
+        idempotency_key: &str,
+    ) -> AppResult<Option<WalletTransactionRecord>> {
+        let kind_name = kind_name.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE kind = {} AND idempotency_key = {}",
+                select_wallet_transaction_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(kind_name)
+                .bind::<Text, _>(idempotency_key)
+                .get_result::<WalletTransactionRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn update_payment_order_error(&self, id: &str, error: &str) -> AppResult<()> {
+        let id = id.to_string();
+        let error = error.chars().take(512).collect::<String>();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE payment_orders SET last_error = {}, updated_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Nullable<Text>, _>(Some(error))
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn mark_payment_order_paid(
+        &self,
+        order_id: &str,
+        provider_trade_id: &str,
+        paid_at: i64,
+    ) -> AppResult<PaymentOrderRecord> {
+        let order_id = order_id.to_string();
+        let provider_trade_id = provider_trade_id.to_string();
+        if provider_trade_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "payment provider transaction id is required".to_string(),
+            ));
+        }
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<PaymentOrderRecord, AppError, _>(|conn| {
+                let order_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
+                let order = sql_query(order_sql)
+                    .bind::<Text, _>(&order_id)
+                    .get_result::<PaymentOrderRecord>(conn)
+                    .map_err(AppError::from)?;
+                if order.status == "paid" {
+                    if order.provider_trade_id.as_deref() != Some(provider_trade_id.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "payment order was already paid with a different provider transaction"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(order);
+                }
+                if order.status != "pending" {
+                    return Err(AppError::BadRequest(
+                        "payment order is not awaiting payment".to_string(),
+                    ));
+                }
+                let scope_key = wallet_account_scope_key(
+                    "user_global",
+                    Some(&order.user_id),
+                    None,
+                    &order.currency,
+                );
+                let wallet_sql = format!(
+                    "{} WHERE scope_key = {}",
+                    select_wallet_account_sql(),
+                    ph(kind, 1)
+                );
+                let wallet = if let Some(wallet) = sql_query(wallet_sql)
+                    .bind::<Text, _>(&scope_key)
+                    .get_result::<WalletAccountRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    wallet
+                } else {
+                    let wallet_id = uuid::Uuid::new_v4().to_string();
+                    let insert_wallet_sql = format!(
+                        "INSERT INTO wallet_accounts (id, account_kind, scope_key, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6),
+                        ph(kind, 7),
+                        ph(kind, 8)
+                    );
+                    sql_query(insert_wallet_sql)
+                        .bind::<Text, _>(&wallet_id)
+                        .bind::<Text, _>("user_global")
+                        .bind::<Text, _>(&scope_key)
+                        .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
+                        .bind::<Nullable<Text>, _>(None::<String>)
+                        .bind::<Text, _>(&order.currency)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    let select_wallet_sql = format!(
+                        "{} WHERE id = {}",
+                        select_wallet_account_sql(),
+                        ph(kind, 1)
+                    );
+                    sql_query(select_wallet_sql)
+                        .bind::<Text, _>(wallet_id)
+                        .get_result::<WalletAccountRecord>(conn)
+                        .map_err(AppError::from)?
+                };
+                let update_wallet_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                sql_query(update_wallet_sql)
+                    .bind::<BigInt, _>(order.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&wallet.id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let insert_transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16)
+                );
+                sql_query(insert_transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("recharge")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&order.currency)
+                    .bind::<BigInt, _>(order.amount_minor)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(wallet.id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&order.id)
+                    .bind::<Nullable<Text>, _>(Some(order.provider_slug.clone()))
+                    .bind::<Nullable<Text>, _>(Some(order.merchant_order_no.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&wallet.id)
+                    .bind::<BigInt, _>(order.amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let update_order_sql = format!(
+                    "UPDATE payment_orders SET status = {}, provider_trade_id = {}, paid_at = {}, updated_at = {}, last_error = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(update_order_sql)
+                    .bind::<Text, _>("paid")
+                    .bind::<Nullable<Text>, _>(Some(provider_trade_id.to_string()))
+                    .bind::<Nullable<BigInt>, _>(Some(paid_at))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&order_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(&order_id)
+                    .get_result::<PaymentOrderRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn refund_payment_order(
+        &self,
+        order_id: &str,
+        amount_minor: i64,
+        provider_refund_id: &str,
+        requested_by: Option<&str>,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> AppResult<PaymentRefundRecord> {
+        #[derive(diesel::QueryableByName)]
+        struct TotalRow {
+            #[diesel(sql_type = BigInt)]
+            total: i64,
+        }
+
+        let order_id = order_id.to_string();
+        let provider_refund_id = provider_refund_id.to_string();
+        let requested_by = requested_by.map(ToOwned::to_owned);
+        let reason = reason.chars().take(512).collect::<String>();
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<PaymentRefundRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE payment_order_id = {} AND idempotency_key = {}",
+                    select_payment_refund_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                if let Some(existing) = sql_query(existing_sql)
+                    .bind::<Text, _>(&order_id)
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<PaymentRefundRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    return Ok(existing);
+                }
+                if amount_minor <= 0 || provider_refund_id.trim().is_empty() {
+                    return Err(AppError::BadRequest(
+                        "billing refund is invalid".to_string(),
+                    ));
+                }
+                let order_sql = format!(
+                    "{} WHERE id = {}",
+                    select_payment_order_sql(),
+                    ph(kind, 1)
+                );
+                let order = sql_query(order_sql)
+                    .bind::<Text, _>(&order_id)
+                    .get_result::<PaymentOrderRecord>(conn)
+                    .map_err(AppError::from)?;
+                if order.status != "paid" {
+                    return Err(AppError::BadRequest(
+                        "payment order is not paid".to_string(),
+                    ));
+                }
+                let total_sql = format!(
+                    "SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payment_refunds WHERE payment_order_id = {} AND status = 'succeeded'",
+                    ph(kind, 1)
+                );
+                let refunded = sql_query(total_sql)
+                    .bind::<Text, _>(&order_id)
+                    .get_result::<TotalRow>(conn)
+                    .map_err(AppError::from)?
+                    .total;
+                if amount_minor > order.amount_minor.saturating_sub(refunded) {
+                    return Err(AppError::BadRequest(
+                        "billing refund exceeds the refundable payment amount".to_string(),
+                    ));
+                }
+
+                let scope_key = wallet_account_scope_key(
+                    "user_global",
+                    Some(&order.user_id),
+                    None,
+                    &order.currency,
+                );
+                let wallet_sql = format!(
+                    "{} WHERE scope_key = {}",
+                    select_wallet_account_sql(),
+                    ph(kind, 1)
+                );
+                let wallet = sql_query(wallet_sql)
+                    .bind::<Text, _>(&scope_key)
+                    .get_result::<WalletAccountRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "the user wallet has no refundable balance".to_string(),
+                        )
+                    })?;
+                let debit_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                if sql_query(debit_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&wallet.id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest(
+                        "billing refund would make the wallet balance negative".to_string(),
+                    ));
+                }
+
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("recharge_refund")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&order.currency)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(wallet.id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(Some(order.provider_slug.clone()))
+                    .bind::<Nullable<Text>, _>(Some(order_id.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&wallet.id)
+                    .bind::<BigInt, _>(-amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let refund_id = uuid::Uuid::new_v4().to_string();
+                let refund_sql = format!(
+                    "INSERT INTO payment_refunds (id, payment_order_id, amount_minor, status, provider_refund_id, requested_by, reason, idempotency_key, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5),
+                    ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10)
+                );
+                sql_query(refund_sql)
+                    .bind::<Text, _>(&refund_id)
+                    .bind::<Text, _>(&order_id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Text, _>("succeeded")
+                    .bind::<Nullable<Text>, _>(Some(provider_refund_id.clone()))
+                    .bind::<Nullable<Text>, _>(requested_by.clone())
+                    .bind::<Text, _>(&reason)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "{} WHERE id = {}",
+                    select_payment_refund_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(refund_id)
+                    .get_result::<PaymentRefundRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn reserve_wallet_hold(
+        &self,
+        wallet_id: &str,
+        user_id: &str,
+        application_id: &str,
+        currency: &str,
+        amount_minor: i64,
+        reference: &str,
+        idempotency_key: &str,
+        expires_at: i64,
+    ) -> AppResult<WalletHoldRecord> {
+        let wallet_id = wallet_id.to_string();
+        let user_id = user_id.to_string();
+        let application_id = application_id.to_string();
+        let currency = currency.to_string();
+        let reference = reference.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE hold_kind = {} AND idempotency_key = {}",
+                    select_wallet_hold_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                if let Some(existing) = sql_query(existing_sql)
+                    .bind::<Text, _>("spend")
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    return Ok(existing);
+                }
+                if amount_minor <= 0 {
+                    return Err(AppError::BadRequest(
+                        "billing amount must be positive".to_string(),
+                    ));
+                }
+                let update_wallet_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, reserved_minor = reserved_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {} AND available_minor >= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                let affected = sql_query(update_wallet_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&wallet_id)
+                    .bind::<Text, _>(&currency)
+                    .bind::<BigInt, _>(amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(AppError::BadRequest(
+                        "billing balance is insufficient or wallet is unavailable".to_string(),
+                    ));
+                }
+                let hold_id = uuid::Uuid::new_v4().to_string();
+                let insert_hold_sql = format!(
+                    "INSERT INTO wallet_holds (id, hold_kind, wallet_id, user_id, application_id, currency, amount_minor, status, reference, idempotency_key, expires_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13)
+                );
+                sql_query(insert_hold_sql)
+                    .bind::<Text, _>(&hold_id)
+                    .bind::<Text, _>("spend")
+                    .bind::<Text, _>(&wallet_id)
+                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(application_id.clone()))
+                    .bind::<Text, _>(&currency)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Text, _>("pending")
+                    .bind::<Text, _>(&reference)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<BigInt, _>(expires_at)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let insert_transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(insert_transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("reserve")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(application_id.clone()))
+                    .bind::<Text, _>(&currency)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(reference.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&wallet_id)
+                    .bind::<BigInt, _>(-amount_minor)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(hold_id)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn find_wallet_hold(&self, hold_id: &str) -> AppResult<Option<WalletHoldRecord>> {
+        let hold_id = hold_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>(hold_id)
+                .get_result::<WalletHoldRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn commit_wallet_hold(
+        &self,
+        hold_id: &str,
+        settlement_wallet_id: &str,
+        idempotency_key: &str,
+    ) -> AppResult<WalletHoldRecord> {
+        let hold_id = hold_id.to_string();
+        let settlement_wallet_id = settlement_wallet_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
+                let hold_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+                let hold = sql_query(hold_sql)
+                    .bind::<Text, _>(&hold_id)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .map_err(AppError::from)?;
+                let existing_operation_sql = format!(
+                    "{} WHERE kind = 'commit' AND idempotency_key = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1)
+                );
+                if let Some(existing) = sql_query(existing_operation_sql)
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    if existing.hold_id.as_deref() != Some(hold_id.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "billing idempotency_key is already used for another commit"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(hold);
+                }
+                if hold.status == "committed" {
+                    return Ok(hold);
+                }
+                if hold.status != "pending" {
+                    return Err(AppError::BadRequest("billing hold is not pending".to_string()));
+                }
+                if hold.expires_at <= now {
+                    return Err(AppError::BadRequest("billing hold has expired".to_string()));
+                }
+                let source_sql = format!(
+                    "UPDATE wallet_accounts SET reserved_minor = reserved_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND reserved_minor >= {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+                );
+                if sql_query(source_sql)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&hold.wallet_id)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest("billing hold source is unavailable".to_string()));
+                }
+                let destination_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+                );
+                if sql_query(destination_sql)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&settlement_wallet_id)
+                    .bind::<Text, _>(&hold.currency)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest("billing settlement wallet is unavailable".to_string()));
+                }
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let insert_transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(insert_transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("commit")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(hold.user_id.clone())
+                    .bind::<Nullable<Text>, _>(hold.application_id.clone())
+                    .bind::<Text, _>(&hold.currency)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(settlement_wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(hold.reference.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&hold.wallet_id)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(-hold.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&settlement_wallet_id)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let update_hold_sql = format!(
+                    "UPDATE wallet_holds SET status = {}, updated_at = {} WHERE id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                );
+                sql_query(update_hold_sql)
+                    .bind::<Text, _>("committed")
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&hold_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(&hold_id)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn release_wallet_hold(
+        &self,
+        hold_id: &str,
+        idempotency_key: &str,
+    ) -> AppResult<WalletHoldRecord> {
+        let hold_id = hold_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
+                let hold_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+                let hold = sql_query(hold_sql)
+                    .bind::<Text, _>(&hold_id)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .map_err(AppError::from)?;
+                let existing_operation_sql = format!(
+                    "{} WHERE kind = 'release' AND idempotency_key = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1)
+                );
+                if let Some(existing) = sql_query(existing_operation_sql)
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    if existing.hold_id.as_deref() != Some(hold_id.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "billing idempotency_key is already used for another release"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(hold);
+                }
+                if hold.status == "released" {
+                    return Ok(hold);
+                }
+                if hold.status != "pending" {
+                    return Err(AppError::BadRequest("billing hold is not pending".to_string()));
+                }
+                let update_wallet_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, reserved_minor = reserved_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND reserved_minor >= {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
+                );
+                if sql_query(update_wallet_sql)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&hold.wallet_id)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest("billing hold source is unavailable".to_string()));
+                }
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let insert_transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(insert_transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("release")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(hold.user_id.clone())
+                    .bind::<Nullable<Text>, _>(hold.application_id.clone())
+                    .bind::<Text, _>(&hold.currency)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(hold.reference.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&hold.wallet_id)
+                    .bind::<BigInt, _>(hold.amount_minor)
+                    .bind::<BigInt, _>(-hold.amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let update_hold_sql = format!(
+                    "UPDATE wallet_holds SET status = {}, updated_at = {} WHERE id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                );
+                sql_query(update_hold_sql)
+                    .bind::<Text, _>("released")
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&hold_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(&hold_id)
+                    .get_result::<WalletHoldRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn transfer_wallets(
+        &self,
+        user_id: &str,
+        source_wallet_id: &str,
+        destination_wallet_id: &str,
+        currency: &str,
+        amount_minor: i64,
+        application_id: Option<&str>,
+        idempotency_key: &str,
+    ) -> AppResult<WalletTransactionRecord> {
+        let user_id = user_id.to_string();
+        let source_wallet_id = source_wallet_id.to_string();
+        let destination_wallet_id = destination_wallet_id.to_string();
+        let currency = currency.to_string();
+        let application_id = application_id.map(ToOwned::to_owned);
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE kind = {} AND idempotency_key = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                if let Some(existing) = sql_query(existing_sql)
+                    .bind::<Text, _>("transfer")
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    return Ok(existing);
+                }
+                if amount_minor <= 0 || source_wallet_id == destination_wallet_id {
+                    return Err(AppError::BadRequest("billing transfer is invalid".to_string()));
+                }
+                let source_sql = format!(
+                    "{} WHERE id = {} AND account_kind IN ('user_global', 'user_application') AND user_id = {} AND currency = {}",
+                    select_wallet_account_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let source = sql_query(source_sql)
+                    .bind::<Text, _>(&source_wallet_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&currency)
+                    .get_result::<WalletAccountRecord>(conn)
+                    .map_err(AppError::from)?;
+                let destination_sql = format!(
+                    "{} WHERE id = {} AND account_kind IN ('user_global', 'user_application') AND user_id = {} AND currency = {}",
+                    select_wallet_account_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let destination = sql_query(destination_sql)
+                    .bind::<Text, _>(&destination_wallet_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&currency)
+                    .get_result::<WalletAccountRecord>(conn)
+                    .map_err(AppError::from)?;
+                let debit_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+                );
+                if sql_query(debit_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&source.id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest("billing balance is insufficient".to_string()));
+                }
+                let credit_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                );
+                sql_query(credit_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&destination.id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let transaction_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(transaction_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("transfer")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
+                    .bind::<Nullable<Text>, _>(application_id.clone())
+                    .bind::<Text, _>(&currency)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(source.id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(destination.id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&source.id)
+                    .bind::<BigInt, _>(-amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&destination.id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(transaction_id)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn refund_committed_charge(
+        &self,
+        transaction_id: &str,
+        user_id: &str,
+        amount_minor: i64,
+        idempotency_key: &str,
+    ) -> AppResult<WalletTransactionRecord> {
+        #[derive(diesel::QueryableByName)]
+        struct TotalRow {
+            #[diesel(sql_type = BigInt)]
+            total: i64,
+        }
+
+        let transaction_id = transaction_id.to_string();
+        let user_id = user_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE kind = {} AND idempotency_key = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                if let Some(existing) = sql_query(existing_sql)
+                    .bind::<Text, _>("charge_refund")
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    if existing.external_order_id.as_deref() != Some(transaction_id.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "billing idempotency_key is already used for another refund"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(existing);
+                }
+                let original_sql = format!(
+                    "{} WHERE id = {} AND kind = 'commit' AND status = 'committed' AND user_id = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let original = sql_query(original_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&user_id)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .map_err(AppError::from)?;
+                if amount_minor <= 0 || amount_minor > original.amount_minor {
+                    return Err(AppError::BadRequest("billing refund amount is invalid".to_string()));
+                }
+                let refunded_sql = format!(
+                    "SELECT COALESCE(SUM(amount_minor), 0) AS total FROM wallet_transactions WHERE kind = 'charge_refund' AND status = 'committed' AND external_order_id = {}",
+                    ph(kind, 1)
+                );
+                let refunded = sql_query(refunded_sql)
+                    .bind::<Nullable<Text>, _>(Some(transaction_id.clone()))
+                    .get_result::<TotalRow>(conn)
+                    .map_err(AppError::from)?
+                    .total;
+                if amount_minor > original.amount_minor.saturating_sub(refunded) {
+                    return Err(AppError::BadRequest(
+                        "billing refund exceeds the refundable charge amount".to_string(),
+                    ));
+                }
+                let settlement_id = original
+                    .destination_wallet_id
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("billing commit has no settlement wallet".to_string()))?;
+                let user_wallet_id = original
+                    .source_wallet_id
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("billing commit has no source wallet".to_string()))?;
+                let debit_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+                );
+                if sql_query(debit_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&settlement_id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .execute(conn)
+                    .map_err(AppError::from)?
+                    == 0
+                {
+                    return Err(AppError::BadRequest("application settlement balance is insufficient".to_string()));
+                }
+                let credit_sql = format!(
+                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                );
+                sql_query(credit_sql)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&user_wallet_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let refund_id = uuid::Uuid::new_v4().to_string();
+                let insert_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&refund_id)
+                    .bind::<Text, _>("charge_refund")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
+                    .bind::<Nullable<Text>, _>(original.application_id.clone())
+                    .bind::<Text, _>(original.currency.clone())
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<Nullable<Text>, _>(Some(settlement_id.clone()))
+                    .bind::<Nullable<Text>, _>(Some(user_wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(transaction_id.clone()))
+                    .bind::<Text, _>("{}")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&refund_id)
+                    .bind::<Text, _>(&settlement_id)
+                    .bind::<BigInt, _>(-amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&refund_id)
+                    .bind::<Text, _>(&user_wallet_id)
+                    .bind::<BigInt, _>(amount_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(refund_id)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn adjust_wallet(
+        &self,
+        wallet_id: &str,
+        user_id: Option<&str>,
+        application_id: Option<&str>,
+        currency: &str,
+        amount_delta_minor: i64,
+        idempotency_key: &str,
+        metadata: serde_json::Value,
+    ) -> AppResult<WalletTransactionRecord> {
+        let wallet_id = wallet_id.to_string();
+        let user_id = user_id.map(ToOwned::to_owned);
+        let application_id = application_id.map(ToOwned::to_owned);
+        let currency = currency.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let metadata = util::to_json(&metadata)?;
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
+                let existing_sql = format!(
+                    "{} WHERE kind = {} AND idempotency_key = {}",
+                    select_wallet_transaction_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                if let Some(existing) = sql_query(existing_sql)
+                    .bind::<Text, _>("adjustment")
+                    .bind::<Text, _>(&idempotency_key)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                {
+                    return Ok(existing);
+                }
+                if amount_delta_minor == 0 {
+                    return Err(AppError::BadRequest("billing adjustment cannot be zero".to_string()));
+                }
+                let update_sql = if amount_delta_minor > 0 {
+                    format!(
+                        "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {}",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+                    )
+                } else {
+                    format!(
+                        "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {} AND available_minor >= {}",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
+                    )
+                };
+                let affected = if amount_delta_minor > 0 {
+                    sql_query(update_sql)
+                        .bind::<BigInt, _>(amount_delta_minor)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&wallet_id)
+                        .bind::<Text, _>(&currency)
+                        .execute(conn)
+                        .map_err(AppError::from)?
+                } else {
+                    sql_query(update_sql)
+                        .bind::<BigInt, _>(-amount_delta_minor)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&wallet_id)
+                        .bind::<Text, _>(&currency)
+                        .bind::<BigInt, _>(-amount_delta_minor)
+                        .execute(conn)
+                        .map_err(AppError::from)?
+                };
+                if affected == 0 {
+                    return Err(AppError::BadRequest("billing adjustment would make balance negative".to_string()));
+                }
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let insert_sql = format!(
+                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>("adjustment")
+                    .bind::<Text, _>("committed")
+                    .bind::<Nullable<Text>, _>(user_id.clone())
+                    .bind::<Nullable<Text>, _>(application_id.clone())
+                    .bind::<Text, _>(&currency)
+                    .bind::<BigInt, _>(amount_delta_minor.abs())
+                    .bind::<Nullable<Text>, _>(Some(wallet_id.clone()))
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(&idempotency_key)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Text, _>(metadata)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let entry_sql = format!(
+                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                );
+                sql_query(entry_sql)
+                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+                    .bind::<Text, _>(&transaction_id)
+                    .bind::<Text, _>(&wallet_id)
+                    .bind::<BigInt, _>(amount_delta_minor)
+                    .bind::<BigInt, _>(0_i64)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(transaction_id)
+                    .get_result::<WalletTransactionRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
     pub async fn list_application_authorization_profiles(
         &self,
         application_id: &str,
@@ -12229,7 +14562,18 @@ impl Db {
             if existing.is_some() {
                 let sql = format!(
                     "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, manifest_url = {}, signer_client_id = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(&profile.connection_kind)
@@ -12249,7 +14593,21 @@ impl Db {
             } else {
                 let sql = format!(
                     "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12), ph(kind, 13), ph(kind, 14), ph(kind, 15)
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(&id)
@@ -12371,18 +14729,24 @@ impl Db {
     ) -> AppResult<ApplicationProfileRoleRecord> {
         let role_key = role.role_key.trim().to_string();
         let name = role.name.trim().to_string();
-        if role_key.is_empty() || role_key.len() > 128 || role_key.chars().any(|ch| ch.is_control()) {
-            return Err(AppError::BadRequest("application role key is invalid".to_string()));
+        if role_key.is_empty() || role_key.len() > 128 || role_key.chars().any(|ch| ch.is_control())
+        {
+            return Err(AppError::BadRequest(
+                "application role key is invalid".to_string(),
+            ));
         }
         if name.is_empty() || name.len() > 160 || name.chars().any(|ch| ch.is_control()) {
-            return Err(AppError::BadRequest("application role name is invalid".to_string()));
+            return Err(AppError::BadRequest(
+                "application role name is invalid".to_string(),
+            ));
         }
         if role.is_default && !role.is_active {
             return Err(AppError::BadRequest(
                 "an inactive application role cannot be the default role".to_string(),
             ));
         }
-        let permissions = util::to_json(&normalize_application_entitlement_keys(role.permissions)?)?;
+        let permissions =
+            util::to_json(&normalize_application_entitlement_keys(role.permissions)?)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<ApplicationProfileRoleRecord, AppError, _>(|conn| {
@@ -12502,7 +14866,8 @@ impl Db {
                 ] {
                     let sql = format!(
                         "DELETE FROM {table} WHERE profile_id = {} AND role_id = {}",
-                        ph(kind, 1), ph(kind, 2)
+                        ph(kind, 1),
+                        ph(kind, 2)
                     );
                     sql_query(sql)
                         .bind::<Text, _>(&profile_id)
@@ -12512,7 +14877,8 @@ impl Db {
                 }
                 let sql = format!(
                     "DELETE FROM application_profile_roles WHERE profile_id = {} AND id = {}",
-                    ph(kind, 1), ph(kind, 2)
+                    ph(kind, 1),
+                    ph(kind, 2)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(&profile_id)
@@ -12717,7 +15083,8 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT role_id FROM {table} WHERE profile_id = {} AND {subject_column} = {} AND is_active = 1 ORDER BY role_id ASC",
-                ph(kind, 1), ph(kind, 2)
+                ph(kind, 1),
+                ph(kind, 2)
             );
             sql_query(sql)
                 .bind::<Text, _>(&profile_id)
@@ -14354,6 +16721,29 @@ impl Db {
         })
     }
 
+    pub async fn find_application_by_slug_in_organization(
+        &self,
+        organization_id: &str,
+        slug: &str,
+    ) -> AppResult<Option<ApplicationRecord>> {
+        let organization_id = organization_id.to_string();
+        let slug = slug.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE organization_id = {} AND slug = {}",
+                select_application_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(organization_id)
+                .bind::<Text, _>(slug)
+                .get_result::<ApplicationRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_application_by_id(&self, id: &str) -> AppResult<Option<ApplicationRecord>> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
@@ -14363,6 +16753,662 @@ impl Db {
                 .get_result::<ApplicationRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_discovery(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Option<ApplicationDiscoveryRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE application_id = {}",
+                select_application_discovery_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_website_managed_discoveries(
+        &self,
+    ) -> AppResult<Vec<(ApplicationRecord, ApplicationDiscoveryRecord)>> {
+        #[derive(Debug, diesel::QueryableByName)]
+        struct DiscoveryRow {
+            #[diesel(sql_type = Text)]
+            application_id: String,
+        }
+        let rows = with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id FROM application_discovery WHERE management_mode = {} ORDER BY application_id ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(crate::application_discovery::MANAGEMENT_MODE_WEBSITE)
+                .load::<DiscoveryRow>(&mut conn)
+                .map_err(AppError::from)
+        })?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(application) = self.find_application_by_id(&row.application_id).await? else {
+                continue;
+            };
+            let Some(discovery) = self.find_application_discovery(&row.application_id).await?
+            else {
+                continue;
+            };
+            result.push((application, discovery));
+        }
+        Ok(result)
+    }
+
+    pub async fn upsert_application_discovery(
+        &self,
+        discovery: NewApplicationDiscovery,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let existing = format!(
+                "SELECT COUNT(*) AS count FROM application_discovery WHERE application_id = {}",
+                ph(kind, 1)
+            );
+            let exists = sql_query(existing)
+                .bind::<Text, _>(&discovery.application_id)
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                > 0;
+            if exists {
+                let sql = format!(
+                    "UPDATE application_discovery SET management_mode = {}, website_url = {}, fetch_secret_ciphertext = {}, signing_public_jwks = {}, last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, operator_disabled = {}, updated_at = {} WHERE application_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&discovery.management_mode)
+                    .bind::<Text, _>(&discovery.website_url)
+                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
+                    .bind::<Text, _>(&discovery.signing_public_jwks)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
+                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
+                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
+                    .bind::<Text, _>(&discovery.sync_status)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
+                    .bind::<Nullable<Text>, _>(&discovery.last_error)
+                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
+                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&discovery.application_id)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            } else {
+                let sql = format!(
+                    "INSERT INTO application_discovery (application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16),
+                    ph(kind, 17)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&discovery.application_id)
+                    .bind::<Text, _>(&discovery.management_mode)
+                    .bind::<Text, _>(&discovery.website_url)
+                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
+                    .bind::<Text, _>(&discovery.signing_public_jwks)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
+                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
+                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
+                    .bind::<Text, _>(&discovery.sync_status)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
+                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
+                    .bind::<Nullable<Text>, _>(&discovery.last_error)
+                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
+                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            }
+            let sql = format!(
+                "{} WHERE application_id = {}",
+                select_application_discovery_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&discovery.application_id)
+                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    /// Records a failed discovery attempt without touching the last verified
+    /// snapshot.  Runtime authorization deliberately reads the verified
+    /// revision/snapshot fields, so a transient website outage only changes
+    /// operator-visible status and diagnostics.
+    pub async fn mark_application_discovery_sync_error(
+        &self,
+        application_id: &str,
+        sync_status: &str,
+        last_error: Option<String>,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
+        let application_id = application_id.to_string();
+        let sync_status = sync_status.to_string();
+        let last_error = last_error.map(|value| value.chars().take(512).collect::<String>());
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE application_discovery SET sync_status = {}, last_fetched_at = {}, last_error = {}, updated_at = {} WHERE application_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5)
+            );
+            let affected = sql_query(sql)
+                .bind::<Text, _>(&sync_status)
+                .bind::<BigInt, _>(now)
+                .bind::<Nullable<Text>, _>(&last_error)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(&application_id)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            if affected == 0 {
+                return Err(AppError::NotFound);
+            }
+            let sql = format!(
+                "{} WHERE application_id = {}",
+                select_application_discovery_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&application_id)
+                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    /// Applies one already verified website snapshot atomically. Network
+    /// fetching and signature validation happen before this method; this
+    /// transaction only reconciles the normalized result and the snapshot
+    /// metadata. Client secrets are already hashed by the verifier.
+    pub async fn apply_website_manifest(
+        &self,
+        application_id: &str,
+        manifest: crate::application_discovery::VerifiedApplicationManifest,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
+        let application_id = application_id.to_string();
+        let manifest_url = self
+            .find_application_discovery(&application_id)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .website_url;
+        let discovery_url = format!(
+            "{}{}",
+            manifest_url.trim_end_matches('/'),
+            crate::application_discovery::DISCOVERY_PATH
+        );
+        let snapshot_json = util::to_json(&manifest.redacted_payload)?;
+        let manifest = manifest.clone();
+        let application_organization_id = self
+            .find_application_by_id(&application_id)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .organization_id;
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<ApplicationDiscoveryRecord, AppError, _>(|conn| {
+                let current_sql = format!(
+                    "{} WHERE application_id = {}",
+                    select_application_discovery_sql(),
+                    ph(kind, 1)
+                );
+                let current = sql_query(current_sql)
+                    .bind::<Text, _>(&application_id)
+                    .get_result::<ApplicationDiscoveryRecord>(conn)
+                    .map_err(AppError::from)?;
+                if current.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE {
+                    return Err(AppError::BadRequest(
+                        "application is not website-managed".to_string(),
+                    ));
+                }
+                if let Some(previous_revision) = current.last_verified_revision {
+                    if manifest.revision < previous_revision {
+                        return Err(AppError::BadRequest(
+                            "application discovery revision moved backwards".to_string(),
+                        ));
+                    }
+                    if manifest.revision == previous_revision {
+                        if current.last_verified_digest.as_deref() == Some(manifest.digest.as_str()) {
+                            // A verified website manifest is a short-lived
+                            // JWS. Refresh its lease and clear a transient
+                            // sync error even when the revision/content digest
+                            // is unchanged; otherwise the persisted expiry
+                            // would age out while periodic verification keeps
+                            // succeeding.
+                            let now = util::now_ts();
+                            let refresh_sql = format!(
+                                "UPDATE application_discovery SET last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, updated_at = {} WHERE application_id = {}",
+                                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
+                            );
+                            sql_query(refresh_sql)
+                                .bind::<BigInt, _>(manifest.expires_at)
+                                .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
+                                .bind::<BigInt, _>(now)
+                                .bind::<BigInt, _>(now)
+                                .bind::<Nullable<Text>, _>(None::<String>)
+                                .bind::<Nullable<Text>, _>(Some(snapshot_json.clone()))
+                                .bind::<BigInt, _>(now)
+                                .bind::<Text, _>(&application_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                            let result_sql = format!(
+                                "{} WHERE application_id = {}",
+                                select_application_discovery_sql(),
+                                ph(kind, 1)
+                            );
+                            return sql_query(result_sql)
+                                .bind::<Text, _>(&application_id)
+                                .get_result::<ApplicationDiscoveryRecord>(conn)
+                                .map_err(AppError::from);
+                        }
+                        return Err(AppError::BadRequest(
+                            "application discovery revision was reused with different content".to_string(),
+                        ));
+                    }
+                }
+
+                let client_ids = manifest
+                    .clients
+                    .iter()
+                    .map(|client| client.client_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let mut client_db_ids = BTreeMap::new();
+                let mut profile_db_ids = BTreeMap::new();
+                for client in &manifest.clients {
+                    let existing_sql = format!(
+                        "{} WHERE client_id = {}",
+                        select_client_sql(),
+                        ph(kind, 1)
+                    );
+                    let existing = sql_query(existing_sql)
+                        .bind::<Text, _>(&client.client_id)
+                        .get_result::<ClientRecord>(conn)
+                        .optional()
+                        .map_err(AppError::from)?;
+                    let client_db_id = if let Some(existing) = existing {
+                        let owner_sql = format!(
+                            "SELECT COUNT(*) AS count FROM application_oidc_clients WHERE client_db_id = {} AND application_id <> {}",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        let owned_elsewhere = sql_query(owner_sql)
+                            .bind::<Text, _>(&existing.id)
+                            .bind::<Text, _>(&application_id)
+                            .get_result::<CountRow>(conn)
+                            .map_err(AppError::from)?
+                            .count
+                            > 0;
+                        if owned_elsewhere {
+                            return Err(AppError::BadRequest(
+                                "website-managed client belongs to another application".to_string(),
+                            ));
+                        }
+                        if existing.organization_id.as_deref()
+                            != Some(application_organization_id.as_str())
+                        {
+                            return Err(AppError::BadRequest(
+                                "website-managed client belongs to another organization"
+                                    .to_string(),
+                            ));
+                        }
+                        conn.website_discovery_update_client(kind, &existing.id, client)?;
+                        existing.id
+                    } else {
+                        conn.website_discovery_insert_client(kind, client)?
+                    };
+                    client_db_ids.insert(client.client_id.clone(), client_db_id.clone());
+                    let link_count_sql = format!(
+                        "SELECT COUNT(*) AS count FROM application_oidc_clients WHERE application_id = {} AND client_db_id = {}",
+                        ph(kind, 1), ph(kind, 2)
+                    );
+                    let linked = sql_query(link_count_sql)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(&client_db_id)
+                        .get_result::<CountRow>(conn)
+                        .map_err(AppError::from)?
+                        .count
+                        > 0;
+                    if !linked {
+                        let link_sql = format!(
+                            "INSERT INTO application_oidc_clients (application_id, client_db_id, created_at) VALUES ({}, {}, {})",
+                            ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                        );
+                        sql_query(link_sql)
+                            .bind::<Text, _>(&application_id)
+                            .bind::<Text, _>(&client_db_id)
+                            .bind::<BigInt, _>(util::now_ts())
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                }
+                let existing_clients_sql = format!(
+                    "SELECT client_db_id FROM application_oidc_clients WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                #[derive(diesel::QueryableByName)]
+                struct ClientIdRow {
+                    #[diesel(sql_type = Text)]
+                    client_db_id: String,
+                }
+                for row in sql_query(existing_clients_sql)
+                    .bind::<Text, _>(&application_id)
+                    .load::<ClientIdRow>(conn)
+                    .map_err(AppError::from)?
+                {
+                    let client_sql = format!(
+                        "SELECT client_id FROM clients WHERE id = {}",
+                        ph(kind, 1)
+                    );
+                    #[derive(diesel::QueryableByName)]
+                    struct ClientNameRow {
+                        #[diesel(sql_type = Text)]
+                        client_id: String,
+                    }
+                    let current_client = sql_query(client_sql)
+                        .bind::<Text, _>(&row.client_db_id)
+                        .get_result::<ClientNameRow>(conn)
+                        .map_err(AppError::from)?;
+                    if !client_ids.contains(&current_client.client_id) {
+                        let deactivate_sql = format!(
+                            "UPDATE clients SET is_active = {}, updated_at = {} WHERE id = {}",
+                            ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                        );
+                        sql_query(deactivate_sql)
+                            .bind::<Integer, _>(0)
+                            .bind::<BigInt, _>(util::now_ts())
+                            .bind::<Text, _>(&row.client_db_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                        let unlink_sql = format!(
+                            "DELETE FROM application_oidc_clients WHERE application_id = {} AND client_db_id = {}",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        sql_query(unlink_sql)
+                            .bind::<Text, _>(&application_id)
+                            .bind::<Text, _>(&row.client_db_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                }
+
+                conn.website_discovery_upsert_module(
+                    kind,
+                    &application_id,
+                    "protocols",
+                    &manifest.protocols,
+                )?;
+                conn.website_discovery_upsert_module(
+                    kind,
+                    &application_id,
+                    "login_adapters",
+                    &manifest.login_adapters,
+                )?;
+                conn.website_discovery_upsert_module(
+                    kind,
+                    &application_id,
+                    "directory_sync",
+                    &manifest.directory_sync,
+                )?;
+                conn.website_discovery_upsert_module(
+                    kind,
+                    &application_id,
+                    "authorization",
+                    &manifest.authorization,
+                )?;
+
+                // The website document is a complete snapshot. Remove
+                // profile records that disappeared from the new revision,
+                // together with their assignments and role/permission rows;
+                // otherwise a later reuse of the same client_id could revive
+                // stale website entitlements.
+                let existing_profiles_sql = format!(
+                    "{} WHERE application_id = {}",
+                    select_application_authorization_profile_sql(),
+                    ph(kind, 1)
+                );
+                let existing_profiles = sql_query(existing_profiles_sql)
+                    .bind::<Text, _>(&application_id)
+                    .load::<ApplicationAuthorizationProfileRecord>(conn)
+                    .map_err(AppError::from)?;
+                for existing_profile in existing_profiles {
+                    if manifest.profiles.contains_key(&existing_profile.profile_key) {
+                        continue;
+                    }
+                    for table in [
+                        "application_profile_permission_overrides",
+                        "application_profile_user_roles",
+                        "application_profile_group_roles",
+                        "application_profile_organization_roles",
+                        "application_permission_definitions",
+                        "application_profile_roles",
+                    ] {
+                        let delete_sql = format!(
+                            "DELETE FROM {table} WHERE profile_id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(delete_sql)
+                            .bind::<Text, _>(&existing_profile.id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    let delete_profile_sql = format!(
+                        "DELETE FROM application_authorization_profiles WHERE id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(delete_profile_sql)
+                        .bind::<Text, _>(&existing_profile.id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+
+                for (profile_key, profile) in &manifest.profiles {
+                    let connection_id = client_db_ids.get(profile_key).cloned();
+                    let profile_id = conn.website_discovery_upsert_profile(
+                        kind,
+                        &application_id,
+                        profile_key,
+                        connection_id.as_deref(),
+                        &discovery_url,
+                        &manifest.version,
+                        &manifest.digest,
+                    )?;
+                    profile_db_ids.insert(profile_key.clone(), profile_id.clone());
+                    conn.website_discovery_replace_permissions(kind, &profile_id, profile)?;
+                    conn.website_discovery_replace_roles(kind, &profile_id, profile)?;
+                }
+
+                if let Some(default_profile_id) = profile_db_ids.get("default") {
+                    #[derive(Debug, diesel::QueryableByName)]
+                    struct IdRow {
+                        #[diesel(sql_type = Text)]
+                        id: String,
+                    }
+
+                    // These mappings are website policy, so the complete set
+                    // is replaced on every verified revision. User role
+                    // assignments remain in the separate user-role table and
+                    // are never present in the website manifest.
+                    for table in [
+                        "application_profile_group_roles",
+                        "application_profile_organization_roles",
+                    ] {
+                        let delete_sql = format!(
+                            "DELETE FROM {table} WHERE profile_id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(delete_sql)
+                            .bind::<Text, _>(default_profile_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    for mapping in &manifest.authorization_mappings.group_mappings {
+                        let group_sql = format!(
+                            "SELECT id FROM access_groups WHERE id = {} OR name = {}",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        let group_id = sql_query(group_sql)
+                            .bind::<Text, _>(&mapping.group)
+                            .bind::<Text, _>(&mapping.group)
+                            .get_result::<IdRow>(conn)
+                            .optional()
+                            .map_err(AppError::from)?
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "website authorization references unknown group: {}",
+                                    mapping.group
+                                ))
+                            })?
+                            .id;
+                        let role_sql = format!(
+                            "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        let role_id = sql_query(role_sql)
+                            .bind::<Text, _>(default_profile_id)
+                            .bind::<Text, _>(&mapping.role)
+                            .get_result::<IdRow>(conn)
+                            .optional()
+                            .map_err(AppError::from)?
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "website authorization references unknown role: {}",
+                                    mapping.role
+                                ))
+                            })?
+                            .id;
+                        let insert_sql = format!(
+                            "INSERT INTO application_profile_group_roles (profile_id, group_id, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
+                            ph(kind, 1),
+                            ph(kind, 2),
+                            ph(kind, 3),
+                            ph(kind, 4),
+                            ph(kind, 5)
+                        );
+                        let now = util::now_ts();
+                        sql_query(insert_sql)
+                            .bind::<Text, _>(default_profile_id)
+                            .bind::<Text, _>(group_id)
+                            .bind::<Text, _>(role_id)
+                            .bind::<BigInt, _>(now)
+                            .bind::<BigInt, _>(now)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    for mapping in &manifest.authorization_mappings.organization_role_mappings {
+                        let role_sql = format!(
+                            "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        let role_id = sql_query(role_sql)
+                            .bind::<Text, _>(default_profile_id)
+                            .bind::<Text, _>(&mapping.role)
+                            .get_result::<IdRow>(conn)
+                            .optional()
+                            .map_err(AppError::from)?
+                            .ok_or_else(|| {
+                                AppError::BadRequest(format!(
+                                    "website authorization references unknown role: {}",
+                                    mapping.role
+                                ))
+                            })?
+                            .id;
+                        let insert_sql = format!(
+                            "INSERT INTO application_profile_organization_roles (profile_id, organization_role, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
+                            ph(kind, 1),
+                            ph(kind, 2),
+                            ph(kind, 3),
+                            ph(kind, 4),
+                            ph(kind, 5)
+                        );
+                        let now = util::now_ts();
+                        sql_query(insert_sql)
+                            .bind::<Text, _>(default_profile_id)
+                            .bind::<Text, _>(&mapping.organization_role)
+                            .bind::<Text, _>(role_id)
+                            .bind::<BigInt, _>(now)
+                            .bind::<BigInt, _>(now)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                }
+
+                let now = util::now_ts();
+                let update_sql = format!(
+                    "UPDATE application_discovery SET last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, updated_at = {} WHERE application_id = {}",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11)
+                );
+                sql_query(update_sql)
+                    .bind::<BigInt, _>(manifest.revision)
+                    .bind::<Text, _>(&manifest.version)
+                    .bind::<Text, _>(&manifest.digest)
+                    .bind::<BigInt, _>(manifest.expires_at)
+                    .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(Some(snapshot_json))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&application_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let result_sql = format!(
+                    "{} WHERE application_id = {}",
+                    select_application_discovery_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(result_sql)
+                    .bind::<Text, _>(&application_id)
+                    .get_result::<ApplicationDiscoveryRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
 
@@ -14636,9 +17682,28 @@ impl Db {
                     .execute(conn)
                     .map_err(AppError::from)?;
                 for table in [
+                    "application_profile_permission_overrides",
+                    "application_profile_user_roles",
+                    "application_profile_group_roles",
+                    "application_profile_organization_roles",
+                    "application_permission_definitions",
+                    "application_profile_roles",
+                ] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE profile_id IN (SELECT id FROM application_authorization_profiles WHERE application_id = {})",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                for table in [
+                    "application_authorization_profiles",
                     "application_jwt_clients",
                     "application_jwt_codes",
                     "application_modules",
+                    "application_billing_settings",
                     "application_identity_bindings",
                     "application_saml_interactions",
                     "application_saml_replays",
@@ -14649,6 +17714,7 @@ impl Db {
                     "application_members",
                     "application_oidc_clients",
                     "application_enrollment_codes",
+                    "application_discovery",
                 ] {
                     let sql = format!("DELETE FROM {table} WHERE application_id = {}", ph(kind, 1));
                     sql_query(sql)
@@ -16887,6 +19953,47 @@ mod tests {
     }
 
     #[test]
+    fn billing_migrations_cover_wallet_orders_refunds_and_all_database_engines() {
+        let required_tables = [
+            "application_billing_settings",
+            "wallet_accounts",
+            "wallet_transactions",
+            "wallet_entries",
+            "wallet_holds",
+            "payment_orders",
+            "payment_refunds",
+        ];
+        for (kind, migrations) in [
+            (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
+            (DatabaseKind::Postgres, POSTGRES_MIGRATIONS),
+            (DatabaseKind::Mysql, MYSQL_MIGRATIONS),
+        ] {
+            for table in required_tables {
+                assert!(
+                    migrations.iter().any(|statement| {
+                        statement.contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+                    }),
+                    "{kind:?} is missing {table}"
+                );
+            }
+            assert!(
+                migrations.iter().any(|statement| {
+                    statement.contains("idempotency_key") && statement.contains("payment_refunds")
+                }),
+                "{kind:?} is missing payment refund idempotency compatibility"
+            );
+            assert!(
+                migrations.iter().any(|statement| {
+                    statement.contains("payment_orders")
+                        && statement.contains("idempotency_key")
+                        && statement.contains("UNIQUE")
+                }),
+                "{kind:?} is missing payment order idempotency uniqueness"
+            );
+        }
+    }
+
+    #[test]
     fn application_jwt_migrations_cover_clients_secrets_and_bound_codes() {
         for (kind, migrations) in [
             (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
@@ -17349,6 +20456,280 @@ mod tests {
         .unwrap();
         db.migrate().await.unwrap();
         (db, path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn billing_wallet_lifecycle_is_atomic_idempotent_and_non_negative() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user("billing@example.com", "billing-user"))
+            .await
+            .unwrap();
+        let application_id = "billing-application";
+        let global = db
+            .ensure_user_wallet_account(&user.id, "CNY")
+            .await
+            .unwrap();
+        let application_wallet = db
+            .ensure_application_wallet_account(&user.id, application_id, "CNY")
+            .await
+            .unwrap();
+        let settlement = db
+            .ensure_settlement_wallet_account(application_id, "CNY")
+            .await
+            .unwrap();
+
+        db.adjust_wallet(
+            &global.id,
+            Some(&user.id),
+            None,
+            "CNY",
+            10_000,
+            "seed-balance",
+            serde_json::json!({"test": true}),
+        )
+        .await
+        .unwrap();
+
+        let hold = db
+            .reserve_wallet_hold(
+                &global.id,
+                &user.id,
+                application_id,
+                "CNY",
+                4_000,
+                "charge-1",
+                "reserve-1",
+                util::now_ts() + 900,
+            )
+            .await
+            .unwrap();
+        let duplicate_hold = db
+            .reserve_wallet_hold(
+                &global.id,
+                &user.id,
+                application_id,
+                "CNY",
+                4_000,
+                "charge-1",
+                "reserve-1",
+                util::now_ts() + 900,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hold.id, duplicate_hold.id);
+        let held_global = db
+            .ensure_user_wallet_account(&user.id, "CNY")
+            .await
+            .unwrap();
+        assert_eq!(held_global.available_minor, 6_000);
+        assert_eq!(held_global.reserved_minor, 4_000);
+
+        let committed_hold = db
+            .commit_wallet_hold(&hold.id, &settlement.id, "commit-1")
+            .await
+            .unwrap();
+        assert_eq!(committed_hold.status, "committed");
+        let duplicate_commit = db
+            .commit_wallet_hold(&hold.id, &settlement.id, "commit-2")
+            .await
+            .unwrap();
+        assert_eq!(duplicate_commit.id, hold.id);
+        let commit_transaction = db
+            .find_wallet_transaction_by_operation("commit", "commit-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first_charge_refund = db
+            .refund_committed_charge(&commit_transaction.id, &user.id, 1_000, "charge-refund-1")
+            .await
+            .unwrap();
+        let duplicate_charge_refund = db
+            .refund_committed_charge(&commit_transaction.id, &user.id, 1_000, "charge-refund-1")
+            .await
+            .unwrap();
+        assert_eq!(first_charge_refund.id, duplicate_charge_refund.id);
+        db.refund_committed_charge(&commit_transaction.id, &user.id, 3_000, "charge-refund-2")
+            .await
+            .unwrap();
+        assert!(
+            db.refund_committed_charge(&commit_transaction.id, &user.id, 1, "charge-refund-3")
+                .await
+                .is_err()
+        );
+        let settled = db
+            .ensure_settlement_wallet_account(application_id, "CNY")
+            .await
+            .unwrap();
+        assert_eq!(settled.available_minor, 0);
+
+        let transferred = db
+            .transfer_wallets(
+                &user.id,
+                &global.id,
+                &application_wallet.id,
+                "CNY",
+                2_000,
+                Some(application_id),
+                "transfer-1",
+            )
+            .await
+            .unwrap();
+        let duplicate_transfer = db
+            .transfer_wallets(
+                &user.id,
+                &global.id,
+                &application_wallet.id,
+                "CNY",
+                2_000,
+                Some(application_id),
+                "transfer-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(transferred.id, duplicate_transfer.id);
+        assert!(
+            db.transfer_wallets(
+                &user.id,
+                &global.id,
+                &application_wallet.id,
+                "CNY",
+                9_000,
+                Some(application_id),
+                "transfer-too-much",
+            )
+            .await
+            .is_err()
+        );
+        db.transfer_wallets(
+            &user.id,
+            &application_wallet.id,
+            &global.id,
+            "CNY",
+            2_000,
+            Some(application_id),
+            "transfer-2",
+        )
+        .await
+        .unwrap();
+
+        let release_hold = db
+            .reserve_wallet_hold(
+                &global.id,
+                &user.id,
+                application_id,
+                "CNY",
+                500,
+                "release-1",
+                "reserve-2",
+                util::now_ts() + 900,
+            )
+            .await
+            .unwrap();
+        db.release_wallet_hold(&release_hold.id, "release-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.release_wallet_hold(&release_hold.id, "release-2")
+                .await
+                .unwrap()
+                .status,
+            "released"
+        );
+
+        let order = db
+            .insert_payment_order(NewPaymentOrder {
+                user_id: user.id.clone(),
+                provider_slug: "test-provider".to_string(),
+                merchant_order_no: "SGT-test-order-1".to_string(),
+                idempotency_key: Some("recharge-test-1".to_string()),
+                currency: "CNY".to_string(),
+                amount_minor: 5_000,
+                subject: "test recharge".to_string(),
+                checkout_kind: "redirect".to_string(),
+                checkout_value: "https://pay.example.test/order".to_string(),
+                expires_at: util::now_ts() + 900,
+            })
+            .await
+            .unwrap();
+        assert_eq!(order.idempotency_key.as_deref(), Some("recharge-test-1"));
+        assert_eq!(
+            db.find_payment_order_by_idempotency_key(&user.id, "test-provider", "recharge-test-1")
+                .await
+                .unwrap()
+                .map(|found| found.id),
+            Some(order.id.clone())
+        );
+        assert!(
+            db.mark_payment_order_paid(&order.id, "", util::now_ts())
+                .await
+                .is_err()
+        );
+        let paid_order = db
+            .mark_payment_order_paid(&order.id, "provider-trade-1", util::now_ts())
+            .await
+            .unwrap();
+        assert_eq!(paid_order.status, "paid");
+        assert_eq!(
+            db.mark_payment_order_paid(&order.id, "provider-trade-1", util::now_ts())
+                .await
+                .unwrap()
+                .id,
+            order.id
+        );
+        assert!(
+            db.mark_payment_order_paid(&order.id, "provider-trade-2", util::now_ts())
+                .await
+                .is_err()
+        );
+
+        let payment_refund = db
+            .refund_payment_order(
+                &order.id,
+                1_000,
+                "provider-refund-1",
+                None,
+                "test refund",
+                "payment-refund-1",
+            )
+            .await
+            .unwrap();
+        let duplicate_payment_refund = db
+            .refund_payment_order(
+                &order.id,
+                1_000,
+                "provider-refund-1",
+                None,
+                "test refund",
+                "payment-refund-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(payment_refund.id, duplicate_payment_refund.id);
+        assert!(
+            db.refund_payment_order(
+                &order.id,
+                5_000,
+                "provider-refund-2",
+                None,
+                "too much",
+                "payment-refund-2",
+            )
+            .await
+            .is_err()
+        );
+
+        let final_global = db
+            .ensure_user_wallet_account(&user.id, "CNY")
+            .await
+            .unwrap();
+        assert_eq!(final_global.available_minor, 14_000);
+        assert_eq!(final_global.reserved_minor, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -20001,6 +23382,189 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn website_manifest_removes_profiles_and_client_links_from_the_snapshot() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("website-snapshot", "Website Snapshot"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "website-snapshot",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        db.upsert_application_discovery(NewApplicationDiscovery {
+            application_id: application.id.clone(),
+            management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.to_string(),
+            website_url: "https://website.example".to_string(),
+            fetch_secret_ciphertext: "encrypted-fetch-secret".to_string(),
+            signing_public_jwks: "{}".to_string(),
+            last_verified_revision: None,
+            last_verified_version: None,
+            last_verified_digest: None,
+            last_verified_expires_at: None,
+            sync_status: crate::application_discovery::SYNC_PENDING.to_string(),
+            last_fetched_at: None,
+            last_success_at: None,
+            last_error: None,
+            snapshot_json: None,
+            operator_disabled: false,
+        })
+        .await
+        .unwrap();
+
+        let old_client = test_client("website-old-client", &organization.id);
+        let old_client_id = old_client.client_id.clone();
+        let profile = crate::application_discovery::NormalizedProfile {
+            permissions: vec![crate::application_discovery::NormalizedPermission {
+                key: "website.read".to_string(),
+                label: "Website read".to_string(),
+                description: None,
+            }],
+            roles: vec![crate::application_discovery::NormalizedRole {
+                key: "member".to_string(),
+                name: "Member".to_string(),
+                description: None,
+                permissions: vec!["website.read".to_string()],
+                is_default: true,
+            }],
+        };
+        let mut profiles = BTreeMap::new();
+        profiles.insert("default".to_string(), profile.clone());
+        profiles.insert(old_client_id.clone(), profile);
+        db.apply_website_manifest(
+            &application.id,
+            crate::application_discovery::VerifiedApplicationManifest {
+                application_id: application.slug.clone(),
+                revision: 1,
+                version: "v1".to_string(),
+                digest: "digest-1".to_string(),
+                issued_at: util::now_ts(),
+                expires_at: util::now_ts() + 300,
+                clients: vec![old_client],
+                protocols: serde_json::json!({
+                    "website_url": "https://website.example",
+                    "oauth2_oidc": {"enabled": true, "client_ids": [old_client_id]}
+                }),
+                login_adapters: serde_json::json!({
+                    "enabled": true,
+                    "allow_signet_password": true,
+                    "provider_ids": []
+                }),
+                directory_sync: serde_json::json!({
+                    "enabled": false,
+                    "scim_enabled": false,
+                    "sync_groups": false
+                }),
+                authorization: serde_json::json!({
+                    "inherit_enterprise_roles": true,
+                    "default_role": "member",
+                    "claims": []
+                }),
+                authorization_mappings: Default::default(),
+                profiles,
+                redacted_payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let old_profile = db
+            .find_application_authorization_profile(&application.id, &old_client_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut default_profiles = BTreeMap::new();
+        default_profiles.insert(
+            "default".to_string(),
+            crate::application_discovery::NormalizedProfile {
+                permissions: vec![crate::application_discovery::NormalizedPermission {
+                    key: "website.read".to_string(),
+                    label: "Website read".to_string(),
+                    description: None,
+                }],
+                roles: vec![crate::application_discovery::NormalizedRole {
+                    key: "member".to_string(),
+                    name: "Member".to_string(),
+                    description: None,
+                    permissions: vec!["website.read".to_string()],
+                    is_default: true,
+                }],
+            },
+        );
+        db.apply_website_manifest(
+            &application.id,
+            crate::application_discovery::VerifiedApplicationManifest {
+                application_id: application.slug,
+                revision: 2,
+                version: "v2".to_string(),
+                digest: "digest-2".to_string(),
+                issued_at: util::now_ts(),
+                expires_at: util::now_ts() + 300,
+                clients: Vec::new(),
+                protocols: serde_json::json!({
+                    "website_url": "https://website.example",
+                    "oauth2_oidc": {"enabled": false, "client_ids": []}
+                }),
+                login_adapters: serde_json::json!({
+                    "enabled": true,
+                    "allow_signet_password": true,
+                    "provider_ids": []
+                }),
+                directory_sync: serde_json::json!({
+                    "enabled": false,
+                    "scim_enabled": false,
+                    "sync_groups": false
+                }),
+                authorization: serde_json::json!({
+                    "inherit_enterprise_roles": true,
+                    "default_role": "member",
+                    "claims": []
+                }),
+                authorization_mappings: Default::default(),
+                profiles: default_profiles,
+                redacted_payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.find_application_authorization_profile(&application.id, &old_client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(db
+            .list_application_profile_roles(&old_profile.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.list_application_authorization_profiles(&application.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.find_client_by_client_id(&old_client_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active,
+            0
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn detached_or_deleted_application_clients_receive_a_locked_fallback() {
         let (db, path) = sqlite_test_db().await;
         let organization = db
@@ -22072,6 +25636,549 @@ mod tests {
     }
 }
 
+macro_rules! insert_client_in_connection {
+    ($conn:expr, $kind:expr, $client:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let client = $client;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = util::now_ts();
+    let redirect_uris = util::to_json(&client.redirect_uris)?;
+    let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
+    let scopes = util::to_json(&client.scopes)?;
+    let grant_types = util::to_json(&client.grant_types)?;
+    let response_types = util::to_json(&client.response_types)?;
+    let authorization_details_types = util::to_json(&client.authorization_details_types)?;
+    let service_account_permissions = util::to_json(&client.service_account_permissions)?;
+    let sql = format!(
+        "INSERT INTO clients (id, client_id, client_secret_hash, client_name, logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, audience, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+        ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+        ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16), ph(kind, 17), ph(kind, 18),
+        ph(kind, 19), ph(kind, 20), ph(kind, 21), ph(kind, 22), ph(kind, 23), ph(kind, 24),
+        ph(kind, 25), ph(kind, 26), ph(kind, 27), ph(kind, 28), ph(kind, 29), ph(kind, 30),
+        ph(kind, 31), ph(kind, 32), ph(kind, 33), ph(kind, 34), ph(kind, 35)
+    );
+    sql_query(sql)
+        .bind::<Text, _>(&id)
+        .bind::<Text, _>(&client.client_id)
+        .bind::<Nullable<Text>, _>(&client.client_secret_hash)
+        .bind::<Text, _>(&client.client_name)
+        .bind::<Text, _>(&client.logo_uri)
+        .bind::<Nullable<Text>, _>(&client.organization_id)
+        .bind::<Text, _>(redirect_uris)
+        .bind::<Text, _>(post_logout_redirect_uris)
+        .bind::<Text, _>(scopes)
+        .bind::<Text, _>(client.audience.trim())
+        .bind::<Text, _>(grant_types)
+        .bind::<Text, _>(response_types)
+        .bind::<Text, _>(&client.token_endpoint_auth_method)
+        .bind::<Integer, _>(i32::from(client.require_pkce))
+        .bind::<Integer, _>(i32::from(client.require_mfa))
+        .bind::<Integer, _>(i32::from(client.require_pushed_authorization_requests))
+        .bind::<Integer, _>(i32::from(client.require_s256_pkce))
+        .bind::<Integer, _>(i32::from(client.require_confidential_client))
+        .bind::<Integer, _>(i32::from(client.require_dpop))
+        .bind::<Integer, _>(i32::from(client.require_account_selection))
+        .bind::<Integer, _>(i32::from(client.trust_email_verified))
+        .bind::<Text, _>(authorization_details_types)
+        .bind::<Text, _>(&client.subject_type)
+        .bind::<Text, _>(&client.sector_identifier_uri)
+        .bind::<Text, _>(&client.jwks_uri)
+        .bind::<Text, _>(&client.jwks)
+        .bind::<Text, _>(&client.backchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.backchannel_logout_session_required))
+        .bind::<Text, _>(&client.frontchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.frontchannel_logout_session_required))
+        .bind::<Integer, _>(i32::from(client.service_account_enabled))
+        .bind::<Text, _>(service_account_permissions)
+        .bind::<Integer, _>(i32::from(client.is_active))
+        .bind::<BigInt, _>(now)
+        .bind::<BigInt, _>(now)
+        .execute(conn)
+        .map_err(AppError::from)?;
+        Ok(id)
+    }};
+}
+
+macro_rules! update_client_in_connection {
+    ($conn:expr, $kind:expr, $id:expr, $client:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let id = $id;
+        let client = $client;
+    let now = util::now_ts();
+    let redirect_uris = util::to_json(&client.redirect_uris)?;
+    let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
+    let scopes = util::to_json(&client.scopes)?;
+    let grant_types = util::to_json(&client.grant_types)?;
+    let response_types = util::to_json(&client.response_types)?;
+    let authorization_details_types = util::to_json(&client.authorization_details_types)?;
+    let service_account_permissions = util::to_json(&client.service_account_permissions)?;
+    let sql = format!(
+        "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, logo_uri = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, audience = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
+        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
+        ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
+        ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16), ph(kind, 17), ph(kind, 18),
+        ph(kind, 19), ph(kind, 20), ph(kind, 21), ph(kind, 22), ph(kind, 23), ph(kind, 24),
+        ph(kind, 25), ph(kind, 26), ph(kind, 27), ph(kind, 28), ph(kind, 29), ph(kind, 30),
+        ph(kind, 31), ph(kind, 32), ph(kind, 33), ph(kind, 34)
+    );
+    let affected = sql_query(sql)
+        .bind::<Text, _>(&client.client_id)
+        .bind::<Nullable<Text>, _>(&client.client_secret_hash)
+        .bind::<Text, _>(&client.client_name)
+        .bind::<Text, _>(&client.logo_uri)
+        .bind::<Nullable<Text>, _>(&client.organization_id)
+        .bind::<Text, _>(redirect_uris)
+        .bind::<Text, _>(post_logout_redirect_uris)
+        .bind::<Text, _>(scopes)
+        .bind::<Text, _>(client.audience.trim())
+        .bind::<Text, _>(grant_types)
+        .bind::<Text, _>(response_types)
+        .bind::<Text, _>(&client.token_endpoint_auth_method)
+        .bind::<Integer, _>(i32::from(client.require_pkce))
+        .bind::<Integer, _>(i32::from(client.require_mfa))
+        .bind::<Integer, _>(i32::from(client.require_pushed_authorization_requests))
+        .bind::<Integer, _>(i32::from(client.require_s256_pkce))
+        .bind::<Integer, _>(i32::from(client.require_confidential_client))
+        .bind::<Integer, _>(i32::from(client.require_dpop))
+        .bind::<Integer, _>(i32::from(client.require_account_selection))
+        .bind::<Integer, _>(i32::from(client.trust_email_verified))
+        .bind::<Text, _>(authorization_details_types)
+        .bind::<Text, _>(&client.subject_type)
+        .bind::<Text, _>(&client.sector_identifier_uri)
+        .bind::<Text, _>(&client.jwks_uri)
+        .bind::<Text, _>(&client.jwks)
+        .bind::<Text, _>(&client.backchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.backchannel_logout_session_required))
+        .bind::<Text, _>(&client.frontchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.frontchannel_logout_session_required))
+        .bind::<Integer, _>(i32::from(client.service_account_enabled))
+        .bind::<Text, _>(service_account_permissions)
+        .bind::<Integer, _>(i32::from(client.is_active))
+        .bind::<BigInt, _>(now)
+        .bind::<Text, _>(id)
+        .execute(conn)
+        .map_err(AppError::from)?;
+    if affected == 0 {
+        return Err(AppError::NotFound);
+    }
+        Ok(())
+    }};
+}
+
+macro_rules! upsert_application_module_in_connection {
+    ($conn:expr, $kind:expr, $application_id:expr, $module_key:expr, $config:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let application_id = $application_id;
+        let module_key = $module_key;
+        let config = $config;
+    let object = config
+        .as_object()
+        .ok_or_else(|| AppError::Internal("discovery module is not an object".to_string()))?;
+    let config_json = util::to_json(config)?;
+    let enabled = object
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(!object.is_empty());
+    let now = util::now_ts();
+    let count_sql = format!(
+        "SELECT COUNT(*) AS count FROM application_modules WHERE application_id = {} AND module_key = {}",
+        ph(kind, 1), ph(kind, 2)
+    );
+    let exists = sql_query(count_sql)
+        .bind::<Text, _>(application_id)
+        .bind::<Text, _>(module_key)
+        .get_result::<CountRow>(conn)
+        .map_err(AppError::from)?
+        .count
+        > 0;
+    if exists {
+        let sql = format!(
+            "UPDATE application_modules SET config_json = {}, is_enabled = {}, updated_at = {} WHERE application_id = {} AND module_key = {}",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(config_json)
+            .bind::<Integer, _>(i32::from(enabled))
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(application_id)
+            .bind::<Text, _>(module_key)
+            .execute(conn)
+            .map_err(AppError::from)?;
+    } else {
+        let sql = format!(
+            "INSERT INTO application_modules (application_id, module_key, config_json, is_enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(application_id)
+            .bind::<Text, _>(module_key)
+            .bind::<Text, _>(config_json)
+            .bind::<Integer, _>(i32::from(enabled))
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(conn)
+            .map_err(AppError::from)?;
+    }
+        Ok(())
+    }};
+}
+
+macro_rules! upsert_website_profile_in_connection {
+    ($conn:expr, $kind:expr, $application_id:expr, $profile_key:expr, $connection_id:expr, $manifest_url:expr, $version:expr, $digest:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let application_id = $application_id;
+        let profile_key = $profile_key;
+        let connection_id = $connection_id;
+        let manifest_url = $manifest_url;
+        let version = $version;
+        let digest = $digest;
+    let now = util::now_ts();
+    let existing_sql = format!(
+        "{} WHERE application_id = {} AND profile_key = {}",
+        select_application_authorization_profile_sql(),
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    let existing = sql_query(existing_sql)
+        .bind::<Text, _>(application_id)
+        .bind::<Text, _>(profile_key)
+        .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+        .optional()
+        .map_err(AppError::from)?;
+    let profile_id = existing
+        .as_ref()
+        .map(|profile| profile.id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let connection_kind = if profile_key == "default" { "application" } else { "oidc" };
+    if existing.is_some() {
+        let sql = format!(
+            "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, manifest_url = {}, signer_client_id = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(connection_kind)
+            .bind::<Nullable<Text>, _>(&connection_id)
+            .bind::<Text, _>(crate::authorization_manifest::SOURCE_MODE_SIGNED)
+            .bind::<Text, _>(manifest_url)
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Nullable<Text>, _>(Some(version.to_string()))
+            .bind::<Nullable<Text>, _>(Some(digest.to_string()))
+            .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
+            .bind::<Nullable<BigInt>, _>(Some(now))
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(&profile_id)
+            .execute(conn)
+            .map_err(AppError::from)?;
+    } else {
+        let sql = format!(
+            "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12), ph(kind, 13), ph(kind, 14), ph(kind, 15)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(&profile_id)
+            .bind::<Text, _>(application_id)
+            .bind::<Text, _>(profile_key)
+            .bind::<Text, _>(connection_kind)
+            .bind::<Nullable<Text>, _>(&connection_id)
+            .bind::<Text, _>(crate::authorization_manifest::SOURCE_MODE_SIGNED)
+            .bind::<Text, _>(manifest_url)
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Nullable<Text>, _>(Some(version.to_string()))
+            .bind::<Nullable<Text>, _>(Some(digest.to_string()))
+            .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
+            .bind::<Nullable<BigInt>, _>(Some(now))
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(conn)
+            .map_err(AppError::from)?;
+    }
+        Ok(profile_id)
+    }};
+}
+
+macro_rules! replace_website_profile_permissions_in_connection {
+    ($conn:expr, $kind:expr, $profile_id:expr, $profile:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let profile_id = $profile_id;
+        let profile = $profile;
+    let now = util::now_ts();
+    let deactivate_sql = format!(
+        "UPDATE application_permission_definitions SET is_active = {}, source = {}, updated_at = {} WHERE profile_id = {}",
+        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+    );
+    sql_query(deactivate_sql)
+        .bind::<Integer, _>(0)
+        .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+        .bind::<BigInt, _>(now)
+        .bind::<Text, _>(profile_id)
+        .execute(conn)
+        .map_err(AppError::from)?;
+    for permission in &profile.permissions {
+        let count_sql = format!(
+            "SELECT COUNT(*) AS count FROM application_permission_definitions WHERE profile_id = {} AND permission_key = {}",
+            ph(kind, 1), ph(kind, 2)
+        );
+        let exists = sql_query(count_sql)
+            .bind::<Text, _>(profile_id)
+            .bind::<Text, _>(&permission.key)
+            .get_result::<CountRow>(conn)
+            .map_err(AppError::from)?
+            .count
+            > 0;
+        if exists {
+            let sql = format!(
+                "UPDATE application_permission_definitions SET label = {}, description = {}, source = {}, is_active = {}, updated_at = {} WHERE profile_id = {} AND permission_key = {}",
+                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&permission.label)
+                .bind::<Nullable<Text>, _>(&permission.description)
+                .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+                .bind::<Integer, _>(1)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(profile_id)
+                .bind::<Text, _>(&permission.key)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        } else {
+            let sql = format!(
+                "INSERT INTO application_permission_definitions (profile_id, permission_key, label, description, source, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(profile_id)
+                .bind::<Text, _>(&permission.key)
+                .bind::<Text, _>(&permission.label)
+                .bind::<Nullable<Text>, _>(&permission.description)
+                .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+                .bind::<Integer, _>(1)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        }
+    }
+        Ok(())
+    }};
+}
+
+macro_rules! replace_website_profile_roles_in_connection {
+    ($conn:expr, $kind:expr, $profile_id:expr, $profile:expr) => {{
+        let conn = $conn;
+        let kind = $kind;
+        let profile_id = $profile_id;
+        let profile = $profile;
+    let now = util::now_ts();
+    let deactivate_sql = format!(
+        "UPDATE application_profile_roles SET is_active = {}, source = {}, updated_at = {} WHERE profile_id = {}",
+        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
+    );
+    sql_query(deactivate_sql)
+        .bind::<Integer, _>(0)
+        .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+        .bind::<BigInt, _>(now)
+        .bind::<Text, _>(profile_id)
+        .execute(conn)
+        .map_err(AppError::from)?;
+    for role in &profile.roles {
+        let permissions = util::to_json(&role.permissions)?;
+        let existing_sql = format!(
+            "{} WHERE profile_id = {} AND role_key = {}",
+            select_application_profile_role_sql(),
+            ph(kind, 1),
+            ph(kind, 2)
+        );
+        let existing = sql_query(existing_sql)
+            .bind::<Text, _>(profile_id)
+            .bind::<Text, _>(&role.key)
+            .get_result::<ApplicationProfileRoleRecord>(conn)
+            .optional()
+            .map_err(AppError::from)?;
+        if let Some(existing) = existing {
+            let sql = format!(
+                "UPDATE application_profile_roles SET name = {}, description = {}, permissions = {}, source = {}, is_default = {}, is_active = {}, updated_at = {} WHERE profile_id = {} AND id = {}",
+                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&role.name)
+                .bind::<Nullable<Text>, _>(&role.description)
+                .bind::<Text, _>(permissions)
+                .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+                .bind::<Integer, _>(i32::from(role.is_default))
+                .bind::<Integer, _>(1)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(profile_id)
+                .bind::<Text, _>(&existing.id)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            let sql = format!(
+                "INSERT INTO application_profile_roles (id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&id)
+                .bind::<Text, _>(profile_id)
+                .bind::<Text, _>(&role.key)
+                .bind::<Text, _>(&role.name)
+                .bind::<Nullable<Text>, _>(&role.description)
+                .bind::<Text, _>(permissions)
+                .bind::<Text, _>(crate::application_discovery::SOURCE_WEBSITE)
+                .bind::<Integer, _>(i32::from(role.is_default))
+                .bind::<Integer, _>(1)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        }
+    }
+        Ok(())
+    }};
+}
+
+trait WebsiteDiscoveryConnection {
+    fn website_discovery_insert_client(
+        &mut self,
+        kind: DatabaseKind,
+        client: &NewClient,
+    ) -> AppResult<String>;
+
+    fn website_discovery_update_client(
+        &mut self,
+        kind: DatabaseKind,
+        id: &str,
+        client: &NewClient,
+    ) -> AppResult<()>;
+
+    fn website_discovery_upsert_module(
+        &mut self,
+        kind: DatabaseKind,
+        application_id: &str,
+        module_key: &str,
+        config: &serde_json::Value,
+    ) -> AppResult<()>;
+
+    fn website_discovery_upsert_profile(
+        &mut self,
+        kind: DatabaseKind,
+        application_id: &str,
+        profile_key: &str,
+        connection_id: Option<&str>,
+        manifest_url: &str,
+        version: &str,
+        digest: &str,
+    ) -> AppResult<String>;
+
+    fn website_discovery_replace_permissions(
+        &mut self,
+        kind: DatabaseKind,
+        profile_id: &str,
+        profile: &crate::application_discovery::NormalizedProfile,
+    ) -> AppResult<()>;
+
+    fn website_discovery_replace_roles(
+        &mut self,
+        kind: DatabaseKind,
+        profile_id: &str,
+        profile: &crate::application_discovery::NormalizedProfile,
+    ) -> AppResult<()>;
+}
+
+macro_rules! impl_website_discovery_connection {
+    ($connection:ty) => {
+        impl WebsiteDiscoveryConnection for $connection {
+            fn website_discovery_insert_client(
+                &mut self,
+                kind: DatabaseKind,
+                client: &NewClient,
+            ) -> AppResult<String> {
+                insert_client_in_connection!(self, kind, client)
+            }
+
+            fn website_discovery_update_client(
+                &mut self,
+                kind: DatabaseKind,
+                id: &str,
+                client: &NewClient,
+            ) -> AppResult<()> {
+                update_client_in_connection!(self, kind, id, client)
+            }
+
+            fn website_discovery_upsert_module(
+                &mut self,
+                kind: DatabaseKind,
+                application_id: &str,
+                module_key: &str,
+                config: &serde_json::Value,
+            ) -> AppResult<()> {
+                upsert_application_module_in_connection!(
+                    self,
+                    kind,
+                    application_id,
+                    module_key,
+                    config
+                )
+            }
+
+            fn website_discovery_upsert_profile(
+                &mut self,
+                kind: DatabaseKind,
+                application_id: &str,
+                profile_key: &str,
+                connection_id: Option<&str>,
+                manifest_url: &str,
+                version: &str,
+                digest: &str,
+            ) -> AppResult<String> {
+                upsert_website_profile_in_connection!(
+                    self,
+                    kind,
+                    application_id,
+                    profile_key,
+                    connection_id,
+                    manifest_url,
+                    version,
+                    digest
+                )
+            }
+
+            fn website_discovery_replace_permissions(
+                &mut self,
+                kind: DatabaseKind,
+                profile_id: &str,
+                profile: &crate::application_discovery::NormalizedProfile,
+            ) -> AppResult<()> {
+                replace_website_profile_permissions_in_connection!(self, kind, profile_id, profile)
+            }
+
+            fn website_discovery_replace_roles(
+                &mut self,
+                kind: DatabaseKind,
+                profile_id: &str,
+                profile: &crate::application_discovery::NormalizedProfile,
+            ) -> AppResult<()> {
+                replace_website_profile_roles_in_connection!(self, kind, profile_id, profile)
+            }
+        }
+    };
+}
+
+#[cfg(feature = "sqlite")]
+impl_website_discovery_connection!(SqliteConnection);
+#[cfg(feature = "postgres")]
+impl_website_discovery_connection!(PgConnection);
+#[cfg(feature = "mysql")]
+impl_website_discovery_connection!(MysqlConnection);
+
 fn migration_sql(kind: DatabaseKind) -> Vec<&'static str> {
     match kind {
         DatabaseKind::Sqlite => SQLITE_MIGRATIONS.to_vec(),
@@ -22721,6 +26828,115 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (application_id, module_key)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_modules_application ON application_modules(application_id, module_key)",
+    "CREATE TABLE IF NOT EXISTS application_billing_settings (
+        application_id TEXT PRIMARY KEY,
+        accept_signet_balance INTEGER NOT NULL DEFAULT 0,
+        wallet_mode TEXT NOT NULL DEFAULT 'shared',
+        supported_currencies TEXT NOT NULL DEFAULT '[]',
+        mode_locked_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_accounts (
+        id TEXT PRIMARY KEY,
+        account_kind TEXT NOT NULL,
+        scope_key TEXT NOT NULL UNIQUE,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        available_minor INTEGER NOT NULL DEFAULT 0,
+        reserved_minor INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_accounts_user ON wallet_accounts(user_id, currency, account_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_accounts_application ON wallet_accounts(application_id, currency, account_kind)",
+    "CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor INTEGER NOT NULL,
+        source_wallet_id TEXT,
+        destination_wallet_id TEXT,
+        hold_id TEXT,
+        idempotency_key TEXT NOT NULL,
+        external_provider TEXT,
+        external_order_id TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(kind, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_application ON wallet_transactions(application_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS wallet_entries (
+        id TEXT PRIMARY KEY,
+        transaction_id TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        available_delta_minor INTEGER NOT NULL,
+        reserved_delta_minor INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_entries_wallet ON wallet_entries(wallet_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS wallet_holds (
+        id TEXT PRIMARY KEY,
+        hold_kind TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        reference TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(hold_kind, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_holds_wallet ON wallet_holds(wallet_id, status, expires_at)",
+    "CREATE TABLE IF NOT EXISTS payment_orders (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider_slug TEXT NOT NULL,
+        merchant_order_no TEXT NOT NULL,
+        idempotency_key TEXT,
+        provider_trade_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor INTEGER NOT NULL,
+        subject TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checkout_kind TEXT NOT NULL,
+        checkout_value TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        paid_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(provider_slug, merchant_order_no)
+    )",
+    "ALTER TABLE payment_orders ADD COLUMN idempotency_key TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders(status, expires_at)",
+    "CREATE TABLE IF NOT EXISTS payment_refunds (
+        id TEXT PRIMARY KEY,
+        payment_order_id TEXT NOT NULL,
+        amount_minor INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        provider_refund_id TEXT,
+        requested_by TEXT,
+        reason TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "ALTER TABLE payment_refunds ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_payment_refunds_order ON payment_refunds(payment_order_id, created_at)",
     "CREATE TABLE IF NOT EXISTS application_scim_tokens (
         id TEXT PRIMARY KEY,
         application_id TEXT NOT NULL,
@@ -22925,6 +27141,26 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (profile_id, user_id, permission)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_profile_permission_overrides_user ON application_profile_permission_overrides(profile_id, user_id, effect)",
+    "CREATE TABLE IF NOT EXISTS application_discovery (
+        application_id TEXT PRIMARY KEY,
+        management_mode TEXT NOT NULL DEFAULT 'signet_managed',
+        website_url TEXT NOT NULL,
+        fetch_secret_ciphertext TEXT NOT NULL DEFAULT '',
+        signing_public_jwks TEXT NOT NULL DEFAULT '',
+        last_verified_revision BIGINT,
+        last_verified_version TEXT,
+        last_verified_digest TEXT,
+        last_verified_expires_at BIGINT,
+        sync_status TEXT NOT NULL DEFAULT 'unconfigured',
+        last_fetched_at BIGINT,
+        last_success_at BIGINT,
+        last_error TEXT,
+        snapshot_json TEXT,
+        operator_disabled INTEGER NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_mode_status ON application_discovery(management_mode, sync_status)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -23727,6 +27963,115 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (application_id, module_key)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_modules_application ON application_modules(application_id, module_key)",
+    "CREATE TABLE IF NOT EXISTS application_billing_settings (
+        application_id TEXT PRIMARY KEY,
+        accept_signet_balance INTEGER NOT NULL DEFAULT 0,
+        wallet_mode TEXT NOT NULL DEFAULT 'shared',
+        supported_currencies TEXT NOT NULL DEFAULT '[]',
+        mode_locked_at BIGINT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_accounts (
+        id TEXT PRIMARY KEY,
+        account_kind TEXT NOT NULL,
+        scope_key TEXT NOT NULL UNIQUE,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        available_minor BIGINT NOT NULL DEFAULT 0,
+        reserved_minor BIGINT NOT NULL DEFAULT 0,
+        version BIGINT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_accounts_user ON wallet_accounts(user_id, currency, account_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_accounts_application ON wallet_accounts(application_id, currency, account_kind)",
+    "CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        source_wallet_id TEXT,
+        destination_wallet_id TEXT,
+        hold_id TEXT,
+        idempotency_key TEXT NOT NULL,
+        external_provider TEXT,
+        external_order_id TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(kind, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user ON wallet_transactions(user_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_application ON wallet_transactions(application_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS wallet_entries (
+        id TEXT PRIMARY KEY,
+        transaction_id TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        available_delta_minor BIGINT NOT NULL,
+        reserved_delta_minor BIGINT NOT NULL,
+        created_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_entries_wallet ON wallet_entries(wallet_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS wallet_holds (
+        id TEXT PRIMARY KEY,
+        hold_kind TEXT NOT NULL,
+        wallet_id TEXT NOT NULL,
+        user_id TEXT,
+        application_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        status TEXT NOT NULL,
+        reference TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(hold_kind, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_holds_wallet ON wallet_holds(wallet_id, status, expires_at)",
+    "CREATE TABLE IF NOT EXISTS payment_orders (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider_slug TEXT NOT NULL,
+        merchant_order_no TEXT NOT NULL,
+        idempotency_key TEXT,
+        provider_trade_id TEXT,
+        currency TEXT NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        subject TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checkout_kind TEXT NOT NULL,
+        checkout_value TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        paid_at BIGINT,
+        last_error TEXT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(provider_slug, merchant_order_no)
+    )",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders(status, expires_at)",
+    "CREATE TABLE IF NOT EXISTS payment_refunds (
+        id TEXT PRIMARY KEY,
+        payment_order_id TEXT NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        status TEXT NOT NULL,
+        provider_refund_id TEXT,
+        requested_by TEXT,
+        reason TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL DEFAULT '',
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "ALTER TABLE payment_refunds ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_payment_refunds_order ON payment_refunds(payment_order_id, created_at)",
     "CREATE TABLE IF NOT EXISTS application_scim_tokens (
         id TEXT PRIMARY KEY,
         application_id TEXT NOT NULL,
@@ -23931,6 +28276,26 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (profile_id, user_id, permission)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_profile_permission_overrides_user ON application_profile_permission_overrides(profile_id, user_id, effect)",
+    "CREATE TABLE IF NOT EXISTS application_discovery (
+        application_id TEXT PRIMARY KEY,
+        management_mode TEXT NOT NULL DEFAULT 'signet_managed',
+        website_url TEXT NOT NULL,
+        fetch_secret_ciphertext TEXT NOT NULL DEFAULT '',
+        signing_public_jwks TEXT NOT NULL DEFAULT '',
+        last_verified_revision BIGINT,
+        last_verified_version TEXT,
+        last_verified_digest TEXT,
+        last_verified_expires_at BIGINT,
+        sync_status TEXT NOT NULL DEFAULT 'unconfigured',
+        last_fetched_at BIGINT,
+        last_success_at BIGINT,
+        last_error TEXT,
+        snapshot_json TEXT,
+        operator_disabled INTEGER NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_mode_status ON application_discovery(management_mode, sync_status)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -24736,6 +29101,115 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (application_id, module_key),
         INDEX idx_application_modules_application (application_id, module_key)
     )",
+    "CREATE TABLE IF NOT EXISTS application_billing_settings (
+        application_id VARCHAR(64) PRIMARY KEY,
+        accept_signet_balance INT NOT NULL DEFAULT 0,
+        wallet_mode VARCHAR(16) NOT NULL DEFAULT 'shared',
+        supported_currencies TEXT NOT NULL,
+        mode_locked_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_accounts (
+        id VARCHAR(64) PRIMARY KEY,
+        account_kind VARCHAR(32) NOT NULL,
+        scope_key VARCHAR(512) NOT NULL UNIQUE,
+        user_id VARCHAR(64) NULL,
+        application_id VARCHAR(64) NULL,
+        currency VARCHAR(3) NOT NULL,
+        available_minor BIGINT NOT NULL DEFAULT 0,
+        reserved_minor BIGINT NOT NULL DEFAULT 0,
+        version BIGINT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_wallet_accounts_user (user_id, currency, account_kind),
+        INDEX idx_wallet_accounts_application (application_id, currency, account_kind)
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id VARCHAR(64) PRIMARY KEY,
+        kind VARCHAR(32) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        user_id VARCHAR(64) NULL,
+        application_id VARCHAR(64) NULL,
+        currency VARCHAR(3) NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        source_wallet_id VARCHAR(64) NULL,
+        destination_wallet_id VARCHAR(64) NULL,
+        hold_id VARCHAR(64) NULL,
+        idempotency_key VARCHAR(255) NOT NULL,
+        external_provider VARCHAR(128) NULL,
+        external_order_id VARCHAR(255) NULL,
+        metadata TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE KEY uq_wallet_transaction_operation (kind, idempotency_key),
+        INDEX idx_wallet_transactions_user (user_id, created_at),
+        INDEX idx_wallet_transactions_application (application_id, created_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_entries (
+        id VARCHAR(64) PRIMARY KEY,
+        transaction_id VARCHAR(64) NOT NULL,
+        wallet_id VARCHAR(64) NOT NULL,
+        available_delta_minor BIGINT NOT NULL,
+        reserved_delta_minor BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        INDEX idx_wallet_entries_wallet (wallet_id, created_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS wallet_holds (
+        id VARCHAR(64) PRIMARY KEY,
+        hold_kind VARCHAR(32) NOT NULL,
+        wallet_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(64) NULL,
+        application_id VARCHAR(64) NULL,
+        currency VARCHAR(3) NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        reference VARCHAR(255) NOT NULL,
+        idempotency_key VARCHAR(255) NOT NULL,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE KEY uq_wallet_hold_operation (hold_kind, idempotency_key),
+        INDEX idx_wallet_holds_wallet (wallet_id, status, expires_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS payment_orders (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64) NOT NULL,
+        provider_slug VARCHAR(128) NOT NULL,
+        merchant_order_no VARCHAR(255) NOT NULL,
+        idempotency_key VARCHAR(255) NULL,
+        provider_trade_id VARCHAR(255) NULL,
+        currency VARCHAR(3) NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        subject VARCHAR(255) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        checkout_kind VARCHAR(32) NOT NULL,
+        checkout_value TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        paid_at BIGINT NULL,
+        last_error TEXT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE KEY uq_payment_order_merchant (provider_slug, merchant_order_no),
+        INDEX idx_payment_orders_user (user_id, created_at),
+        INDEX idx_payment_orders_status (status, expires_at)
+    )",
+    "ALTER TABLE payment_orders ADD COLUMN idempotency_key VARCHAR(255) NULL",
+    "CREATE UNIQUE INDEX uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
+    "CREATE TABLE IF NOT EXISTS payment_refunds (
+        id VARCHAR(64) PRIMARY KEY,
+        payment_order_id VARCHAR(64) NOT NULL,
+        amount_minor BIGINT NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        provider_refund_id VARCHAR(255) NULL,
+        requested_by VARCHAR(64) NULL,
+        reason VARCHAR(512) NOT NULL,
+        idempotency_key VARCHAR(255) NOT NULL DEFAULT '',
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_payment_refunds_order (payment_order_id, created_at)
+    )",
+    "ALTER TABLE payment_refunds ADD COLUMN idempotency_key VARCHAR(255) NOT NULL DEFAULT ''",
     "CREATE TABLE IF NOT EXISTS application_scim_tokens (
         id VARCHAR(64) PRIMARY KEY,
         application_id VARCHAR(64) NOT NULL,
@@ -24939,6 +29413,26 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (profile_id, user_id, permission),
         INDEX idx_application_profile_permission_overrides_user (profile_id, user_id, effect)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_discovery (
+        application_id VARCHAR(64) PRIMARY KEY,
+        management_mode VARCHAR(32) NOT NULL DEFAULT 'signet_managed',
+        website_url VARCHAR(2048) NOT NULL,
+        fetch_secret_ciphertext TEXT NOT NULL,
+        signing_public_jwks LONGTEXT NOT NULL,
+        last_verified_revision BIGINT NULL,
+        last_verified_version VARCHAR(255) NULL,
+        last_verified_digest VARCHAR(128) NULL,
+        last_verified_expires_at BIGINT NULL,
+        sync_status VARCHAR(32) NOT NULL DEFAULT 'unconfigured',
+        last_fetched_at BIGINT NULL,
+        last_success_at BIGINT NULL,
+        last_error TEXT NULL,
+        snapshot_json LONGTEXT NULL,
+        operator_disabled INT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_application_discovery_mode_status (management_mode, sync_status)
     )",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id VARCHAR(64) PRIMARY KEY,

@@ -11,7 +11,7 @@ FROM rust:1.94.1-bookworm AS backend-builder
 WORKDIR /src
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libsqlite3-dev libssl-dev pkg-config \
+    && apt-get install -y --no-install-recommends libmariadb-dev libpq-dev libsqlite3-dev libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
@@ -20,12 +20,12 @@ COPY --from=frontend-builder /src/frontend/dist frontend/dist
 
 # The frontend is already built in the preceding stage and embedded by build.rs.
 ENV SSO_SKIP_FRONTEND_BUILD=1
-RUN cargo build --release --locked --package sso-backend
+RUN cargo build --release --locked --package sso-backend --all-features
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libmariadb3 libpq5 libsqlite3-0 libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system signet \
     && useradd --system --gid signet --create-home --home-dir /app signet

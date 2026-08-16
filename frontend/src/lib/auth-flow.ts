@@ -167,11 +167,14 @@ export function authContextError(
   context: InitialAuthContext,
   t: (key: TranslationKey) => string
 ): string {
-  if (context.authError) return context.authError;
   if (context.authErrorCode === "company_email_required") {
     return context.authErrorDetail
       ? `${t("companyEmailRequired")}: ${context.authErrorDetail}`
       : t("companyEmailRequired");
   }
+  // Error text can originate in a redirect URL or an external identity
+  // provider. Keep the browser-facing message on our own translation allowlist
+  // instead of treating provider-controlled text as a trusted Signet message.
+  if (context.authError || context.authErrorCode) return t("authenticationFailed");
   return "";
 }

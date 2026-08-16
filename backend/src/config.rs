@@ -10,11 +10,136 @@ pub struct Settings {
     pub security: SecuritySettings,
     pub registration: RegistrationSettings,
     pub verification: VerificationSettings,
+    #[serde(default)]
+    pub discovery: DiscoverySettings,
+    #[serde(default)]
+    pub billing: BillingSettings,
     pub i18n: I18nSettings,
     #[serde(default)]
     pub external_oidc_providers: Vec<ExternalOidcProviderSettings>,
     pub cors: CorsSettings,
     pub bootstrap: BootstrapSettings,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscoverySettings {
+    #[serde(default = "default_discovery_sync_interval_seconds")]
+    pub sync_interval_seconds: i64,
+    /// Development-only escape hatch for a Compose edge whose DNS name
+    /// resolves to a private container address. Production deployments must
+    /// keep this false so a website-managed application cannot turn Signet
+    /// into an SSRF primitive.
+    #[serde(default)]
+    pub allow_private_networks: bool,
+    /// Base64url/base64 encoded 32-byte key used only to encrypt discovery
+    /// fetch secrets before they are persisted. It is deliberately separate
+    /// from Signet's JWT/SAML signing material.
+    #[serde(default)]
+    pub encryption_key: String,
+}
+
+impl Default for DiscoverySettings {
+    fn default() -> Self {
+        Self {
+            sync_interval_seconds: default_discovery_sync_interval_seconds(),
+            allow_private_networks: false,
+            encryption_key: String::new(),
+        }
+    }
+}
+
+fn default_discovery_sync_interval_seconds() -> i64 {
+    300
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BillingSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_billing_currency")]
+    pub default_currency: String,
+    #[serde(default = "default_billing_currencies")]
+    pub supported_currencies: Vec<CurrencySettings>,
+    #[serde(default = "default_reservation_ttl_seconds")]
+    pub reservation_ttl_seconds: i64,
+    #[serde(default)]
+    pub providers: Vec<PaymentProviderSettings>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CurrencySettings {
+    pub code: String,
+    pub minor_unit: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PaymentProviderSettings {
+    pub slug: String,
+    pub kind: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub gateway_url: String,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default = "default_epay_channel")]
+    pub payment_channel: String,
+    #[serde(default)]
+    pub merchant_id: String,
+    #[serde(default)]
+    pub merchant_secret: String,
+    #[serde(default)]
+    pub merchant_secret_env: Option<String>,
+    #[serde(default)]
+    pub private_key_pem: String,
+    #[serde(default)]
+    pub private_key_env: Option<String>,
+    #[serde(default)]
+    pub alipay_public_key_pem: String,
+    #[serde(default)]
+    pub alipay_public_key_env: Option<String>,
+    #[serde(default)]
+    pub certificate_serial_no: String,
+    #[serde(default)]
+    pub api_v3_key: String,
+    #[serde(default)]
+    pub api_v3_key_env: Option<String>,
+    #[serde(default)]
+    pub platform_certificate_pem: String,
+    #[serde(default)]
+    pub platform_certificate_env: Option<String>,
+    #[serde(default)]
+    pub notify_url: Option<String>,
+}
+
+impl Default for BillingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_currency: default_billing_currency(),
+            supported_currencies: default_billing_currencies(),
+            reservation_ttl_seconds: default_reservation_ttl_seconds(),
+            providers: Vec::new(),
+        }
+    }
+}
+
+fn default_billing_currency() -> String {
+    "CNY".to_string()
+}
+
+fn default_billing_currencies() -> Vec<CurrencySettings> {
+    vec![CurrencySettings {
+        code: "CNY".to_string(),
+        minor_unit: 2,
+    }]
+}
+
+fn default_reservation_ttl_seconds() -> i64 {
+    900
+}
+
+fn default_epay_channel() -> String {
+    "alipay".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -226,7 +351,38 @@ fn default_true() -> bool {
 pub struct BootstrapSettings {
     pub admin: BootstrapAdmin,
     #[serde(default)]
+    pub applications: Vec<BootstrapApplication>,
+    #[serde(default)]
     pub clients: Vec<BootstrapClient>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BootstrapApplication {
+    /// Public stable application identifier. This maps to applications.slug;
+    /// the database UUID remains an internal foreign key.
+    pub application_id: String,
+    pub name: String,
+    pub website_url: String,
+    #[serde(default = "default_management_mode")]
+    pub management_mode: String,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    /// Optional environment variable names used to enroll Discovery trust
+    /// material without putting secrets in TOML. These fields are not
+    /// authentication policy; they only establish the fetch/signing trust
+    /// root for a website-managed application.
+    #[serde(default)]
+    pub fetch_secret_env: Option<String>,
+    #[serde(default)]
+    pub signing_public_jwks_env: Option<String>,
+    #[serde(skip)]
+    pub fetch_secret: String,
+    #[serde(skip)]
+    pub signing_public_jwks: String,
+}
+
+fn default_management_mode() -> String {
+    "signet_managed".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -329,6 +485,15 @@ impl Settings {
         if let Ok(value) = env::var("SSO_SAML_SIGNING_CERTIFICATE_PEM") {
             self.security.saml_signing_certificate_pem = value;
         }
+        if let Ok(value) = env::var("SSO_DISCOVERY_ENCRYPTION_KEY") {
+            self.discovery.encryption_key = value;
+        }
+        if let Ok(value) = env::var("SSO_DISCOVERY_ALLOW_PRIVATE_NETWORKS") {
+            self.discovery.allow_private_networks = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         if let Ok(value) = env::var("SSO_BOOTSTRAP_ADMIN_PASSWORD") {
             self.bootstrap.admin.password = value;
         }
@@ -344,6 +509,51 @@ impl Settings {
             };
             resolve_bootstrap_client_secret(client, env::var(&env_name))?;
         }
+        for application in &mut self.bootstrap.applications {
+            if let Some(env_name) = application
+                .fetch_secret_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                // Missing trust material leaves the application explicitly
+                // unconfigured. Signet must still boot so an operator can
+                // enroll the website later through deployment secrets or the
+                // admin API; the runtime application gate remains fail-closed
+                // until a verified snapshot exists.
+                application.fetch_secret = env::var(env_name).unwrap_or_default();
+            }
+            if let Some(env_name) = application
+                .signing_public_jwks_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                application.signing_public_jwks = env::var(env_name).unwrap_or_default();
+            }
+        }
+        for provider in &mut self.billing.providers {
+            if !provider.enabled {
+                continue;
+            }
+            resolve_optional_secret(
+                &mut provider.merchant_secret,
+                provider.merchant_secret_env.as_deref(),
+            )?;
+            resolve_optional_secret(
+                &mut provider.private_key_pem,
+                provider.private_key_env.as_deref(),
+            )?;
+            resolve_optional_secret(
+                &mut provider.alipay_public_key_pem,
+                provider.alipay_public_key_env.as_deref(),
+            )?;
+            resolve_optional_secret(&mut provider.api_v3_key, provider.api_v3_key_env.as_deref())?;
+            resolve_optional_secret(
+                &mut provider.platform_certificate_pem,
+                provider.platform_certificate_env.as_deref(),
+            )?;
+        }
         Ok(())
     }
 
@@ -358,6 +568,13 @@ impl Settings {
             .any(|scope| scope == "openid")
         {
             anyhow::bail!("oidc.supported_scopes must include openid");
+        }
+        validate_billing_settings(&self.billing)?;
+        if self.discovery.sync_interval_seconds < 30 {
+            anyhow::bail!("discovery.sync_interval_seconds must be at least 30");
+        }
+        if !self.discovery.encryption_key.trim().is_empty() {
+            validate_discovery_encryption_key(&self.discovery.encryption_key)?;
         }
         if self.security.password_min_length < 8 {
             anyhow::bail!("security.password_min_length must be at least 8");
@@ -383,9 +600,7 @@ impl Settings {
             );
         }
         if !(300..=600).contains(&self.oidc.access_token_ttl_seconds) {
-            anyhow::bail!(
-                "oidc.access_token_ttl_seconds must be between 300 and 600 seconds"
-            );
+            anyhow::bail!("oidc.access_token_ttl_seconds must be between 300 and 600 seconds");
         }
         if !self
             .i18n
@@ -410,6 +625,26 @@ impl Settings {
         }
         validate_verification_channel("email", &self.verification.email)?;
         validate_verification_channel("phone", &self.verification.phone)?;
+        let mut application_ids = BTreeSet::new();
+        for application in &self.bootstrap.applications {
+            validate_bootstrap_application(application)?;
+            if !application_ids.insert(application.application_id.trim().to_string()) {
+                anyhow::bail!(
+                    "bootstrap application_id must be unique: {}",
+                    application.application_id
+                );
+            }
+            if application.management_mode == "website_managed"
+                && (!application.fetch_secret.trim().is_empty()
+                    || !application.signing_public_jwks.trim().is_empty())
+                && self.discovery.encryption_key.trim().is_empty()
+            {
+                anyhow::bail!(
+                    "website-managed bootstrap application {} requires discovery.encryption_key or SSO_DISCOVERY_ENCRYPTION_KEY",
+                    application.application_id
+                );
+            }
+        }
         for client in &self.bootstrap.clients {
             validate_bootstrap_client_logo_uri(&client.client_id, &client.logo_uri)?;
             if client.client_id.trim().is_empty() {
@@ -456,9 +691,7 @@ impl Settings {
                     client.client_id
                 );
             }
-            if client.require_confidential_client
-                && client.token_endpoint_auth_method == "none"
-            {
+            if client.require_confidential_client && client.token_endpoint_auth_method == "none" {
                 anyhow::bail!(
                     "bootstrap client {} cannot require confidentiality with token_endpoint_auth_method=none",
                     client.client_id
@@ -519,16 +752,12 @@ impl Settings {
                 ("subject_client_id", entry.subject_client_id.as_deref()),
             ] {
                 if value.is_some_and(|value| value.trim().is_empty()) {
-                    anyhow::bail!(
-                        "oidc.delegated_allowlist[{index}].{label} cannot be empty"
-                    );
+                    anyhow::bail!("oidc.delegated_allowlist[{index}].{label} cannot be empty");
                 }
             }
             let scopes = entry.normalized_scopes();
             if scopes.is_empty() {
-                anyhow::bail!(
-                    "oidc.delegated_allowlist[{index}] must contain at least one scope"
-                );
+                anyhow::bail!("oidc.delegated_allowlist[{index}] must contain at least one scope");
             }
             for scope in scopes {
                 if scope.ends_with(".service") {
@@ -537,9 +766,7 @@ impl Settings {
                     );
                 }
                 if scope.len() > 256 || scope.chars().any(char::is_whitespace) {
-                    anyhow::bail!(
-                        "oidc.delegated_allowlist[{index}] contains an invalid scope"
-                    );
+                    anyhow::bail!("oidc.delegated_allowlist[{index}] contains an invalid scope");
                 }
             }
         }
@@ -561,6 +788,72 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+fn validate_bootstrap_application(application: &BootstrapApplication) -> Result<()> {
+    let application_id = application.application_id.trim();
+    if application_id.is_empty()
+        || application_id.len() > 64
+        || application_id
+            .chars()
+            .any(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'))
+        || application_id.starts_with('-')
+        || application_id.ends_with('-')
+    {
+        anyhow::bail!(
+            "bootstrap application_id {} is invalid",
+            application.application_id
+        );
+    }
+    if application.name.trim().is_empty() || application.name.len() > 160 {
+        anyhow::bail!(
+            "bootstrap application {} name is invalid",
+            application.application_id
+        );
+    }
+    let parsed = url::Url::parse(application.website_url.trim()).with_context(|| {
+        format!(
+            "bootstrap application {} website_url must be an absolute URL",
+            application.application_id
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!(
+            "bootstrap application {} website_url must be an http(s) origin",
+            application.application_id
+        );
+    }
+    if !matches!(
+        application.management_mode.as_str(),
+        "signet_managed" | "website_managed"
+    ) {
+        anyhow::bail!(
+            "bootstrap application {} has unsupported management_mode",
+            application.application_id
+        );
+    }
+    Ok(())
+}
+
+fn validate_discovery_encryption_key(value: &str) -> Result<()> {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .or_else(|_| STANDARD.decode(value.trim()))
+        .with_context(|| "discovery.encryption_key must be base64 encoded")?;
+    if decoded.len() != 32 {
+        anyhow::bail!("discovery.encryption_key must decode to exactly 32 bytes");
+    }
+    Ok(())
 }
 
 fn validate_verification_channel(name: &str, channel: &VerificationChannelSettings) -> Result<()> {
@@ -687,12 +980,126 @@ fn resolve_bootstrap_client_secret(
     Ok(())
 }
 
+fn resolve_optional_secret(value: &mut String, env_name: Option<&str>) -> Result<()> {
+    let Some(env_name) = env_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    *value = env::var(env_name).with_context(|| {
+        format!("billing provider references missing secret environment variable {env_name}")
+    })?;
+    Ok(())
+}
+
+fn validate_billing_settings(settings: &BillingSettings) -> Result<()> {
+    if settings.default_currency.trim().is_empty() {
+        anyhow::bail!("billing.default_currency cannot be empty");
+    }
+    let mut seen_currencies = BTreeSet::new();
+    for currency in &settings.supported_currencies {
+        let code = currency.code.trim().to_ascii_uppercase();
+        if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            anyhow::bail!("billing currency codes must be three uppercase ASCII letters");
+        }
+        if currency.minor_unit > 8 {
+            anyhow::bail!("billing currency minor_unit must be between 0 and 8");
+        }
+        if !seen_currencies.insert(code) {
+            anyhow::bail!("billing currency codes must be unique");
+        }
+    }
+    if !seen_currencies.contains(&settings.default_currency.trim().to_ascii_uppercase()) {
+        anyhow::bail!("billing.default_currency must be in billing.supported_currencies");
+    }
+    if settings.reservation_ttl_seconds <= 0 {
+        anyhow::bail!("billing.reservation_ttl_seconds must be positive");
+    }
+    let mut seen_providers = BTreeSet::new();
+    for provider in &settings.providers {
+        let slug = provider.slug.trim();
+        if slug.is_empty() || slug.len() > 128 || !seen_providers.insert(slug.to_string()) {
+            anyhow::bail!("billing provider slugs must be unique and non-empty");
+        }
+        if !matches!(
+            provider.kind.as_str(),
+            "epay_v1" | "alipay_page" | "wechat_native"
+        ) {
+            anyhow::bail!("unsupported billing provider kind: {}", provider.kind);
+        }
+        if provider.enabled && provider.gateway_url.trim().is_empty() {
+            anyhow::bail!("enabled billing provider {slug} requires gateway_url");
+        }
+        if provider.enabled && provider.kind == "wechat_native" {
+            for (name, value) in [
+                ("app_id", provider.app_id.as_str()),
+                ("merchant_id", provider.merchant_id.as_str()),
+                (
+                    "certificate_serial_no",
+                    provider.certificate_serial_no.as_str(),
+                ),
+                ("api_v3_key", provider.api_v3_key.as_str()),
+                ("private_key_pem", provider.private_key_pem.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    anyhow::bail!("enabled WeChat billing provider {slug} requires {name}");
+                }
+            }
+        }
+        if provider.enabled && provider.kind == "alipay_page" {
+            for (name, value) in [
+                ("app_id", provider.app_id.as_str()),
+                ("private_key_pem", provider.private_key_pem.as_str()),
+                (
+                    "alipay_public_key_pem",
+                    provider.alipay_public_key_pem.as_str(),
+                ),
+            ] {
+                if value.trim().is_empty() {
+                    anyhow::bail!("enabled Alipay billing provider {slug} requires {name}");
+                }
+            }
+        }
+        if provider.enabled && provider.kind == "epay_v1" {
+            for (name, value) in [
+                ("merchant_id", provider.merchant_id.as_str()),
+                ("merchant_secret", provider.merchant_secret.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    anyhow::bail!("enabled EPay billing provider {slug} requires {name}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn default_settings() -> Settings {
         toml::from_str(include_str!("../../config/default.toml")).unwrap()
+    }
+
+    fn sample_bootstrap_client() -> BootstrapClient {
+        BootstrapClient {
+            client_id: "sample-client".to_string(),
+            client_name: "Sample Client".to_string(),
+            logo_uri: String::new(),
+            client_secret: "sample-secret".to_string(),
+            client_secret_env: None,
+            redirect_uris: vec!["https://example.test/callback".to_string()],
+            post_logout_redirect_uris: Vec::new(),
+            scopes: vec!["openid".to_string()],
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: "client_secret_basic".to_string(),
+            require_pkce: true,
+            require_confidential_client: true,
+            service_account_enabled: false,
+            service_account_permissions: Vec::new(),
+            audience: None,
+            rotate_secret: false,
+        }
     }
 
     fn verification_channel(delivery: VerificationDelivery) -> VerificationChannelSettings {
@@ -760,8 +1167,29 @@ mod tests {
     }
 
     #[test]
+    fn billing_provider_validation_requires_enabled_provider_credentials() {
+        let mut settings = default_settings();
+        settings.billing.providers[0].enabled = true;
+        assert!(settings.validate().is_err());
+
+        settings.billing.providers[0].merchant_id = "merchant-1".to_string();
+        settings.billing.providers[0].merchant_secret = "secret".to_string();
+        assert!(settings.validate().is_ok());
+
+        settings
+            .billing
+            .supported_currencies
+            .push(CurrencySettings {
+                code: "CNY".to_string(),
+                minor_unit: 2,
+            });
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn bootstrap_client_supports_service_accounts_without_openid_scope() {
         let mut settings = default_settings();
+        settings.bootstrap.clients.push(sample_bootstrap_client());
         {
             let client = settings.bootstrap.clients.first_mut().unwrap();
             client.scopes = vec!["memory.service".to_string()];
@@ -782,6 +1210,7 @@ mod tests {
     #[test]
     fn bootstrap_client_secret_env_replaces_literal_secret() {
         let mut settings = default_settings();
+        settings.bootstrap.clients.push(sample_bootstrap_client());
         let client = settings.bootstrap.clients.first_mut().unwrap();
         client.client_secret = "literal-secret".to_string();
         client.client_secret_env = Some("SIGNET_TEST_CLIENT_SECRET".to_string());
@@ -793,6 +1222,7 @@ mod tests {
     #[test]
     fn bootstrap_client_secret_can_be_omitted_for_existing_clients() {
         let mut settings = default_settings();
+        settings.bootstrap.clients.push(sample_bootstrap_client());
         settings.bootstrap.clients[0].client_secret.clear();
         assert!(settings.validate().is_ok());
 

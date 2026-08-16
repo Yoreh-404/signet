@@ -82,6 +82,10 @@ fn oidc_login_grant_credential_hash(state: &AppState, jar: &CookieJar) -> Option
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
+        // RFC 8414 OAuth clients (including external MCP clients) discover
+        // the same authorization server through this standard endpoint. The
+        // OIDC document already contains the complete OAuth metadata surface.
+        .route("/.well-known/oauth-authorization-server", get(discovery))
         .route("/oauth2/jwks", get(jwks))
         .route("/oauth2/authorize", get(authorize).post(authorize_consent))
         .route("/oauth2/par", post(crate::par::pushed_authorization))
@@ -3197,6 +3201,12 @@ async fn login_form(
     let return_to = redirects::local_return_to(payload.return_to.as_deref());
     let login_context =
         authorization_login_context_from_return_to(&state, &headers, Some(&return_to)).await?;
+    let local_password_allowed = match login_context.application.as_ref() {
+        Some(application) => {
+            applications::application_signet_password_enabled(&state, &application.id).await?
+        }
+        None => true,
+    };
     if let Some(captcha) = auth::login_captcha_prompt_if_required(
         &state,
         &subject,
@@ -3224,7 +3234,8 @@ async fn login_form(
     let mut login_method = "oidc_login".to_string();
     let mut external_provider = None;
     let mut user = local_user.filter(|candidate| {
-        candidate.is_active == 1
+        local_password_allowed
+            && candidate.is_active == 1
             && candidate.archived_at.is_none()
             && util::verify_password(&candidate.password_hash, password)
     });
@@ -3944,6 +3955,9 @@ pub(crate) async fn authorization_login_context_from_return_to(
     };
     let client = validate_authorize_request(state, &request).await?;
     let application = state.db.find_application_for_client(&client.id).await?;
+    if let Some(application) = application.as_ref() {
+        applications::ensure_application_runtime_active(state, application).await?;
+    }
     let requested_assurance = request.requested_assurance()?;
     Ok(AuthorizationLoginContext {
         client: Some(client),
@@ -6811,6 +6825,46 @@ mod tests {
         settings.database.url = path.to_string_lossy().to_string();
         settings.database.run_migrations = true;
         settings.bootstrap.admin.create_on_startup = false;
+        // Keep the production profile free of authentication clients while
+        // preserving the historical OIDC HTTP fixture used by this module.
+        // This client exists only in the per-test database and is still
+        // reconciled through the normal bootstrap path, including its
+        // application boundary.
+        settings
+            .bootstrap
+            .clients
+            .push(crate::config::BootstrapClient {
+                client_id: "demo-web".to_string(),
+                client_name: "Demo Web App".to_string(),
+                logo_uri: String::new(),
+                client_secret: "demo-secret-change-me".to_string(),
+                client_secret_env: None,
+                redirect_uris: vec![
+                    "http://localhost:3000/callback".to_string(),
+                    "http://localhost:5173/callback".to_string(),
+                ],
+                post_logout_redirect_uris: vec!["http://localhost:3000/".to_string()],
+                scopes: vec![
+                    "openid".to_string(),
+                    "profile".to_string(),
+                    "email".to_string(),
+                    "offline_access".to_string(),
+                ],
+                grant_types: vec![
+                    "authorization_code".to_string(),
+                    "refresh_token".to_string(),
+                    "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+                    "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+                ],
+                response_types: vec!["code".to_string()],
+                token_endpoint_auth_method: "client_secret_basic".to_string(),
+                require_pkce: false,
+                require_confidential_client: false,
+                service_account_enabled: false,
+                service_account_permissions: Vec::new(),
+                audience: None,
+                rotate_secret: false,
+            });
         let db = crate::db::Db::connect(&settings).unwrap();
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();

@@ -1,4 +1,10 @@
-use sso_backend::{AppState, Settings, db::Db, jwt::JwtManager, server};
+use sso_backend::{
+    AppState, Settings,
+    application_discovery,
+    db::Db,
+    jwt::JwtManager,
+    server,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
             "CSRF Origin/Referer verification is disabled; use this setting only for local testing"
         );
     }
-    let db = Db::connect(&settings)?;
+    let db = Db::connect_with_retry(&settings).await?;
     if settings.database.run_migrations {
         db.migrate().await?;
     }
@@ -27,6 +33,14 @@ async fn main() -> anyhow::Result<()> {
         db,
         jwt,
     };
+
+    // A website-managed application stays unavailable until this initial
+    // refresh succeeds, but one unavailable website must not prevent Signet
+    // from starting. The failed attempt is persisted as operator-visible
+    // discovery status by the synchronizer.
+    if let Err(error) = application_discovery::sync_all(&state).await {
+        tracing::warn!(error = %error, "initial website application discovery sweep failed");
+    }
 
     server::serve(state, &settings).await
 }

@@ -9,6 +9,7 @@ import {
   ChevronUp,
   Clock3,
   Copy,
+  Coins,
   Eye,
   ExternalLink,
   FileUp,
@@ -57,6 +58,7 @@ import {
 } from "./components/LoginMethod";
 import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
 import { ApplicationWorkspace } from "./features/applications/ApplicationWorkspace";
+import { WalletWorkspace } from "./features/billing/WalletWorkspace";
 import { translations } from "./i18n";
 import type { TranslationKey } from "./i18n";
 import {
@@ -110,7 +112,7 @@ import {
   emptyRoleForm,
   emptyUserForm
 } from "./lib/form-defaults";
-import { initialTab, initialTheme } from "./lib/navigation";
+import { initialNavigation, initialTheme } from "./lib/navigation";
 import {
   authenticationCredentialJson,
   passkeyCreationOptions,
@@ -120,6 +122,7 @@ import {
 import type {
   AccessGroup,
   ApplicationModule,
+  ApplicationSection,
   AuditEvent,
   AuditWebhook,
   BrowserAccount,
@@ -195,6 +198,19 @@ type UserLinkedIdentityFilter = "all" | "linked" | "unlinked";
 type UserLifecycleState = "active" | "disabled" | "archived";
 type BulkUserAction = "enable" | "disable" | "archive" | "delete" | "reset_mfa";
 type BrowserAccountContinuation = () => Promise<void>;
+type EnterpriseFormState = {
+  slug: string;
+  name: string;
+  description: string;
+  allowed_email_domains: string;
+};
+
+const emptyEnterpriseForm: EnterpriseFormState = {
+  slug: "",
+  name: "",
+  description: "",
+  allowed_email_domains: ""
+};
 
 function timestampAtDayEnd(value: string): number | null {
   const timestamp = toTimestamp(value);
@@ -309,6 +325,7 @@ function formatDiagnosticValue(
 
 export function App() {
   const initialAuth = useMemo(initialAuthContext, []);
+  const initialNavigationState = useMemo(() => initialNavigation(), []);
   const [locale, setLocale] = useState<Locale>(() => {
     const saved = localStorage.getItem("gpt-sso-locale");
     return saved === "en-US" ? "en-US" : "zh-CN";
@@ -316,12 +333,19 @@ export function App() {
   const t = (key: TranslationKey) => translations[locale][key];
   const messageOr = (err: unknown, fallback: TranslationKey) => {
     if (err instanceof ApiError && err.code === "network_error") return t("networkError");
+    if (err instanceof ApiError && err.code === "csrf_failed") return t("sessionExpired");
+    if (err instanceof ApiError && err.status >= 500) return t("serverError");
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) return t(fallback);
     return err instanceof Error ? err.message : t(fallback);
   };
 
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [user, setUser] = useState<User | null | undefined>(undefined);
-  const [tab, setTab] = useState<Tab>(initialTab);
+  const [tab, setTab] = useState<Tab>(initialNavigationState.tab);
+  const [applicationNavigationId, setApplicationNavigationId] = useState<string | null>(initialNavigationState.applicationId);
+  const [applicationNavigationSection, setApplicationNavigationSection] = useState<ApplicationSection | null>(initialNavigationState.applicationSection);
+  const [billingOrderReference, setBillingOrderReference] = useState<string | null>(initialNavigationState.billingOrder);
+  const [applicationWorkspaceDirty, setApplicationWorkspaceDirty] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const sidebarRef = useRef<HTMLElement | null>(null);
@@ -385,6 +409,7 @@ export function App() {
   const [userLinkedIdentityFilter, setUserLinkedIdentityFilter] = useState<UserLinkedIdentityFilter>("all");
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [userForm, setUserForm] = useState(emptyUserForm);
+  const [userFormBaseline, setUserFormBaseline] = useState<typeof emptyUserForm | null>(null);
   const [bulkImportOpen, setBulkImportOpen] = useState(false);
   const [bulkImportCsv, setBulkImportCsv] = useState("");
   const [bulkImportFileName, setBulkImportFileName] = useState("");
@@ -399,13 +424,11 @@ export function App() {
   const [clientForm, setClientForm] = useState(emptyClientForm);
   const [clientFormBaseline, setClientFormBaseline] = useState<typeof emptyClientForm | null>(null);
   const [clientFormErrors, setClientFormErrors] = useState<string[]>([]);
+  const [clientFieldErrors, setClientFieldErrors] = useState<Record<string, string>>({});
   const [applicationForm, setApplicationForm] = useState(emptyApplicationForm);
-  const [enterpriseForm, setEnterpriseForm] = useState({
-    slug: "",
-    name: "",
-    description: "",
-    allowed_email_domains: ""
-  });
+  const [applicationFormBaseline, setApplicationFormBaseline] = useState<typeof emptyApplicationForm | null>(null);
+  const [enterpriseForm, setEnterpriseForm] = useState<EnterpriseFormState>(emptyEnterpriseForm);
+  const [enterpriseFormBaseline, setEnterpriseFormBaseline] = useState<EnterpriseFormState | null>(null);
   const [enterpriseMemberEmail, setEnterpriseMemberEmail] = useState("");
   const [enterpriseMemberRole, setEnterpriseMemberRole] = useState<OrganizationMemberRole>("member");
   const [organizationMemberInvitations, setOrganizationMemberInvitations] = useState<Invitation[]>([]);
@@ -419,7 +442,9 @@ export function App() {
   });
   const [revealedOrganizationMemberInvitation, setRevealedOrganizationMemberInvitation] = useState<OrganizationMemberInvitationCreateResponse | null>(null);
   const [iapApplicationForm, setIapApplicationForm] = useState(emptyIapApplicationForm);
+  const [iapApplicationFormBaseline, setIapApplicationFormBaseline] = useState<typeof emptyIapApplicationForm | null>(null);
   const [invitationForm, setInvitationForm] = useState(emptyInvitationForm);
+  const [invitationFormBaseline, setInvitationFormBaseline] = useState<typeof emptyInvitationForm | null>(null);
   const [revealedInvitation, setRevealedInvitation] = useState<Invitation | null>(null);
   const [revealedInvitationCode, setRevealedInvitationCode] = useState("");
   const [revealingInvitationId, setRevealingInvitationId] = useState("");
@@ -431,8 +456,12 @@ export function App() {
   const [invitationRedemptionsError, setInvitationRedemptionsError] = useState("");
   const invitationRedemptionsLoadId = useRef(0);
   const [roleForm, setRoleForm] = useState(emptyRoleForm);
+  const [roleFormBaseline, setRoleFormBaseline] = useState<typeof emptyRoleForm | null>(null);
   const [groupForm, setGroupForm] = useState(emptyGroupForm);
+  const [groupFormBaseline, setGroupFormBaseline] = useState<typeof emptyGroupForm | null>(null);
   const [organizationForm, setOrganizationForm] = useState(emptyOrganizationForm);
+  const [organizationFormBaseline, setOrganizationFormBaseline] = useState<typeof emptyOrganizationForm | null>(null);
+  const [organizationMemberRolesBaseline, setOrganizationMemberRolesBaseline] = useState<Record<string, string> | null>(null);
   const [organizationMemberRoles, setOrganizationMemberRoles] = useState<Record<string, string>>({});
   const [organizationMembers, setOrganizationMembers] = useState<OrganizationMember[]>([]);
   const [organizationMembersLoading, setOrganizationMembersLoading] = useState(false);
@@ -482,6 +511,7 @@ export function App() {
   const [verificationMessage, setVerificationMessage] = useState("");
   const [error, setError] = useState(() => authContextError(initialAuth, t));
   const [busy, setBusy] = useState(false);
+  const authModeHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
   const userPermissions = user?.permissions ?? [];
   const isTrialEnrollmentSession = user?.session_kind === "trial_enrollment"
@@ -743,6 +773,7 @@ export function App() {
         || cachedApiValue<AuditWebhook[]>("/api/admin/audit-webhooks") !== undefined
       );
       case "settings": return cachedApiValue<RuntimeSettings>("/api/admin/runtime-settings") !== undefined;
+      case "billing": return false;
       case "account": return false;
     }
   }
@@ -977,7 +1008,7 @@ export function App() {
   }, [initialAuth.isAuthPage, user?.id]);
 
   useEffect(() => {
-    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || (tab === "overview" && !hasGlobalConsolePermission)) return;
+    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || tab === "billing" || (tab === "overview" && !hasGlobalConsolePermission)) return;
     loadAdminData(tab).catch((err) =>
       setError(messageOr(err, "loadFailed"))
     );
@@ -1037,8 +1068,11 @@ export function App() {
 
   useEffect(() => {
     const handleHashChange = () => {
-      const next = initialTab();
-      setTab(next);
+      const navigation = initialNavigation();
+      setTab(navigation.tab);
+      setApplicationNavigationId(navigation.applicationId);
+      setApplicationNavigationSection(navigation.applicationSection);
+      setBillingOrderReference(navigation.billingOrder);
       setSidebarOpen(false);
     };
     window.addEventListener("hashchange", handleHashChange);
@@ -1094,6 +1128,12 @@ export function App() {
     const timer = window.setTimeout(() => setVerificationMessage(""), 4200);
     return () => window.clearTimeout(timer);
   }, [user, verificationMessage]);
+
+  useEffect(() => {
+    if (!initialAuth.isAuthPage && !loginMfaChallengeId && !loginCaptchaChallengeId) return;
+    const frame = window.requestAnimationFrame(() => authModeHeadingRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [authMode, loginMethod, loginMfaChallengeId, loginCaptchaChallengeId, initialAuth.isAuthPage]);
 
   useEffect(() => {
     if (editor) setError("");
@@ -1306,11 +1346,12 @@ export function App() {
       setVerificationMessage(
         `${t("codeSent")}${result.dev_code ? `: ${result.dev_code}. ${t("copiedCodeHint")}` : ""}`
       );
-      if (channel === "email" && result.dev_code) {
-        setRegisterForm({ ...registerForm, email_code: result.dev_code });
+      const devCode = result.dev_code;
+      if (channel === "email" && devCode) {
+        setRegisterForm((current) => ({ ...current, email_code: devCode }));
       }
-      if (channel === "phone" && result.dev_code) {
-        setRegisterForm({ ...registerForm, phone_code: result.dev_code });
+      if (channel === "phone" && devCode) {
+        setRegisterForm((current) => ({ ...current, phone_code: devCode }));
       }
     }, "sendVerificationFailed");
   }
@@ -1324,8 +1365,9 @@ export function App() {
       setVerificationMessage(
         `${t("codeSent")}${result.dev_code ? `: ${result.dev_code}. ${t("copiedCodeHint")}` : ""}`
       );
-      if (result.dev_code) {
-        setPasswordResetForm({ ...passwordResetForm, code: result.dev_code });
+      const devCode = result.dev_code;
+      if (devCode) {
+        setPasswordResetForm((current) => ({ ...current, code: devCode }));
       }
     }, "sendResetCodeFailed");
   }
@@ -1443,6 +1485,7 @@ export function App() {
         await api<User>("/api/admin/users", { method: "POST", body });
       }
       setUserForm(emptyUserForm);
+      setUserFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -1548,25 +1591,40 @@ export function App() {
     await api(`/api/admin/users/${id}`, { method: "DELETE" });
     await loadAdminData();
     if (selectedUser?.user.id === id) setSelectedUser(null);
-    if (userForm.id === id) setUserForm(emptyUserForm);
+    if (userForm.id === id) {
+      setUserForm(emptyUserForm);
+      setUserFormBaseline(null);
+    }
   }
 
   async function saveClient(event: FormEvent) {
     event.preventDefault();
     const isNewClient = !clientForm.id;
     const validationErrors: string[] = [];
-    if (!clientForm.client_id.trim()) validationErrors.push(`${t("clientId")} · ${t("requiredField")}`);
-    if (!clientForm.client_name.trim()) validationErrors.push(`${t("clientName")} · ${t("requiredField")}`);
+    const fieldErrors: Record<string, string> = {};
+    const fieldLabels: Record<string, string> = {
+      client_id: t("clientId"),
+      client_name: t("clientName"),
+      redirect_uris: t("redirectUris"),
+      post_logout_redirect_uris: t("postLogoutUris"),
+      require_s256_pkce: t("requireS256Pkce")
+    };
+    const addFieldError = (field: string, message: string) => {
+      validationErrors.push(`${fieldLabels[field] ?? field} · ${message}`);
+      if (!fieldErrors[field]) fieldErrors[field] = message;
+    };
+    if (!clientForm.client_id.trim()) addFieldError("client_id", t("requiredField"));
+    if (!clientForm.client_name.trim()) addFieldError("client_name", t("requiredField"));
     const redirectValues = splitList(clientForm.redirect_uris);
     if (redirectValues.length === 0) {
-      validationErrors.push(`${t("redirectUris")} · ${t("requiredField")}`);
+      addFieldError("redirect_uris", t("requiredField"));
     } else {
       redirectValues.forEach((value) => {
         try {
           const url = new URL(value);
           if (!matchesHttpUrl(url)) throw new Error("invalid");
         } catch {
-          validationErrors.push(`${t("redirectUris")}: ${value} · ${t("invalidUrl")}`);
+          addFieldError("redirect_uris", `${value} · ${t("invalidUrl")}`);
         }
       });
     }
@@ -1576,21 +1634,23 @@ export function App() {
           const url = new URL(value);
           if (!matchesHttpUrl(url)) throw new Error("invalid");
         } catch {
-          validationErrors.push(`${t("postLogoutUris")}: ${value} · ${t("invalidUrl")}`);
+          addFieldError("post_logout_redirect_uris", `${value} · ${t("invalidUrl")}`);
         }
       });
     }
     if (clientForm.require_s256_pkce && !clientForm.require_pkce) {
-      validationErrors.push(`${t("requireS256Pkce")} · ${t("requirePkce")}`);
+      addFieldError("require_s256_pkce", t("requirePkce"));
     }
     if (validationErrors.length > 0) {
       setClientFormErrors(validationErrors);
+      setClientFieldErrors(fieldErrors);
       window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".form-error-summary")?.focus());
       return;
     }
     setBusy(true);
     setError("");
     setClientFormErrors([]);
+    setClientFieldErrors({});
     try {
       const body = JSON.stringify({
         client_id: clientForm.client_id,
@@ -1646,6 +1706,7 @@ export function App() {
       setClientForm(emptyClientForm);
       setClientFormBaseline(null);
       setClientFormErrors([]);
+      setClientFieldErrors({});
       setEditor(null);
       setVerificationMessage(t(isNewClient ? "clientCreatedApplicationHint" : "changesSaved"));
       await loadAdminData();
@@ -1672,7 +1733,7 @@ export function App() {
       ? protocolModule.config
       : {};
     const websiteUrl = typeof protocolConfig.website_url === "string" ? protocolConfig.website_url : "";
-    setApplicationForm({
+    const nextForm = {
       id: application.id,
       slug: application.slug,
       name: application.name,
@@ -1682,7 +1743,9 @@ export function App() {
       unique_identity_factors: application.unique_identity_factors,
       is_active: application.is_active,
       oidc_client_ids: application.oidc_clients.map((client) => client.id)
-    });
+    };
+    setApplicationForm(nextForm);
+    setApplicationFormBaseline(nextForm);
     setEditor("application");
   }
 
@@ -1721,6 +1784,7 @@ export function App() {
         })
       });
       setApplicationForm(emptyApplicationForm);
+      setApplicationFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData("applications", { force: true });
@@ -1735,6 +1799,7 @@ export function App() {
     await api(`/api/admin/applications/${id}`, { method: "DELETE" });
     if (applicationForm.id === id) {
       setApplicationForm(emptyApplicationForm);
+      setApplicationFormBaseline(null);
       setEditor(null);
     }
     await loadAdminData("applications", { force: true });
@@ -1883,6 +1948,7 @@ export function App() {
         await api<IapApplication>("/api/admin/iap-applications", { method: "POST", body });
       }
       setIapApplicationForm(emptyIapApplicationForm);
+      setIapApplicationFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -1906,11 +1972,26 @@ export function App() {
       required_permissions: application.required_permissions.join("\n"),
       is_active: application.is_active
     });
+    setIapApplicationFormBaseline({
+      id: application.id,
+      slug: application.slug,
+      name: application.name,
+      description: application.description ?? "",
+      external_host: application.external_host,
+      path_prefix: application.path_prefix,
+      required_organization_id: application.required_organization_id ?? "",
+      required_organization_roles: application.required_organization_roles,
+      required_permissions: application.required_permissions.join("\n"),
+      is_active: application.is_active
+    });
   }
 
   async function deleteIapApplication(id: string) {
     await api(`/api/admin/iap-applications/${id}`, { method: "DELETE" });
-    if (iapApplicationForm.id === id) setIapApplicationForm(emptyIapApplicationForm);
+    if (iapApplicationForm.id === id) {
+      setIapApplicationForm(emptyIapApplicationForm);
+      setIapApplicationFormBaseline(null);
+    }
     await loadAdminData();
   }
 
@@ -1982,6 +2063,7 @@ export function App() {
         setLastInvitationCode(result.code);
       }
       setInvitationForm(emptyInvitationForm);
+      setInvitationFormBaseline(null);
       // Keep a newly-created code visible so it can be copied once; edits can
       // return straight to the list.
       setEditor(editingInvitation ? null : "invitation");
@@ -2091,6 +2173,7 @@ export function App() {
         await api<Role>("/api/admin/access/roles", { method: "POST", body });
       }
       setRoleForm(emptyRoleForm);
+      setRoleFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -2110,11 +2193,20 @@ export function App() {
       description: role.description ?? "",
       permissions: role.permissions
     });
+    setRoleFormBaseline({
+      id: role.id,
+      name: role.name,
+      description: role.description ?? "",
+      permissions: role.permissions
+    });
   }
 
   async function deleteRole(id: string) {
     await api(`/api/admin/access/roles/${id}`, { method: "DELETE" });
-    if (roleForm.id === id) setRoleForm(emptyRoleForm);
+    if (roleForm.id === id) {
+      setRoleForm(emptyRoleForm);
+      setRoleFormBaseline(null);
+    }
     await loadAdminData();
     if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
   }
@@ -2140,6 +2232,7 @@ export function App() {
         body: JSON.stringify({ user_ids: groupForm.user_ids })
       });
       setGroupForm(emptyGroupForm);
+      setGroupFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData();
@@ -2159,11 +2252,21 @@ export function App() {
       role_ids: (group.roles ?? []).map((role) => role.id),
       user_ids: (group.members ?? []).map((member) => member.id)
     });
+    setGroupFormBaseline({
+      id: group.id,
+      name: group.name,
+      description: group.description ?? "",
+      role_ids: (group.roles ?? []).map((role) => role.id),
+      user_ids: (group.members ?? []).map((member) => member.id)
+    });
   }
 
   async function deleteGroup(id: string) {
     await api(`/api/admin/access/groups/${id}`, { method: "DELETE" });
-    if (groupForm.id === id) setGroupForm(emptyGroupForm);
+    if (groupForm.id === id) {
+      setGroupForm(emptyGroupForm);
+      setGroupFormBaseline(null);
+    }
     await loadAdminData();
     if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
   }
@@ -2192,6 +2295,8 @@ export function App() {
       });
       organizationMembersLoadId.current += 1;
       setOrganizationForm(emptyOrganizationForm);
+      setOrganizationFormBaseline(null);
+      setOrganizationMemberRolesBaseline(null);
       setOrganizationMemberRoles({});
       setOrganizationMembersLoading(false);
       setEditor(null);
@@ -2206,23 +2311,26 @@ export function App() {
 
   async function editOrganization(organization: Organization) {
     const loadId = ++organizationMembersLoadId.current;
-    setOrganizationForm({
+    const nextForm = {
       id: organization.id,
       slug: organization.slug,
       name: organization.name,
       description: organization.description ?? "",
       allowed_email_domains: organization.allowed_email_domains.join("\n"),
       is_active: organization.is_active
-    });
+    };
+    setOrganizationForm(nextForm);
+    setOrganizationFormBaseline(nextForm);
     setOrganizationMemberRoles({});
+    setOrganizationMemberRolesBaseline(null);
     setOrganizationMembersLoading(true);
     setEditor("organization");
     try {
       const members = await api<OrganizationMember[]>(`/api/admin/organizations/${organization.id}/members`);
       if (loadId !== organizationMembersLoadId.current) return;
-      setOrganizationMemberRoles(
-        Object.fromEntries(members.map((member) => [member.user_id, member.role]))
-      );
+      const nextRoles = Object.fromEntries(members.map((member) => [member.user_id, member.role]));
+      setOrganizationMemberRoles(nextRoles);
+      setOrganizationMemberRolesBaseline(nextRoles);
     } catch (err) {
       if (loadId === organizationMembersLoadId.current) {
         setError(messageOr(err, "loadFailed"));
@@ -2251,7 +2359,9 @@ export function App() {
     if (organizationForm.id === id) {
       organizationMembersLoadId.current += 1;
       setOrganizationForm(emptyOrganizationForm);
+      setOrganizationFormBaseline(null);
       setOrganizationMemberRoles({});
+      setOrganizationMemberRolesBaseline(null);
       setOrganizationMembersLoading(false);
     }
     await loadAdminData();
@@ -2820,7 +2930,7 @@ export function App() {
     setError("");
     setRefreshing(true);
     try {
-      if (tab === "account") {
+      if (tab === "account" || tab === "billing") {
         await loadAccountData();
       } else {
         await loadAdminData(tab, { force: true });
@@ -2835,6 +2945,9 @@ export function App() {
 
   async function switchEnterprise(organizationId: string) {
     if (!organizationId || organizationId === organizationContext?.id) return;
+    if (configurationFormsDirty() && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -2869,7 +2982,8 @@ export function App() {
           allowed_email_domains: splitList(enterpriseForm.allowed_email_domains).map(normalizeDomain)
         })
       });
-      setEnterpriseForm({ slug: "", name: "", description: "", allowed_email_domains: "" });
+      setEnterpriseForm(emptyEnterpriseForm);
+      setEnterpriseFormBaseline(null);
       setEditor(null);
       await loadEnterpriseContext(user?.id);
       setVerificationMessage(t("changesSaved"));
@@ -2881,14 +2995,32 @@ export function App() {
     }
   }
 
-  function navigateToTab(next: Tab) {
+  function navigateToTab(
+    next: Tab,
+    options: { applicationId?: string | null; applicationSection?: ApplicationSection | null } = {}
+  ) {
     if (next !== tab && configurationFormsDirty() && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
       return;
     }
     setTab(next);
     setSearchQuery("");
     setSidebarOpen(false);
-    const nextHash = `#/${next}`;
+    const applicationId = next === "applications"
+      ? options.applicationId ?? applicationNavigationId
+      : null;
+    const applicationSection = next === "applications"
+      ? options.applicationSection ?? applicationNavigationSection
+      : null;
+    const billingOrder = next === "billing" ? billingOrderReference : null;
+    setApplicationNavigationId(applicationId);
+    setApplicationNavigationSection(applicationSection);
+    setBillingOrderReference(billingOrder);
+    const params = new URLSearchParams();
+    if (applicationId) params.set("application", applicationId);
+    if (applicationSection) params.set("section", applicationSection);
+    if (billingOrder) params.set("billing_order", billingOrder);
+    const query = params.toString();
+    const nextHash = `#/${next}${query ? `?${query}` : ""}`;
     if (window.location.hash !== nextHash) {
       window.history.pushState(null, "", nextHash);
     }
@@ -2930,16 +3062,68 @@ export function App() {
       && JSON.stringify(loginSettingsDraft) !== JSON.stringify(loginSettingsBaseline);
   }
 
+  function applicationFormIsDirty(): boolean {
+    return applicationFormBaseline !== null
+      && JSON.stringify(applicationForm) !== JSON.stringify(applicationFormBaseline);
+  }
+
   function securityPolicyIsDirty(): boolean {
     return securityPolicyBaseline !== null
       && securityPolicy !== null
       && JSON.stringify(securityPolicy) !== JSON.stringify(securityPolicyBaseline);
   }
 
+  function userFormIsDirty(): boolean {
+    return userFormBaseline !== null
+      && JSON.stringify(userForm) !== JSON.stringify(userFormBaseline);
+  }
+
+  function enterpriseFormIsDirty(): boolean {
+    return enterpriseFormBaseline !== null
+      && JSON.stringify(enterpriseForm) !== JSON.stringify(enterpriseFormBaseline);
+  }
+
+  function iapApplicationFormIsDirty(): boolean {
+    return iapApplicationFormBaseline !== null
+      && JSON.stringify(iapApplicationForm) !== JSON.stringify(iapApplicationFormBaseline);
+  }
+
+  function invitationFormIsDirty(): boolean {
+    return invitationFormBaseline !== null
+      && JSON.stringify(invitationForm) !== JSON.stringify(invitationFormBaseline);
+  }
+
+  function roleFormIsDirty(): boolean {
+    return roleFormBaseline !== null
+      && JSON.stringify(roleForm) !== JSON.stringify(roleFormBaseline);
+  }
+
+  function groupFormIsDirty(): boolean {
+    return groupFormBaseline !== null
+      && JSON.stringify(groupForm) !== JSON.stringify(groupFormBaseline);
+  }
+
+  function organizationFormIsDirty(): boolean {
+    const formDirty = organizationFormBaseline !== null
+      && JSON.stringify(organizationForm) !== JSON.stringify(organizationFormBaseline);
+    const membersDirty = organizationMemberRolesBaseline !== null
+      && JSON.stringify(organizationMemberRoles) !== JSON.stringify(organizationMemberRolesBaseline);
+    return formDirty || membersDirty;
+  }
+
   function configurationFormsDirty(): boolean {
-    return clientDraftIsDirty()
+    return applicationWorkspaceDirty
+      || userFormIsDirty()
+      || enterpriseFormIsDirty()
+      || organizationFormIsDirty()
+      || clientDraftIsDirty()
       || providerFormIsDirty()
       || ldapProviderFormIsDirty()
+      || applicationFormIsDirty()
+      || iapApplicationFormIsDirty()
+      || invitationFormIsDirty()
+      || roleFormIsDirty()
+      || groupFormIsDirty()
       || auditWebhookFormIsDirty()
       || registrationSettingsIsDirty()
       || runtimeSettingsIsDirty()
@@ -2951,6 +3135,7 @@ export function App() {
     setClientForm(next);
     setClientFormBaseline(next);
     setClientFormErrors([]);
+    setClientFieldErrors({});
     setError("");
     setEditor("client");
   }
@@ -2958,6 +3143,22 @@ export function App() {
   function closeEditor(force = false): boolean {
     const editorDirty = editor === "client"
       ? clientDraftIsDirty()
+      : editor === "application"
+        ? applicationFormIsDirty()
+      : editor === "user"
+        ? userFormIsDirty()
+      : editor === "enterprise"
+        ? enterpriseFormIsDirty()
+      : editor === "organization"
+        ? organizationFormIsDirty()
+      : editor === "iap"
+        ? iapApplicationFormIsDirty()
+      : editor === "invitation"
+        ? invitationFormIsDirty()
+      : editor === "role"
+        ? roleFormIsDirty()
+      : editor === "group"
+        ? groupFormIsDirty()
       : editor === "provider"
         ? providerFormIsDirty()
         : editor === "ldap"
@@ -2973,6 +3174,25 @@ export function App() {
     if (editor === "client") {
       setClientFormBaseline(null);
       setClientFormErrors([]);
+      setClientFieldErrors({});
+    }
+    if (editor === "user") {
+      setUserForm(emptyUserForm);
+      setUserFormBaseline(null);
+    }
+    if (editor === "enterprise") {
+      setEnterpriseForm(emptyEnterpriseForm);
+      setEnterpriseFormBaseline(null);
+    }
+    if (editor === "organization") {
+      setOrganizationForm(emptyOrganizationForm);
+      setOrganizationFormBaseline(null);
+      setOrganizationMemberRoles({});
+      setOrganizationMemberRolesBaseline(null);
+    }
+    if (editor === "application") {
+      setApplicationForm(emptyApplicationForm);
+      setApplicationFormBaseline(null);
     }
     if (editor === "provider") {
       setProviderForm(emptyProviderForm);
@@ -2982,6 +3202,23 @@ export function App() {
     if (editor === "ldap") {
       setLdapProviderForm(emptyLdapProviderForm);
       setLdapProviderFormBaseline(null);
+    }
+    if (editor === "iap") {
+      setIapApplicationForm(emptyIapApplicationForm);
+      setIapApplicationFormBaseline(null);
+    }
+    if (editor === "invitation") {
+      setInvitationForm(emptyInvitationForm);
+      setInvitationFormBaseline(null);
+      setLastInvitationCode("");
+    }
+    if (editor === "role") {
+      setRoleForm(emptyRoleForm);
+      setRoleFormBaseline(null);
+    }
+    if (editor === "group") {
+      setGroupForm(emptyGroupForm);
+      setGroupFormBaseline(null);
     }
     setEditor(null);
     setError("");
@@ -3015,6 +3252,9 @@ export function App() {
   const tabs = useMemo(
     () => {
       const accountTab = { id: "account" as const, label: t("account"), icon: UserRound };
+      const billingTab = user && !isRestrictedLoginCodeSession
+        ? { id: "billing" as const, label: t("billing"), icon: Coins }
+        : null;
       const adminTabs = [
         hasGlobalConsolePermission ? { id: "overview" as const, label: t("overview"), icon: Shield } : null,
         canReadUsers ? { id: "users" as const, label: t("users"), icon: Users } : null,
@@ -3029,7 +3269,9 @@ export function App() {
         (canManageSecurity || canReadAudit) ? { id: "security" as const, label: t("security"), icon: Shield } : null,
         canManageSettings ? { id: "settings" as const, label: t("settings"), icon: Settings } : null
       ].filter((item): item is NonNullable<typeof item> => Boolean(item));
-      return canAdmin ? [accountTab, ...adminTabs] : [accountTab];
+      return canAdmin
+        ? [accountTab, ...(billingTab ? [billingTab] : []), ...adminTabs]
+        : [accountTab, ...(billingTab ? [billingTab] : [])];
     },
     [
       locale,
@@ -3044,7 +3286,9 @@ export function App() {
       canManageSettings,
       canManageProviders,
       canManageSecurity,
-      canReadAudit
+      canReadAudit,
+      user,
+      isRestrictedLoginCodeSession
     ]
   );
 
@@ -3054,7 +3298,7 @@ export function App() {
         id: "workspace",
         label: t("navWorkspace"),
         hint: t("navWorkspaceHint"),
-        ids: ["overview"] as Tab[]
+        ids: ["overview", "billing"] as Tab[]
       },
       {
         id: "directory",
@@ -3103,8 +3347,31 @@ export function App() {
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [
+    applicationWorkspaceDirty,
+    userForm,
+    userFormBaseline,
+    enterpriseForm,
+    enterpriseFormBaseline,
+    organizationForm,
+    organizationFormBaseline,
+    organizationMemberRoles,
+    organizationMemberRolesBaseline,
     clientForm,
     clientFormBaseline,
+    providerForm,
+    providerFormBaseline,
+    ldapProviderForm,
+    ldapProviderFormBaseline,
+    auditWebhookForm,
+    auditWebhookFormBaseline,
+    iapApplicationForm,
+    iapApplicationFormBaseline,
+    invitationForm,
+    invitationFormBaseline,
+    roleForm,
+    roleFormBaseline,
+    groupForm,
+    groupFormBaseline,
     registrationSettings,
     registrationSettingsBaseline,
     runtimeSettings,
@@ -3480,7 +3747,7 @@ export function App() {
         <section className={`unified-auth-main${authFormsVisible ? " auth-form-mode" : ""}`}>
           <div className="unified-auth-content">
           <section className="unified-auth-title">
-            <h1>{unifiedAuthTitle}</h1>
+            <h1 ref={authModeHeadingRef} tabIndex={-1}>{unifiedAuthTitle}</h1>
           </section>
           {error && <div className="error" role="alert">{error}</div>}
           {authAccountSwitch && <div className="info">{t("authAccountSwitch")}</div>}
@@ -3580,13 +3847,13 @@ export function App() {
                   {loginMfaChallengeId && (
                     <>
                       <Field label={t("mfaCode")} autoComplete="one-time-code" value={loginMfaCode} onChange={setLoginMfaCode} />
-                      <small>{t("mfaRequired")}{loginRecoveryAvailable ? ` · ${t("recoveryCodes")}` : ""}</small>
+                      <small role="status" aria-live="polite">{t("mfaRequired")}{loginRecoveryAvailable ? ` · ${t("recoveryCodes")}` : ""}</small>
                     </>
                   )}
                   {loginCaptchaChallengeId && (
                     <>
                       <Field label={`${t("captchaAnswer")} · ${loginCaptchaPrompt}`} value={loginCaptchaAnswer} onChange={setLoginCaptchaAnswer} />
-                      <small>{t("captchaRequired")}</small>
+                      <small role="status" aria-live="polite">{t("captchaRequired")}</small>
                     </>
                   )}
                   <button className="primary" type="submit" disabled={busy}>
@@ -3598,18 +3865,27 @@ export function App() {
                   </button>
                 </form>
               ) : (
-                <AuthorizationCodeLoginForm
-                  email={authorizationCodeLoginForm.email}
-                  authorizationCode={authorizationCodeLoginForm.authorization_code}
-                  onAuthorizationCodeChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, authorization_code: value }))}
-                  onEmailChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, email: value }))}
-                  onSubmit={handleAuthorizationCodeLogin}
-                  busy={busy}
-                  emailLabel={t("email")}
-                  authorizationCodeLabel={t("loginAuthorizationCode")}
-                  hint={t("loginAuthorizationCodeHint")}
-                  submitLabel={t("authorizationCodeLogin")}
-                />
+                <>
+                  <div className="info authorization-code-purpose" role="note">
+                    <strong>{t("authorizationCodeLoginPurposeTitle")}</strong>
+                    <p>{t("authorizationCodeLoginPurposeHint")}</p>
+                    {browserAccountsContext?.client_name && (
+                      <small>{t("authorizationCodeLoginScopeHint").replace("{client}", browserAccountsContext.client_name)}</small>
+                    )}
+                  </div>
+                  <AuthorizationCodeLoginForm
+                    email={authorizationCodeLoginForm.email}
+                    authorizationCode={authorizationCodeLoginForm.authorization_code}
+                    onAuthorizationCodeChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, authorization_code: value }))}
+                    onEmailChange={(value) => setAuthorizationCodeLoginForm((current) => ({ ...current, email: value }))}
+                    onSubmit={handleAuthorizationCodeLogin}
+                    busy={busy}
+                    emailLabel={t("email")}
+                    authorizationCodeLabel={t("loginAuthorizationCode")}
+                    hint={t("loginAuthorizationCodeHint")}
+                    submitLabel={t("authorizationCodeLogin")}
+                  />
+                </>
               )}
               <div className="auth-secondary-actions">
                 <span>
@@ -3872,6 +4148,12 @@ export function App() {
             {activeNavigationGroup && <span className="page-heading-context">{activeNavigationGroup.label}</span>}
             <h2>{tabs.find((item) => item.id === tab)?.label}</h2>
             {activeNavigationGroup && <small className="page-heading-hint">{activeNavigationGroup.hint}</small>}
+            {user && (
+              <span className="page-heading-context current-enterprise-context" aria-live="polite">
+                <Building2 size={13} aria-hidden="true" />
+                {t("enterprise")} · {organizationContext?.name ?? t("noEnterprise")}
+              </span>
+            )}
           </div>
           {user && (
             <div className="enterprise-switcher">
@@ -3889,7 +4171,7 @@ export function App() {
                   </option>
                 ))}
               </select>
-              <button className="icon-button" type="button" onClick={() => setEditor("enterprise")} title={t("createEnterprise")} aria-label={t("createEnterprise")} disabled={busy}>
+              <button className="icon-button" type="button" onClick={() => { setEnterpriseForm(emptyEnterpriseForm); setEnterpriseFormBaseline(emptyEnterpriseForm); setEditor("enterprise"); }} title={t("createEnterprise")} aria-label={t("createEnterprise")} disabled={busy}>
                 <Plus size={16} />
               </button>
             </div>
@@ -3925,7 +4207,15 @@ export function App() {
               <Field label={t("enterpriseName")} value={enterpriseForm.name} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, name: value })} />
               <Field label={t("enterpriseDescription")} value={enterpriseForm.description} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, description: value })} textarea />
               <Field label={t("enterpriseEmailDomains")} value={enterpriseForm.allowed_email_domains} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, allowed_email_domains: value })} textarea />
-              <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{t("createEnterprise")}</button></div>
+              <FormActions
+                submitLabel={t("createEnterprise")}
+                cancelLabel={t("cancel")}
+                onCancel={closeEditor}
+                busy={busy}
+                dirty={enterpriseFormIsDirty()}
+                statusLabel={enterpriseFormIsDirty() ? t("unsavedChanges") : undefined}
+                savingLabel={t("saving")}
+              />
             </form>
           </Modal>
         )}
@@ -3938,7 +4228,7 @@ export function App() {
           </div>
         )}
         {verificationMessage && <div className="toast" role="status" aria-live="polite">{verificationMessage}</div>}
-        {!canAdmin && tab !== "account" ? <div className="empty">{t("noUserAdminOnly")}</div> : null}
+        {!canAdmin && tab !== "account" && tab !== "billing" ? <div className="empty">{t("noUserAdminOnly")}</div> : null}
         {tab === "account" && (
           <section className="account-layout">
             <div className="client-list">
@@ -3996,8 +4286,8 @@ export function App() {
                 {canMutateAccount && (
                   <div className="actions">
                     <button type="button" onClick={startTotpSetup} disabled={busy}><KeyRound size={14} />{t("startTotpSetup")}</button>
-                    {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
-                    {mfaStatus?.enabled && <button type="button" onClick={() => requestConfirmation(disableMfa)} disabled={busy}>{t("disableMfa")}</button>}
+                    {mfaStatus?.enabled && <button type="button" onClick={() => requestConfirmation(rotateRecoveryCodes, t("rotateRecoveryCodes"), t("rotateRecoveryCodesDescription"))} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
+                    {mfaStatus?.enabled && <button type="button" onClick={() => requestConfirmation(disableMfa, t("disableMfa"), t("disableMfaDescription"))} disabled={busy}>{t("disableMfa")}</button>}
                   </div>
                 )}
                 {totpSetup && canMutateAccount && (
@@ -4160,6 +4450,9 @@ export function App() {
             </div>
           </section>
         )}
+        {tab === "billing" && user && !isRestrictedLoginCodeSession && (
+          <WalletWorkspace locale={locale} t={t} orderReference={billingOrderReference} />
+        )}
         {canAdmin && tab === "overview" && (
           <section className="dashboard">
             <article className="welcome-card">
@@ -4225,10 +4518,15 @@ export function App() {
                 <Field label={t("password")} type="password" value={userForm.password} onChange={(value) => setUserForm({ ...userForm, password: value })} />
                 <Check label={t("admin")} checked={userForm.is_admin} onChange={(value) => setUserForm({ ...userForm, is_admin: value })} />
                 {!userForm.id && <Check label={t("active")} checked={userForm.is_active} onChange={(value) => setUserForm({ ...userForm, is_active: value })} />}
-                <button className="primary" type="submit" disabled={busy}>
-                  <Save size={16} />
-                  {t("save")}
-                </button>
+                <FormActions
+                  submitLabel={t("save")}
+                  cancelLabel={t("cancel")}
+                  onCancel={closeEditor}
+                  busy={busy}
+                  dirty={userFormIsDirty()}
+                  statusLabel={userFormIsDirty() ? t("unsavedChanges") : undefined}
+                  savingLabel={t("saving")}
+                />
               </form>
               </Modal>
             )}
@@ -4371,7 +4669,7 @@ export function App() {
             <div className="table-panel users-table-panel">
               <div className="table-toolbar users-toolbar">
                 <div className="users-toolbar-actions">
-                  {canManageUsers && <button type="button" onClick={() => { setUserForm(emptyUserForm); setEditor("user"); }}><Plus size={14} />{t("createUser")}</button>}
+                  {canManageUsers && <button type="button" onClick={() => { setUserForm(emptyUserForm); setUserFormBaseline(emptyUserForm); setEditor("user"); }}><Plus size={14} />{t("createUser")}</button>}
                   {canManageUsers && <button type="button" onClick={openBulkUserImport}><FileUp size={14} />{t("bulkUserImport")}</button>}
                 </div>
                 <label className="filter-control">
@@ -4550,7 +4848,7 @@ export function App() {
                       <td className="actions user-actions">
                         {canManageUsers && item.archived_at === null && (
                           <button type="button" onClick={() => {
-                            setUserForm({
+                            const nextForm = {
                               id: item.id,
                               email: item.email,
                               username: item.username,
@@ -4559,7 +4857,9 @@ export function App() {
                               password: "",
                               is_admin: item.is_admin,
                               is_active: item.is_active
-                            });
+                            };
+                            setUserForm(nextForm);
+                            setUserFormBaseline(nextForm);
                             setEditor("user");
                           }}>{t("edit")}</button>
                         )}
@@ -4599,7 +4899,7 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
+              {!adminLoading && filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
               {selectedUser && <Modal title={t("userDetails")} closeLabel={t("close")} onClose={() => setSelectedUser(null)} wide className="user-detail-modal"><UserDetailPanel detail={selectedUser} locale={locale} t={t} /></Modal>}
             </div>
           </section>
@@ -4644,22 +4944,20 @@ export function App() {
                     })}
                   </div>
                 )}
-                <div className="actions">
-                  <button type="submit" disabled={busy || organizationMembersLoading}><Save size={14} />{organizationForm.id ? t("save") : t("create")}</button>
-                  {organizationForm.id && (
-                    <button type="button" onClick={() => {
-                      organizationMembersLoadId.current += 1;
-                      setOrganizationForm(emptyOrganizationForm);
-                      setOrganizationMemberRoles({});
-                      setOrganizationMembersLoading(false);
-                    }}>{t("clear")}</button>
-                  )}
-                </div>
+                <FormActions
+                  submitLabel={organizationForm.id ? t("save") : t("create")}
+                  cancelLabel={t("cancel")}
+                  onCancel={closeEditor}
+                  busy={busy || organizationMembersLoading}
+                  dirty={organizationFormIsDirty()}
+                  statusLabel={organizationFormIsDirty() ? t("unsavedChanges") : undefined}
+                  savingLabel={t("saving")}
+                />
               </form>
               </Modal>
             )}
             <div className="table-panel">
-              <div className="table-toolbar"><h3>{t("organizations")}</h3>{canManageOrganizations && <button type="button" onClick={() => { organizationMembersLoadId.current += 1; setOrganizationForm(emptyOrganizationForm); setOrganizationMemberRoles({}); setOrganizationMembersLoading(false); setEditor("organization"); }}><Plus size={14} />{t("createOrganization")}</button>}</div>
+              <div className="table-toolbar"><h3>{t("organizations")}</h3>{canManageOrganizations && <button type="button" onClick={() => { organizationMembersLoadId.current += 1; setOrganizationForm(emptyOrganizationForm); setOrganizationFormBaseline(emptyOrganizationForm); setOrganizationMemberRoles({}); setOrganizationMemberRolesBaseline({}); setOrganizationMembersLoading(false); setEditor("organization"); }}><Plus size={14} />{t("createOrganization")}</button>}</div>
               <table>
                 <thead>
                   <tr>
@@ -4703,7 +5001,7 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {filteredOrganizations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Building2 size={22} />} />}
+              {!adminLoading && filteredOrganizations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Building2 size={22} />} />}
             </div>
           </section>
         )}
@@ -4731,7 +5029,10 @@ export function App() {
                     <option value="required">{t("accountSelectionRequired")}</option>
                   </SelectField>
                   <Check label={t("active")} checked={applicationForm.is_active} onChange={(value) => setApplicationForm({ ...applicationForm, is_active: value })} />
-                  <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{applicationForm.id ? t("save") : t("create")}</button></div>
+                  <div className="form-actions">
+                    <span className="form-actions-status" aria-live="polite">{applicationFormIsDirty() ? t("unsavedChanges") : ""}</span>
+                    <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{applicationForm.id ? t("save") : t("create")}</button></div>
+                  </div>
                 </form>
               </Modal>
             )}
@@ -4744,11 +5045,17 @@ export function App() {
               canManage={canManageActiveOrganization}
               onCreateApplication={() => {
                 setApplicationForm(emptyApplicationForm);
+                setApplicationFormBaseline(emptyApplicationForm);
                 setEditor("application");
               }}
               onEditApplication={(application) => void editApplication(application)}
-              onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id))}
+              onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id), t("delete"), t("deleteApplicationDescription"))}
               onApplicationModuleChanged={updateApplicationModuleInState}
+              initialApplicationId={applicationNavigationId}
+              initialSection={applicationNavigationSection}
+              onNavigationChange={(applicationId, section) => navigateToTab("applications", { applicationId, applicationSection: section })}
+              onDirtyChange={setApplicationWorkspaceDirty}
+              onRequestConfirmation={requestConfirmation}
             />
           </>
         )}
@@ -4759,8 +5066,8 @@ export function App() {
               <form className="panel" onSubmit={saveClient}>
                 <FormErrorSummary title={t("fixFormErrors")} errors={clientFormErrors} />
                 <SettingsSection title={t("clientBasics")} description={t("clientBasicsHint")} collapsible={false}>
-                  <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} required />
-                  <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} required />
+                  <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} error={clientFieldErrors.client_id} required />
+                  <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} error={clientFieldErrors.client_name} required />
                   <Field label={t("clientLogoUri")} type="url" value={clientForm.logo_uri} onChange={(value) => setClientForm({ ...clientForm, logo_uri: value })} />
                   <div className="info client-enterprise-lock" role="status">
                     <strong>{t("clientOrganization")}</strong>
@@ -4781,6 +5088,7 @@ export function App() {
                     label={t("redirectUris")}
                     value={clientForm.redirect_uris}
                     onChange={(value) => setClientForm({ ...clientForm, redirect_uris: value })}
+                    error={clientFieldErrors.redirect_uris}
                     addLabel={t("addItem")}
                     removeLabel={t("removeItem")}
                     type="url"
@@ -4790,6 +5098,7 @@ export function App() {
                     label={t("postLogoutUris")}
                     value={clientForm.post_logout_redirect_uris}
                     onChange={(value) => setClientForm({ ...clientForm, post_logout_redirect_uris: value })}
+                    error={clientFieldErrors.post_logout_redirect_uris}
                     addLabel={t("addItem")}
                     removeLabel={t("removeItem")}
                     type="url"
@@ -4823,7 +5132,7 @@ export function App() {
                 <SettingsSection title={t("clientSecurity")} description={t("clientSecurityHint")}>
                   <div className="check-grid-inline">
                     <Check label={t("requirePkce")} checked={clientForm.require_pkce} onChange={(value) => setClientForm({ ...clientForm, require_pkce: value })} />
-                    <Check label={t("requireS256Pkce")} checked={clientForm.require_s256_pkce} onChange={(value) => setClientForm({ ...clientForm, require_s256_pkce: value, require_pkce: value ? true : clientForm.require_pkce })} />
+                    <Check label={t("requireS256Pkce")} checked={clientForm.require_s256_pkce} error={clientFieldErrors.require_s256_pkce} onChange={(value) => setClientForm({ ...clientForm, require_s256_pkce: value, require_pkce: value ? true : clientForm.require_pkce })} />
                     <Check label={t("requireClientMfa")} checked={clientForm.require_mfa} onChange={(value) => setClientForm({ ...clientForm, require_mfa: value })} />
                     <Check label={t("requirePar")} checked={clientForm.require_pushed_authorization_requests} onChange={(value) => setClientForm({ ...clientForm, require_pushed_authorization_requests: value })} />
                     <Check label={t("requireConfidentialClient")} checked={clientForm.require_confidential_client} onChange={(value) => setClientForm({ ...clientForm, require_confidential_client: value })} />
@@ -4910,7 +5219,7 @@ export function App() {
                         <span>{t("applicationConnection")}</span>
                         <strong>{application.name}</strong>
                         {canManageActiveOrganization && (
-                          <button className="text-button" type="button" onClick={() => navigateToTab("applications")}>
+                          <button className="text-button" type="button" onClick={() => navigateToTab("applications", { applicationId: application.id, applicationSection: "authorization" })}>
                             <Link2 size={14} />
                             {t("openApplicationPolicy")}
                           </button>
@@ -5004,7 +5313,7 @@ export function App() {
                   )}
                 </article>
               ))}
-              {filteredClients.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<KeyRound size={22} />} />}
+              {!adminLoading && filteredClients.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<KeyRound size={22} />} />}
             </div>
           </section>
         )}
@@ -5047,17 +5356,20 @@ export function App() {
                   onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, required_permissions: value })}
                 />
                 <Check label={t("active")} checked={iapApplicationForm.is_active} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, is_active: value })} />
-                <div className="actions">
-                  <button type="submit" disabled={busy}><Save size={14} />{iapApplicationForm.id ? t("save") : t("create")}</button>
-                  {iapApplicationForm.id && (
-                    <button type="button" onClick={() => setIapApplicationForm(emptyIapApplicationForm)}>{t("clear")}</button>
-                  )}
-                </div>
+                <FormActions
+                  submitLabel={iapApplicationForm.id ? t("save") : t("create")}
+                  cancelLabel={t("cancel")}
+                  onCancel={closeEditor}
+                  busy={busy}
+                  dirty={iapApplicationFormIsDirty()}
+                  statusLabel={iapApplicationFormIsDirty() ? t("unsavedChanges") : undefined}
+                  savingLabel={t("saving")}
+                />
               </form>
               </Modal>
             )}
             <div className="client-list">
-              {canManageIap && <div className="table-toolbar"><button type="button" onClick={() => { setIapApplicationForm(emptyIapApplicationForm); setEditor("iap"); }}><Plus size={14} />{t("createIapApplication")}</button></div>}
+              {canManageIap && <div className="table-toolbar"><button type="button" onClick={() => { setIapApplicationForm(emptyIapApplicationForm); setIapApplicationFormBaseline(emptyIapApplicationForm); setEditor("iap"); }}><Plus size={14} />{t("createIapApplication")}</button></div>}
               {filteredIapApplications.map((application) => {
                 const organization = organizationOptions.find((item) => item.id === application.required_organization_id);
                 return (
@@ -5090,7 +5402,7 @@ export function App() {
                   </article>
                 );
               })}
-              {filteredIapApplications.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Shield size={22} />} />}
+              {!adminLoading && filteredIapApplications.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Shield size={22} />} />}
             </div>
           </section>
         )}
@@ -5103,9 +5415,7 @@ export function App() {
                 error={error}
                 dismissible={!busy}
                 onClose={() => {
-                  setInvitationForm(emptyInvitationForm);
-                  setLastInvitationCode("");
-                  closeEditor();
+                  if (closeEditor()) setLastInvitationCode("");
                 }}
                 wide
               >
@@ -5268,7 +5578,15 @@ export function App() {
                 description={invitationForm.code_type === "login" && invitationForm.login_code_level === "trial_enrollment" ? t("trialEnrollmentUsesHint") : undefined}
               />
               <Check label={t("active")} checked={invitationForm.is_active} onChange={(value) => setInvitationForm({ ...invitationForm, is_active: value })} />
-              <button className="primary" type="submit" disabled={busy}><Ticket size={16} />{t("save")}</button>
+              <FormActions
+                submitLabel={t("save")}
+                cancelLabel={t("cancel")}
+                onCancel={closeEditor}
+                busy={busy}
+                dirty={invitationFormIsDirty()}
+                statusLabel={invitationFormIsDirty() ? t("unsavedChanges") : undefined}
+                savingLabel={t("saving")}
+              />
               {lastInvitationCode && (
                 <div className="info">
                   {t("createdInvitation")}: <strong>{lastInvitationCode}</strong>
@@ -5360,6 +5678,7 @@ export function App() {
                 <h3>{t("invitations")}</h3>
                 <button type="button" onClick={() => {
                   setInvitationForm(emptyInvitationForm);
+                  setInvitationFormBaseline(emptyInvitationForm);
                   setLastInvitationCode("");
                   setEditor("invitation");
                 }}>
@@ -5445,7 +5764,7 @@ export function App() {
                       <td>{item.is_active ? t("active") : t("disabled")}</td>
                       <td className="actions">
                         <button type="button" onClick={() => {
-                          setInvitationForm({
+                          const nextForm = {
                             id: item.id,
                             code_type: item.code_type,
                             login_code_level: item.login_code_level ?? "account_recovery",
@@ -5459,7 +5778,9 @@ export function App() {
                             expires_at: toDatetimeLocalValue(item.expires_at),
                             max_uses: item.max_uses ? String(item.max_uses) : "",
                             is_active: item.is_active
-                          });
+                          };
+                          setInvitationForm(nextForm);
+                          setInvitationFormBaseline(nextForm);
                           setLastInvitationCode("");
                           setEditor("invitation");
                         }}>{t("edit")}</button>
@@ -5469,7 +5790,7 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {filteredInvitations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Ticket size={22} />} />}
+              {!adminLoading && filteredInvitations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Ticket size={22} />} />}
             </div>
           </section>
         )}
@@ -5655,7 +5976,7 @@ export function App() {
                   })()}
                 </article>
               ))}
-              {filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
+              {!adminLoading && filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
               </div>
             </section>
             {canManagePlatformProviders && editor === "ldap" && (
@@ -5762,7 +6083,7 @@ export function App() {
                   </div>
                 </article>
               ))}
-              {filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
+              {!adminLoading && filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
             </div>
           </section>
             )}
@@ -5858,8 +6179,8 @@ export function App() {
                     </div>
                     <div className="actions security-card-actions">
                       <button className="security-action-primary" type="button" onClick={startTotpSetup} disabled={busy}><KeyRound size={14} />{t("startTotpSetup")}</button>
-                      {mfaStatus?.enabled && <button type="button" onClick={rotateRecoveryCodes} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
-                      {mfaStatus?.enabled && <button className="danger-button" type="button" onClick={() => requestConfirmation(disableMfa)} disabled={busy}>{t("disableMfa")}</button>}
+                      {mfaStatus?.enabled && <button type="button" onClick={() => requestConfirmation(rotateRecoveryCodes, t("rotateRecoveryCodes"), t("rotateRecoveryCodesDescription"))} disabled={busy}>{t("rotateRecoveryCodes")}</button>}
+                      {mfaStatus?.enabled && <button className="danger-button" type="button" onClick={() => requestConfirmation(disableMfa, t("disableMfa"), t("disableMfaDescription"))} disabled={busy}>{t("disableMfa")}</button>}
                     </div>
                     {totpSetup && (
                       <div className="mfa-setup security-mfa-setup">
@@ -6078,12 +6399,15 @@ export function App() {
                         />
                       ))}
                     </div>
-                    <div className="actions">
-                      <button type="submit" disabled={busy}><Save size={14} />{roleForm.id ? t("save") : t("create")}</button>
-                      {roleForm.id && (
-                        <button type="button" onClick={() => setRoleForm(emptyRoleForm)}>{t("clear")}</button>
-                      )}
-                    </div>
+                    <FormActions
+                      submitLabel={roleForm.id ? t("save") : t("create")}
+                      cancelLabel={t("cancel")}
+                      onCancel={closeEditor}
+                      busy={busy}
+                      dirty={roleFormIsDirty()}
+                      statusLabel={roleFormIsDirty() ? t("unsavedChanges") : undefined}
+                      savingLabel={t("saving")}
+                    />
                   </form>
                 </Modal>}
 
@@ -6113,18 +6437,21 @@ export function App() {
                         />
                       ))}
                     </div>
-                    <div className="actions">
-                      <button type="submit" disabled={busy}><Save size={14} />{groupForm.id ? t("save") : t("create")}</button>
-                      {groupForm.id && (
-                        <button type="button" onClick={() => setGroupForm(emptyGroupForm)}>{t("clear")}</button>
-                      )}
-                    </div>
+                    <FormActions
+                      submitLabel={groupForm.id ? t("save") : t("create")}
+                      cancelLabel={t("cancel")}
+                      onCancel={closeEditor}
+                      busy={busy}
+                      dirty={groupFormIsDirty()}
+                      statusLabel={groupFormIsDirty() ? t("unsavedChanges") : undefined}
+                      savingLabel={t("saving")}
+                    />
                   </form>
                 </Modal>}
 
                 <div className="security-management-grid">
                   <section className="table-panel security-roles-panel">
-                    <div className="table-toolbar"><h3>{t("roles")}</h3><button type="button" onClick={() => { setRoleForm(emptyRoleForm); setEditor("role"); }}><Plus size={14} />{t("createRole")}</button></div>
+                    <div className="table-toolbar"><h3>{t("roles")}</h3><button type="button" onClick={() => { setRoleForm(emptyRoleForm); setRoleFormBaseline(emptyRoleForm); setEditor("role"); }}><Plus size={14} />{t("createRole")}</button></div>
                     <table>
                       <thead><tr><th>{t("role")}</th><th>{t("permissions")}</th><th>{t("status")}</th><th></th></tr></thead>
                       <tbody>
@@ -6141,7 +6468,7 @@ export function App() {
                         ))}
                       </tbody>
                     </table>
-                    {filteredRoles.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                    {!adminLoading && filteredRoles.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                   </section>
 
                   <section className="panel security-user-access-panel">
@@ -6190,7 +6517,7 @@ export function App() {
                   </section>
 
                   <section className="table-panel security-groups-panel">
-                    <div className="table-toolbar"><h3>{t("groups")}</h3><button type="button" onClick={() => { setGroupForm(emptyGroupForm); setEditor("group"); }}><Plus size={14} />{t("createGroup")}</button></div>
+                    <div className="table-toolbar"><h3>{t("groups")}</h3><button type="button" onClick={() => { setGroupForm(emptyGroupForm); setGroupFormBaseline(emptyGroupForm); setEditor("group"); }}><Plus size={14} />{t("createGroup")}</button></div>
                     <table>
                       <thead><tr><th>{t("groups")}</th><th>{t("groupRoles")}</th><th>{t("groupMembers")}</th><th></th></tr></thead>
                       <tbody>
@@ -6207,7 +6534,7 @@ export function App() {
                         ))}
                       </tbody>
                     </table>
-                    {filteredGroups.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                    {!adminLoading && filteredGroups.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                   </section>
                 </div>
               </>
@@ -6301,7 +6628,7 @@ export function App() {
                       ))}
                     </tbody>
                   </table>
-                  {filteredAuditWebhooks.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                  {!adminLoading && filteredAuditWebhooks.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                 </section>
               )}
             </div>
@@ -6323,7 +6650,7 @@ export function App() {
                     ))}
                   </tbody>
                 </table>
-                {filteredAuditEvents.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                {!adminLoading && filteredAuditEvents.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
               </section>
             )}
           </section>

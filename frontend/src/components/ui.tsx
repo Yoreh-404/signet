@@ -37,6 +37,7 @@ type FieldProps = {
   required?: boolean;
   disabled?: boolean;
   description?: string;
+  error?: string;
 };
 
 export function Field({
@@ -53,17 +54,21 @@ export function Field({
   step,
   required,
   disabled,
-  description
+  description,
+  error
 }: FieldProps) {
   const id = useId();
   const descriptionId = description ? `${id}-description` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  const describedBy = [descriptionId, errorId].filter(Boolean).join(" ") || undefined;
   const common = {
     id,
     value,
     placeholder,
     required,
     disabled,
-    "aria-describedby": descriptionId,
+    "aria-describedby": describedBy,
+    "aria-invalid": error ? true : undefined,
     onChange: (event: FormEvent<HTMLInputElement | HTMLTextAreaElement>) =>
       onChange(event.currentTarget.value)
   };
@@ -85,6 +90,7 @@ export function Field({
         />
       )}
       {description && <small id={descriptionId} className="field-description">{description}</small>}
+      {error && <small id={errorId} className="field-error" role="alert">{error}</small>}
     </div>
   );
 }
@@ -95,7 +101,8 @@ export function SelectField({
   onChange,
   children,
   disabled = false,
-  description
+  description,
+  error
 }: {
   label: string;
   value: string;
@@ -103,9 +110,12 @@ export function SelectField({
   children: ReactNode;
   disabled?: boolean;
   description?: string;
+  error?: string;
 }) {
   const id = useId();
   const descriptionId = description ? `${id}-description` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  const describedBy = [descriptionId, errorId].filter(Boolean).join(" ") || undefined;
   return (
     <div className="field">
       <label htmlFor={id}>{label}</label>
@@ -113,12 +123,14 @@ export function SelectField({
         id={id}
         value={value}
         disabled={disabled}
-        aria-describedby={descriptionId}
+        aria-describedby={describedBy}
+        aria-invalid={error ? true : undefined}
         onChange={(event) => onChange(event.target.value)}
       >
         {children}
       </select>
       {description && <small id={descriptionId} className="field-description">{description}</small>}
+      {error && <small id={errorId} className="field-error" role="alert">{error}</small>}
     </div>
   );
 }
@@ -127,22 +139,30 @@ export function Check({
   label,
   checked,
   onChange,
-  disabled = false
+  disabled = false,
+  error
 }: {
   label: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
   disabled?: boolean;
+  error?: string;
 }) {
+  const id = useId();
+  const errorId = error ? `${id}-error` : undefined;
   return (
     <label className="check">
       <input
+        id={id}
         type="checkbox"
         checked={checked}
         disabled={disabled}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={errorId}
         onChange={(event) => onChange(event.target.checked)}
       />
       <span>{label}</span>
+      {error && <small id={errorId} className="field-error" role="alert">{error}</small>}
     </label>
   );
 }
@@ -244,6 +264,7 @@ export function SecretField({
   required,
   disabled,
   description,
+  error,
   revealLabel,
   hideLabel
 }: {
@@ -255,12 +276,15 @@ export function SecretField({
   required?: boolean;
   disabled?: boolean;
   description?: string;
+  error?: string;
   revealLabel: string;
   hideLabel: string;
 }) {
   const [revealed, setRevealed] = useState(false);
   const id = useId();
   const descriptionId = description ? `${id}-description` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  const describedBy = [descriptionId, errorId].filter(Boolean).join(" ") || undefined;
 
   return (
     <div className="field secret-field">
@@ -274,7 +298,8 @@ export function SecretField({
           autoComplete={autoComplete}
           required={required}
           disabled={disabled}
-          aria-describedby={descriptionId}
+          aria-describedby={describedBy}
+          aria-invalid={error ? true : undefined}
           onChange={(event) => onChange(event.currentTarget.value)}
         />
         <button
@@ -289,6 +314,7 @@ export function SecretField({
         </button>
       </div>
       {description && <small id={descriptionId} className="field-description">{description}</small>}
+      {error && <small id={errorId} className="field-error" role="alert">{error}</small>}
     </div>
   );
 }
@@ -301,6 +327,7 @@ export function ListField({
   removeLabel,
   placeholder,
   description,
+  error,
   type = "text",
   disabled = false
 }: {
@@ -311,11 +338,14 @@ export function ListField({
   removeLabel: string;
   placeholder?: string;
   description?: string;
+  error?: string;
   type?: string;
   disabled?: boolean;
 }) {
   const id = useId();
   const descriptionId = description ? `${id}-description` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  const describedBy = [descriptionId, errorId].filter(Boolean).join(" ") || undefined;
   const items = value === "" ? [""] : value.split(/\r?\n/);
 
   function updateItem(index: number, nextValue: string) {
@@ -331,10 +361,12 @@ export function ListField({
   return (
     <div className="field list-field">
       <label id={`${id}-label`}>{label}</label>
-      <div className="list-field-items" role="group" aria-labelledby={`${id}-label`} aria-describedby={descriptionId}>
+      <div className="list-field-items" role="group" aria-labelledby={`${id}-label`} aria-describedby={describedBy} aria-invalid={error ? true : undefined}>
         {items.map((item, index) => (
           <div className="list-field-row" key={`${id}-${index}`}>
             <input
+              aria-label={`${label} ${index + 1}`}
+              aria-invalid={error ? true : undefined}
               type={type}
               value={item}
               placeholder={placeholder}
@@ -359,6 +391,7 @@ export function ListField({
         {addLabel}
       </button>
       {description && <small id={descriptionId} className="field-description">{description}</small>}
+      {error && <small id={errorId} className="field-error" role="alert">{error}</small>}
     </div>
   );
 }
