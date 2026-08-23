@@ -2,7 +2,10 @@ use crate::{
     config::Settings,
     error::{AppError, AppResult},
 };
-use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
@@ -102,7 +105,9 @@ fn decode_discovery_key(value: &str) -> AppResult<[u8; 32]> {
 /// plaintext is intentionally never returned after this function completes.
 pub fn encrypt_discovery_secret(key: &str, secret: &str) -> AppResult<String> {
     if secret.is_empty() {
-        return Err(AppError::BadRequest("discovery fetch secret cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "discovery fetch secret cannot be empty".to_string(),
+        ));
     }
     let key = decode_discovery_key(key)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
@@ -139,14 +144,20 @@ pub fn decrypt_discovery_secret(key: &str, ciphertext: &str) -> AppResult<String
         || ciphertext_part.is_none()
         || parts.next().is_some()
     {
-        return Err(AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()));
+        return Err(AppError::Configuration(
+            "discovery fetch secret ciphertext is invalid".to_string(),
+        ));
     }
     let nonce_bytes = URL_SAFE_NO_PAD
         .decode(nonce_part.unwrap_or_default())
-        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
+        .map_err(|_| {
+            AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+        })?;
     let ciphertext_bytes = URL_SAFE_NO_PAD
         .decode(ciphertext_part.unwrap_or_default())
-        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
+        .map_err(|_| {
+            AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+        })?;
     let nonce: [u8; 12] = nonce_bytes.try_into().map_err(|_| {
         AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
     })?;
@@ -161,9 +172,12 @@ pub fn decrypt_discovery_secret(key: &str, ciphertext: &str) -> AppResult<String
                 aad: DISCOVERY_SECRET_AAD,
             },
         )
-        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))?;
-    String::from_utf8(plaintext)
-        .map_err(|_| AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string()))
+        .map_err(|_| {
+            AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+        })?;
+    String::from_utf8(plaintext).map_err(|_| {
+        AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+    })
 }
 
 /// Encrypts an administrator-visible authorization code at rest with RSA-OAEP

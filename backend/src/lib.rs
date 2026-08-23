@@ -1,14 +1,15 @@
 pub mod access;
 pub mod admin;
+pub mod application_contract;
+pub mod application_discovery;
 pub mod applications;
 pub mod archived_accounts;
 pub mod assurance;
 pub mod audit;
 pub mod auth;
+pub mod auth_domain;
 pub mod auth_flow;
 pub mod authorization;
-pub mod authorization_manifest;
-pub mod application_discovery;
 pub mod authorization_details;
 pub mod backchannel_logout;
 pub mod billing;

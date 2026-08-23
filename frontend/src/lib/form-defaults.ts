@@ -92,8 +92,7 @@ export const emptyApplicationForm = {
   description: "",
   account_selection_mode: "optional" as "optional" | "required",
   unique_identity_factors: [] as Array<"email" | "phone">,
-  is_active: true,
-  oidc_client_ids: [] as string[]
+  is_active: true
 };
 
 export function emptyClaimMapperForm(sortOrder: number): ClientClaimMapperForm {

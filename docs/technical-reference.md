@@ -787,7 +787,9 @@ https://sso.example.com/oauth2/authorize?client_id=CLIENT_ID&request=SIGNED_REQU
 PAR 也可提交同一个 signed request object：
 
 ```bash
-curl -u CLIENT_ID:CLIENT_SECRET \
+curl -d client_id=CLIENT_ID \
+  -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  -d client_assertion=SIGNED_CLIENT_ASSERTION \
   -d request=SIGNED_REQUEST_OBJECT \
   https://sso.example.com/oauth2/par
 ```
@@ -900,7 +902,7 @@ curl -u demo-web:demo-secret-change-me \
 
 ### 授权同意
 
-`[oidc].skip_consent = true` 时，已登录用户访问 `/oauth2/authorize` 会直接签发 authorization code。设为 `false` 后，首次授权某个客户端或请求新增 scope 时会显示同意页；用户允许并勾选记住后，后端把 `user_id + client_id + granted_scopes` 写入 `user_consents`，后续同一客户端请求已授权 scope 的子集会直接放行。用户拒绝时，后端会按 OAuth 规范带 `error=access_denied` 跳回客户端 `redirect_uri`。
+`[oidc].skip_consent = true` 时，已登录用户访问 `/oauth2/authorize` 会直接签发 authorization code。设为 `false` 后，首次授权某个客户端或请求新增 scope 时会显示同意页；用户允许并勾选记住后，后端把 `user_id + client_id + authorization_profile_id + granted_scopes` 写入 `client_grants`，后续同一客户端和授权 Profile 请求已授权 scope 的子集会直接放行。用户拒绝时，后端会按 OAuth 规范带 `error=access_denied` 跳回客户端 `redirect_uri`。
 
 授权请求支持 `prompt=consent` 强制重新显示同意页、`prompt=login` 强制重新认证、`prompt=select_account` 强制选择浏览器账号，以及 `prompt=none` 静默授权。无法静默完成时会按原因返回 `login_required`、`account_selection_required`、`consent_required` 或其他交互错误；`prompt=none` 不能与其他 prompt 值组合。
 

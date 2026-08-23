@@ -222,11 +222,25 @@ pub async fn resolve_entitlements_for_client(
     client: &ClientRecord,
     user: &UserRecord,
 ) -> AppResult<ApplicationEntitlements> {
-    let Some(profile) = state
-        .db
-        .find_application_authorization_profile(&application.id, &client.client_id)
-        .await?
-    else {
+    let profile = if let Some(binding) = state.db.find_application_client_binding(&client.id).await? {
+        if binding.authorization_profile_id == "default" {
+            state
+                .db
+                .find_application_authorization_profile(&application.id, "default")
+                .await?
+        } else {
+            state
+                .db
+                .find_application_authorization_profile_by_id(&binding.authorization_profile_id)
+                .await?
+        }
+    } else {
+        state
+            .db
+            .find_application_authorization_profile(&application.id, &client.client_id)
+            .await?
+    };
+    let Some(profile) = profile else {
         return resolve_entitlements(state, application, user).await;
     };
     resolve_entitlements_for_profile(state, application, &profile, user).await
@@ -247,10 +261,7 @@ pub async fn resolve_entitlements_for_profile(
     let mut permissions = BTreeSet::new();
     let mut groups = BTreeSet::new();
     let mut organization_role = None;
-    let profile_roles = state
-        .db
-        .list_application_profile_roles(&profile.id)
-        .await?;
+    let profile_roles = state.db.list_application_profile_roles(&profile.id).await?;
     let active_roles = profile_roles
         .iter()
         .filter(|role| role.is_active == 1)

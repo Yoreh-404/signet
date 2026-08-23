@@ -1,5 +1,5 @@
 [server]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 8080
 public_base_url = "http://localhost:8080"
 # Trust Forwarded / X-Forwarded-* / Host headers only behind a trusted reverse proxy or tunnel.
@@ -289,5 +289,5 @@ signing_public_jwks_env = "SIGNET_OCR_DISCOVERY_SIGNING_PUBLIC_JWKS"
 
 # Authentication clients, protocol adapters, directory connectors, and role
 # catalogs are intentionally not bootstrapped here. Each website publishes
-# its signed signet-application/v2 manifest; Signet only enrolls the
+# its signed signet-application/v3 contract; Signet only enrolls the
 # application boundary and reconciles that verified snapshot.

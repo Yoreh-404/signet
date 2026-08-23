@@ -1,4 +1,4 @@
-use crate::db::UserConsentRecord;
+use crate::db::ClientGrantRecord;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy)]
@@ -13,7 +13,7 @@ impl OidcConsentPolicy {
 
     pub fn requires_prompt(
         self,
-        existing: Option<&UserConsentRecord>,
+        existing: Option<&ClientGrantRecord>,
         requested_scopes: &[String],
     ) -> bool {
         if self.skip_consent {
@@ -26,7 +26,7 @@ impl OidcConsentPolicy {
 }
 
 pub fn merged_granted_scopes(
-    existing: Option<&UserConsentRecord>,
+    existing: Option<&ClientGrantRecord>,
     requested_scopes: &[String],
 ) -> String {
     let mut scopes = BTreeSet::new();
@@ -65,8 +65,8 @@ fn scope_set(scopes: &str) -> BTreeSet<&str> {
 mod tests {
     use super::*;
 
-    fn consent(scopes: &str) -> UserConsentRecord {
-        UserConsentRecord {
+    fn consent(scopes: &str) -> ClientGrantRecord {
+        ClientGrantRecord {
             user_id: "user".to_string(),
             client_id: "client".to_string(),
             granted_scopes: scopes.to_string(),

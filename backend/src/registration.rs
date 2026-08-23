@@ -549,8 +549,7 @@ async fn registration_target_application(
         .await?
         // An OIDC client must be governed by an application before its login
         // page can admit a new identity. This is deliberately fail-closed.
-        .ok_or(AppError::Forbidden)
-        ?;
+        .ok_or(AppError::Forbidden)?;
     crate::applications::ensure_application_runtime_active(state, &application).await?;
     Ok(Some(application))
 }

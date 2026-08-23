@@ -24,6 +24,8 @@ AnchorDocs 是模块化设计与生命周期状态的权威来源。AI 应从具
 | --- | --- |
 | 在本地或服务器上运行 Signet | [部署指南](deployment.md) |
 | 让 Web 应用使用 Signet 登录 | [OIDC 应用接入](oidc-integration.md) |
+| 设计多类型应用接入模式 | [应用接入模型](application-integration-model.md) |
+| 编写无 secret 的 v3 producer | [v3 契约示例](examples/application-v3.json) |
 | 在公网安全运行、接入自建前端 | [安全指南](security.md) |
 | 离线查找协议、接口和高级能力的精确行为 | [完整技术参考](technical-reference.md) |
 

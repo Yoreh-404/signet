@@ -121,6 +121,7 @@ import {
 } from "./lib/webauthn";
 import type {
   AccessGroup,
+  ApplicationClientBinding,
   ApplicationModule,
   ApplicationSection,
   AuditEvent,
@@ -1742,7 +1743,6 @@ export function App() {
       account_selection_mode: application.account_selection_mode,
       unique_identity_factors: application.unique_identity_factors,
       is_active: application.is_active,
-      oidc_client_ids: application.oidc_clients.map((client) => client.id)
     };
     setApplicationForm(nextForm);
     setApplicationFormBaseline(nextForm);
@@ -1765,12 +1765,6 @@ export function App() {
       const application = applicationForm.id
         ? await api<TenantApplication>(`/api/admin/applications/${applicationForm.id}`, { method: "PUT", body })
         : await api<TenantApplication>("/api/admin/applications", { method: "POST", body });
-      // Protocol connections are configured in the application's Protocols
-      // module. Application membership is not part of the website contract.
-      await api<Client[]>(`/api/admin/applications/${application.id}/oidc-clients`, {
-        method: "PUT",
-        body: JSON.stringify({ client_ids: applicationForm.oidc_client_ids })
-      });
       const currentProtocolModule = application.modules?.find((module) => module.module_key === "protocols");
       const currentProtocolConfig = currentProtocolModule?.config ?? {};
       await api<ApplicationModule>(`/api/admin/applications/${application.id}/modules/protocols`, {
@@ -1780,7 +1774,7 @@ export function App() {
             ...(currentProtocolConfig && typeof currentProtocolConfig === "object" ? currentProtocolConfig : {}),
             website_url: applicationForm.website_url
           },
-          is_enabled: currentProtocolModule?.is_enabled ?? Boolean(application.oidc_clients.length)
+          is_enabled: currentProtocolModule?.is_enabled ?? Boolean(application.client_bindings.length)
         })
       });
       setApplicationForm(emptyApplicationForm);
@@ -1808,7 +1802,7 @@ export function App() {
   function updateApplicationModuleInState(
     applicationId: string,
     module: ApplicationModule,
-    oidcClients?: Client[]
+    clientBindings?: ApplicationClientBinding[]
   ) {
     setApplications((current) => current.map((application) => {
       if (application.id !== applicationId) return application;
@@ -1819,7 +1813,7 @@ export function App() {
       return {
         ...application,
         modules,
-        ...(oidcClients ? { oidc_clients: oidcClients } : {})
+        ...(clientBindings ? { client_bindings: clientBindings } : {})
       };
     }));
   }
@@ -3442,7 +3436,7 @@ export function App() {
   ));
   const applicationByOidcClientId = new Map(
     applications.flatMap((application) =>
-      application.oidc_clients.map((client) => [client.id, application] as const)
+      application.client_bindings.map((binding) => [binding.id, application] as const)
     )
   );
   const filteredIapApplications = iapApplications.filter((item) => matchesSearch(

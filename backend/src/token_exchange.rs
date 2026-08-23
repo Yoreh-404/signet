@@ -3,7 +3,7 @@ use crate::{
     audit::{self, AuditOutcome, AuditSink},
     claim_mapper::{self, ClaimContext, ClaimOutputTarget},
     config::DelegatedAllowlistEntry,
-    db::{ClientRecord, UserConsentRecord, UserRecord},
+    db::{ClientGrantRecord, ClientRecord, UserRecord},
     error::{AppError, AppResult},
     jwt::TokenSubject,
 };
@@ -80,14 +80,12 @@ impl TokenExchangePolicy for DefaultTokenExchangePolicy<'_> {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let requested = explicit
-            .map(scope_set)
-            .unwrap_or_else(|| {
-                subject_scopes
-                    .intersection(&client_scopes)
-                    .cloned()
-                    .collect()
-            });
+        let requested = explicit.map(scope_set).unwrap_or_else(|| {
+            subject_scopes
+                .intersection(&client_scopes)
+                .cloned()
+                .collect()
+        });
         for scope in &requested {
             if scope.ends_with(".service") {
                 return Err(oauth_error(
@@ -167,9 +165,7 @@ pub async fn exchange_token(
         .verify_access_token_for_token_exchange(&input.subject_token, &issuer_refs)
         .map_err(|_| oauth_error("invalid_grant", "subject_token is invalid"))?;
     if subject_claims.sub == subject_claims.client_id
-        || subject_claims
-            .sub
-            .starts_with("service-account:")
+        || subject_claims.sub.starts_with("service-account:")
     {
         return Err(oauth_error(
             "invalid_grant",
@@ -192,6 +188,30 @@ pub async fn exchange_token(
         return Err(oauth_error(
             "invalid_grant",
             "subject token client is inactive",
+        ));
+    }
+    let subject_binding = state
+        .db
+        .find_application_client_binding(&subject_client.id)
+        .await?;
+    if let Some(binding) = subject_binding.as_ref()
+        && (subject_claims.application_id.as_deref() != Some(binding.application_id.as_str())
+            || subject_claims.authorization_profile_id.as_deref()
+                != Some(binding.authorization_profile_id.as_str()))
+    {
+        return Err(oauth_error(
+            "invalid_grant",
+            "subject token application boundary is invalid",
+        ));
+    }
+    let target_binding = state.db.find_application_client_binding(&client.id).await?;
+    if let (Some(subject_binding), Some(target_binding)) =
+        (subject_binding.as_ref(), target_binding.as_ref())
+        && subject_binding.application_id != target_binding.application_id
+    {
+        return Err(oauth_error(
+            "invalid_target",
+            "token exchange cannot cross application boundaries",
         ));
     }
     let user = load_active_user(state, &subject_claims.sub).await?;
@@ -248,6 +268,16 @@ pub async fn exchange_token(
     );
     if let Some(authorization_details) = subject_claims.authorization_details.clone() {
         extra_claims.insert("authorization_details".to_string(), authorization_details);
+    }
+    if let Some(binding) = target_binding.as_ref() {
+        extra_claims.insert(
+            "application_id".to_string(),
+            Value::String(binding.application_id.clone()),
+        );
+        extra_claims.insert(
+            "authorization_profile_id".to_string(),
+            Value::String(binding.authorization_profile_id.clone()),
+        );
     }
     let ttl = exchanged_token_ttl(state.settings.oidc.access_token_ttl_seconds);
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
@@ -338,7 +368,12 @@ fn assert_allowlisted_delegated_scope(
 ) -> AppResult<()> {
     let allowed = allowlist
         .iter()
-        .filter(|entry| entry.client_id.as_deref().is_none_or(|value| value.trim() == client_id))
+        .filter(|entry| {
+            entry
+                .client_id
+                .as_deref()
+                .is_none_or(|value| value.trim() == client_id)
+        })
         .filter(|entry| {
             entry
                 .audience
@@ -370,13 +405,13 @@ async fn find_delegation_consent(
     subject_client_id: &str,
     actor_client_id: &str,
     requested_scope: &str,
-) -> AppResult<UserConsentRecord> {
+) -> AppResult<ClientGrantRecord> {
     let mut client_ids = vec![subject_client_id.to_string()];
     if actor_client_id != subject_client_id {
         client_ids.push(actor_client_id.to_string());
     }
     for client_id in client_ids {
-        if let Some(consent) = state.db.find_user_consent(user_id, &client_id).await?
+        if let Some(consent) = state.db.find_client_grant(user_id, &client_id).await?
             && consent.revoked_at.is_none()
             && grants_all(&consent.granted_scopes, requested_scope)
         {
@@ -396,13 +431,15 @@ fn grants_all(granted_scopes: &str, requested_scope: &str) -> bool {
         .all(|scope| granted.contains(scope))
 }
 
-pub fn consent_grant_reference(consent: &UserConsentRecord) -> String {
+pub fn consent_grant_reference(consent: &ClientGrantRecord) -> String {
     format!("consent:{}:{}", consent.client_id, consent.updated_at)
 }
 
 pub fn exchanged_token_ttl(access_token_ttl_seconds: i64) -> i64 {
-    access_token_ttl_seconds
-        .clamp(MIN_EXCHANGED_TOKEN_TTL_SECONDS, MAX_EXCHANGED_TOKEN_TTL_SECONDS)
+    access_token_ttl_seconds.clamp(
+        MIN_EXCHANGED_TOKEN_TTL_SECONDS,
+        MAX_EXCHANGED_TOKEN_TTL_SECONDS,
+    )
 }
 
 async fn load_active_user(state: &AppState, user_id: &str) -> AppResult<UserRecord> {
@@ -444,10 +481,7 @@ fn oauth_error(error: &str, description: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        assert_allowlisted_delegated_scope,
-        token_exchange_forbidden_login_code_level,
-    };
+    use super::{assert_allowlisted_delegated_scope, token_exchange_forbidden_login_code_level};
     use crate::config::DelegatedAllowlistEntry;
 
     #[test]
@@ -480,22 +514,26 @@ mod tests {
             scopes: vec!["memory.code.index".to_string()],
             scope: None,
         }];
-        assert!(assert_allowlisted_delegated_scope(
-            &allowlist,
-            "axon",
-            "memory-atlas",
-            "axon",
-            "memory.code.index",
-        )
-        .is_ok());
-        assert!(assert_allowlisted_delegated_scope(
-            &allowlist,
-            "other",
-            "memory-atlas",
-            "axon",
-            "memory.code.index",
-        )
-        .is_err());
+        assert!(
+            assert_allowlisted_delegated_scope(
+                &allowlist,
+                "axon",
+                "memory-atlas",
+                "axon",
+                "memory.code.index",
+            )
+            .is_ok()
+        );
+        assert!(
+            assert_allowlisted_delegated_scope(
+                &allowlist,
+                "other",
+                "memory-atlas",
+                "axon",
+                "memory.code.index",
+            )
+            .is_err()
+        );
     }
 
     #[test]

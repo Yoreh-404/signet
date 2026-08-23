@@ -1,10 +1,4 @@
-use sso_backend::{
-    AppState, Settings,
-    application_discovery,
-    db::Db,
-    jwt::JwtManager,
-    server,
-};
+use sso_backend::{AppState, Settings, application_discovery, db::Db, jwt::JwtManager, server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

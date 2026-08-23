@@ -23,6 +23,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type {
   ApplicationBillingSettings,
+  ApplicationClientBinding,
   ApplicationSection,
   ApplicationModule,
   ApplicationModuleKey,
@@ -94,6 +95,7 @@ type Copy = {
   connections: string;
   noConnections: string;
   client: string;
+  bindingProtocol: string;
   clientId: string;
   redirect: string;
   entityId: string;
@@ -183,10 +185,6 @@ type Copy = {
   noAuthorizationProfile: string;
   profileManual: string;
   profileSigned: string;
-  profileManifestUrl: string;
-  profileSigner: string;
-  profileMode: string;
-  refreshProfile: string;
   profileSynced: string;
   profileManualStatus: string;
   profileNoDefinition: string;
@@ -257,12 +255,12 @@ type Copy = {
 
 const ZH: Copy = {
   applications: "应用",
-  websites: "网站接入",
-  applicationIntro: "每个应用对应一个网站。把协议、登录适配器、目录同步和权限策略配置在这里，Signet 统一账户即可直接登录。",
-  createWebsite: "接入网站",
-  selectWebsite: "选择一个网站",
-  noWebsites: "还没有网站应用",
-  noWebsitesHint: "先接入一个网站，再按需开启协议和身份源。",
+  websites: "应用",
+  applicationIntro: "每个应用可以绑定多个客户端。把协议、登录适配器、目录同步和权限策略配置在这里，Signet 统一认证上下文即可复用。",
+  createWebsite: "创建应用",
+  selectWebsite: "选择一个应用",
+  noWebsites: "还没有应用",
+  noWebsitesHint: "先创建一个应用，再绑定客户端并按需开启能力。",
   active: "已启用",
   disabled: "已停用",
   edit: "编辑基本信息",
@@ -273,18 +271,18 @@ const ZH: Copy = {
   directory: "目录同步",
   permissions: "权限",
   billing: "余额接入",
-  billingHint: "决定这个网站是否接受 Signet 余额，以及用户是否需要先把总账户余额划转到应用账户。",
+  billingHint: "决定这个应用是否接受 Signet 余额，以及用户是否需要先把总账户余额划转到应用账户。",
   acceptSignetBalance: "接受 Signet 余额",
-  acceptSignetBalanceHint: "关闭后，网站可以继续使用自己的支付系统；Signet 不会为它执行余额扣费。",
+  acceptSignetBalanceHint: "关闭后，应用可以继续使用自己的支付系统；Signet 不会为它执行余额扣费。",
   walletMode: "账户模式",
   sharedWallet: "共享总账户",
   isolatedWallet: "独立应用账户",
   walletModeLocked: "首次发生账务交易后账户模式会锁定。",
   billingCurrencies: "支持币种",
   billingCurrenciesHint: "留空表示使用 Signet 全局启用的币种；多个币种用逗号分隔。",
-  accessBundle: "网站接入包",
-  accessBundleHint: "应用把网站需要的接入能力绑定在一起；模块可以独立配置和启停。",
-  websiteUrl: "网站地址",
+  accessBundle: "应用能力包",
+  accessBundleHint: "应用把多个客户端需要的接入能力绑定在一起；模块可以独立配置和启停。",
+  websiteUrl: "应用地址",
   notConfigured: "未配置",
   configured: "已配置",
   enabled: "启用此模块",
@@ -294,7 +292,7 @@ const ZH: Copy = {
   saveFailed: "配置保存失败",
   loadFailed: "配置加载失败",
   retry: "重试",
-  protocolHint: "选择这个网站接受的标准协议。OAuth 2.0 / OIDC 使用下方的客户端连接；其他协议保留独立的端点和签名配置。",
+  protocolHint: "选择应用支持的标准协议，并为每个客户端绑定协议和权限 Profile。",
   protocolRuntimeHint: "协议配置属于应用，不再散落在全局客户端列表中。",
   oauth: "OAuth 2.0 / OIDC",
   oauthHint: "使用 Signet 作为身份提供方，为网站提供标准授权码、Token 和 UserInfo。",
@@ -304,9 +302,11 @@ const ZH: Copy = {
   casHint: "为支持 CAS 的内部系统提供票据校验入口。",
   jwt: "JWT",
   jwtHint: "为 API 或无状态服务配置 Signet 签发的 JWT 受众和有效期。",
-  connections: "OIDC 客户端连接",
-  noConnections: "尚未绑定 OIDC 客户端",
+  connections: "客户端绑定",
+  noConnections: "没有可绑定的客户端",
   client: "客户端",
+  bindingProtocol: "绑定协议",
+  authorizationProfile: "权限 Profile",
   clientId: "客户端 ID",
   redirect: "回调地址",
   entityId: "Entity ID",
@@ -390,16 +390,11 @@ const ZH: Copy = {
   tokenOnlyOnce: "完整令牌只显示这一次，请立即复制并安全保存。",
   unsavedChanges: "有未保存的更改",
   discardChanges: "放弃更改",
-  authorizationHint: "权限采用两层合并：继承企业默认角色，再叠加这个网站的专属角色和 Claim。",
-  authorizationProfile: "OIDC 权限 Profile",
-  authorizationProfileHint: "每个 OIDC 客户端独立维护一套权限定义、角色和用户映射。网站可以通过签名 manifest 提供定义，也可以在 Signet 手工维护。",
-  noAuthorizationProfile: "请先为网站绑定一个 OIDC 客户端",
+  authorizationHint: "权限采用两层合并：继承企业默认角色，再叠加应用 Profile 的专属角色和 Claim。",
+  authorizationProfileHint: "每个客户端 Profile 独立维护权限定义、角色和用户映射。应用可以通过签名 v3 契约提供定义，也可以在 Signet 手工维护。",
+  noAuthorizationProfile: "请先为应用绑定一个客户端",
   profileManual: "手工配置",
   profileSigned: "签名 Manifest",
-  profileManifestUrl: "Manifest 地址",
-  profileSigner: "Manifest 签名客户端",
-  profileMode: "权限来源",
-  refreshProfile: "刷新权限定义",
   profileSynced: "已同步",
   profileManualStatus: "手工模式",
   profileNoDefinition: "目标网站没有提供权限定义；请在下方手工创建角色并填写权限字符串。",
@@ -463,19 +458,19 @@ const ZH: Copy = {
   syncSources: "个同步源",
   protocolCount: "个协议",
   setupNext: "接入下一步",
-  setupNextHint: "先绑定 OAuth/OIDC 客户端，再按网站实际情况开启 SAML、CAS、JWT、第三方登录或目录同步。",
+  setupNextHint: "先绑定客户端并选择协议和权限 Profile，再按应用实际情况开启 SAML、CAS、JWT、第三方登录或目录同步。",
   configure: "去配置",
   notAvailable: "尚未接入运行时"
 };
 
 const EN: Copy = {
   applications: "Applications",
-  websites: "Website access",
-  applicationIntro: "Each application represents one website. Configure protocols, login adapters, directory sync, and authorization here so every active Signet account can sign in directly.",
-  createWebsite: "Connect a website",
-  selectWebsite: "Select a website",
-  noWebsites: "No website applications yet",
-  noWebsitesHint: "Connect a website first, then enable only the capabilities it needs.",
+  websites: "Applications",
+  applicationIntro: "Each application can bind multiple clients. Configure protocols, login adapters, directory sync, and authorization here so one Signet authentication context can be reused safely.",
+  createWebsite: "Create application",
+  selectWebsite: "Select an application",
+  noWebsites: "No applications yet",
+  noWebsitesHint: "Create an application first, then bind clients and enable only the capabilities it needs.",
   active: "Enabled",
   disabled: "Disabled",
   edit: "Edit basics",
@@ -486,18 +481,18 @@ const EN: Copy = {
   directory: "Directory sync",
   permissions: "Permissions",
   billing: "Billing",
-  billingHint: "Choose whether this website accepts Signet balance and whether users must transfer funds into an application wallet first.",
+  billingHint: "Choose whether this application accepts Signet balance and whether users must transfer funds into an application wallet first.",
   acceptSignetBalance: "Accept Signet balance",
-  acceptSignetBalanceHint: "When disabled, the website may use its own payment system and Signet will not authorize wallet charges for it.",
+  acceptSignetBalanceHint: "When disabled, the application may use its own payment system and Signet will not authorize wallet charges for it.",
   walletMode: "Wallet mode",
   sharedWallet: "Shared global wallet",
   isolatedWallet: "Isolated application wallet",
   walletModeLocked: "Wallet mode is locked after the first billing transaction.",
   billingCurrencies: "Supported currencies",
   billingCurrenciesHint: "Leave empty to accept all currencies enabled globally; separate multiple currencies with commas.",
-  accessBundle: "Website access bundle",
-  accessBundleHint: "An application binds the capabilities a website needs; each module can be configured and enabled independently.",
-  websiteUrl: "Website URL",
+  accessBundle: "Application capability bundle",
+  accessBundleHint: "An application binds the capabilities its clients need; each module can be configured and enabled independently.",
+  websiteUrl: "Application URL",
   notConfigured: "Not configured",
   configured: "Configured",
   enabled: "Enable this module",
@@ -507,7 +502,7 @@ const EN: Copy = {
   saveFailed: "Failed to save configuration",
   loadFailed: "Failed to load configuration",
   retry: "Retry",
-  protocolHint: "Choose the standards this website accepts. OAuth 2.0 / OIDC uses the client connections below; other protocols keep independent endpoint and signing settings.",
+  protocolHint: "Choose the standards this application supports, then bind each client to its protocol and authorization profile.",
   protocolRuntimeHint: "Protocol settings belong to the application instead of being scattered across a global client list.",
   oauth: "OAuth 2.0 / OIDC",
   oauthHint: "Use Signet as the identity provider with standard authorization code, token, and UserInfo flows.",
@@ -517,9 +512,11 @@ const EN: Copy = {
   casHint: "Provide ticket validation endpoints for internal CAS systems.",
   jwt: "JWT",
   jwtHint: "Configure Signet-issued JWT audiences and lifetimes for APIs or stateless services.",
-  connections: "OIDC client connections",
-  noConnections: "No OIDC client is attached",
+  connections: "Client bindings",
+  noConnections: "No clients are available to bind",
   client: "Client",
+  bindingProtocol: "Binding protocol",
+  authorizationProfile: "Authorization profile",
   clientId: "Client ID",
   redirect: "Redirect URI",
   entityId: "Entity ID",
@@ -603,16 +600,11 @@ const EN: Copy = {
   tokenOnlyOnce: "The complete token is shown only once. Copy it now and store it securely.",
   unsavedChanges: "Unsaved changes",
   discardChanges: "Discard changes",
-  authorizationHint: "Authorization is merged in two layers: inherit enterprise defaults, then add website-specific roles and claims.",
-  authorizationProfile: "OIDC authorization profile",
-  authorizationProfileHint: "Each OIDC client has an independent permission vocabulary, role catalog, and subject mappings. A website can publish a signed manifest or be configured manually in Signet.",
-  noAuthorizationProfile: "Attach an OIDC client to this website first",
+  authorizationHint: "Authorization is merged in two layers: inherit enterprise defaults, then add application Profile roles and claims.",
+  authorizationProfileHint: "Each client Profile has an independent permission vocabulary, role catalog, and subject mappings. An application can publish a signed v3 contract or be configured manually in Signet.",
+  noAuthorizationProfile: "Bind a client to this application first",
   profileManual: "Manual configuration",
   profileSigned: "Signed manifest",
-  profileManifestUrl: "Manifest URL",
-  profileSigner: "Manifest signing client",
-  profileMode: "Permission source",
-  refreshProfile: "Refresh permission definitions",
   profileSynced: "Synced",
   profileManualStatus: "Manual mode",
   profileNoDefinition: "The website did not publish permission definitions. Create roles below and enter permission strings manually.",
@@ -784,7 +776,7 @@ function defaultModuleConfig(key: ApplicationModuleKey, application: TenantAppli
   switch (key) {
     case "protocols":
       return {
-        oauth2_oidc: { enabled: application.oidc_clients.length > 0, client_ids: application.oidc_clients.map((client) => client.id) },
+        oauth2_oidc: { enabled: application.client_bindings.some((binding) => binding.protocol === "oidc"), client_ids: application.client_bindings.filter((binding) => binding.protocol === "oidc").map((binding) => binding.id) },
         saml2: {
           enabled: false,
           entity_id: "",
@@ -836,7 +828,7 @@ function moduleEnabled(application: TenantApplication, key: ApplicationModuleKey
   return module?.is_enabled ?? (
     key === "authorization"
     || key === "login_adapters"
-    || (key === "protocols" && application.oidc_clients.length > 0)
+    || (key === "protocols" && application.client_bindings.length > 0)
   );
 }
 
@@ -875,7 +867,7 @@ export function ApplicationWorkspace({
   onCreateApplication: () => void;
   onEditApplication: (application: TenantApplication) => void;
   onDeleteApplication: (id: string) => void;
-  onApplicationModuleChanged: (applicationId: string, module: ApplicationModule, oidcClients?: Client[]) => void;
+  onApplicationModuleChanged: (applicationId: string, module: ApplicationModule, clientBindings?: ApplicationClientBinding[]) => void;
   onNavigationChange?: (applicationId: string, section: ApplicationSection) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onRequestConfirmation?: (
@@ -902,11 +894,6 @@ export function ApplicationWorkspace({
   const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
   const [authorizationProfiles, setAuthorizationProfiles] = useState<ApplicationAuthorizationProfile[]>([]);
   const [selectedAuthorizationProfileId, setSelectedAuthorizationProfileId] = useState("");
-  const [profileManifestUrl, setProfileManifestUrl] = useState("");
-  const [profileSignerClientId, setProfileSignerClientId] = useState("");
-  const [profileSignedEnabled, setProfileSignedEnabled] = useState(false);
-  const [profileSaving, setProfileSaving] = useState(false);
-  const [profileRefreshing, setProfileRefreshing] = useState(false);
   const [profileFeedback, setProfileFeedback] = useState("");
   const [applicationRoles, setApplicationRoles] = useState<ApplicationProfileRole[]>([]);
   const [applicationPermissionCatalog, setApplicationPermissionCatalog] = useState<ApplicationPermissionDefinition[]>([]);
@@ -929,6 +916,7 @@ export function ApplicationWorkspace({
   const [billingError, setBillingError] = useState("");
   const [billingReloadToken, setBillingReloadToken] = useState(0);
   const [billingSaving, setBillingSaving] = useState(false);
+  const [bindingDraft, setBindingDraft] = useState<Record<string, { protocol: string; authorization_profile_id: string }>>({});
   const selectedIdRef = useRef(selectedId);
   const selected = applications.find((item) => item.id === selectedId) ?? null;
   const selectedAuthorizationProfile = authorizationProfiles.find((profile) => profile.id === selectedAuthorizationProfileId) ?? null;
@@ -969,9 +957,6 @@ export function ApplicationWorkspace({
     setRunningProviderId(null);
     setAuthorizationProfiles([]);
     setSelectedAuthorizationProfileId("");
-    setProfileManifestUrl("");
-    setProfileSignerClientId("");
-    setProfileSignedEnabled(false);
     setProfileFeedback("");
     setApplicationRoles([]);
     setApplicationPermissionCatalog([]);
@@ -990,6 +975,12 @@ export function ApplicationWorkspace({
     setBillingLoading(false);
     setBillingError("");
     setBillingSaving(false);
+    setBindingDraft(Object.fromEntries(
+      (selected?.client_bindings ?? []).map((binding) => [binding.id, {
+        protocol: binding.protocol,
+        authorization_profile_id: binding.authorization_profile_id
+      }])
+    ));
   }, [selectedId]);
 
   function hasUnsavedDrafts(): boolean {
@@ -1149,12 +1140,6 @@ export function ApplicationWorkspace({
       setApplicationPermissionCatalog([]);
       return () => { cancelled = true; };
     }
-    const profile = authorizationProfiles.find((item) => item.id === selectedAuthorizationProfileId);
-    if (profile) {
-      setProfileManifestUrl(profile.manifest_url);
-      setProfileSignerClientId(profile.signer_client_id ?? "");
-      setProfileSignedEnabled(profile.source_mode === "signed_manifest");
-    }
     void Promise.all([
       api<ApplicationProfileRole[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`),
       api<ApplicationPermissionDefinition[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/catalog`)
@@ -1201,7 +1186,7 @@ export function ApplicationWorkspace({
 
   const selectedClients = useMemo(() => {
     if (!selected) return [];
-    const ids = new Set(selected.oidc_clients.map((client) => client.id));
+    const ids = new Set(selected.client_bindings.map((binding) => binding.id));
     return clients.filter((client) => ids.has(client.id));
   }, [clients, selected]);
 
@@ -1221,18 +1206,15 @@ export function ApplicationWorkspace({
     setFeedback("");
     try {
       const config = draftFor(key);
-      let attachedClients: Client[] | undefined;
+      let attachedClients: ApplicationClientBinding[] | undefined;
       if (key === "protocols") {
-        const protocolConfig = record(config);
-        const oauthConfig = record(protocolConfig.oauth2_oidc);
-        const clientIds = stringList(oauthConfig.client_ids);
-        attachedClients = await api<Client[]>(`/api/admin/applications/${selected.id}/oidc-clients`, {
+        attachedClients = await api<ApplicationClientBinding[]>(`/api/admin/applications/${selected.id}/client-bindings`, {
           method: "PUT",
-          body: JSON.stringify({ client_ids: clientIds })
+          body: JSON.stringify({ bindings: Object.entries(bindingDraft).map(([client_id, binding]) => ({ client_id, ...binding })) })
         });
       }
       const isEnabled = key === "protocols"
-        ? ["oauth2_oidc", "saml2", "cas", "jwt"].some((protocol) => booleanValue(record(config[protocol]).enabled))
+        ? ["oauth2_oidc", "saml2", "cas", "jwt", "iap", "forward_auth"].some((protocol) => booleanValue(record(config[protocol]).enabled))
         : key === "login_adapters"
           ? booleanValue(config.enabled, true)
           : key === "directory_sync"
@@ -1288,52 +1270,6 @@ export function ApplicationWorkspace({
       setFeedback(c.saveFailed);
     } finally {
       setBillingSaving(false);
-    }
-  }
-
-  async function saveAuthorizationProfile() {
-    if (!selected || !selectedAuthorizationProfileId) return;
-    setProfileSaving(true);
-    setProfileFeedback("");
-    try {
-      const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          manifest_url: profileManifestUrl.trim() || null,
-          signer_client_id: profileSignerClientId.trim() || null,
-          signed_manifest_enabled: profileSignedEnabled
-        })
-      });
-      setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
-      setProfileManifestUrl(profile.manifest_url);
-      setProfileSignerClientId(profile.signer_client_id ?? "");
-      setProfileSignedEnabled(profile.source_mode === "signed_manifest");
-      setProfileFeedback(c.saved);
-    } catch {
-      setProfileFeedback(c.saveFailed);
-    } finally {
-      setProfileSaving(false);
-    }
-  }
-
-  async function refreshAuthorizationProfile() {
-    if (!selected || !selectedAuthorizationProfileId || !profileSignedEnabled) return;
-    setProfileRefreshing(true);
-    setProfileFeedback("");
-    try {
-      const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/refresh`, { method: "POST" });
-      setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
-      setProfileFeedback(profile.sync_status === "synced" ? c.profileSynced : c.profileManualStatus);
-    } catch {
-      setProfileFeedback(c.saveFailed);
-      try {
-        const profile = await api<ApplicationAuthorizationProfile>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}`);
-        setAuthorizationProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
-      } catch {
-        // Keep the refresh error visible when the status request also fails.
-      }
-    } finally {
-      setProfileRefreshing(false);
     }
   }
 
@@ -1682,6 +1618,51 @@ export function ApplicationWorkspace({
     updateDraft(key === "client_ids" ? "protocols" : key === "provider_ids" ? "login_adapters" : "directory_sync", { ...current, [key]: next });
   }
 
+  function toggleClientBinding(clientId: string) {
+    const existing = bindingDraft[clientId];
+    const next = { ...bindingDraft };
+    if (existing) {
+      delete next[clientId];
+    } else {
+      next[clientId] = { protocol: "oidc", authorization_profile_id: "default" };
+    }
+    setBindingDraft(next);
+    const config = draftFor("protocols");
+    const oauth = record(config.oauth2_oidc);
+    updateDraft("protocols", {
+      ...config,
+      oauth2_oidc: {
+        ...oauth,
+        client_ids: Object.entries(next)
+          .filter(([, binding]) => binding.protocol === "oidc")
+          .map(([id]) => id)
+      }
+    });
+  }
+
+  function updateClientBinding(clientId: string, field: "protocol" | "authorization_profile_id", value: string) {
+    const existing = bindingDraft[clientId];
+    if (!existing) return;
+    const next = {
+      ...bindingDraft,
+      [clientId]: { ...existing, [field]: value }
+    };
+    setBindingDraft(next);
+    if (field === "protocol") {
+      const config = draftFor("protocols");
+      const oauth = record(config.oauth2_oidc);
+      updateDraft("protocols", {
+        ...config,
+        oauth2_oidc: {
+          ...oauth,
+          client_ids: Object.entries(next)
+            .filter(([, binding]) => binding.protocol === "oidc")
+            .map(([id]) => id)
+        }
+      });
+    }
+  }
+
   function renderProtocolEditor() {
     if (!selected) return null;
     const config = draftFor("protocols");
@@ -1693,16 +1674,28 @@ export function ApplicationWorkspace({
       <div className="application-module-content">
         <ModuleHeader icon={<Code2 size={19} />} title={c.protocols} description={c.protocolHint} />
         <div className="protocol-grid">
-          <ProtocolCard icon={<Globe2 size={19} />} title={c.oauth} description={c.oauthHint} enabled={booleanValue(oauth.enabled, selected.oidc_clients.length > 0)} onToggle={(value) => updateProtocol("oauth2_oidc", "enabled", value)} tone="brand">
+          <ProtocolCard icon={<Globe2 size={19} />} title={c.oauth} description={c.oauthHint} enabled={booleanValue(oauth.enabled, selected.client_bindings.some((binding) => binding.protocol === "oidc"))} onToggle={(value) => updateProtocol("oauth2_oidc", "enabled", value)} tone="brand">
             <div className="application-connection-list">
               <div className="subsection-heading"><strong>{c.connections}</strong><span>{selectedClients.length}</span></div>
-              {clients.filter((client) => client.organization_id === selected.organization_id).map((client) => (
-                <label className="application-choice" key={client.id}>
-                  <input type="checkbox" checked={stringList(oauth.client_ids).includes(client.id)} onChange={() => toggleId("client_ids", client.id)} />
-                  <span><strong>{client.client_name}</strong><small>{client.client_id}</small></span>
-                  <span className="application-choice-status">{client.is_active ? c.active : c.disabled}</span>
-                </label>
-              ))}
+              {clients.filter((client) => client.organization_id === selected.organization_id).map((client) => {
+                const binding = bindingDraft[client.id];
+                return (
+                  <div className="application-choice" key={client.id}>
+                    <input type="checkbox" checked={Boolean(binding)} onChange={() => toggleClientBinding(client.id)} />
+                    <span><strong>{client.client_name}</strong><small>{client.client_id}</small></span>
+                    {binding && <>
+                      <select aria-label={`${c.bindingProtocol}: ${client.client_id}`} value={binding.protocol} onChange={(event) => updateClientBinding(client.id, "protocol", event.target.value)}>
+                        {[["oidc", "OIDC"], ["saml", "SAML"], ["cas", "CAS"], ["jwt", "JWT"], ["iap", "IAP"], ["forward_auth", "Forward Auth"]].map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                      </select>
+                      <select aria-label={`${c.authorizationProfile}: ${client.client_id}`} value={binding.authorization_profile_id} onChange={(event) => updateClientBinding(client.id, "authorization_profile_id", event.target.value)}>
+                        <option value="default">default</option>
+                        {(selected.authorization_profiles ?? []).filter((profile) => profile.profile_key !== "default").map((profile) => <option value={profile.id} key={profile.id}>{profile.profile_key}</option>)}
+                      </select>
+                    </>}
+                    <span className="application-choice-status">{client.is_active ? c.active : c.disabled}</span>
+                  </div>
+                );
+              })}
               {clients.filter((client) => client.organization_id === selected.organization_id).length === 0 && <p className="muted">{c.noConnections}</p>}
             </div>
           </ProtocolCard>
@@ -1916,25 +1909,9 @@ export function ApplicationWorkspace({
               </select>
             </label>
             {selectedAuthorizationProfile && <>
-              <div className="form-grid-2 compact-form-grid">
-                <Input label={c.profileManifestUrl} value={profileManifestUrl} onChange={setProfileManifestUrl} />
-                <label className="application-input"><span>{c.profileSigner}</span><select value={profileSignerClientId} onChange={(event) => setProfileSignerClientId(event.target.value)}>
-                  <option value="">{c.notConfigured}</option>
-                  {selected.oidc_clients.map((client) => <option value={client.client_id} key={client.id}>{client.client_name} · {client.client_id}</option>)}
-                </select></label>
-              </div>
               <div className="authorization-profile-mode-row">
-                <Toggle label={c.profileMode} hint={profileSignedEnabled ? c.profileSigned : c.profileManual} checked={profileSignedEnabled} onChange={setProfileSignedEnabled} />
-                <span className={`application-role-badge ${selectedAuthorizationProfile.sync_status === "synced" ? "default" : ""}`}>
-                  {selectedAuthorizationProfile.sync_status === "synced" ? c.profileSynced : selectedAuthorizationProfile.source_mode === "manual" ? c.profileManualStatus : selectedAuthorizationProfile.sync_status}
-                </span>
-              </div>
-              <div className="application-role-editor-actions">
-                <span className={profileFeedback === c.saveFailed ? "module-save-error" : "module-save-feedback"} role="status">{profileFeedback}</span>
-                {canManage && <>
-                  <button type="button" className="secondary-button" onClick={() => void refreshAuthorizationProfile()} disabled={profileRefreshing || profileSaving || !profileSignedEnabled}><RefreshCw size={14} />{profileRefreshing ? c.saving : c.refreshProfile}</button>
-                  <button type="button" className="primary-action" onClick={() => void saveAuthorizationProfile()} disabled={profileSaving || profileRefreshing}>{profileSaving ? c.saving : c.save}<ArrowRight size={15} /></button>
-                </>}
+                <span className="application-role-badge default">{c.profileManual}</span>
+                <span className="muted">{selectedAuthorizationProfile.sync_status}</span>
               </div>
               {selectedAuthorizationProfile.last_error && <p className="module-save-error" role="alert">{selectedAuthorizationProfile.last_error}</p>}
               {selectedAuthorizationProfile.source_mode === "manual" && <p className="module-note"><Circle size={11} />{c.profileNoDefinition}</p>}
@@ -2127,7 +2104,7 @@ export function ApplicationWorkspace({
       </div>
       <div className="application-stat-strip">
         <div><span>{c.websites}</span><strong>{applications.length}</strong></div>
-        <div><span>{c.protocols}</span><strong>{applications.reduce((total, item) => total + (item.oidc_clients.length > 0 ? 1 : 0) + (item.modules ?? []).filter((module) => module.module_key === "protocols" && module.is_enabled).length, 0)}</strong></div>
+                <div><span>{c.protocols}</span><strong>{applications.reduce((total, item) => total + (item.client_bindings.length > 0 ? 1 : 0) + (item.modules ?? []).filter((module) => module.module_key === "protocols" && module.is_enabled).length, 0)}</strong></div>
         <div><span>{c.identitySources}</span><strong>{providers.filter((provider) => provider.is_active).length + ldapProviders.filter((provider) => provider.is_active).length}</strong></div>
       </div>
       <div className="application-workspace-layout">

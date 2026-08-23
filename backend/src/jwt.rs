@@ -66,6 +66,10 @@ pub struct TokenClaims {
     pub jti: Option<String>,
     pub token_use: String,
     pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_profile_id: Option<String>,
     pub scope: String,
     pub email: String,
     pub email_verified: bool,
@@ -429,6 +433,14 @@ impl JwtManager {
             jti: Some(jti.clone()),
             token_use: "access_token".to_string(),
             client_id: client.client_id.clone(),
+            application_id: extra_claims
+                .get("application_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            authorization_profile_id: extra_claims
+                .get("authorization_profile_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             scope: scope.to_string(),
             email: String::new(),
             email_verified: false,
@@ -632,6 +644,14 @@ impl JwtManager {
             jti: Some(jti.clone()),
             token_use: token_use.to_string(),
             client_id: subject.client_id.to_string(),
+            application_id: extra_claims
+                .get("application_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            authorization_profile_id: extra_claims
+                .get("authorization_profile_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             scope: subject.scope.to_string(),
             email: subject.user.email.clone(),
             email_verified: subject.user.email_verified_at.is_some(),

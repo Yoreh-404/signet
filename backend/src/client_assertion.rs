@@ -278,8 +278,7 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
         }
         body.extend_from_slice(&chunk);
     }
-    let jwks = serde_json::from_slice::<ClientJwks>(&body)
-        .map_err(|_| AppError::Unauthorized)?;
+    let jwks = serde_json::from_slice::<ClientJwks>(&body).map_err(|_| AppError::Unauthorized)?;
     validate_jwks(&jwks).map_err(|_| AppError::Unauthorized)?;
     Ok(jwks)
 }

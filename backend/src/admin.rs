@@ -4,26 +4,28 @@ use crate::{
     application_discovery, applications, archived_accounts,
     audit::{self, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization, authorization_manifest, backchannel_logout, billing, claim_mapper,
+    auth_flow, authorization, backchannel_logout, billing, claim_mapper,
     client_assertion, client_policy, csrf,
     db::{
-        ApplicationAuthorizationProfileRecord, ApplicationDiscoveryRecord,
+        ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
+        ApplicationDiscoveryRecord,
         ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
         ApplicationProfileRoleRecord, ApplicationRecord, ApplicationRoleRecord,
-        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType, GroupRecord,
-        InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord,
-        NewApplication, NewApplicationAuthorizationProfile, NewApplicationBillingSettings,
-        NewApplicationDiscovery, NewApplicationJwtClient, NewApplicationProfileRole,
-        NewApplicationRole, NewApplicationScimToken, NewBulkProvisionedUser, NewClient,
-        NewClientClaimMapper, NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation,
-        NewLdapProvider, NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole,
-        NewRuntimeSettings, NewSecurityPolicy, NewUser, OrganizationMemberInput,
-        OrganizationMemberWithUserRecord, OrganizationRecord, PublicAuditWebhook, PublicClient,
-        PublicClientClaimMapper, PublicExternalOidcProvider, PublicIapApplication,
-        PublicInvitation, PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
+        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
+        ClientGrantWithClientRecord, GroupRecord, InvitationRecord, InvitationUpdate,
+        LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord, NewApplication,
+        NewApplicationAuthorizationProfile, NewApplicationBillingSettings, NewApplicationDiscovery,
+        NewApplicationJwtClient, NewApplicationProfileRole, NewApplicationRole,
+        NewApplicationScimToken, NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
+        NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation, NewLdapProvider,
+        NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole, NewRuntimeSettings,
+        NewSecurityPolicy, NewUser, OrganizationMemberInput, OrganizationMemberWithUserRecord,
+        OrganizationRecord, PublicAuditWebhook, PublicClient, PublicClientClaimMapper,
+        PublicExternalOidcProvider, PublicIapApplication, PublicInvitation,
+        PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
         PublicRegistrationSettings, PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord,
-        SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserConsentWithClientRecord,
-        UserListScope, UserOrganizationRecord, UserUpdate,
+        SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserListScope,
+        UserOrganizationRecord, UserUpdate,
     },
     directory, directory_sync,
     error::{AppError, AppResult},
@@ -135,8 +137,8 @@ pub fn routes() -> Router<AppState> {
             post(sync_application_discovery),
         )
         .route(
-            "/api/admin/applications/{id}/oidc-clients",
-            get(list_application_oidc_clients).put(replace_application_oidc_clients),
+            "/api/admin/applications/{id}/client-bindings",
+            get(list_application_client_bindings).put(replace_application_client_bindings),
         )
         .route(
             "/api/admin/applications/{id}/modules",
@@ -192,12 +194,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/applications/{id}/authorization/profiles/{profile_id}",
-            get(get_application_authorization_profile)
-                .put(update_application_authorization_profile),
-        )
-        .route(
-            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/refresh",
-            post(refresh_application_authorization_profile),
+            get(get_application_authorization_profile),
         )
         .route(
             "/api/admin/applications/{id}/authorization/profiles/{profile_id}/catalog",
@@ -1088,8 +1085,8 @@ struct MyConsentResponse {
     updated_at: i64,
 }
 
-impl From<UserConsentWithClientRecord> for MyConsentResponse {
-    fn from(record: UserConsentWithClientRecord) -> Self {
+impl From<ClientGrantWithClientRecord> for MyConsentResponse {
+    fn from(record: ClientGrantWithClientRecord) -> Self {
         Self {
             client_id: record.client_id,
             client_name: record.client_name,
@@ -1112,7 +1109,7 @@ async fn list_my_consents(
     let current = auth::require_current_user(&state, &jar).await?;
     let consents = state
         .db
-        .list_active_user_consents(&current.user.id)
+        .list_active_client_grants(&current.user.id)
         .await?
         .into_iter()
         .map(MyConsentResponse::from)
@@ -1128,7 +1125,7 @@ async fn get_my_consent(
     let current = auth::require_current_user(&state, &jar).await?;
     let consent = state
         .db
-        .list_active_user_consents(&current.user.id)
+        .list_active_client_grants(&current.user.id)
         .await?
         .into_iter()
         .find(|record| record.client_id == client_id)
@@ -1145,7 +1142,7 @@ async fn revoke_my_consent(
     auth::ensure_current_account_mutable(&current)?;
     let revoked = state
         .db
-        .revoke_user_consent(&current.user.id, &client_id)
+        .revoke_client_grant(&current.user.id, &client_id)
         .await?;
     if !revoked {
         return Err(AppError::NotFound);
@@ -4435,8 +4432,25 @@ struct ApplicationInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApplicationOidcClientsInput {
-    client_ids: Vec<String>,
+struct ApplicationClientBindingInput {
+    client_id: String,
+    #[serde(default = "default_oidc_protocol")]
+    protocol: String,
+    #[serde(default = "default_authorization_profile")]
+    authorization_profile_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationClientBindingsInput {
+    bindings: Vec<ApplicationClientBindingInput>,
+}
+
+fn default_oidc_protocol() -> String {
+    "oidc".to_string()
+}
+
+fn default_authorization_profile() -> String {
+    "default".to_string()
 }
 
 const APPLICATION_MODULE_KEYS: &[&str] = &[
@@ -4462,8 +4476,6 @@ struct ApplicationAuthorizationProfileResponse {
     connection_kind: String,
     connection_id: Option<String>,
     source_mode: String,
-    manifest_url: String,
-    signer_client_id: Option<String>,
     remote_version: Option<String>,
     remote_digest: Option<String>,
     sync_status: String,
@@ -4473,16 +4485,6 @@ struct ApplicationAuthorizationProfileResponse {
     role_count: usize,
     created_at: i64,
     updated_at: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationAuthorizationProfileInput {
-    #[serde(default)]
-    manifest_url: Option<String>,
-    #[serde(default)]
-    signer_client_id: Option<String>,
-    #[serde(default = "default_true")]
-    signed_manifest_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4760,11 +4762,35 @@ struct ApplicationResponse {
     account_selection_mode: String,
     unique_identity_factors: Vec<String>,
     is_active: bool,
-    oidc_clients: Vec<PublicClient>,
+    client_bindings: Vec<ApplicationClientBindingResponse>,
     modules: Vec<ApplicationModuleResponse>,
     authorization_profiles: Vec<ApplicationAuthorizationProfileResponse>,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicationClientBindingResponse {
+    #[serde(flatten)]
+    client: PublicClient,
+    protocol: String,
+    authorization_profile_id: String,
+    auth_domain_id: String,
+}
+
+async fn application_client_binding_response(
+    state: &AppState,
+    binding: ApplicationClientBindingRecord,
+) -> AppResult<Option<ApplicationClientBindingResponse>> {
+    let Some(client) = state.db.find_client_by_id(&binding.client_db_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(ApplicationClientBindingResponse {
+        client: public_client_with_claim_mappers(state, client).await?,
+        protocol: binding.protocol,
+        authorization_profile_id: binding.authorization_profile_id,
+        auth_domain_id: binding.auth_domain_id,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4875,97 +4901,48 @@ async fn ensure_application_authorization_profiles(
     state: &AppState,
     application: &ApplicationRecord,
 ) -> AppResult<Vec<ApplicationAuthorizationProfileRecord>> {
-    // Website-managed applications publish the canonical profile catalog in
-    // the v2 application manifest. Do not manufacture one legacy profile per
-    // OIDC client here; that would make the old admin model compete with the
-    // website-owned snapshot and would reintroduce the v1/v2 URL collision.
     if state
         .db
         .find_application_discovery(&application.id)
         .await?
-        .is_some_and(|record| {
-            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-        })
+        .is_some_and(|record| record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE)
     {
         return state
             .db
             .list_application_authorization_profiles(&application.id)
             .await;
     }
-    let website_url = applications::application_website_url(state, &application.id)
-        .await?
-        .unwrap_or_default();
-    let manifest_url = if website_url.trim().is_empty() {
-        String::new()
-    } else {
-        authorization_manifest::default_manifest_url(&website_url)?
-    };
+
     let mut profiles = Vec::new();
-    for client_id in state
-        .db
-        .list_application_oidc_client_ids(&application.id)
-        .await?
-    {
+    for binding in state.db.list_application_client_bindings(&application.id).await? {
         let client = state
             .db
-            .find_client_by_id(&client_id)
+            .find_client_by_id(&binding.client_db_id)
             .await?
             .ok_or(AppError::NotFound)?;
         let existing = state
             .db
             .find_application_authorization_profile(&application.id, &client.client_id)
             .await?;
-        let profile = if let Some(existing) = existing {
-            if existing.manifest_url.is_empty() && !manifest_url.is_empty() {
-                state
-                    .db
-                    .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-                        id: existing.id.clone(),
-                        application_id: application.id.clone(),
-                        profile_key: existing.profile_key.clone(),
-                        connection_kind: existing.connection_kind.clone(),
-                        connection_id: existing.connection_id.clone(),
-                        source_mode: existing.source_mode.clone(),
-                        manifest_url: manifest_url.clone(),
-                        signer_client_id: existing.signer_client_id.clone(),
-                        remote_version: existing.remote_version.clone(),
-                        remote_digest: existing.remote_digest.clone(),
-                        sync_status: existing.sync_status.clone(),
-                        last_synced_at: existing.last_synced_at,
-                        last_error: existing.last_error.clone(),
-                    })
-                    .await?
-            } else {
-                existing
-            }
-        } else {
-            let manifest_capable = !manifest_url.is_empty()
-                && (!client.jwks.trim().is_empty() || !client.jwks_uri.trim().is_empty());
-            state
-                .db
-                .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    application_id: application.id.clone(),
-                    profile_key: client.client_id.clone(),
-                    connection_kind: "oidc".to_string(),
-                    connection_id: Some(client.id.clone()),
-                    source_mode: if manifest_capable {
-                        authorization_manifest::SOURCE_MODE_SIGNED.to_string()
-                    } else {
-                        authorization_manifest::SOURCE_MODE_MANUAL.to_string()
-                    },
-                    manifest_url: manifest_url.clone(),
-                    signer_client_id: (!client.jwks.trim().is_empty()
-                        || !client.jwks_uri.trim().is_empty())
-                    .then(|| client.client_id.clone()),
-                    remote_version: None,
-                    remote_digest: None,
-                    sync_status: authorization_manifest::SYNC_STATUS_MANUAL.to_string(),
-                    last_synced_at: None,
-                    last_error: None,
-                })
-                .await?
-        };
+        let profile = state
+            .db
+            .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+                id: existing
+                    .as_ref()
+                    .map(|profile| profile.id.clone())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                application_id: application.id.clone(),
+                profile_key: client.client_id.clone(),
+                connection_kind: binding.protocol,
+                connection_id: Some(client.id.clone()),
+                source_mode: application_discovery::SOURCE_MODE_MANUAL.to_string(),
+                remote_version: None,
+                remote_digest: None,
+                sync_status: application_discovery::SYNC_STATUS_MANUAL.to_string(),
+                last_synced_at: None,
+                last_error: None,
+            })
+            .await?;
         profiles.push(profile);
     }
     Ok(profiles)
@@ -4975,14 +4952,10 @@ async fn application_response(
     state: &AppState,
     application: ApplicationRecord,
 ) -> AppResult<ApplicationResponse> {
-    let mut oidc_clients = Vec::new();
-    for client_db_id in state
-        .db
-        .list_application_oidc_client_ids(&application.id)
-        .await?
-    {
-        if let Some(client) = state.db.find_client_by_id(&client_db_id).await? {
-            oidc_clients.push(public_client_with_claim_mappers(state, client).await?);
+    let mut client_bindings = Vec::new();
+    for binding in state.db.list_application_client_bindings(&application.id).await? {
+        if let Some(binding) = application_client_binding_response(state, binding).await? {
+            client_bindings.push(binding);
         }
     }
     let unique_identity_factors = application.unique_identity_factors()?;
@@ -5007,8 +4980,6 @@ async fn application_response(
             connection_kind: profile.connection_kind.clone(),
             connection_id: profile.connection_id.clone(),
             source_mode: profile.source_mode.clone(),
-            manifest_url: profile.manifest_url.clone(),
-            signer_client_id: profile.signer_client_id.clone(),
             remote_version: profile.remote_version.clone(),
             remote_digest: profile.remote_digest.clone(),
             sync_status: profile.sync_status.clone(),
@@ -5032,7 +5003,7 @@ async fn application_response(
         account_selection_mode: application.account_selection_mode,
         unique_identity_factors,
         is_active: application.is_active == 1,
-        oidc_clients,
+        client_bindings,
         modules,
         authorization_profiles,
         created_at: application.created_at,
@@ -6268,8 +6239,6 @@ async fn authorization_profile_response(
         connection_kind: profile.connection_kind,
         connection_id: profile.connection_id,
         source_mode: profile.source_mode,
-        manifest_url: profile.manifest_url,
-        signer_client_id: profile.signer_client_id,
         remote_version: profile.remote_version,
         remote_digest: profile.remote_digest,
         sync_status: profile.sync_status,
@@ -6291,7 +6260,6 @@ async fn list_application_authorization_profiles(
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<ApplicationAuthorizationProfileResponse>>> {
     let (_current, application) = managed_application(&state, &jar, &id).await?;
-    auto_refresh_application_authorization_profiles(&state, &application).await?;
     let profiles = ensure_application_authorization_profiles(&state, &application).await?;
     let mut response = Vec::with_capacity(profiles.len());
     for profile in profiles {
@@ -6310,354 +6278,6 @@ async fn get_application_authorization_profile(
     Ok(Json(authorization_profile_response(&state, profile).await?))
 }
 
-async fn update_application_authorization_profile(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id)): Path<(String, String)>,
-    Json(payload): Json<ApplicationAuthorizationProfileInput>,
-) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
-    let (current, application, profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    if state
-        .db
-        .find_application_discovery(&application.id)
-        .await?
-        .is_some_and(|record| {
-            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-        })
-    {
-        return Err(AppError::BadRequest(
-            "website-managed authorization profiles are read-only; update the website manifest"
-                .to_string(),
-        ));
-    }
-    let manifest_url = payload
-        .manifest_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| profile.manifest_url.clone());
-    let signer_client_id = payload
-        .signer_client_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or(profile.signer_client_id.clone());
-    let source_mode = if payload.signed_manifest_enabled {
-        if manifest_url.is_empty() || signer_client_id.is_none() {
-            return Err(AppError::BadRequest(
-                "signed authorization profiles require a manifest URL and signer client"
-                    .to_string(),
-            ));
-        }
-        authorization_manifest::SOURCE_MODE_SIGNED.to_string()
-    } else {
-        authorization_manifest::SOURCE_MODE_MANUAL.to_string()
-    };
-    if let Some(signer_client_id) = signer_client_id.as_deref() {
-        let signer = state
-            .db
-            .find_client_by_client_id(signer_client_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::BadRequest("manifest signer client does not exist".to_string())
-            })?;
-        if signer.organization_id.as_deref() != Some(application.organization_id.as_str())
-            || !state
-                .db
-                .list_application_oidc_client_ids(&application.id)
-                .await?
-                .contains(&signer.id)
-        {
-            return Err(AppError::Forbidden);
-        }
-        if signer.jwks.trim().is_empty() && signer.jwks_uri.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "manifest signer client must have a public JWKS".to_string(),
-            ));
-        }
-    }
-    let updated = state
-        .db
-        .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-            id: profile.id.clone(),
-            application_id: application.id.clone(),
-            profile_key: profile.profile_key.clone(),
-            connection_kind: profile.connection_kind.clone(),
-            connection_id: profile.connection_id.clone(),
-            source_mode,
-            manifest_url,
-            signer_client_id,
-            remote_version: profile.remote_version.clone(),
-            remote_digest: profile.remote_digest.clone(),
-            sync_status: if payload.signed_manifest_enabled {
-                profile.sync_status.clone()
-            } else {
-                authorization_manifest::SYNC_STATUS_MANUAL.to_string()
-            },
-            last_synced_at: profile.last_synced_at,
-            last_error: None,
-        })
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.authorization_profile.update",
-            "application_authorization_profile",
-            Some(updated.id.clone()),
-            serde_json::json!({
-                "application_id": application.id,
-                "profile_key": updated.profile_key,
-                "source_mode": updated.source_mode,
-            }),
-        ))
-        .await?;
-    Ok(Json(authorization_profile_response(&state, updated).await?))
-}
-
-async fn synchronize_authorization_profile(
-    state: &AppState,
-    application: &ApplicationRecord,
-    profile: &ApplicationAuthorizationProfileRecord,
-) -> AppResult<ApplicationAuthorizationProfileRecord> {
-    if state
-        .db
-        .find_application_discovery(&application.id)
-        .await?
-        .is_some_and(|record| {
-            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-        })
-    {
-        application_discovery::sync_application(state, &application.id).await?;
-        let profiles = state
-            .db
-            .list_application_authorization_profiles(&application.id)
-            .await?;
-        if let Some(matching) = profiles
-            .into_iter()
-            .find(|candidate| candidate.profile_key == profile.profile_key)
-        {
-            return Ok(matching);
-        }
-        return state
-            .db
-            .find_application_authorization_profile(&application.id, "default")
-            .await?
-            .ok_or(AppError::NotFound);
-    }
-    if profile.source_mode != authorization_manifest::SOURCE_MODE_SIGNED {
-        return Err(AppError::BadRequest(
-            "enable signed manifest mode before refreshing this profile".to_string(),
-        ));
-    }
-    let website_url = applications::application_website_url(state, &application.id)
-        .await?
-        .ok_or_else(|| {
-            AppError::BadRequest("website URL is required for manifest discovery".to_string())
-        })?;
-    let signer_client_id = profile.signer_client_id.as_deref().ok_or_else(|| {
-        AppError::BadRequest("manifest signer client is not configured".to_string())
-    })?;
-    let signer = state
-        .db
-        .find_client_by_client_id(signer_client_id)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("manifest signer client does not exist".to_string()))?;
-    let result = authorization_manifest::discover_profile(
-        state,
-        &signer,
-        &profile.manifest_url,
-        &website_url,
-        &application.id,
-        &profile.profile_key,
-        &profile.id,
-    )
-    .await;
-    let verified = match result {
-        Ok(value) => value,
-        Err(error) => {
-            state
-                .db
-                .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-                    id: profile.id.clone(),
-                    application_id: profile.application_id.clone(),
-                    profile_key: profile.profile_key.clone(),
-                    connection_kind: profile.connection_kind.clone(),
-                    connection_id: profile.connection_id.clone(),
-                    source_mode: profile.source_mode.clone(),
-                    manifest_url: profile.manifest_url.clone(),
-                    signer_client_id: profile.signer_client_id.clone(),
-                    remote_version: profile.remote_version.clone(),
-                    remote_digest: profile.remote_digest.clone(),
-                    sync_status: authorization_manifest::SYNC_STATUS_ERROR.to_string(),
-                    last_synced_at: profile.last_synced_at,
-                    last_error: Some(error.to_string().chars().take(512).collect()),
-                })
-                .await?;
-            return Err(error);
-        }
-    };
-    let Some(verified) = verified else {
-        let no_profile = state
-            .db
-            .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-                id: profile.id.clone(),
-                application_id: profile.application_id.clone(),
-                profile_key: profile.profile_key.clone(),
-                connection_kind: profile.connection_kind.clone(),
-                connection_id: profile.connection_id.clone(),
-                source_mode: authorization_manifest::SOURCE_MODE_MANUAL.to_string(),
-                manifest_url: profile.manifest_url.clone(),
-                signer_client_id: profile.signer_client_id.clone(),
-                remote_version: profile.remote_version.clone(),
-                remote_digest: profile.remote_digest.clone(),
-                sync_status: authorization_manifest::SYNC_STATUS_NO_PROFILE.to_string(),
-                last_synced_at: profile.last_synced_at,
-                last_error: None,
-            })
-            .await?;
-        return Ok(no_profile);
-    };
-
-    state
-        .db
-        .replace_application_permission_definitions(&profile.id, verified.permissions)
-        .await?;
-    let existing_roles = state.db.list_application_profile_roles(&profile.id).await?;
-    let incoming_keys = verified
-        .roles
-        .iter()
-        .map(|role| role.role_key.as_str())
-        .collect::<BTreeSet<_>>();
-    for role in existing_roles
-        .into_iter()
-        .filter(|role| role.source == authorization_manifest::SOURCE_MANIFEST)
-        .filter(|role| !incoming_keys.contains(role.role_key.as_str()))
-    {
-        let permissions = role.permission_keys()?;
-        state
-            .db
-            .upsert_application_profile_role(NewApplicationProfileRole {
-                id: Some(role.id),
-                profile_id: profile.id.clone(),
-                role_key: role.role_key,
-                name: role.name,
-                description: role.description,
-                permissions,
-                source: authorization_manifest::SOURCE_MANIFEST.to_string(),
-                is_default: false,
-                is_active: false,
-            })
-            .await?;
-    }
-    for role in verified.roles {
-        state.db.upsert_application_profile_role(role).await?;
-    }
-    let synced = state
-        .db
-        .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-            id: profile.id.clone(),
-            application_id: profile.application_id.clone(),
-            profile_key: profile.profile_key.clone(),
-            connection_kind: profile.connection_kind.clone(),
-            connection_id: profile.connection_id.clone(),
-            source_mode: authorization_manifest::SOURCE_MODE_SIGNED.to_string(),
-            manifest_url: profile.manifest_url.clone(),
-            signer_client_id: profile.signer_client_id.clone(),
-            remote_version: Some(verified.version),
-            remote_digest: Some(verified.digest),
-            sync_status: authorization_manifest::SYNC_STATUS_SYNCED.to_string(),
-            last_synced_at: Some(util::now_ts()),
-            last_error: None,
-        })
-        .await?;
-    Ok(synced)
-}
-
-async fn auto_refresh_application_authorization_profiles(
-    state: &AppState,
-    application: &ApplicationRecord,
-) -> AppResult<()> {
-    if let Some(discovery) = state.db.find_application_discovery(&application.id).await?
-        && discovery.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-    {
-        let refresh_required = discovery.snapshot_json.is_none()
-            || discovery
-                .last_verified_expires_at
-                .is_some_and(|expires_at| expires_at <= util::now_ts())
-            || discovery.sync_status == application_discovery::SYNC_PENDING;
-        if refresh_required {
-            if let Err(error) =
-                application_discovery::sync_application(state, &application.id).await
-            {
-                tracing::warn!(
-                    application_id = %application.id,
-                    error = %error,
-                    "initial application discovery refresh failed"
-                );
-            }
-        }
-        return Ok(());
-    }
-    let profiles = ensure_application_authorization_profiles(state, application).await?;
-    for profile in profiles.into_iter().filter(|profile| {
-        profile.source_mode == authorization_manifest::SOURCE_MODE_SIGNED
-            && profile.remote_digest.is_none()
-            && profile.sync_status == authorization_manifest::SYNC_STATUS_MANUAL
-    }) {
-        if let Err(error) = synchronize_authorization_profile(state, application, &profile).await {
-            tracing::warn!(
-                application_id = %application.id,
-                profile_id = %profile.id,
-                error = %error,
-                "initial authorization manifest refresh failed"
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn refresh_application_authorization_profile(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id)): Path<(String, String)>,
-) -> AppResult<Json<ApplicationAuthorizationProfileResponse>> {
-    let (current, application, profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let synced = synchronize_authorization_profile(&state, &application, &profile).await;
-    match synced {
-        Ok(synced) => {
-            state
-                .db
-                .record_audit_event(audit::management_event(
-                    current.user.id,
-                    "application.authorization_profile.refresh",
-                    "application_authorization_profile",
-                    Some(profile.id.clone()),
-                    serde_json::json!({ "status": "synced", "profile_key": profile.profile_key }),
-                ))
-                .await?;
-            Ok(Json(authorization_profile_response(&state, synced).await?))
-        }
-        Err(error) => {
-            let _ = state
-                .db
-                .record_audit_event(audit::management_event(
-                    current.user.id,
-                    "application.authorization_profile.refresh",
-                    "application_authorization_profile",
-                    Some(profile.id),
-                    serde_json::json!({ "status": "error" }),
-                ))
-                .await;
-            Err(error)
-        }
-    }
-}
-
 async fn application_profile_permission_catalog(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -6666,7 +6286,7 @@ async fn application_profile_permission_catalog(
     let (_current, _application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
     let mut definitions = Vec::new();
-    if profile.source_mode == authorization_manifest::SOURCE_MODE_MANUAL {
+    if profile.source_mode == application_discovery::SOURCE_MODE_MANUAL {
         definitions.extend(permission_catalog().into_iter().map(|item| {
             ApplicationPermissionDefinitionResponse {
                 key: item.key.to_string(),
@@ -6726,7 +6346,7 @@ async fn create_application_profile_role(
             name: payload.name,
             description: payload.description,
             permissions: payload.permissions,
-            source: authorization_manifest::SOURCE_MANUAL.to_string(),
+            source: application_discovery::SOURCE_MANUAL.to_string(),
             is_default: payload.is_default,
             is_active: payload.is_active,
         })
@@ -6760,7 +6380,7 @@ async fn update_application_profile_role(
         .into_iter()
         .find(|role| role.id == role_id)
         .ok_or(AppError::NotFound)?;
-    if current_role.source == authorization_manifest::SOURCE_MANIFEST
+    if current_role.source == application_discovery::SOURCE_WEBSITE
         && payload.role_key != current_role.role_key
     {
         return Err(AppError::BadRequest(
@@ -7399,11 +7019,11 @@ async fn delete_application(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn list_application_oidc_clients(
+async fn list_application_client_bindings(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
-) -> AppResult<Json<Vec<PublicClient>>> {
+) -> AppResult<Json<Vec<ApplicationClientBindingResponse>>> {
     let current = auth::require_current_user(&state, &jar).await?;
     let application = state
         .db
@@ -7411,24 +7031,21 @@ async fn list_application_oidc_clients(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
-    let mut clients = Vec::new();
-    for client_id in state.db.list_application_oidc_client_ids(&id).await? {
-        let client = state
-            .db
-            .find_client_by_id(&client_id)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        clients.push(public_client_with_claim_mappers(&state, client).await?);
+    let mut response = Vec::new();
+    for binding in state.db.list_application_client_bindings(&id).await? {
+        if let Some(binding) = application_client_binding_response(&state, binding).await? {
+            response.push(binding);
+        }
     }
-    Ok(Json(clients))
+    Ok(Json(response))
 }
 
-async fn replace_application_oidc_clients(
+async fn replace_application_client_bindings(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
-    Json(payload): Json<ApplicationOidcClientsInput>,
-) -> AppResult<Json<Vec<PublicClient>>> {
+    Json(payload): Json<ApplicationClientBindingsInput>,
+) -> AppResult<Json<Vec<ApplicationClientBindingResponse>>> {
     let current = auth::require_current_user(&state, &jar).await?;
     let application = state
         .db
@@ -7437,51 +7054,75 @@ async fn replace_application_oidc_clients(
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
     ensure_website_application_modules_editable(&state, &application).await?;
-    let requested_ids = payload
-        .client_ids
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<BTreeSet<_>>();
-    for client_id in &requested_ids {
+
+    let mut requested = BTreeMap::new();
+    for binding in payload.bindings {
+        let client_id = binding.client_id.trim().to_string();
+        let protocol = binding.protocol.trim().to_ascii_lowercase();
+        let profile_id = binding.authorization_profile_id.trim().to_string();
+        if client_id.is_empty() || profile_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "client binding requires client_id and authorization_profile_id".to_string(),
+            ));
+        }
+        if !matches!(
+            protocol.as_str(),
+            "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
+        ) {
+            return Err(AppError::BadRequest(
+                "unsupported client binding protocol".to_string(),
+            ));
+        }
         let client = state
             .db
-            .find_client_by_id(client_id)
+            .find_client_by_id(&client_id)
             .await?
-            .ok_or_else(|| AppError::BadRequest("OIDC client does not exist".to_string()))?;
+            .ok_or_else(|| AppError::BadRequest("client does not exist".to_string()))?;
         if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
             return Err(AppError::Forbidden);
         }
+        if profile_id != "default" {
+            let profile = state
+                .db
+                .find_application_authorization_profile_by_id(&profile_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::BadRequest("authorization profile does not exist".to_string())
+                })?;
+            if profile.application_id != application.id {
+                return Err(AppError::BadRequest(
+                    "authorization profile belongs to another application".to_string(),
+                ));
+            }
+        }
+        requested.insert(client_id, (protocol, profile_id));
     }
-    for existing_client_id in state.db.list_application_oidc_client_ids(&id).await? {
-        if !requested_ids.contains(&existing_client_id) {
-            // Removing a connection leaves its compatibility application in
-            // place only when explicitly linked elsewhere. The mapping table
-            // is the sole authority, so deletion is safe here.
+
+    for binding in state.db.list_application_client_bindings(&id).await? {
+        if !requested.contains_key(&binding.client_db_id) {
             state
                 .db
-                .unlink_oidc_client_from_application(&existing_client_id)
+                .unlink_client_from_application(&binding.client_db_id)
                 .await?;
         }
     }
-    for client_id in &requested_ids {
+    for (client_id, (protocol, profile_id)) in &requested {
         state
             .db
-            .link_oidc_client_to_application(&id, client_id)
+            .link_client_to_application(&id, client_id, protocol, profile_id)
             .await?;
     }
-    auto_refresh_application_authorization_profiles(&state, &application).await?;
     state
         .db
         .record_audit_event(audit::management_event(
             current.user.id,
-            "application.oidc_clients.update",
+            "application.client_bindings.update",
             "application",
             Some(id.clone()),
-            serde_json::json!({ "client_ids": requested_ids }),
+            serde_json::json!({ "bindings": requested }),
         ))
         .await?;
-    list_application_oidc_clients(State(state), jar, Path(id)).await
+    list_application_client_bindings(State(state), jar, Path(id)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -7545,7 +7186,7 @@ async fn active_application_client_ids(
     let mut client_ids = Vec::new();
     for client_db_id in state
         .db
-        .list_application_oidc_client_ids(&application.id)
+        .list_application_client_ids(&application.id)
         .await?
     {
         let client = state

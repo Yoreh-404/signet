@@ -212,7 +212,7 @@ async function main() {
             account_selection_mode: "required",
             unique_identity_factors: ["email", "phone"],
             is_active: true,
-            oidc_clients: [clients[0]],
+            client_bindings: [{ ...clients[0], protocol: "oidc", authorization_profile_id: "default", auth_domain_id: "auth-domain:application-one" }],
             created_at: now - 3600,
             updated_at: now - 60,
           },
@@ -225,7 +225,7 @@ async function main() {
             account_selection_mode: "optional",
             unique_identity_factors: [],
             is_active: true,
-            oidc_clients: [clients[1]],
+            client_bindings: [{ ...clients[1], protocol: "saml", authorization_profile_id: "default", auth_domain_id: "auth-domain:application-two" }],
             created_at: now - 3500,
             updated_at: now - 55,
           },
@@ -238,7 +238,7 @@ async function main() {
             account_selection_mode: "optional",
             unique_identity_factors: [],
             is_active: true,
-            oidc_clients: [clients[2]],
+            client_bindings: [{ ...clients[2], protocol: "forward_auth", authorization_profile_id: "default", auth_domain_id: "auth-domain:application-lab" }],
             created_at: now - 3400,
             updated_at: now - 40,
           },
@@ -375,12 +375,12 @@ async function main() {
           if (path === "/api/admin/organization-options") return response(organizationOptions);
           if (path === "/api/admin/organizations/" + activeEnterpriseId + "/members") return response(enterpriseMembers[activeEnterpriseId] ?? []);
           if (path === "/api/admin/organizations/" + activeEnterpriseId + "/member-invitations") return response([]);
-          const applicationPath = /^\/api\/admin\/applications\/([^/]+)\/(oidc-clients|enrollment-codes)$/.exec(path);
+          const applicationPath = /^\/api\/admin\/applications\/([^/]+)\/(client-bindings|enrollment-codes)$/.exec(path);
           if (applicationPath && method === "GET") {
             const [, applicationId, resource] = applicationPath;
             const application = applications.find((candidate) => candidate.id === applicationId);
             if (!application) return response({ message: "unknown mock application" }, 404);
-            if (resource === "oidc-clients") return response(application.oidc_clients);
+            if (resource === "client-bindings") return response(application.client_bindings);
             return response([]);
           }
           if (path === "/api/admin/users" && method === "GET") return response(managedUsers);

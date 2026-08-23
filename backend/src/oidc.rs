@@ -3,6 +3,7 @@ use crate::{
     assurance::{self, AssurancePolicy, SessionAuthenticationAssurance},
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
+    auth_domain::ApplicationAuthContext,
     auth_flow, authorization, authorization_details,
     claim_mapper::{self, ClaimContext, ClaimOutputTarget},
     client_assertion,
@@ -12,8 +13,8 @@ use crate::{
     },
     consent::{self, OidcConsentPolicy},
     db::{
-        ApplicationRecord, ClientRecord, LoginCodeLevel, NewAuthorizationCode, RefreshTokenInput,
-        SessionRecord, UserRecord,
+        ApplicationRecord, ClientRecord, LoginCodeLevel, NewApplicationAuthContext,
+        NewAuthorizationCode, RefreshTokenInput, SessionRecord, UserRecord,
     },
     directory,
     dpop::{self, DpopBinding},
@@ -878,6 +879,9 @@ async fn authorize_with_admin_universal_login_grant(
                 code: code.clone(),
                 client_id: client.client_id.clone(),
                 user_id: user.id.clone(),
+                application_id: None,
+                authorization_profile_id: None,
+                auth_context_id: None,
                 session_id: None,
                 redirect_uri: request.redirect_uri.clone(),
                 scope: requested_scopes.join(" "),
@@ -1039,13 +1043,13 @@ async fn authorize_consent(
             if payload.remember.is_some() {
                 let existing = state
                     .db
-                    .find_user_consent(&current.user.id, &client.client_id)
+                    .find_client_grant(&current.user.id, &client.client_id)
                     .await?;
                 let granted_scopes =
                     consent::merged_granted_scopes(existing.as_ref(), &requested_scopes);
                 state
                     .db
-                    .upsert_user_consent(&current.user.id, &client.client_id, granted_scopes)
+                    .upsert_client_grant(&current.user.id, &client.client_id, granted_scopes)
                     .await?;
             }
             issue_authorization_code_redirect(
@@ -1092,7 +1096,7 @@ async fn requires_authorization_consent(
 ) -> AppResult<bool> {
     let existing = state
         .db
-        .find_user_consent(&user.id, &client.client_id)
+        .find_client_grant(&user.id, &client.client_id)
         .await?;
     Ok(OidcConsentPolicy::new(state.settings.oidc.skip_consent)
         .requires_prompt(existing.as_ref(), requested_scopes))
@@ -1210,13 +1214,64 @@ async fn issue_authorization_code_redirect(
 ) -> AppResult<Response> {
     ensure_trial_enrollment_client_allowed_for_user(context.state, &user.id, &client.client_id)
         .await?;
-    ensure_application_client_allowed_for_user(context.state, user, client).await?;
+    let (_application, client_binding) =
+        applications::authorize_user_for_application(context.state, client, user).await?;
     let code = util::random_token(32);
     let session_assurance = session.authentication_assurance();
     let requested_assurance = request.requested_assurance()?;
     let acr =
         assurance::DefaultAssurancePolicy.select_acr(&session_assurance, &requested_assurance)?;
     assurance::DefaultAssurancePolicy.assert_amr(&session_assurance, &requested_assurance)?;
+    let now = util::now_ts();
+    let auth_context_id = if let Some(existing) = context
+        .state
+        .db
+        .find_application_auth_context(&client_binding.auth_domain_id, &user.id)
+        .await?
+    {
+        let existing_context = ApplicationAuthContext {
+            id: existing.id.clone(),
+            auth_domain_id: existing.auth_domain_id,
+            user_id: existing.user_id,
+            acr: existing.acr,
+            amr: util::from_json(&existing.amr)?,
+            authenticated_at: existing.authenticated_at,
+            expires_at: existing.expires_at,
+        };
+        if existing_context.can_satisfy(Some(&acr), now) {
+            existing_context.id
+        } else {
+            context
+                .state
+                .db
+                .insert_application_auth_context(NewApplicationAuthContext {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    auth_domain_id: client_binding.auth_domain_id.clone(),
+                    user_id: user.id.clone(),
+                    acr: acr.clone(),
+                    amr: session_assurance.amr.clone(),
+                    authenticated_at: session.created_at,
+                    expires_at: now + 3600,
+                })
+                .await?
+                .id
+        }
+    } else {
+        context
+            .state
+            .db
+            .insert_application_auth_context(NewApplicationAuthContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                auth_domain_id: client_binding.auth_domain_id.clone(),
+                user_id: user.id.clone(),
+                acr: acr.clone(),
+                amr: session_assurance.amr.clone(),
+                authenticated_at: session.created_at,
+                expires_at: now + 3600,
+            })
+            .await?
+            .id
+    };
     let authorization_details = authorization_details::normalize_authorization_details_for_client(
         client,
         request.authorization_details.as_deref(),
@@ -1228,6 +1283,9 @@ async fn issue_authorization_code_redirect(
             code: code.clone(),
             client_id: client.client_id.clone(),
             user_id: user.id.clone(),
+            application_id: Some(_application.id.clone()),
+            authorization_profile_id: Some(client_binding.authorization_profile_id.clone()),
+            auth_context_id: Some(auth_context_id),
             session_id: Some(util::session_public_id(&session.id)),
             redirect_uri: request.redirect_uri.clone(),
             scope: requested_scopes.join(" "),
@@ -1436,8 +1494,7 @@ async fn validate_authorize_request(
     // This keeps an archived application or a disabled OAuth/OIDC module from
     // reaching the login page and then failing only after the user has
     // authenticated. Unbound historical clients intentionally remain on the
-    // compatibility path inside `authorize_client_for_protocol`.
-    applications::authorize_client_for_protocol(state, &client, "oauth2_oidc")
+    applications::authorize_application_client(state, &client, "oauth2_oidc")
         .await
         .map_err(|_| AppError::Oidc("client application is unavailable".to_string()))?;
     Ok(client)
@@ -1592,7 +1649,7 @@ async fn ensure_application_client_allowed_for_user(
         return Ok(());
     }
 
-    applications::authorize_user_for_client(state, client, user)
+    applications::authorize_user_for_application(state, client, user)
         .await
         .map(|_| ())
 }
@@ -1752,6 +1809,16 @@ async fn token_from_client_credentials(
         payload.authorization_details.as_deref(),
     )?;
     let mut access_claims = serde_json::Map::new();
+    if let Some(binding) = state.db.find_application_client_binding(&client.id).await? {
+        access_claims.insert(
+            "application_id".to_string(),
+            serde_json::Value::String(binding.application_id),
+        );
+        access_claims.insert(
+            "authorization_profile_id".to_string(),
+            serde_json::Value::String(binding.authorization_profile_id),
+        );
+    }
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
     let service_account_permissions = if client.service_account_enabled() {
@@ -1863,6 +1930,9 @@ async fn token_from_authorization_code(
             // stored request somehow contains offline_access.
             allow_refresh_token: login_code_level.is_none(),
             login_code_level,
+            application_id: record.application_id,
+            authorization_profile_id: record.authorization_profile_id,
+            auth_context_id: record.auth_context_id,
             dpop,
         },
     )
@@ -1927,6 +1997,9 @@ async fn token_from_device_code(
             sid: None,
             allow_refresh_token: true,
             login_code_level: None,
+            application_id: None,
+            authorization_profile_id: None,
+            auth_context_id: None,
             dpop,
         },
     )
@@ -2016,6 +2089,15 @@ async fn token_from_refresh_token(
     // gate before minting another token so disabling a website or its tenant
     // revokes access immediately rather than waiting for token expiry.
     ensure_application_client_allowed_for_user(&state, &user, &client).await?;
+    let binding = state.db.find_application_client_binding(&client.id).await?;
+    if let Some(binding) = binding.as_ref() {
+        if record.application_id.as_deref() != Some(binding.application_id.as_str())
+            || record.authorization_profile_id.as_deref()
+                != Some(binding.authorization_profile_id.as_str())
+        {
+            return Err(invalid_refresh_token_grant());
+        }
+    }
     let scope = record.scope;
     let resource = merge_token_resource(record.resource, payload.resource)?;
     let authorization_details = authorization_details::merge_authorization_details(
@@ -2031,11 +2113,23 @@ async fn token_from_refresh_token(
         ClaimOutputTarget::AccessToken,
     )
     .await?;
+    if let Some(application_id) = record.application_id.as_deref() {
+        access_claims.insert(
+            "application_id".to_string(),
+            serde_json::Value::String(application_id.to_string()),
+        );
+    }
+    if let Some(profile_id) = record.authorization_profile_id.as_deref() {
+        access_claims.insert(
+            "authorization_profile_id".to_string(),
+            serde_json::Value::String(profile_id.to_string()),
+        );
+    }
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
-    let token_audience = resource.as_deref().or_else(|| {
-        (!client.audience.trim().is_empty()).then_some(client.audience.as_str())
-    });
+    let token_audience = resource
+        .as_deref()
+        .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         &issuer,
         TokenSubject {
@@ -2086,6 +2180,7 @@ async fn token_from_refresh_token(
                 resource: resource.clone(),
                 authorization_details: authorization_details.clone(),
                 dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
+                auth_context_id: record.auth_context_id.clone(),
                 expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
             },
         )
@@ -2124,6 +2219,9 @@ struct IssueUserTokensInput {
     sid: Option<String>,
     allow_refresh_token: bool,
     login_code_level: Option<LoginCodeLevel>,
+    application_id: Option<String>,
+    authorization_profile_id: Option<String>,
+    auth_context_id: Option<String>,
     dpop: Option<DpopBinding>,
 }
 
@@ -2144,6 +2242,9 @@ async fn issue_tokens_for_user(
         sid,
         allow_refresh_token,
         login_code_level,
+        application_id,
+        authorization_profile_id,
+        auth_context_id,
         dpop,
     } = input;
     let user = load_oidc_user(state, &user_id).await?;
@@ -2153,6 +2254,18 @@ async fn issue_tokens_for_user(
     // exchange time.
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
     ensure_application_client_allowed_for_user(state, &user, client).await?;
+    let binding = state.db.find_application_client_binding(&client.id).await?;
+    if let Some(binding) = binding.as_ref() {
+        if application_id
+            .as_deref()
+            .is_some_and(|value| value != binding.application_id)
+            || authorization_profile_id
+                .as_deref()
+                .is_some_and(|value| value != binding.authorization_profile_id)
+        {
+            return Err(invalid_refresh_token_grant());
+        }
+    }
     tracing::info!(
         client_id = %client.client_id,
         user_id = %user.id,
@@ -2164,6 +2277,28 @@ async fn issue_tokens_for_user(
     let mut access_claims =
         mapped_claims_for_user(state, client, &user, &scope, ClaimOutputTarget::AccessToken)
             .await?;
+    if let Some(application_id) = application_id.as_deref() {
+        access_claims.insert(
+            "application_id".to_string(),
+            serde_json::Value::String(application_id.to_string()),
+        );
+    } else if let Some(binding) = binding.as_ref() {
+        access_claims.insert(
+            "application_id".to_string(),
+            serde_json::Value::String(binding.application_id.clone()),
+        );
+    }
+    if let Some(profile_id) = authorization_profile_id.as_deref() {
+        access_claims.insert(
+            "authorization_profile_id".to_string(),
+            serde_json::Value::String(profile_id.to_string()),
+        );
+    } else if let Some(binding) = binding.as_ref() {
+        access_claims.insert(
+            "authorization_profile_id".to_string(),
+            serde_json::Value::String(binding.authorization_profile_id.clone()),
+        );
+    }
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
     if let Some(level) = login_code_level {
@@ -2172,9 +2307,9 @@ async fn issue_tokens_for_user(
             serde_json::Value::String(level.as_str().to_string()),
         );
     }
-    let token_audience = resource.as_deref().or_else(|| {
-        (!client.audience.trim().is_empty()).then_some(client.audience.as_str())
-    });
+    let token_audience = resource
+        .as_deref()
+        .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         issuer,
         TokenSubject {
@@ -2190,6 +2325,16 @@ async fn issue_tokens_for_user(
     )?;
     let mut id_claims =
         mapped_claims_for_user(state, client, &user, &scope, ClaimOutputTarget::IdToken).await?;
+    if let Some(binding) = binding.as_ref() {
+        id_claims.insert(
+            "application_id".to_string(),
+            serde_json::Value::String(binding.application_id.clone()),
+        );
+        id_claims.insert(
+            "authorization_profile_id".to_string(),
+            serde_json::Value::String(binding.authorization_profile_id.clone()),
+        );
+    }
     insert_sid_claim(&mut id_claims, sid.as_deref());
     if let Some(level) = login_code_level {
         id_claims.insert(
@@ -2241,6 +2386,7 @@ async fn issue_tokens_for_user(
                     resource: resource.clone(),
                     authorization_details: authorization_details.clone(),
                     dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
+                    auth_context_id: auth_context_id.clone(),
                     expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
                 },
             )
@@ -2453,8 +2599,27 @@ async fn introspect(
         .verify_access_token_for_introspection(&payload.token, &issuer_refs)
     {
         let source_client = state.db.find_client_by_client_id(&claims.client_id).await?;
+        let boundary_matches = if let Some(source_client) = source_client.as_ref() {
+            match state
+                .db
+                .find_application_client_binding(&source_client.id)
+                .await?
+            {
+                Some(binding) => {
+                    claims.application_id.as_deref() == Some(binding.application_id.as_str())
+                        && claims.authorization_profile_id.as_deref()
+                            == Some(binding.authorization_profile_id.as_str())
+                }
+                None => {
+                    claims.application_id.is_none() && claims.authorization_profile_id.is_none()
+                }
+            }
+        } else {
+            false
+        };
         let active = claims.exp > util::now_ts()
             && claims.aud == expected_audience
+            && boundary_matches
             && source_client
                 .as_ref()
                 .is_some_and(|source_client| source_client.is_active == 1)
@@ -2503,10 +2668,7 @@ async fn introspect(
             .unwrap_or(record.client_id.as_str())
             == expected_audience
     {
-        let source_client = state
-            .db
-            .find_client_by_client_id(&record.client_id)
-            .await?;
+        let source_client = state.db.find_client_by_client_id(&record.client_id).await?;
         let user = source_client
             .as_ref()
             .filter(|source_client| source_client.is_active == 1)
@@ -2612,18 +2774,14 @@ async fn introspected_user_grant_is_live(
         let Ok(version) = version.parse::<i64>() else {
             return Ok(false);
         };
-        let Some(consent) = state
-            .db
-            .find_user_consent(user_id, grant_client_id)
-            .await?
-        else {
+        let Some(consent) = state.db.find_client_grant(user_id, grant_client_id).await? else {
             return Ok(false);
         };
         return Ok(consent.revoked_at.is_none()
             && consent.updated_at == version
             && grants_all_scopes(&consent.granted_scopes, scope));
     }
-    let Some(consent) = state.db.find_user_consent(user_id, client_id).await? else {
+    let Some(consent) = state.db.find_client_grant(user_id, client_id).await? else {
         // `skip_consent` creates an implicit authorization grant for ordinary
         // browser flows. Delegated exchanges never take this branch because
         // they always carry a consent:* grant reference.
@@ -2637,14 +2795,16 @@ async fn introspected_refresh_grant_is_live(
     user_id: &str,
     client_id: &str,
 ) -> AppResult<bool> {
-    let Some(consent) = state.db.find_user_consent(user_id, client_id).await? else {
+    let Some(consent) = state.db.find_client_grant(user_id, client_id).await? else {
         return Ok(true);
     };
     Ok(consent.revoked_at.is_none())
 }
 
 fn grants_all_scopes(granted_scopes: &str, requested_scope: &str) -> bool {
-    let granted = granted_scopes.split_whitespace().collect::<std::collections::BTreeSet<_>>();
+    let granted = granted_scopes
+        .split_whitespace()
+        .collect::<std::collections::BTreeSet<_>>();
     requested_scope
         .split_whitespace()
         .all(|scope| granted.contains(scope))
@@ -3344,12 +3504,10 @@ pub(crate) async fn authenticate_client_at<T: ClientAuthFields>(
     if client.is_active != 1 {
         return Err(AppError::Unauthorized);
     }
-    applications::authorize_client_for_protocol(state, &client, "oauth2_oidc")
+    applications::authorize_application_client(state, &client, "oauth2_oidc")
         .await
         .map_err(|_| AppError::Unauthorized)?;
-    if client.require_confidential_client == 1
-        && client.token_endpoint_auth_method == "none"
-    {
+    if client.require_confidential_client == 1 && client.token_endpoint_auth_method == "none" {
         return Err(AppError::Unauthorized);
     }
     match client.token_endpoint_auth_method.as_str() {
@@ -6135,6 +6293,9 @@ mod tests {
                     code: code.clone(),
                     client_id: client.client_id.clone(),
                     user_id: user.id.clone(),
+                    application_id: None,
+                    authorization_profile_id: None,
+                    auth_context_id: None,
                     session_id,
                     redirect_uri: "http://localhost:3000/callback".to_string(),
                     // This inconsistent defense-in-depth fixture proves that
@@ -6205,6 +6366,7 @@ mod tests {
                     resource: None,
                     authorization_details: None,
                     dpop_jkt: None,
+                    auth_context_id: None,
                     expires_at: util::now_ts() + 600,
                 },
             )
@@ -6288,6 +6450,7 @@ mod tests {
                     resource: Some("https://api.example/one".to_string()),
                     authorization_details: None,
                     dpop_jkt: Some("expected-jkt".to_string()),
+                    auth_context_id: None,
                     expires_at: util::now_ts() + 600,
                 },
             )

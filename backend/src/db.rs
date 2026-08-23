@@ -1143,6 +1143,12 @@ pub struct AuthorizationCodeRecord {
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub authorization_profile_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub auth_context_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
     pub session_id: Option<String>,
     #[diesel(sql_type = Text)]
     pub redirect_uri: String,
@@ -1177,6 +1183,9 @@ pub struct NewAuthorizationCode {
     pub code: String,
     pub client_id: String,
     pub user_id: String,
+    pub application_id: Option<String>,
+    pub authorization_profile_id: Option<String>,
+    pub auth_context_id: Option<String>,
     pub session_id: Option<String>,
     pub redirect_uri: String,
     pub scope: String,
@@ -1307,6 +1316,12 @@ pub struct RefreshTokenRecord {
     pub token_hash: String,
     #[diesel(sql_type = Text)]
     pub client_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub authorization_profile_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub auth_context_id: Option<String>,
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Text)]
@@ -1333,11 +1348,12 @@ pub struct RefreshTokenInput {
     pub resource: Option<String>,
     pub authorization_details: Option<String>,
     pub dpop_jkt: Option<String>,
+    pub auth_context_id: Option<String>,
     pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct UserConsentRecord {
+pub struct ClientGrantRecord {
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Text)]
@@ -1353,7 +1369,7 @@ pub struct UserConsentRecord {
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct UserConsentWithClientRecord {
+pub struct ClientGrantWithClientRecord {
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Text)]
@@ -2414,6 +2430,77 @@ pub struct ApplicationRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationAuthDomainRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub application_id: String,
+    #[diesel(sql_type = Text)]
+    pub assurance_policy: String,
+    #[diesel(sql_type = Integer)]
+    pub is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationClientBindingRecord {
+    #[diesel(sql_type = Text)]
+    pub application_id: String,
+    #[diesel(sql_type = Text)]
+    pub client_db_id: String,
+    #[diesel(sql_type = Text)]
+    pub protocol: String,
+    #[diesel(sql_type = Text)]
+    pub authorization_profile_id: String,
+    #[diesel(sql_type = Text)]
+    pub auth_domain_id: String,
+    #[diesel(sql_type = Integer)]
+    pub is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct ApplicationAuthContextRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub auth_domain_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub acr: String,
+    #[diesel(sql_type = Text)]
+    pub amr: String,
+    #[diesel(sql_type = BigInt)]
+    pub authenticated_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub revoked_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApplicationAuthContext {
+    pub id: String,
+    pub auth_domain_id: String,
+    pub user_id: String,
+    pub acr: String,
+    pub amr: Vec<String>,
+    pub authenticated_at: i64,
+    pub expires_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewApplication {
     pub organization_id: String,
@@ -2717,10 +2804,6 @@ pub struct ApplicationAuthorizationProfileRecord {
     pub connection_id: Option<String>,
     #[diesel(sql_type = Text)]
     pub source_mode: String,
-    #[diesel(sql_type = Text)]
-    pub manifest_url: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub signer_client_id: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub remote_version: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
@@ -2745,8 +2828,6 @@ pub struct NewApplicationAuthorizationProfile {
     pub connection_kind: String,
     pub connection_id: Option<String>,
     pub source_mode: String,
-    pub manifest_url: String,
-    pub signer_client_id: Option<String>,
     pub remote_version: Option<String>,
     pub remote_digest: Option<String>,
     pub sync_status: String,
@@ -3929,7 +4010,7 @@ fn wallet_account_scope_key(
 }
 
 fn select_application_authorization_profile_sql() -> &'static str {
-    "SELECT id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at FROM application_authorization_profiles"
+    "SELECT id, application_id, profile_key, connection_kind, connection_id, source_mode, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at FROM application_authorization_profiles"
 }
 
 fn select_application_discovery_sql() -> &'static str {
@@ -4238,6 +4319,7 @@ impl Db {
         for client in self.list_clients().await? {
             self.ensure_application_for_client(&client).await?;
         }
+        self.migrate_application_binding_storage().await?;
         self.normalize_application_login_boundary().await?;
         // Every application gets an explicit discovery ownership record. The
         // migration default is Signet-managed, so existing installations keep
@@ -4289,6 +4371,139 @@ impl Db {
             .await?;
         }
         Ok(())
+    }
+
+    async fn migrate_application_binding_storage(&self) -> AppResult<()> {
+        with_conn!(self, |conn, kind| {
+            let auth_domain_insert = match kind {
+                DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                    "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) SELECT 'auth-domain:' || applications.id, applications.id, 'default', 1, applications.created_at, applications.updated_at FROM applications LEFT JOIN application_auth_domains ON application_auth_domains.application_id = applications.id WHERE application_auth_domains.application_id IS NULL"
+                }
+                DatabaseKind::Mysql => {
+                    "INSERT IGNORE INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) SELECT CONCAT('auth-domain:', applications.id), applications.id, 'default', 1, applications.created_at, applications.updated_at FROM applications LEFT JOIN application_auth_domains ON application_auth_domains.application_id = applications.id WHERE application_auth_domains.application_id IS NULL"
+                }
+            };
+            conn.batch_execute(auth_domain_insert)
+                .map_err(AppError::from)?;
+            let legacy_table_exists = match kind {
+                DatabaseKind::Sqlite => sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'application_oidc_clients'",
+                )
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+                DatabaseKind::Postgres => sql_query(format!(
+                    "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = {}",
+                    ph(kind, 1)
+                ))
+                .bind::<Text, _>("application_oidc_clients")
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+                DatabaseKind::Mysql => sql_query(format!(
+                    "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = {}",
+                    ph(kind, 1)
+                ))
+                .bind::<Text, _>("application_oidc_clients")
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+            };
+            if !legacy_table_exists {
+                let legacy_consent_table_exists = match kind {
+                    DatabaseKind::Sqlite => sql_query(
+                        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'user_consents'",
+                    )
+                    .get_result::<CountRow>(&mut conn)
+                    .map_err(AppError::from)?
+                    .count
+                        > 0,
+                    DatabaseKind::Postgres => sql_query(format!(
+                        "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = {}",
+                        ph(kind, 1)
+                    ))
+                    .bind::<Text, _>("user_consents")
+                    .get_result::<CountRow>(&mut conn)
+                    .map_err(AppError::from)?
+                    .count
+                        > 0,
+                    DatabaseKind::Mysql => sql_query(format!(
+                        "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = {}",
+                        ph(kind, 1)
+                    ))
+                    .bind::<Text, _>("user_consents")
+                    .get_result::<CountRow>(&mut conn)
+                    .map_err(AppError::from)?
+                    .count
+                        > 0,
+                };
+                if legacy_consent_table_exists {
+                    let consent_migration = match kind {
+                        DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                            "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents ON CONFLICT DO NOTHING"
+                        }
+                        DatabaseKind::Mysql => {
+                            "INSERT IGNORE INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents"
+                        }
+                    };
+                    conn.batch_execute(consent_migration)
+                        .map_err(AppError::from)?;
+                }
+                return Ok(());
+            }
+            let binding_insert = match kind {
+                DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                    "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oidc', 'default', 'auth-domain:' || links.application_id, clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL ON CONFLICT DO NOTHING"
+                }
+                DatabaseKind::Mysql => {
+                    "INSERT IGNORE INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oidc', 'default', CONCAT('auth-domain:', links.application_id), clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL"
+                }
+            };
+            conn.batch_execute(binding_insert).map_err(AppError::from)?;
+            let legacy_consent_table_exists = match kind {
+                DatabaseKind::Sqlite => sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'user_consents'",
+                )
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+                DatabaseKind::Postgres => sql_query(format!(
+                    "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = {}",
+                    ph(kind, 1)
+                ))
+                .bind::<Text, _>("user_consents")
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+                DatabaseKind::Mysql => sql_query(format!(
+                    "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = {}",
+                    ph(kind, 1)
+                ))
+                .bind::<Text, _>("user_consents")
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                    > 0,
+            };
+            if legacy_consent_table_exists {
+                let consent_migration = match kind {
+                    DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                        "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents ON CONFLICT DO NOTHING"
+                    }
+                    DatabaseKind::Mysql => {
+                        "INSERT IGNORE INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents"
+                    }
+                };
+                conn.batch_execute(consent_migration)
+                    .map_err(AppError::from)?;
+            }
+            Ok(())
+        })
     }
 
     async fn normalize_application_login_boundary(&self) -> AppResult<()> {
@@ -4347,7 +4562,12 @@ impl Db {
                 });
             if is_website_managed {
                 return self
-                    .link_oidc_client_to_application(&existing_application.id, &client.id)
+                    .link_client_to_application(
+                        &existing_application.id,
+                        &client.id,
+                        "oidc",
+                        "default",
+                    )
                     .await;
             }
         }
@@ -4374,7 +4594,7 @@ impl Db {
                 is_active: client.is_active == 1,
             })
             .await?;
-        self.link_oidc_client_to_application(&application.id, &client.id)
+        self.link_client_to_application(&application.id, &client.id, "oidc", "default")
             .await
     }
 
@@ -5491,7 +5711,7 @@ impl Db {
             conn.transaction::<(), AppError, _>(|conn| {
                 clear_user_auth_state_for_conn!(conn, kind, &id)?;
                 for table in [
-                    "user_consents",
+                    "client_grants",
                     "user_roles",
                     "group_members",
                     "organization_members",
@@ -6843,7 +7063,7 @@ impl Db {
                 for (table, column) in [
                     ("authorization_codes", "client_id"),
                     ("refresh_tokens", "client_id"),
-                    ("user_consents", "client_id"),
+                    ("client_grants", "client_id"),
                     ("device_authorizations", "client_id"),
                     ("pushed_authorization_requests", "client_id"),
                     ("oidc_login_grants", "client_id"),
@@ -7887,29 +8107,19 @@ impl Db {
                     return Err(AppError::Unauthorized);
                 }
                 let sql = format!(
-                    "INSERT INTO authorization_codes (code, client_id, user_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16),
-                    ph(kind, 17)
+                    "INSERT INTO authorization_codes (code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5),
+                    ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10),
+                    ph(kind, 11), ph(kind, 12), ph(kind, 13), ph(kind, 14), ph(kind, 15),
+                    ph(kind, 16), ph(kind, 17), ph(kind, 18), ph(kind, 19), ph(kind, 20)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(code.code)
                     .bind::<Text, _>(code.client_id)
                     .bind::<Text, _>(code.user_id)
+                    .bind::<Nullable<Text>, _>(code.application_id)
+                    .bind::<Nullable<Text>, _>(code.authorization_profile_id)
+                    .bind::<Nullable<Text>, _>(code.auth_context_id)
                     .bind::<Nullable<Text>, _>(code.session_id)
                     .bind::<Text, _>(code.redirect_uri)
                     .bind::<Text, _>(code.scope)
@@ -7936,7 +8146,7 @@ impl Db {
         let amr = util::to_json(&code.amr)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO authorization_codes (code, client_id, user_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO authorization_codes (code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -7953,12 +8163,18 @@ impl Db {
                 ph(kind, 14),
                 ph(kind, 15),
                 ph(kind, 16),
-                ph(kind, 17)
+                ph(kind, 17),
+                ph(kind, 18),
+                ph(kind, 19),
+                ph(kind, 20)
             );
             sql_query(sql)
                 .bind::<Text, _>(code.code)
                 .bind::<Text, _>(code.client_id)
                 .bind::<Text, _>(code.user_id)
+                .bind::<Nullable<Text>, _>(code.application_id)
+                .bind::<Nullable<Text>, _>(code.authorization_profile_id)
+                .bind::<Nullable<Text>, _>(code.auth_context_id)
                 .bind::<Nullable<Text>, _>(code.session_id)
                 .bind::<Text, _>(code.redirect_uri)
                 .bind::<Text, _>(code.scope)
@@ -7987,7 +8203,7 @@ impl Db {
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let select_sql = format!(
-                "SELECT code, client_id, user_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
+                "SELECT code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
                 ph(kind, 1)
             );
             let record = sql_query(select_sql)
@@ -8040,7 +8256,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             conn.transaction::<AuthorizationCodeRecord, AppError, _>(|conn| {
                 let select_sql = format!(
-                    "SELECT code, client_id, user_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
+                    "SELECT code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
                     ph(kind, 1)
                 );
                 let record = sql_query(select_sql)
@@ -8456,12 +8672,20 @@ impl Db {
             resource,
             authorization_details,
             dpop_jkt,
+            auth_context_id,
             expires_at,
         } = token;
+        let binding = self
+            .find_application_client_binding_by_public_client_id(&client_id)
+            .await?;
+        let application_id = binding.as_ref().map(|value| value.application_id.clone());
+        let authorization_profile_id = binding
+            .as_ref()
+            .map(|value| value.authorization_profile_id.clone());
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO refresh_tokens (token_hash, client_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO refresh_tokens (token_hash, client_id, application_id, authorization_profile_id, auth_context_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -8471,11 +8695,17 @@ impl Db {
                 ph(kind, 7),
                 ph(kind, 8),
                 ph(kind, 9),
-                ph(kind, 10)
+                ph(kind, 10),
+                ph(kind, 11),
+                ph(kind, 12),
+                ph(kind, 13)
             );
             sql_query(sql)
                 .bind::<Text, _>(token_hash)
                 .bind::<Text, _>(client_id)
+                .bind::<Nullable<Text>, _>(application_id)
+                .bind::<Nullable<Text>, _>(authorization_profile_id)
+                .bind::<Nullable<Text>, _>(auth_context_id)
                 .bind::<Text, _>(user_id)
                 .bind::<Text, _>(scope)
                 .bind::<Nullable<Text>, _>(resource)
@@ -8497,7 +8727,7 @@ impl Db {
         let token_hash = token_hash.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT token_hash, client_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at FROM refresh_tokens WHERE token_hash = {}",
+                "SELECT token_hash, client_id, application_id, authorization_profile_id, auth_context_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at FROM refresh_tokens WHERE token_hash = {}",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -8534,6 +8764,16 @@ impl Db {
     ) -> AppResult<bool> {
         let token_hash = token_hash.to_string();
         let client_id = client_id.to_string();
+        let previous = self.find_refresh_token(&token_hash).await?;
+        let application_id = previous
+            .as_ref()
+            .and_then(|value| value.application_id.clone());
+        let authorization_profile_id = previous
+            .as_ref()
+            .and_then(|value| value.authorization_profile_id.clone());
+        let auth_context_id = previous
+            .as_ref()
+            .and_then(|value| value.auth_context_id.clone());
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<bool, AppError, _>(|conn| {
@@ -8556,7 +8796,7 @@ impl Db {
                 }
 
                 let insert_sql = format!(
-                    "INSERT INTO refresh_tokens (token_hash, client_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    "INSERT INTO refresh_tokens (token_hash, client_id, application_id, authorization_profile_id, auth_context_id, user_id, scope, resource, authorization_details, dpop_jkt, expires_at, revoked_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
@@ -8566,11 +8806,17 @@ impl Db {
                     ph(kind, 7),
                     ph(kind, 8),
                     ph(kind, 9),
-                    ph(kind, 10)
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13)
                 );
                 sql_query(insert_sql)
                     .bind::<Text, _>(replacement.token_hash)
                     .bind::<Text, _>(client_id)
+                    .bind::<Nullable<Text>, _>(application_id)
+                    .bind::<Nullable<Text>, _>(authorization_profile_id)
+                    .bind::<Nullable<Text>, _>(auth_context_id)
                     .bind::<Text, _>(replacement.user_id)
                     .bind::<Text, _>(replacement.scope)
                     .bind::<Nullable<Text>, _>(replacement.resource)
@@ -8586,57 +8832,57 @@ impl Db {
         })
     }
 
-    pub async fn find_user_consent(
+    pub async fn find_client_grant(
         &self,
         user_id: &str,
         client_id: &str,
-    ) -> AppResult<Option<UserConsentRecord>> {
+    ) -> AppResult<Option<ClientGrantRecord>> {
         let user_id = user_id.to_string();
         let client_id = client_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM user_consents WHERE user_id = {} AND client_id = {}",
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2)
             );
             sql_query(sql)
                 .bind::<Text, _>(user_id)
                 .bind::<Text, _>(client_id)
-                .get_result::<UserConsentRecord>(&mut conn)
+                .get_result::<ClientGrantRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
         })
     }
 
-    pub async fn list_active_user_consents(
+    pub async fn list_active_client_grants(
         &self,
         user_id: &str,
-    ) -> AppResult<Vec<UserConsentWithClientRecord>> {
+    ) -> AppResult<Vec<ClientGrantWithClientRecord>> {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT user_consents.user_id, user_consents.client_id, clients.client_name, user_consents.granted_scopes, user_consents.granted_at, user_consents.updated_at, user_consents.revoked_at FROM user_consents LEFT JOIN clients ON clients.client_id = user_consents.client_id WHERE user_consents.user_id = {} AND user_consents.revoked_at IS NULL ORDER BY user_consents.updated_at DESC",
+                "SELECT client_grants.user_id, client_grants.client_id, clients.client_name, client_grants.granted_scopes, client_grants.granted_at, client_grants.updated_at, client_grants.revoked_at FROM client_grants LEFT JOIN clients ON clients.client_id = client_grants.client_id WHERE client_grants.user_id = {} AND client_grants.revoked_at IS NULL ORDER BY client_grants.updated_at DESC",
                 ph(kind, 1)
             );
             sql_query(sql)
                 .bind::<Text, _>(user_id)
-                .load::<UserConsentWithClientRecord>(&mut conn)
+                .load::<ClientGrantWithClientRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }
 
-    pub async fn upsert_user_consent(
+    pub async fn upsert_client_grant(
         &self,
         user_id: &str,
         client_id: &str,
         granted_scopes: String,
-    ) -> AppResult<UserConsentRecord> {
+    ) -> AppResult<ClientGrantRecord> {
         let user_id = user_id.to_string();
         let client_id = client_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let update_sql = format!(
-                "UPDATE user_consents SET granted_scopes = {}, updated_at = {}, revoked_at = {} WHERE user_id = {} AND client_id = {}",
+                "UPDATE client_grants SET granted_scopes = {}, updated_at = {}, revoked_at = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -8653,7 +8899,7 @@ impl Db {
                 .map_err(AppError::from)?;
             if changed == 0 {
                 let insert_sql = format!(
-                    "INSERT INTO user_consents (user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) VALUES ({}, {}, 'default', {}, {}, {}, {})",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
@@ -8672,25 +8918,25 @@ impl Db {
                     .map_err(AppError::from)?;
             }
             let sql = format!(
-                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM user_consents WHERE user_id = {} AND client_id = {}",
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2)
             );
             sql_query(sql)
                 .bind::<Text, _>(user_id)
                 .bind::<Text, _>(client_id)
-                .get_result::<UserConsentRecord>(&mut conn)
+                .get_result::<ClientGrantRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }
 
-    pub async fn revoke_user_consent(&self, user_id: &str, client_id: &str) -> AppResult<bool> {
+    pub async fn revoke_client_grant(&self, user_id: &str, client_id: &str) -> AppResult<bool> {
         let user_id = user_id.to_string();
         let client_id = client_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE user_consents SET revoked_at = {}, updated_at = {} WHERE user_id = {} AND client_id = {} AND revoked_at IS NULL",
+                "UPDATE client_grants SET revoked_at = {}, updated_at = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default' AND revoked_at IS NULL",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -14561,7 +14807,7 @@ impl Db {
                 .unwrap_or(profile.id);
             if existing.is_some() {
                 let sql = format!(
-                    "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, manifest_url = {}, signer_client_id = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
+                    "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
@@ -14571,16 +14817,12 @@ impl Db {
                     ph(kind, 7),
                     ph(kind, 8),
                     ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12)
+                    ph(kind, 10)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(&profile.connection_kind)
                     .bind::<Nullable<Text>, _>(&profile.connection_id)
                     .bind::<Text, _>(&profile.source_mode)
-                    .bind::<Text, _>(&profile.manifest_url)
-                    .bind::<Nullable<Text>, _>(&profile.signer_client_id)
                     .bind::<Nullable<Text>, _>(&profile.remote_version)
                     .bind::<Nullable<Text>, _>(&profile.remote_digest)
                     .bind::<Text, _>(&profile.sync_status)
@@ -14592,7 +14834,7 @@ impl Db {
                     .map_err(AppError::from)?;
             } else {
                 let sql = format!(
-                    "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
@@ -14605,9 +14847,7 @@ impl Db {
                     ph(kind, 10),
                     ph(kind, 11),
                     ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15)
+                    ph(kind, 13)
                 );
                 sql_query(sql)
                     .bind::<Text, _>(&id)
@@ -14616,8 +14856,6 @@ impl Db {
                     .bind::<Text, _>(&profile.connection_kind)
                     .bind::<Nullable<Text>, _>(&profile.connection_id)
                     .bind::<Text, _>(&profile.source_mode)
-                    .bind::<Text, _>(&profile.manifest_url)
-                    .bind::<Nullable<Text>, _>(&profile.signer_client_id)
                     .bind::<Nullable<Text>, _>(&profile.remote_version)
                     .bind::<Nullable<Text>, _>(&profile.remote_digest)
                     .bind::<Text, _>(&profile.sync_status)
@@ -16966,22 +17204,12 @@ impl Db {
     /// fetching and signature validation happen before this method; this
     /// transaction only reconciles the normalized result and the snapshot
     /// metadata. Client secrets are already hashed by the verifier.
-    pub async fn apply_website_manifest(
+    pub async fn apply_application_contract(
         &self,
         application_id: &str,
         manifest: crate::application_discovery::VerifiedApplicationManifest,
     ) -> AppResult<ApplicationDiscoveryRecord> {
         let application_id = application_id.to_string();
-        let manifest_url = self
-            .find_application_discovery(&application_id)
-            .await?
-            .ok_or(AppError::NotFound)?
-            .website_url;
-        let discovery_url = format!(
-            "{}{}",
-            manifest_url.trim_end_matches('/'),
-            crate::application_discovery::DISCOVERY_PATH
-        );
         let snapshot_json = util::to_json(&manifest.redacted_payload)?;
         let manifest = manifest.clone();
         let application_organization_id = self
@@ -17059,6 +17287,14 @@ impl Db {
                 let mut client_db_ids = BTreeMap::new();
                 let mut profile_db_ids = BTreeMap::new();
                 for client in &manifest.clients {
+                    let protocol = manifest
+                        .client_protocols
+                        .get(&client.client_id)
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "application contract is missing a client protocol".to_string(),
+                            )
+                        })?;
                     let existing_sql = format!(
                         "{} WHERE client_id = {}",
                         select_client_sql(),
@@ -17071,7 +17307,7 @@ impl Db {
                         .map_err(AppError::from)?;
                     let client_db_id = if let Some(existing) = existing {
                         let owner_sql = format!(
-                            "SELECT COUNT(*) AS count FROM application_oidc_clients WHERE client_db_id = {} AND application_id <> {}",
+                            "SELECT COUNT(*) AS count FROM application_client_bindings WHERE client_db_id = {} AND application_id <> {}",
                             ph(kind, 1),
                             ph(kind, 2)
                         );
@@ -17102,7 +17338,7 @@ impl Db {
                     };
                     client_db_ids.insert(client.client_id.clone(), client_db_id.clone());
                     let link_count_sql = format!(
-                        "SELECT COUNT(*) AS count FROM application_oidc_clients WHERE application_id = {} AND client_db_id = {}",
+                        "SELECT COUNT(*) AS count FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
                         ph(kind, 1), ph(kind, 2)
                     );
                     let linked = sql_query(link_count_sql)
@@ -17114,19 +17350,24 @@ impl Db {
                         > 0;
                     if !linked {
                         let link_sql = format!(
-                            "INSERT INTO application_oidc_clients (application_id, client_db_id, created_at) VALUES ({}, {}, {})",
-                            ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                            "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
                         );
                         sql_query(link_sql)
                             .bind::<Text, _>(&application_id)
                             .bind::<Text, _>(&client_db_id)
+                            .bind::<Text, _>(protocol)
+                            .bind::<Text, _>("default")
+                            .bind::<Text, _>(&format!("auth-domain:{application_id}"))
+                            .bind::<Integer, _>(1)
+                            .bind::<BigInt, _>(util::now_ts())
                             .bind::<BigInt, _>(util::now_ts())
                             .execute(conn)
                             .map_err(AppError::from)?;
                     }
                 }
                 let existing_clients_sql = format!(
-                    "SELECT client_db_id FROM application_oidc_clients WHERE application_id = {}",
+                    "SELECT client_db_id FROM application_client_bindings WHERE application_id = {} AND is_active = 1",
                     ph(kind, 1)
                 );
                 #[derive(diesel::QueryableByName)]
@@ -17134,45 +17375,57 @@ impl Db {
                     #[diesel(sql_type = Text)]
                     client_db_id: String,
                 }
-                for row in sql_query(existing_clients_sql)
-                    .bind::<Text, _>(&application_id)
-                    .load::<ClientIdRow>(conn)
-                    .map_err(AppError::from)?
-                {
-                    let client_sql = format!(
-                        "SELECT client_id FROM clients WHERE id = {}",
-                        ph(kind, 1)
-                    );
-                    #[derive(diesel::QueryableByName)]
-                    struct ClientNameRow {
-                        #[diesel(sql_type = Text)]
-                        client_id: String,
-                    }
-                    let current_client = sql_query(client_sql)
-                        .bind::<Text, _>(&row.client_db_id)
-                        .get_result::<ClientNameRow>(conn)
-                        .map_err(AppError::from)?;
-                    if !client_ids.contains(&current_client.client_id) {
-                        let deactivate_sql = format!(
-                            "UPDATE clients SET is_active = {}, updated_at = {} WHERE id = {}",
-                            ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                if manifest.revoke_removed_clients {
+                    for row in sql_query(existing_clients_sql)
+                        .bind::<Text, _>(&application_id)
+                        .load::<ClientIdRow>(conn)
+                        .map_err(AppError::from)?
+                    {
+                        let client_sql = format!(
+                            "SELECT client_id FROM clients WHERE id = {}",
+                            ph(kind, 1)
                         );
-                        sql_query(deactivate_sql)
-                            .bind::<Integer, _>(0)
-                            .bind::<BigInt, _>(util::now_ts())
+                        #[derive(diesel::QueryableByName)]
+                        struct ClientNameRow {
+                            #[diesel(sql_type = Text)]
+                            client_id: String,
+                        }
+                        let current_client = sql_query(client_sql)
                             .bind::<Text, _>(&row.client_db_id)
-                            .execute(conn)
+                            .get_result::<ClientNameRow>(conn)
                             .map_err(AppError::from)?;
-                        let unlink_sql = format!(
-                            "DELETE FROM application_oidc_clients WHERE application_id = {} AND client_db_id = {}",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        sql_query(unlink_sql)
-                            .bind::<Text, _>(&application_id)
-                            .bind::<Text, _>(&row.client_db_id)
-                            .execute(conn)
-                            .map_err(AppError::from)?;
+                        if !client_ids.contains(&current_client.client_id) {
+                            let deactivate_sql = format!(
+                                "UPDATE clients SET is_active = {}, updated_at = {} WHERE id = {}",
+                                ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                            );
+                            sql_query(deactivate_sql)
+                                .bind::<Integer, _>(0)
+                                .bind::<BigInt, _>(util::now_ts())
+                                .bind::<Text, _>(&row.client_db_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                            let unlink_sql = format!(
+                    "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
+                                ph(kind, 1),
+                                ph(kind, 2)
+                            );
+                            sql_query(unlink_sql)
+                                .bind::<Text, _>(&application_id)
+                                .bind::<Text, _>(&row.client_db_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                            let unlink_binding_sql = format!(
+                                "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
+                                ph(kind, 1),
+                                ph(kind, 2)
+                            );
+                            sql_query(unlink_binding_sql)
+                                .bind::<Text, _>(&application_id)
+                                .bind::<Text, _>(&row.client_db_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                        }
                     }
                 }
 
@@ -17248,18 +17501,96 @@ impl Db {
 
                 for (profile_key, profile) in &manifest.profiles {
                     let connection_id = client_db_ids.get(profile_key).cloned();
+                    let connection_kind = if profile_key == "default" {
+                        "application".to_string()
+                    } else {
+                        manifest
+                            .client_protocols
+                            .get(profile_key)
+                            .cloned()
+                            .ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "application contract profile has no client protocol"
+                                        .to_string(),
+                                )
+                            })?
+                    };
                     let profile_id = conn.website_discovery_upsert_profile(
                         kind,
                         &application_id,
                         profile_key,
                         connection_id.as_deref(),
-                        &discovery_url,
+                        &connection_kind,
                         &manifest.version,
                         &manifest.digest,
                     )?;
                     profile_db_ids.insert(profile_key.clone(), profile_id.clone());
                     conn.website_discovery_replace_permissions(kind, &profile_id, profile)?;
                     conn.website_discovery_replace_roles(kind, &profile_id, profile)?;
+                }
+
+                // Every verified v3 client receives an explicit
+                // application/profile binding in the runtime authority.
+                let now = util::now_ts();
+                let auth_domain_id = format!("auth-domain:{application_id}");
+                let auth_domain_count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM application_auth_domains WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                if sql_query(auth_domain_count_sql)
+                    .bind::<Text, _>(&application_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    == 0
+                {
+                    let auth_domain_sql = format!(
+                        "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                    );
+                    sql_query(auth_domain_sql)
+                        .bind::<Text, _>(&auth_domain_id)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>("default")
+                        .bind::<Integer, _>(1)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                for (client_id, client_db_id) in &client_db_ids {
+                    let profile_id = profile_db_ids
+                        .get(client_id)
+                        .or_else(|| profile_db_ids.get("default"))
+                        .map(String::as_str)
+                        .unwrap_or("default");
+                    let delete_binding_sql = format!(
+                        "DELETE FROM application_client_bindings WHERE client_db_id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(delete_binding_sql)
+                        .bind::<Text, _>(client_db_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    let binding_sql = format!(
+                        "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
+                    );
+                    sql_query(binding_sql)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(client_db_id)
+                        .bind::<Text, _>(manifest.client_protocols.get(client_id).ok_or_else(|| {
+                            AppError::BadRequest(
+                                "application contract is missing a client protocol".to_string(),
+                            )
+                        })?)
+                        .bind::<Text, _>(profile_id)
+                        .bind::<Text, _>(&auth_domain_id)
+                        .bind::<Integer, _>(1)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
                 }
 
                 if let Some(default_profile_id) = profile_db_ids.get("default") {
@@ -17273,18 +17604,21 @@ impl Db {
                     // is replaced on every verified revision. User role
                     // assignments remain in the separate user-role table and
                     // are never present in the website manifest.
-                    for table in [
-                        "application_profile_group_roles",
-                        "application_profile_organization_roles",
-                    ] {
-                        let delete_sql = format!(
-                            "DELETE FROM {table} WHERE profile_id = {}",
-                            ph(kind, 1)
-                        );
-                        sql_query(delete_sql)
-                            .bind::<Text, _>(default_profile_id)
-                            .execute(conn)
-                            .map_err(AppError::from)?;
+                    let profile_ids = profile_db_ids.values().cloned().collect::<Vec<_>>();
+                    for profile_id in &profile_ids {
+                        for table in [
+                            "application_profile_group_roles",
+                            "application_profile_organization_roles",
+                        ] {
+                            let delete_sql = format!(
+                                "DELETE FROM {table} WHERE profile_id = {}",
+                                ph(kind, 1)
+                            );
+                            sql_query(delete_sql)
+                                .bind::<Text, _>(profile_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                        }
                     }
                     for mapping in &manifest.authorization_mappings.group_mappings {
                         let group_sql = format!(
@@ -17305,78 +17639,86 @@ impl Db {
                                 ))
                             })?
                             .id;
-                        let role_sql = format!(
-                            "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let role_id = sql_query(role_sql)
-                            .bind::<Text, _>(default_profile_id)
-                            .bind::<Text, _>(&mapping.role)
-                            .get_result::<IdRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                            .ok_or_else(|| {
-                                AppError::BadRequest(format!(
-                                    "website authorization references unknown role: {}",
-                                    mapping.role
-                                ))
-                            })?
-                            .id;
-                        let insert_sql = format!(
-                            "INSERT INTO application_profile_group_roles (profile_id, group_id, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                            ph(kind, 1),
-                            ph(kind, 2),
-                            ph(kind, 3),
-                            ph(kind, 4),
-                            ph(kind, 5)
-                        );
-                        let now = util::now_ts();
-                        sql_query(insert_sql)
-                            .bind::<Text, _>(default_profile_id)
-                            .bind::<Text, _>(group_id)
-                            .bind::<Text, _>(role_id)
-                            .bind::<BigInt, _>(now)
-                            .bind::<BigInt, _>(now)
-                            .execute(conn)
-                            .map_err(AppError::from)?;
+                        for profile_id in &profile_ids {
+                            let role_sql = format!(
+                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                                ph(kind, 1),
+                                ph(kind, 2)
+                            );
+                            let role_id = sql_query(role_sql)
+                                .bind::<Text, _>(profile_id)
+                                .bind::<Text, _>(&mapping.role)
+                                .get_result::<IdRow>(conn)
+                                .optional()
+                                .map_err(AppError::from)?;
+                            let Some(role_id) = role_id else {
+                                if profile_id == default_profile_id {
+                                    return Err(AppError::BadRequest(format!(
+                                        "website authorization references unknown role: {}",
+                                        mapping.role
+                                    )));
+                                }
+                                continue;
+                            };
+                            let insert_sql = format!(
+                                "INSERT INTO application_profile_group_roles (profile_id, group_id, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
+                                ph(kind, 1),
+                                ph(kind, 2),
+                                ph(kind, 3),
+                                ph(kind, 4),
+                                ph(kind, 5)
+                            );
+                            let now = util::now_ts();
+                            sql_query(insert_sql)
+                                .bind::<Text, _>(profile_id)
+                                .bind::<Text, _>(group_id.clone())
+                                .bind::<Text, _>(role_id.id)
+                                .bind::<BigInt, _>(now)
+                                .bind::<BigInt, _>(now)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                        }
                     }
                     for mapping in &manifest.authorization_mappings.organization_role_mappings {
-                        let role_sql = format!(
-                            "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let role_id = sql_query(role_sql)
-                            .bind::<Text, _>(default_profile_id)
-                            .bind::<Text, _>(&mapping.role)
-                            .get_result::<IdRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                            .ok_or_else(|| {
-                                AppError::BadRequest(format!(
-                                    "website authorization references unknown role: {}",
-                                    mapping.role
-                                ))
-                            })?
-                            .id;
-                        let insert_sql = format!(
-                            "INSERT INTO application_profile_organization_roles (profile_id, organization_role, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                            ph(kind, 1),
-                            ph(kind, 2),
-                            ph(kind, 3),
-                            ph(kind, 4),
-                            ph(kind, 5)
-                        );
-                        let now = util::now_ts();
-                        sql_query(insert_sql)
-                            .bind::<Text, _>(default_profile_id)
-                            .bind::<Text, _>(&mapping.organization_role)
-                            .bind::<Text, _>(role_id)
-                            .bind::<BigInt, _>(now)
-                            .bind::<BigInt, _>(now)
-                            .execute(conn)
-                            .map_err(AppError::from)?;
+                        for profile_id in &profile_ids {
+                            let role_sql = format!(
+                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                                ph(kind, 1),
+                                ph(kind, 2)
+                            );
+                            let role_id = sql_query(role_sql)
+                                .bind::<Text, _>(profile_id)
+                                .bind::<Text, _>(&mapping.role)
+                                .get_result::<IdRow>(conn)
+                                .optional()
+                                .map_err(AppError::from)?;
+                            let Some(role_id) = role_id else {
+                                if profile_id == default_profile_id {
+                                    return Err(AppError::BadRequest(format!(
+                                        "website authorization references unknown role: {}",
+                                        mapping.role
+                                    )));
+                                }
+                                continue;
+                            };
+                            let insert_sql = format!(
+                                "INSERT INTO application_profile_organization_roles (profile_id, organization_role, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
+                                ph(kind, 1),
+                                ph(kind, 2),
+                                ph(kind, 3),
+                                ph(kind, 4),
+                                ph(kind, 5)
+                            );
+                            let now = util::now_ts();
+                            sql_query(insert_sql)
+                                .bind::<Text, _>(profile_id)
+                                .bind::<Text, _>(&mapping.organization_role)
+                                .bind::<Text, _>(role_id.id)
+                                .bind::<BigInt, _>(now)
+                                .bind::<BigInt, _>(now)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                        }
                     }
                 }
 
@@ -17444,13 +17786,151 @@ impl Db {
         let client_db_id = client_db_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "{} WHERE id IN (SELECT application_id FROM application_oidc_clients WHERE client_db_id = {})",
+                "{} WHERE id IN (SELECT application_id FROM application_client_bindings WHERE client_db_id = {} AND is_active = 1)",
                 select_application_sql(),
                 ph(kind, 1)
             );
             sql_query(sql)
                 .bind::<Text, _>(client_db_id)
                 .get_result::<ApplicationRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_auth_domain(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Option<ApplicationAuthDomainRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, application_id, assurance_policy, is_active, created_at, updated_at FROM application_auth_domains WHERE application_id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .get_result::<ApplicationAuthDomainRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_auth_context(
+        &self,
+        auth_domain_id: &str,
+        user_id: &str,
+    ) -> AppResult<Option<ApplicationAuthContextRecord>> {
+        let auth_domain_id = auth_domain_id.to_string();
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE auth_domain_id = {} AND user_id = {} AND revoked_at IS NULL ORDER BY authenticated_at DESC LIMIT 1",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(auth_domain_id)
+                .bind::<Text, _>(user_id)
+                .get_result::<ApplicationAuthContextRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn insert_application_auth_context(
+        &self,
+        context: NewApplicationAuthContext,
+    ) -> AppResult<ApplicationAuthContextRecord> {
+        let now = util::now_ts();
+        let amr = serde_json::to_string(&context.amr)
+            .map_err(|err| AppError::Internal(err.to_string()))?;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "INSERT INTO application_auth_contexts (id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7),
+                ph(kind, 8),
+                ph(kind, 9),
+                ph(kind, 10)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&context.id)
+                .bind::<Text, _>(&context.auth_domain_id)
+                .bind::<Text, _>(&context.user_id)
+                .bind::<Text, _>(&context.acr)
+                .bind::<Text, _>(amr)
+                .bind::<BigInt, _>(context.authenticated_at)
+                .bind::<BigInt, _>(context.expires_at)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            let select_sql = format!(
+                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE id = {}",
+                ph(kind, 1)
+            );
+            sql_query(select_sql)
+                .bind::<Text, _>(context.id)
+                .get_result::<ApplicationAuthContextRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_application_client_bindings(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Vec<ApplicationClientBindingRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE application_id = {} ORDER BY created_at ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .load::<ApplicationClientBindingRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_client_binding(
+        &self,
+        client_db_id: &str,
+    ) -> AppResult<Option<ApplicationClientBindingRecord>> {
+        let client_db_id = client_db_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE client_db_id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(client_db_id)
+                .get_result::<ApplicationClientBindingRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_client_binding_by_public_client_id(
+        &self,
+        client_id: &str,
+    ) -> AppResult<Option<ApplicationClientBindingRecord>> {
+        let client_id = client_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT bindings.application_id, bindings.client_db_id, bindings.protocol, bindings.authorization_profile_id, bindings.auth_domain_id, bindings.is_active, bindings.created_at, bindings.updated_at FROM application_client_bindings bindings INNER JOIN clients ON clients.id = bindings.client_db_id WHERE clients.client_id = {} AND bindings.is_active = 1",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(client_id)
+                .get_result::<ApplicationClientBindingRecord>(&mut conn)
                 .optional()
                 .map_err(AppError::from)
         })
@@ -17479,7 +17959,7 @@ impl Db {
         })
     }
 
-    pub async fn list_application_oidc_client_ids(
+    pub async fn list_application_client_ids(
         &self,
         application_id: &str,
     ) -> AppResult<Vec<String>> {
@@ -17492,7 +17972,7 @@ impl Db {
         let application_id = application_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT client_db_id FROM application_oidc_clients WHERE application_id = {} ORDER BY created_at ASC",
+                "SELECT client_db_id FROM application_client_bindings WHERE application_id = {} AND is_active = 1 ORDER BY created_at ASC",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -17670,7 +18150,7 @@ impl Db {
         // policy. Capture the current links before deleting the aggregate so
         // each detached connection can immediately receive a new locked
         // fallback application afterwards.
-        let detached_client_ids = self.list_application_oidc_client_ids(&id).await?;
+        let detached_client_ids = self.list_application_client_ids(&id).await?;
         with_conn!(self, |conn, kind| {
             conn.transaction::<(), AppError, _>(|conn| {
                 let sql = format!(
@@ -17712,16 +18192,23 @@ impl Db {
                     "application_scim_tokens",
                     "application_scim_groups",
                     "application_members",
-                    "application_oidc_clients",
                     "application_enrollment_codes",
                     "application_discovery",
                 ] {
-                    let sql = format!("DELETE FROM {table} WHERE application_id = {}", ph(kind, 1));
+                let sql = format!("DELETE FROM {table} WHERE application_id = {}", ph(kind, 1));
                     sql_query(sql)
                         .bind::<Text, _>(&id)
                         .execute(conn)
                         .map_err(AppError::from)?;
                 }
+                let binding_sql = format!(
+                    "DELETE FROM application_client_bindings WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(binding_sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
                 let sql = format!("DELETE FROM applications WHERE id = {}", ph(kind, 1));
                 let affected = sql_query(sql)
                     .bind::<Text, _>(&id)
@@ -17746,16 +18233,20 @@ impl Db {
         Ok(())
     }
 
-    /// Links one OIDC client to exactly one application.  Client configuration
-    /// remains protocol-specific, but its authorization policy is inherited
-    /// from the application.
-    pub async fn link_oidc_client_to_application(
+    /// Links one protocol client to exactly one application and profile.
+    /// Client configuration remains protocol-specific, while the application
+    /// binding owns the authentication domain and authorization boundary.
+    pub async fn link_client_to_application(
         &self,
         application_id: &str,
         client_db_id: &str,
+        protocol: &str,
+        authorization_profile_id: &str,
     ) -> AppResult<()> {
         let application_id = application_id.to_string();
         let client_db_id = client_db_id.to_string();
+        let protocol = protocol.to_string();
+        let authorization_profile_id = authorization_profile_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<(), AppError, _>(|conn| {
@@ -17789,21 +18280,52 @@ impl Db {
                         "OIDC client must belong to the application's organization".to_string(),
                     ));
                 }
-                let delete_sql = format!(
-                    "DELETE FROM application_oidc_clients WHERE client_db_id = {}",
+                let delete_binding_sql = format!(
+                    "DELETE FROM application_client_bindings WHERE client_db_id = {}",
                     ph(kind, 1)
                 );
-                sql_query(delete_sql)
+                sql_query(delete_binding_sql)
                     .bind::<Text, _>(&client_db_id)
                     .execute(conn)
                     .map_err(AppError::from)?;
-                let insert_sql = format!(
-                    "INSERT INTO application_oidc_clients (application_id, client_db_id, created_at) VALUES ({}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                let auth_domain_id = format!("auth-domain:{application_id}");
+                let auth_domain_count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM application_auth_domains WHERE application_id = {}",
+                    ph(kind, 1)
                 );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(application_id)
-                    .bind::<Text, _>(client_db_id)
+                if sql_query(auth_domain_count_sql)
+                    .bind::<Text, _>(&application_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    == 0
+                {
+                    let auth_domain_sql = format!(
+                        "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
+                    );
+                    sql_query(auth_domain_sql)
+                        .bind::<Text, _>(&auth_domain_id)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>("default")
+                        .bind::<Integer, _>(1)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let binding_sql = format!(
+                        "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
+                );
+                sql_query(binding_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&client_db_id)
+                    .bind::<Text, _>(&protocol)
+                    .bind::<Text, _>(&authorization_profile_id)
+                    .bind::<Text, _>(&auth_domain_id)
+                    .bind::<Integer, _>(1)
+                    .bind::<BigInt, _>(now)
                     .bind::<BigInt, _>(now)
                     .execute(conn)
                     .map_err(AppError::from)?;
@@ -17812,19 +18334,19 @@ impl Db {
         })
     }
 
-    /// Detaches a connection without leaving an OIDC client ungoverned. The
-    /// client immediately receives a locked fallback application, so removing
-    /// it can never revive the legacy "all users" compatibility policy.
-    pub async fn unlink_oidc_client_from_application(&self, client_db_id: &str) -> AppResult<()> {
+    /// Detaches a client without leaving it ungoverned. The client immediately
+    /// receives a locked fallback application.
+    pub async fn unlink_client_from_application(&self, client_db_id: &str) -> AppResult<()> {
         let client_db_id = client_db_id.to_string();
         let lookup_client_db_id = client_db_id.clone();
+        let generic_client_db_id = client_db_id.clone();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "DELETE FROM application_oidc_clients WHERE client_db_id = {}",
+                "DELETE FROM application_client_bindings WHERE client_db_id = {}",
                 ph(kind, 1)
             );
             sql_query(sql)
-                .bind::<Text, _>(&client_db_id)
+                .bind::<Text, _>(&generic_client_db_id)
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(AppError::from)
@@ -23166,7 +23688,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        db.link_oidc_client_to_application(&application.id, &client.id)
+        db.link_client_to_application(&application.id, &client.id, "oidc", "default")
             .await
             .unwrap();
 
@@ -23278,7 +23800,7 @@ mod tests {
             .insert_client(test_client("employee-app-client", &organization.id))
             .await
             .unwrap();
-        db.link_oidc_client_to_application(&application.id, &client.id)
+        db.link_client_to_application(&application.id, &client.id, "oidc", "default")
             .await
             .unwrap();
 
@@ -23435,7 +23957,7 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert("default".to_string(), profile.clone());
         profiles.insert(old_client_id.clone(), profile);
-        db.apply_website_manifest(
+        db.apply_application_contract(
             &application.id,
             crate::application_discovery::VerifiedApplicationManifest {
                 application_id: application.slug.clone(),
@@ -23444,7 +23966,11 @@ mod tests {
                 digest: "digest-1".to_string(),
                 issued_at: util::now_ts(),
                 expires_at: util::now_ts() + 300,
+                revoke_removed_clients: true,
                 clients: vec![old_client],
+                client_protocols: [(old_client_id.clone(), "oidc".to_string())]
+                    .into_iter()
+                    .collect(),
                 protocols: serde_json::json!({
                     "website_url": "https://website.example",
                     "oauth2_oidc": {"enabled": true, "client_ids": [old_client_id]}
@@ -23495,7 +24021,7 @@ mod tests {
                 }],
             },
         );
-        db.apply_website_manifest(
+        db.apply_application_contract(
             &application.id,
             crate::application_discovery::VerifiedApplicationManifest {
                 application_id: application.slug,
@@ -23504,7 +24030,9 @@ mod tests {
                 digest: "digest-2".to_string(),
                 issued_at: util::now_ts(),
                 expires_at: util::now_ts() + 300,
+                revoke_removed_clients: false,
                 clients: Vec::new(),
+                client_protocols: BTreeMap::new(),
                 protocols: serde_json::json!({
                     "website_url": "https://website.example",
                     "oauth2_oidc": {"enabled": false, "client_ids": []}
@@ -23538,11 +24066,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(db
-            .list_application_profile_roles(&old_profile.id)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_application_profile_roles(&old_profile.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             db.list_application_authorization_profiles(&application.id)
                 .await
@@ -23556,7 +24085,21 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .is_active,
-            0
+            1
+        );
+        assert_eq!(
+            db.find_application_for_client(
+                &db.find_client_by_client_id(&old_client_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+            application.id
         );
 
         drop(db);
@@ -23580,7 +24123,7 @@ mod tests {
             .harden_new_client_application(&detached_client.id)
             .await
             .unwrap();
-        db.unlink_oidc_client_from_application(&detached_client.id)
+        db.unlink_client_from_application(&detached_client.id)
             .await
             .unwrap();
         let detached_fallback = db
@@ -23689,17 +24232,15 @@ mod tests {
             .await
             .unwrap();
 
-        db.link_oidc_client_to_application(&first.id, &client.id)
+        db.link_client_to_application(&first.id, &client.id, "oidc", "default")
             .await
             .unwrap();
         assert_eq!(
-            db.list_application_oidc_client_ids(&first.id)
-                .await
-                .unwrap(),
+            db.list_application_client_ids(&first.id).await.unwrap(),
             vec![client.id.clone()]
         );
         assert!(
-            db.link_oidc_client_to_application(&foreign_application.id, &client.id)
+            db.link_client_to_application(&foreign_application.id, &client.id, "oidc", "default")
                 .await
                 .is_err()
         );
@@ -23712,23 +24253,21 @@ mod tests {
             first.id
         );
 
-        db.link_oidc_client_to_application(&second.id, &client.id)
+        db.link_client_to_application(&second.id, &client.id, "oidc", "default")
             .await
             .unwrap();
         assert!(
-            db.list_application_oidc_client_ids(&first.id)
+            db.list_application_client_ids(&first.id)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            db.list_application_oidc_client_ids(&second.id)
-                .await
-                .unwrap(),
+            db.list_application_client_ids(&second.id).await.unwrap(),
             vec![client.id.clone()]
         );
 
-        db.unlink_oidc_client_from_application(&client.id)
+        db.unlink_client_from_application(&client.id)
             .await
             .unwrap();
         let detached = db
@@ -23739,13 +24278,13 @@ mod tests {
         assert_ne!(detached.id, first.id);
         assert_ne!(detached.id, second.id);
         assert!(
-            db.list_application_oidc_client_ids(&second.id)
+            db.list_application_client_ids(&second.id)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
-        db.link_oidc_client_to_application(&second.id, &client.id)
+        db.link_client_to_application(&second.id, &client.id, "oidc", "default")
             .await
             .unwrap();
         db.delete_application(&second.id).await.unwrap();
@@ -24531,6 +25070,9 @@ mod tests {
             code: format!("auth-code-{suffix}"),
             client_id: "client".to_string(),
             user_id: user_id.to_string(),
+            application_id: None,
+            authorization_profile_id: None,
+            auth_context_id: None,
             session_id: None,
             redirect_uri: "https://client.example/callback".to_string(),
             scope: "openid".to_string(),
@@ -24555,6 +25097,7 @@ mod tests {
                 resource: None,
                 authorization_details: None,
                 dpop_jkt: None,
+                auth_context_id: None,
                 expires_at: now + 600,
             },
         )
@@ -24652,6 +25195,7 @@ mod tests {
             resource: Some("https://api.example/".to_string()),
             authorization_details: None,
             dpop_jkt: None,
+            auth_context_id: None,
             expires_at: util::now_ts() + 600,
         }
     }
@@ -24670,6 +25214,7 @@ mod tests {
                 resource: Some("https://api.example/".to_string()),
                 authorization_details: None,
                 dpop_jkt: None,
+                auth_context_id: None,
                 expires_at: now + 600,
             },
         )
@@ -24877,6 +25422,7 @@ mod tests {
                     resource: None,
                     authorization_details: None,
                     dpop_jkt: None,
+                    auth_context_id: None,
                     expires_at: now + 600,
                 },
             )
@@ -25828,13 +26374,13 @@ macro_rules! upsert_application_module_in_connection {
 }
 
 macro_rules! upsert_website_profile_in_connection {
-    ($conn:expr, $kind:expr, $application_id:expr, $profile_key:expr, $connection_id:expr, $manifest_url:expr, $version:expr, $digest:expr) => {{
+    ($conn:expr, $kind:expr, $application_id:expr, $profile_key:expr, $connection_id:expr, $connection_kind:expr, $version:expr, $digest:expr) => {{
         let conn = $conn;
         let kind = $kind;
         let application_id = $application_id;
         let profile_key = $profile_key;
         let connection_id = $connection_id;
-        let manifest_url = $manifest_url;
+        let connection_kind = $connection_kind;
         let version = $version;
         let digest = $digest;
     let now = util::now_ts();
@@ -25854,18 +26400,15 @@ macro_rules! upsert_website_profile_in_connection {
         .as_ref()
         .map(|profile| profile.id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let connection_kind = if profile_key == "default" { "application" } else { "oidc" };
     if existing.is_some() {
         let sql = format!(
-            "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, manifest_url = {}, signer_client_id = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
-            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
+            "UPDATE application_authorization_profiles SET connection_kind = {}, connection_id = {}, source_mode = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {}",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10)
         );
         sql_query(sql)
             .bind::<Text, _>(connection_kind)
             .bind::<Nullable<Text>, _>(&connection_id)
-            .bind::<Text, _>(crate::authorization_manifest::SOURCE_MODE_SIGNED)
-            .bind::<Text, _>(manifest_url)
-            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Text, _>(crate::application_discovery::SOURCE_MODE_DISCOVERY)
             .bind::<Nullable<Text>, _>(Some(version.to_string()))
             .bind::<Nullable<Text>, _>(Some(digest.to_string()))
             .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
@@ -25877,8 +26420,8 @@ macro_rules! upsert_website_profile_in_connection {
             .map_err(AppError::from)?;
     } else {
         let sql = format!(
-            "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, manifest_url, signer_client_id, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12), ph(kind, 13), ph(kind, 14), ph(kind, 15)
+            "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12), ph(kind, 13)
         );
         sql_query(sql)
             .bind::<Text, _>(&profile_id)
@@ -25886,9 +26429,7 @@ macro_rules! upsert_website_profile_in_connection {
             .bind::<Text, _>(profile_key)
             .bind::<Text, _>(connection_kind)
             .bind::<Nullable<Text>, _>(&connection_id)
-            .bind::<Text, _>(crate::authorization_manifest::SOURCE_MODE_SIGNED)
-            .bind::<Text, _>(manifest_url)
-            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Text, _>(crate::application_discovery::SOURCE_MODE_DISCOVERY)
             .bind::<Nullable<Text>, _>(Some(version.to_string()))
             .bind::<Nullable<Text>, _>(Some(digest.to_string()))
             .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
@@ -26073,7 +26614,7 @@ trait WebsiteDiscoveryConnection {
         application_id: &str,
         profile_key: &str,
         connection_id: Option<&str>,
-        manifest_url: &str,
+        connection_kind: &str,
         version: &str,
         digest: &str,
     ) -> AppResult<String>;
@@ -26135,7 +26676,7 @@ macro_rules! impl_website_discovery_connection {
                 application_id: &str,
                 profile_key: &str,
                 connection_id: Option<&str>,
-                manifest_url: &str,
+                connection_kind: &str,
                 version: &str,
                 digest: &str,
             ) -> AppResult<String> {
@@ -26145,7 +26686,7 @@ macro_rules! impl_website_discovery_connection {
                     application_id,
                     profile_key,
                     connection_id,
-                    manifest_url,
+                    connection_kind,
                     version,
                     digest
                 )
@@ -26434,6 +26975,9 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         code TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
+        application_id TEXT,
+        authorization_profile_id TEXT,
+        auth_context_id TEXT,
         session_id TEXT,
         redirect_uri TEXT NOT NULL,
         scope TEXT NOT NULL,
@@ -26452,6 +26996,9 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN resource TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN authorization_details TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN session_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN auth_context_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN application_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN authorization_profile_id TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN auth_time INTEGER",
     "ALTER TABLE authorization_codes ADD COLUMN acr TEXT NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN amr TEXT NOT NULL DEFAULT '[]'",
@@ -26500,6 +27047,9 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS refresh_tokens (
         token_hash TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
+        application_id TEXT,
+        authorization_profile_id TEXT,
+        auth_context_id TEXT,
         user_id TEXT NOT NULL,
         scope TEXT NOT NULL,
         resource TEXT,
@@ -26512,6 +27062,9 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE refresh_tokens ADD COLUMN resource TEXT",
     "ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT",
     "ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN application_id TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN authorization_profile_id TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN auth_context_id TEXT",
     "CREATE TABLE IF NOT EXISTS dpop_proofs (
         jkt TEXT NOT NULL,
         jti TEXT NOT NULL,
@@ -26520,16 +27073,17 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (jkt, jti)
     )",
     "CREATE INDEX IF NOT EXISTS idx_dpop_proofs_expires ON dpop_proofs(expires_at)",
-    "CREATE TABLE IF NOT EXISTS user_consents (
+    "CREATE TABLE IF NOT EXISTS client_grants (
         user_id TEXT NOT NULL,
         client_id TEXT NOT NULL,
+        authorization_profile_id TEXT NOT NULL DEFAULT 'default',
         granted_scopes TEXT NOT NULL,
         granted_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         revoked_at INTEGER,
-        PRIMARY KEY (user_id, client_id)
+        PRIMARY KEY (user_id, client_id, authorization_profile_id)
     )",
-    "CREATE INDEX IF NOT EXISTS idx_user_consents_client ON user_consents(client_id, revoked_at)",
+    "CREATE INDEX IF NOT EXISTS idx_client_grants_client ON client_grants(client_id, revoked_at)",
     "CREATE TABLE IF NOT EXISTS registration_settings (
         id TEXT PRIMARY KEY,
         allow_password_registration INTEGER NOT NULL,
@@ -26784,13 +27338,40 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         UNIQUE(organization_id, slug)
     )",
     "CREATE INDEX IF NOT EXISTS idx_applications_organization_active ON applications(organization_id, is_active, name)",
-    "CREATE TABLE IF NOT EXISTS application_oidc_clients (
+    "CREATE TABLE IF NOT EXISTS application_auth_domains (
+        id TEXT PRIMARY KEY,
+        application_id TEXT NOT NULL UNIQUE,
+        assurance_policy TEXT NOT NULL DEFAULT 'default',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_domains_active ON application_auth_domains(application_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_client_bindings (
         application_id TEXT NOT NULL,
         client_db_id TEXT NOT NULL UNIQUE,
+        protocol TEXT NOT NULL,
+        authorization_profile_id TEXT NOT NULL DEFAULT 'default',
+        auth_domain_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
         PRIMARY KEY (application_id, client_db_id)
     )",
-    "CREATE INDEX IF NOT EXISTS idx_application_oidc_clients_application ON application_oidc_clients(application_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_client_bindings_application ON application_client_bindings(application_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS application_auth_contexts (
+        id TEXT PRIMARY KEY,
+        auth_domain_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        acr TEXT NOT NULL,
+        amr TEXT NOT NULL DEFAULT '[]',
+        authenticated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_lookup ON application_auth_contexts(auth_domain_id, user_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id TEXT NOT NULL,
         invitation_id TEXT NOT NULL UNIQUE,
@@ -27062,8 +27643,6 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         connection_kind TEXT NOT NULL,
         connection_id TEXT,
         source_mode TEXT NOT NULL,
-        manifest_url TEXT NOT NULL DEFAULT '',
-        signer_client_id TEXT,
         remote_version TEXT,
         remote_digest TEXT,
         sync_status TEXT NOT NULL DEFAULT 'manual',
@@ -27569,6 +28148,9 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         code TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
+        application_id TEXT,
+        authorization_profile_id TEXT,
+        auth_context_id TEXT,
         session_id TEXT,
         redirect_uri TEXT NOT NULL,
         scope TEXT NOT NULL,
@@ -27587,6 +28169,9 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS resource TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS authorization_details TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS session_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS auth_context_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS application_id TEXT",
+    "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS authorization_profile_id TEXT",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS auth_time BIGINT",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS acr TEXT NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN IF NOT EXISTS amr TEXT NOT NULL DEFAULT '[]'",
@@ -27635,6 +28220,9 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS refresh_tokens (
         token_hash TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
+        application_id TEXT,
+        authorization_profile_id TEXT,
+        auth_context_id TEXT,
         user_id TEXT NOT NULL,
         scope TEXT NOT NULL,
         resource TEXT,
@@ -27647,6 +28235,9 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS resource TEXT",
     "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS authorization_details TEXT",
     "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS dpop_jkt TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS application_id TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS authorization_profile_id TEXT",
+    "ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS auth_context_id TEXT",
     "CREATE TABLE IF NOT EXISTS dpop_proofs (
         jkt TEXT NOT NULL,
         jti TEXT NOT NULL,
@@ -27655,16 +28246,17 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (jkt, jti)
     )",
     "CREATE INDEX IF NOT EXISTS idx_dpop_proofs_expires ON dpop_proofs(expires_at)",
-    "CREATE TABLE IF NOT EXISTS user_consents (
+    "CREATE TABLE IF NOT EXISTS client_grants (
         user_id TEXT NOT NULL,
         client_id TEXT NOT NULL,
+        authorization_profile_id TEXT NOT NULL DEFAULT 'default',
         granted_scopes TEXT NOT NULL,
         granted_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         revoked_at BIGINT,
-        PRIMARY KEY (user_id, client_id)
+        PRIMARY KEY (user_id, client_id, authorization_profile_id)
     )",
-    "CREATE INDEX IF NOT EXISTS idx_user_consents_client ON user_consents(client_id, revoked_at)",
+    "CREATE INDEX IF NOT EXISTS idx_client_grants_client ON client_grants(client_id, revoked_at)",
     "CREATE TABLE IF NOT EXISTS registration_settings (
         id TEXT PRIMARY KEY,
         allow_password_registration INTEGER NOT NULL,
@@ -27919,13 +28511,40 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         UNIQUE(organization_id, slug)
     )",
     "CREATE INDEX IF NOT EXISTS idx_applications_organization_active ON applications(organization_id, is_active, name)",
-    "CREATE TABLE IF NOT EXISTS application_oidc_clients (
+    "CREATE TABLE IF NOT EXISTS application_auth_domains (
+        id TEXT PRIMARY KEY,
+        application_id TEXT NOT NULL UNIQUE,
+        assurance_policy TEXT NOT NULL DEFAULT 'default',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_domains_active ON application_auth_domains(application_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_client_bindings (
         application_id TEXT NOT NULL,
         client_db_id TEXT NOT NULL UNIQUE,
+        protocol TEXT NOT NULL,
+        authorization_profile_id TEXT NOT NULL DEFAULT 'default',
+        auth_domain_id TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
         created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
         PRIMARY KEY (application_id, client_db_id)
     )",
-    "CREATE INDEX IF NOT EXISTS idx_application_oidc_clients_application ON application_oidc_clients(application_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_client_bindings_application ON application_client_bindings(application_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS application_auth_contexts (
+        id TEXT PRIMARY KEY,
+        auth_domain_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        acr TEXT NOT NULL,
+        amr TEXT NOT NULL DEFAULT '[]',
+        authenticated_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        revoked_at BIGINT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_lookup ON application_auth_contexts(auth_domain_id, user_id, expires_at)",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id TEXT NOT NULL,
         invitation_id TEXT NOT NULL UNIQUE,
@@ -28197,8 +28816,6 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         connection_kind TEXT NOT NULL,
         connection_id TEXT,
         source_mode TEXT NOT NULL,
-        manifest_url TEXT NOT NULL DEFAULT '',
-        signer_client_id TEXT,
         remote_version TEXT,
         remote_digest TEXT,
         sync_status TEXT NOT NULL DEFAULT 'manual',
@@ -28705,6 +29322,9 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         code VARCHAR(128) PRIMARY KEY,
         client_id VARCHAR(255) NOT NULL,
         user_id VARCHAR(64) NOT NULL,
+        application_id VARCHAR(128) NULL,
+        authorization_profile_id VARCHAR(128) NULL,
+        auth_context_id VARCHAR(128) NULL,
         session_id VARCHAR(128) NULL,
         redirect_uri TEXT NOT NULL,
         scope TEXT NOT NULL,
@@ -28723,6 +29343,9 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE authorization_codes ADD COLUMN resource TEXT NULL",
     "ALTER TABLE authorization_codes ADD COLUMN authorization_details TEXT NULL",
     "ALTER TABLE authorization_codes ADD COLUMN session_id VARCHAR(128) NULL",
+    "ALTER TABLE authorization_codes ADD COLUMN auth_context_id VARCHAR(128) NULL",
+    "ALTER TABLE authorization_codes ADD COLUMN application_id VARCHAR(128) NULL",
+    "ALTER TABLE authorization_codes ADD COLUMN authorization_profile_id VARCHAR(128) NULL",
     "ALTER TABLE authorization_codes ADD COLUMN auth_time BIGINT NULL",
     "ALTER TABLE authorization_codes ADD COLUMN acr VARCHAR(255) NOT NULL DEFAULT 'urn:gpt-sso:acr:loa:1'",
     "ALTER TABLE authorization_codes ADD COLUMN amr TEXT NULL",
@@ -28771,6 +29394,9 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS refresh_tokens (
         token_hash VARCHAR(128) PRIMARY KEY,
         client_id VARCHAR(255) NOT NULL,
+        application_id VARCHAR(128) NULL,
+        authorization_profile_id VARCHAR(128) NULL,
+        auth_context_id VARCHAR(128) NULL,
         user_id VARCHAR(64) NOT NULL,
         scope TEXT NOT NULL,
         resource TEXT NULL,
@@ -28783,6 +29409,9 @@ const MYSQL_MIGRATIONS: &[&str] = &[
     "ALTER TABLE refresh_tokens ADD COLUMN resource TEXT NULL",
     "ALTER TABLE refresh_tokens ADD COLUMN authorization_details TEXT NULL",
     "ALTER TABLE refresh_tokens ADD COLUMN dpop_jkt VARCHAR(128) NULL",
+    "ALTER TABLE refresh_tokens ADD COLUMN application_id VARCHAR(128) NULL",
+    "ALTER TABLE refresh_tokens ADD COLUMN authorization_profile_id VARCHAR(128) NULL",
+    "ALTER TABLE refresh_tokens ADD COLUMN auth_context_id VARCHAR(128) NULL",
     "CREATE TABLE IF NOT EXISTS dpop_proofs (
         jkt VARCHAR(128) NOT NULL,
         jti VARCHAR(255) NOT NULL,
@@ -28791,15 +29420,16 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         PRIMARY KEY (jkt, jti),
         INDEX idx_dpop_proofs_expires (expires_at)
     )",
-    "CREATE TABLE IF NOT EXISTS user_consents (
+    "CREATE TABLE IF NOT EXISTS client_grants (
         user_id VARCHAR(64) NOT NULL,
         client_id VARCHAR(255) NOT NULL,
+        authorization_profile_id VARCHAR(128) NOT NULL DEFAULT 'default',
         granted_scopes TEXT NOT NULL,
         granted_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         revoked_at BIGINT NULL,
-        PRIMARY KEY (user_id, client_id),
-        INDEX idx_user_consents_client (client_id, revoked_at)
+        PRIMARY KEY (user_id, client_id, authorization_profile_id),
+        INDEX idx_client_grants_client (client_id, revoked_at)
     )",
     "CREATE TABLE IF NOT EXISTS registration_settings (
         id VARCHAR(32) PRIMARY KEY,
@@ -29055,13 +29685,39 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         UNIQUE KEY uq_applications_organization_slug (organization_id, slug),
         INDEX idx_applications_organization_active (organization_id, is_active, name)
     )",
-    "CREATE TABLE IF NOT EXISTS application_oidc_clients (
-        application_id VARCHAR(64) NOT NULL,
-        client_db_id VARCHAR(64) NOT NULL,
+    "CREATE TABLE IF NOT EXISTS application_auth_domains (
+        id VARCHAR(64) PRIMARY KEY,
+        application_id VARCHAR(64) NOT NULL UNIQUE,
+        assurance_policy VARCHAR(64) NOT NULL DEFAULT 'default',
+        is_active INT NOT NULL DEFAULT 1,
         created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX idx_application_auth_domains_active ON application_auth_domains(application_id, is_active)",
+    "CREATE TABLE IF NOT EXISTS application_client_bindings (
+        application_id VARCHAR(64) NOT NULL,
+        client_db_id VARCHAR(64) NOT NULL UNIQUE,
+        protocol VARCHAR(64) NOT NULL,
+        authorization_profile_id VARCHAR(64) NOT NULL DEFAULT 'default',
+        auth_domain_id VARCHAR(64) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
         PRIMARY KEY (application_id, client_db_id),
-        UNIQUE KEY uq_application_oidc_client (client_db_id),
-        INDEX idx_application_oidc_clients_application (application_id, created_at)
+        INDEX idx_application_client_bindings_application (application_id, created_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS application_auth_contexts (
+        id VARCHAR(64) PRIMARY KEY,
+        auth_domain_id VARCHAR(128) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        acr VARCHAR(255) NOT NULL,
+        amr TEXT NOT NULL,
+        authenticated_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        revoked_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_application_auth_contexts_lookup (auth_domain_id, user_id, expires_at)
     )",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id VARCHAR(64) NOT NULL,
@@ -29335,8 +29991,6 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         connection_kind VARCHAR(32) NOT NULL,
         connection_id VARCHAR(255) NULL,
         source_mode VARCHAR(32) NOT NULL,
-        manifest_url VARCHAR(2048) NOT NULL DEFAULT '',
-        signer_client_id VARCHAR(255) NULL,
         remote_version VARCHAR(255) NULL,
         remote_digest VARCHAR(128) NULL,
         sync_status VARCHAR(32) NOT NULL DEFAULT 'manual',

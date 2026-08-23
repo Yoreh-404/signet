@@ -7,10 +7,11 @@
 //! effects.
 
 use crate::{
-    AppState, client_assertion,
+    AppState,
+    application_contract::{ApplicationContract, ClientContract, IntegrationProfile},
     db::{ApplicationDiscoveryRecord, NewClient},
     error::{AppError, AppResult},
-    service_accounts, util,
+    util,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -24,163 +25,26 @@ use std::{
 use tokio::net::lookup_host;
 use url::{Host, Url};
 
-pub const FORMAT: &str = "signet-application/v2";
+pub const FORMAT: &str = crate::application_contract::FORMAT;
 pub const DISCOVERY_PATH: &str = "/.well-known/signet-authorization.json";
 pub const MANAGEMENT_MODE_SIGNET: &str = "signet_managed";
 pub const MANAGEMENT_MODE_WEBSITE: &str = "website_managed";
 pub const SOURCE_WEBSITE: &str = "website_manifest";
+pub const SOURCE_MANUAL: &str = "manual";
+pub const SOURCE_MODE_MANUAL: &str = "manual";
+pub const SOURCE_MODE_DISCOVERY: &str = "application_discovery";
+pub const SYNC_STATUS_MANUAL: &str = "manual";
+pub const SYNC_STATUS_SYNCED: &str = "synced";
+pub const SYNC_STATUS_NO_PROFILE: &str = "no_profile";
+pub const SYNC_STATUS_ERROR: &str = "error";
 pub const SYNC_UNCONFIGURED: &str = "unconfigured";
 pub const SYNC_PENDING: &str = "pending";
 pub const SYNC_SYNCED: &str = "synced";
 pub const SYNC_ERROR: &str = "error";
 pub const SYNC_DISABLED: &str = "disabled";
 
-const MAX_CLIENTS: usize = 512;
 const MAX_CLIENT_ID_LENGTH: usize = 255;
 const MAX_SCOPE_LENGTH: usize = 256;
-const MAX_REVISION: i64 = i64::MAX;
-const MAX_TOKEN_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplicationManifest {
-    pub format: String,
-    pub application_id: String,
-    pub revision: i64,
-    pub version: String,
-    pub iss: String,
-    pub aud: Value,
-    pub iat: i64,
-    pub exp: i64,
-    #[serde(default)]
-    pub clients: Vec<ManifestClient>,
-    #[serde(default = "empty_object")]
-    pub protocols: Map<String, Value>,
-    #[serde(default = "empty_object")]
-    pub login_adapters: Map<String, Value>,
-    #[serde(default = "empty_object")]
-    pub directory_sync: Map<String, Value>,
-    #[serde(default = "empty_object")]
-    pub authorization: Map<String, Value>,
-    #[serde(default)]
-    pub profiles: BTreeMap<String, ManifestProfile>,
-}
-
-fn empty_object() -> Map<String, Value> {
-    Map::new()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManifestClient {
-    pub client_id: String,
-    #[serde(default)]
-    pub client_name: String,
-    #[serde(default)]
-    pub logo_uri: String,
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    #[serde(default)]
-    pub redirect_uris: Vec<String>,
-    #[serde(default)]
-    pub post_logout_redirect_uris: Vec<String>,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    #[serde(default)]
-    pub audience: String,
-    #[serde(default)]
-    pub grant_types: Vec<String>,
-    #[serde(default)]
-    pub response_types: Vec<String>,
-    #[serde(default = "default_client_auth_method")]
-    pub token_endpoint_auth_method: String,
-    #[serde(default)]
-    pub require_pkce: bool,
-    #[serde(default)]
-    pub require_mfa: bool,
-    #[serde(default)]
-    pub require_pushed_authorization_requests: bool,
-    #[serde(default)]
-    pub require_s256_pkce: bool,
-    #[serde(default)]
-    pub require_confidential_client: bool,
-    #[serde(default)]
-    pub require_dpop: bool,
-    #[serde(default)]
-    pub require_account_selection: bool,
-    #[serde(default)]
-    pub trust_email_verified: bool,
-    #[serde(default)]
-    pub authorization_details_types: Vec<String>,
-    #[serde(default = "default_subject_type")]
-    pub subject_type: String,
-    #[serde(default)]
-    pub sector_identifier_uri: String,
-    #[serde(default)]
-    pub jwks_uri: String,
-    #[serde(default)]
-    pub jwks: Value,
-    #[serde(default)]
-    pub backchannel_logout_uri: String,
-    #[serde(default)]
-    pub backchannel_logout_session_required: bool,
-    #[serde(default)]
-    pub frontchannel_logout_uri: String,
-    #[serde(default)]
-    pub frontchannel_logout_session_required: bool,
-    #[serde(default)]
-    pub service_account_enabled: bool,
-    #[serde(default)]
-    pub service_account_permissions: Vec<String>,
-    #[serde(default = "default_true")]
-    pub is_active: bool,
-}
-
-fn default_client_auth_method() -> String {
-    "none".to_string()
-}
-
-fn default_subject_type() -> String {
-    "public".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManifestProfile {
-    #[serde(default)]
-    pub permissions: Vec<ManifestPermission>,
-    #[serde(default)]
-    pub roles: Vec<ManifestRole>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManifestPermission {
-    pub key: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManifestRole {
-    pub key: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub permissions: Vec<String>,
-    #[serde(default)]
-    pub is_default: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct NormalizedProfile {
     pub permissions: Vec<NormalizedPermission>,
@@ -230,7 +94,9 @@ pub struct VerifiedApplicationManifest {
     pub digest: String,
     pub issued_at: i64,
     pub expires_at: i64,
+    pub revoke_removed_clients: bool,
     pub clients: Vec<NewClient>,
+    pub client_protocols: BTreeMap<String, String>,
     pub protocols: Value,
     pub login_adapters: Value,
     pub directory_sync: Value,
@@ -240,31 +106,6 @@ pub struct VerifiedApplicationManifest {
     /// A redacted JSON representation suitable for storing as the last
     /// verified snapshot. Client secrets are deliberately omitted.
     pub redacted_payload: Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct JwsHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PinnedJwks {
-    keys: Vec<PinnedJwk>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PinnedJwk {
-    kty: String,
-    crv: String,
-    x: String,
-    #[serde(default)]
-    kid: Option<String>,
-    #[serde(rename = "use", default)]
-    use_: Option<String>,
-    #[serde(default)]
-    alg: Option<String>,
 }
 
 pub fn website_origin(website_url: &str) -> AppResult<String> {
@@ -411,123 +252,6 @@ async fn resolve_public_host(url: &Url, allow_private_networks: bool) -> AppResu
     Ok(address)
 }
 
-pub fn verify_and_normalize(
-    body: &[u8],
-    pinned_jwks: &str,
-    expected_issuer: &str,
-    expected_application_id: &str,
-    expected_audience: &str,
-    organization_id: &str,
-) -> AppResult<VerifiedApplicationManifest> {
-    if body.is_empty() || body.len() > 512 * 1024 {
-        return Err(AppError::BadRequest(
-            "application discovery document is too large or empty".to_string(),
-        ));
-    }
-    let token = extract_jws(body)?;
-    let payload = verify_jws(&token, pinned_jwks)?;
-    let manifest = serde_json::from_slice::<ApplicationManifest>(&payload)
-        .map_err(|_| AppError::BadRequest("application discovery schema is invalid".to_string()))?;
-    // The JWS is deliberately short-lived, so `iat` and `exp` change on every
-    // fetch even when the website's authorization configuration is unchanged.
-    // Revision reuse must compare the signed configuration, not that
-    // transport/cache lifetime metadata. The signature is still verified over
-    // the complete payload above, including both temporal claims.
-    let digest = manifest_content_digest(&payload)?;
-    validate_claims(
-        &manifest,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-    )?;
-    if manifest.clients.len() > MAX_CLIENTS {
-        return Err(AppError::BadRequest(
-            "application discovery declares too many clients".to_string(),
-        ));
-    }
-    if manifest.profiles.is_empty() || !manifest.profiles.contains_key("default") {
-        return Err(AppError::BadRequest(
-            "application discovery must declare a default authorization profile".to_string(),
-        ));
-    }
-    let clients = manifest
-        .clients
-        .iter()
-        .map(|client| normalize_client(client, organization_id))
-        .collect::<AppResult<Vec<_>>>()?;
-    let mut client_ids = BTreeSet::new();
-    for client in &clients {
-        if !client_ids.insert(client.client_id.clone()) {
-            return Err(AppError::BadRequest(
-                "application discovery repeats a client_id".to_string(),
-            ));
-        }
-    }
-    let protocols = normalize_module("protocols", &manifest.protocols, expected_issuer)?;
-    let login_adapters =
-        normalize_module("login_adapters", &manifest.login_adapters, expected_issuer)?;
-    let directory_sync =
-        normalize_module("directory_sync", &manifest.directory_sync, expected_issuer)?;
-    let authorization =
-        normalize_module("authorization", &manifest.authorization, expected_issuer)?;
-    let mut profiles = manifest
-        .profiles
-        .iter()
-        .map(|(key, profile)| Ok((normalize_profile_key(key)?, normalize_profile(profile)?)))
-        .collect::<AppResult<BTreeMap<_, _>>>()?;
-    if profiles
-        .keys()
-        .any(|profile_key| profile_key != "default" && !client_ids.contains(profile_key))
-    {
-        return Err(AppError::BadRequest(
-            "application discovery profile must be default or a declared client_id".to_string(),
-        ));
-    }
-    validate_protocol_client_bindings(&protocols, &clients)?;
-    let authorization_mappings = normalize_authorization_bindings(&authorization, &profiles)?;
-    if let Some(default_role) = authorization_mappings.default_role.as_deref() {
-        let profile = profiles.get_mut("default").ok_or_else(|| {
-            AppError::BadRequest("application discovery must declare a default profile".to_string())
-        })?;
-        if profile
-            .roles
-            .iter()
-            .any(|role| role.is_default && role.key != default_role)
-        {
-            return Err(AppError::BadRequest(
-                "authorization declares conflicting default roles".to_string(),
-            ));
-        }
-        for role in &mut profile.roles {
-            role.is_default = role.key == default_role;
-        }
-    }
-    let redacted_payload = redacted_payload(
-        &manifest,
-        &protocols,
-        &login_adapters,
-        &directory_sync,
-        &authorization,
-        &profiles,
-    )?;
-    Ok(VerifiedApplicationManifest {
-        application_id: manifest.application_id,
-        revision: manifest.revision,
-        version: manifest.version,
-        digest,
-        issued_at: manifest.iat,
-        expires_at: manifest.exp,
-        clients,
-        protocols,
-        login_adapters,
-        directory_sync,
-        authorization,
-        authorization_mappings,
-        profiles,
-        redacted_payload,
-    })
-}
-
 fn manifest_content_digest(payload: &[u8]) -> AppResult<String> {
     let mut value = serde_json::from_slice::<Value>(payload)
         .map_err(|_| AppError::BadRequest("application discovery schema is invalid".to_string()))?;
@@ -536,9 +260,8 @@ fn manifest_content_digest(payload: &[u8]) -> AppResult<String> {
     })?;
     object.remove("iat");
     object.remove("exp");
-    let canonical = serde_json::to_string(&value).map_err(|_| {
-        AppError::Internal("failed to encode application discovery digest".to_string())
-    })?;
+    let canonical = serde_json::to_string(&value)
+        .map_err(|_| AppError::Internal("failed to encode application discovery digest".to_string()))?;
     Ok(util::sha256_base64url(&canonical))
 }
 
@@ -565,36 +288,20 @@ pub async fn fetch_and_verify(
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
-        // Pin the DNS result used for this request.  This closes the common
-        // DNS-rebinding gap between a public-host check and the actual HTTP
-        // connection.
         .resolve(host, resolved_address)
         .build()
         .map_err(|_| AppError::Internal("failed to build discovery HTTP client".to_string()))?
         .get(discovery_url.as_str())
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {fetch_secret}"),
-        )
-        .header(
-            reqwest::header::ACCEPT,
-            "application/jose, application/json",
-        )
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {fetch_secret}"))
+        .header(reqwest::header::ACCEPT, "application/jose, application/json")
         .send()
         .await
         .map_err(|_| AppError::BadRequest("application discovery request failed".to_string()))?;
     if !response.status().is_success() {
-        return Err(AppError::BadRequest(
-            "application discovery returned an error".to_string(),
-        ));
+        return Err(AppError::BadRequest("application discovery returned an error".to_string()));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > 512 * 1024)
-    {
-        return Err(AppError::BadRequest(
-            "application discovery response is too large".to_string(),
-        ));
+    if response.content_length().is_some_and(|length| length > 512 * 1024) {
+        return Err(AppError::BadRequest("application discovery response is too large".to_string()));
     }
     let mut body = Vec::new();
     let mut response = response;
@@ -604,9 +311,7 @@ pub async fn fetch_and_verify(
         .map_err(|_| AppError::BadRequest("application discovery body failed".to_string()))?
     {
         if body.len().saturating_add(chunk.len()) > 512 * 1024 {
-            return Err(AppError::BadRequest(
-                "application discovery response is too large".to_string(),
-            ));
+            return Err(AppError::BadRequest("application discovery response is too large".to_string()));
         }
         body.extend_from_slice(&chunk);
     }
@@ -631,13 +336,10 @@ fn extract_jws(body: &[u8]) -> AppResult<String> {
             format: String,
             token: String,
         }
-        let envelope = serde_json::from_str::<DiscoveryEnvelope>(text).map_err(|_| {
-            AppError::BadRequest("application discovery envelope is invalid".to_string())
-        })?;
+        let envelope = serde_json::from_str::<DiscoveryEnvelope>(text)
+            .map_err(|_| AppError::BadRequest("application discovery envelope is invalid".to_string()))?;
         if envelope.format != FORMAT {
-            return Err(AppError::BadRequest(
-                "application discovery format is unsupported".to_string(),
-            ));
+            return Err(AppError::BadRequest("application discovery format is unsupported".to_string()));
         }
         return Ok(envelope.token.trim().to_string());
     }
@@ -652,28 +354,46 @@ fn verify_jws(token: &str, pinned_jwks: &str) -> AppResult<Vec<u8>> {
     if parts.next().is_some() {
         return Err(AppError::Unauthorized);
     }
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(encoded_header)
-        .map_err(|_| AppError::Unauthorized)?;
-    let header =
-        serde_json::from_slice::<JwsHeader>(&header_bytes).map_err(|_| AppError::Unauthorized)?;
+    #[derive(Deserialize)]
+    struct JwsHeader {
+        alg: String,
+        #[serde(default)]
+        kid: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct PinnedJwks {
+        keys: Vec<PinnedJwk>,
+    }
+    #[derive(Deserialize)]
+    struct PinnedJwk {
+        kty: String,
+        crv: String,
+        x: String,
+        #[serde(default)]
+        kid: Option<String>,
+        #[serde(rename = "use", default)]
+        use_: Option<String>,
+        #[serde(default)]
+        alg: Option<String>,
+    }
+    let header = serde_json::from_slice::<JwsHeader>(
+        &URL_SAFE_NO_PAD.decode(encoded_header).map_err(|_| AppError::Unauthorized)?,
+    )
+    .map_err(|_| AppError::Unauthorized)?;
     if header.alg != "EdDSA" {
         return Err(AppError::Unauthorized);
     }
-    let key_set =
-        serde_json::from_str::<PinnedJwks>(pinned_jwks).map_err(|_| AppError::Unauthorized)?;
-    let candidates = key_set
-        .keys
+    let keys = serde_json::from_str::<PinnedJwks>(pinned_jwks)
+        .map_err(|_| AppError::Unauthorized)?
+        .keys;
+    let candidates = keys
         .iter()
         .filter(|key| {
             key.kty == "OKP"
                 && key.crv == "Ed25519"
                 && key.use_.as_deref().is_none_or(|value| value == "sig")
                 && key.alg.as_deref().is_none_or(|value| value == "EdDSA")
-                && header
-                    .kid
-                    .as_deref()
-                    .is_none_or(|kid| key.kid.as_deref() == Some(kid))
+                && header.kid.as_deref().is_none_or(|kid| key.kid.as_deref() == Some(kid))
         })
         .collect::<Vec<_>>();
     let key = match (header.kid.as_deref(), candidates.as_slice()) {
@@ -682,16 +402,16 @@ fn verify_jws(token: &str, pinned_jwks: &str) -> AppResult<Vec<u8>> {
         (None, [key]) => *key,
         (None, _) => return Err(AppError::Unauthorized),
     };
-    let public_key = URL_SAFE_NO_PAD
+    let public_key: [u8; 32] = URL_SAFE_NO_PAD
         .decode(&key.x)
+        .map_err(|_| AppError::Unauthorized)?
+        .try_into()
         .map_err(|_| AppError::Unauthorized)?;
-    let public_key: [u8; 32] = public_key.try_into().map_err(|_| AppError::Unauthorized)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key).map_err(|_| AppError::Unauthorized)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(encoded_signature)
-        .map_err(|_| AppError::Unauthorized)?;
-    let signature = Signature::from_slice(&signature).map_err(|_| AppError::Unauthorized)?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(|_| AppError::Unauthorized)?;
+    let signature = Signature::from_slice(
+        &URL_SAFE_NO_PAD.decode(encoded_signature).map_err(|_| AppError::Unauthorized)?,
+    )
+    .map_err(|_| AppError::Unauthorized)?;
     let signing_input = format!("{encoded_header}.{encoded_payload}");
     verifying_key
         .verify(signing_input.as_bytes(), &signature)
@@ -701,44 +421,113 @@ fn verify_jws(token: &str, pinned_jwks: &str) -> AppResult<Vec<u8>> {
         .map_err(|_| AppError::Unauthorized)
 }
 
-fn validate_claims(
-    manifest: &ApplicationManifest,
+fn normalize_application_contract(
+    contract: &ApplicationContract,
+    payload: &[u8],
     expected_issuer: &str,
     expected_application_id: &str,
     expected_audience: &str,
-) -> AppResult<()> {
-    if manifest.format != FORMAT
-        || manifest.application_id != expected_application_id
-        || manifest.iss != expected_issuer
-        || manifest.revision <= 0
-        || manifest.revision > MAX_REVISION
-        || manifest.version.trim().is_empty()
-        || manifest.version.len() > 128
+    organization_id: &str,
+) -> AppResult<VerifiedApplicationManifest> {
+    contract
+        .validate(util::now_ts())
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if contract.application_id != expected_application_id
+        || website_origin(&contract.issuer)? != website_origin(expected_issuer)?
+        || !audience_contains(&contract.audience, expected_audience)
     {
+        return Err(AppError::Unauthorized);
+    }
+    let clients = contract
+        .modules
+        .clients
+        .iter()
+        .map(|client| normalize_contract_client(client, organization_id, &contract.modules.policies))
+        .collect::<AppResult<Vec<_>>>()?;
+    let client_protocols = contract
+        .modules
+        .clients
+        .iter()
+        .map(|client| {
+            Ok((
+                client.client_id.clone(),
+                normalize_client_protocol(&client.protocol)?,
+            ))
+        })
+        .collect::<AppResult<BTreeMap<_, _>>>()?;
+    let profiles = normalize_contract_profiles(contract)?;
+    let authorization = contract_authorization_module(&profiles)?;
+    let authorization_mappings = normalize_authorization_bindings(&authorization, &profiles)?;
+    let protocols = normalize_contract_protocols(
+        &contract.modules.connections,
+        &client_protocols,
+        expected_issuer,
+    )?;
+    let login_adapters = normalize_module(
+        "login_adapters",
+        &serde_json::json!({"enabled": true, "allow_signet_password": true})
+            .as_object()
+            .cloned()
+            .ok_or_else(|| AppError::Internal("failed to build login adapters".to_string()))?,
+        expected_issuer,
+    )?;
+    let directory_sync = normalize_directory_sync(&contract.modules.connections, expected_issuer)?;
+    validate_protocol_client_bindings(&protocols, &clients)?;
+    let redacted_payload = serde_json::to_value(contract)
+        .map_err(|_| AppError::Internal("failed to encode v3 contract snapshot".to_string()))?;
+    Ok(VerifiedApplicationManifest {
+        application_id: contract.application_id.clone(),
+        revision: contract.revision,
+        version: contract.version.clone(),
+        digest: manifest_content_digest(payload)?,
+        issued_at: contract.issued_at,
+        expires_at: contract.expires_at,
+        revoke_removed_clients: contract.modules.lifecycle.revoke_removed_clients,
+        clients,
+        client_protocols,
+        protocols,
+        login_adapters,
+        directory_sync,
+        authorization,
+        authorization_mappings,
+        profiles,
+        redacted_payload,
+    })
+}
+
+pub fn verify_and_normalize(
+    body: &[u8],
+    pinned_jwks: &str,
+    expected_issuer: &str,
+    expected_application_id: &str,
+    expected_audience: &str,
+    organization_id: &str,
+) -> AppResult<VerifiedApplicationManifest> {
+    if body.is_empty() || body.len() > 512 * 1024 {
         return Err(AppError::BadRequest(
-            "application discovery claims are invalid".to_string(),
+            "application discovery document is too large or empty".to_string(),
         ));
     }
-    let now = util::now_ts();
-    if manifest.iat > now + 60 || manifest.exp <= now || manifest.exp <= manifest.iat {
+    let token = extract_jws(body)?;
+    let payload = verify_jws(&token, pinned_jwks)?;
+    let payload_value = serde_json::from_slice::<Value>(&payload)
+        .map_err(|_| AppError::BadRequest("application discovery schema is invalid".to_string()))?;
+    if payload_value.get("format").and_then(Value::as_str) != Some(FORMAT) {
         return Err(AppError::BadRequest(
-            "application discovery timestamps are invalid".to_string(),
+            "only signet-application/v3 discovery contracts are supported".to_string(),
         ));
     }
-    if manifest.exp.saturating_sub(manifest.iat) > MAX_TOKEN_TTL_SECONDS {
-        return Err(AppError::BadRequest(
-            "application discovery expiry is too far in the future".to_string(),
-        ));
-    }
-    let application_audience = format!("signet:application:{expected_application_id}");
-    if !audience_contains(&manifest.aud, expected_audience)
-        || !audience_contains(&manifest.aud, &application_audience)
-    {
-        return Err(AppError::BadRequest(
-            "application discovery audience is invalid".to_string(),
-        ));
-    }
-    Ok(())
+    let contract = serde_json::from_value::<ApplicationContract>(payload_value).map_err(|_| {
+        AppError::BadRequest("application v3 contract schema is invalid".to_string())
+    })?;
+    normalize_application_contract(
+        &contract,
+        &payload,
+        expected_issuer,
+        expected_application_id,
+        expected_audience,
+        organization_id,
+    )
 }
 
 fn audience_contains(value: &Value, expected: &str) -> bool {
@@ -749,100 +538,64 @@ fn audience_contains(value: &Value, expected: &str) -> bool {
     }
 }
 
-fn normalize_client(client: &ManifestClient, organization_id: &str) -> AppResult<NewClient> {
+fn normalize_contract_client(
+    client: &ClientContract,
+    organization_id: &str,
+    policies: &[crate::application_contract::PolicyContract],
+) -> AppResult<NewClient> {
     let client_id = visible_text(&client.client_id, MAX_CLIENT_ID_LENGTH, "client_id")?;
-    let client_name = if client.client_name.trim().is_empty() {
+    let client_name = if client.display_name.trim().is_empty() {
         client_id.clone()
     } else {
-        normalize_display_text(&client.client_name, 160, "client_name")?
+        normalize_display_text(&client.display_name, 160, "client_name")?
     };
     let auth_method = client.token_endpoint_auth_method.trim();
-    if !matches!(
-        auth_method,
-        "client_secret_basic"
-            | "client_secret_post"
-            | "client_secret_jwt"
-            | "private_key_jwt"
-            | "none"
-    ) {
+    if !matches!(auth_method, "none" | "private_key_jwt") {
         return Err(AppError::BadRequest(
-            "website-managed clients use an unsupported authentication method".to_string(),
+            "v3 clients cannot transport shared secrets".to_string(),
         ));
     }
-    let client_secret_hash = match auth_method {
-        "client_secret_basic" | "client_secret_post" | "client_secret_jwt" => {
-            let secret = client
-                .client_secret
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "confidential website-managed clients require client_secret".to_string(),
-                    )
-                })?;
-            Some(
-                client_assertion::store_client_secret(auth_method, secret)?.ok_or_else(|| {
-                    AppError::Internal("failed to hash website-managed client secret".to_string())
-                })?,
-            )
-        }
-        "private_key_jwt" | "none" => {
-            if client
-                .client_secret
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            {
-                return Err(AppError::BadRequest(
-                    "client_secret is not allowed for this website-managed authentication method"
-                        .to_string(),
-                ));
-            }
-            None
-        }
-        _ => unreachable!(),
-    };
-    let jwks = if client.jwks.is_null() {
-        String::new()
-    } else {
-        client_assertion::normalize_jwks_json(&client.jwks.to_string())?
-    };
-    let jwks_uri = client_assertion::validate_jwks_uri(&client.jwks_uri)?;
-    client_assertion::validate_key_source(auth_method, &jwks_uri, &jwks)?;
+    let jwks = client
+        .jwks
+        .as_ref()
+        .filter(|value| !value.is_null())
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| AppError::BadRequest("client jwks is invalid".to_string()))?
+        .unwrap_or_default();
+    let audiences = normalize_string_list(&client.audiences, 2048, "audience")?;
     let scopes = normalize_string_list(&client.scopes, MAX_SCOPE_LENGTH, "scope")?;
     let grant_types = normalize_string_list(&client.grant_types, 128, "grant_type")?;
     let response_types = normalize_string_list(&client.response_types, 128, "response_type")?;
-    if grant_types
+    let service_account_enabled = client
+        .profiles
+        .contains(&IntegrationProfile::MachineIdentity);
+    let service_account_permissions = policies
         .iter()
-        .any(|value| value == "authorization_code")
-        && (!scopes.iter().any(|value| value == "openid")
-            || !response_types.iter().any(|value| value == "code"))
-    {
-        return Err(AppError::BadRequest(
-            "authorization_code website-managed clients require openid and code".to_string(),
-        ));
-    }
-    if client.service_account_enabled
-        && !grant_types
-            .iter()
-            .any(|value| value == "client_credentials")
-    {
-        return Err(AppError::BadRequest(
-            "website service accounts require client_credentials".to_string(),
-        ));
-    }
-    if client.require_confidential_client && auth_method == "none" {
-        return Err(AppError::BadRequest(
-            "confidential website-managed clients cannot use none".to_string(),
-        ));
-    }
-    let audience = visible_optional_text(&client.audience, 2048, "audience")?;
-    let service_account_permissions =
-        service_accounts::normalize_permissions(client.service_account_permissions.clone())?;
+        .filter(|policy| policy.client_ids.iter().any(|id| id == &client.client_id))
+        .flat_map(|policy| policy.permissions.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let client_require_mfa = client.require_mfa
+        || policies.iter().any(|policy| {
+            policy.client_ids.iter().any(|id| id == &client.client_id) && policy.require_mfa
+        });
+    let client_require_dpop = client.require_dpop
+        || policies.iter().any(|policy| {
+            policy.client_ids.iter().any(|id| id == &client.client_id) && policy.require_dpop
+        });
+    let logo_uri = client
+        .metadata
+        .get("logo_uri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     Ok(NewClient {
         client_id,
-        client_secret_hash,
+        client_secret_hash: None,
         client_name,
-        logo_uri: client.logo_uri.clone(),
+        logo_uri,
         organization_id: Some(organization_id.to_string()),
         redirect_uris: normalize_url_list(&client.redirect_uris, "redirect_uri")?,
         post_logout_redirect_uris: normalize_url_list(
@@ -850,110 +603,268 @@ fn normalize_client(client: &ManifestClient, organization_id: &str) -> AppResult
             "post_logout_redirect_uri",
         )?,
         scopes,
-        audience,
+        audience: audiences.first().cloned().unwrap_or_default(),
         grant_types,
         response_types,
         token_endpoint_auth_method: auth_method.to_string(),
         require_pkce: client.require_pkce,
-        require_mfa: client.require_mfa,
-        require_pushed_authorization_requests: client.require_pushed_authorization_requests,
+        require_mfa: client_require_mfa,
+        require_pushed_authorization_requests: false,
         require_s256_pkce: client.require_s256_pkce,
-        require_confidential_client: client.require_confidential_client,
-        require_dpop: client.require_dpop,
-        require_account_selection: client.require_account_selection,
-        trust_email_verified: client.trust_email_verified,
-        authorization_details_types: normalize_string_list(
-            &client.authorization_details_types,
-            128,
-            "authorization_details_type",
-        )?,
-        subject_type: client.subject_type.clone(),
-        sector_identifier_uri: client.sector_identifier_uri.clone(),
-        jwks_uri,
+        require_confidential_client: auth_method != "none",
+        require_dpop: client_require_dpop,
+        require_account_selection: false,
+        trust_email_verified: false,
+        authorization_details_types: Vec::new(),
+        subject_type: if service_account_enabled {
+            "pairwise".to_string()
+        } else {
+            "public".to_string()
+        },
+        sector_identifier_uri: String::new(),
+        jwks_uri: client.jwks_uri.clone().unwrap_or_default(),
         jwks,
-        backchannel_logout_uri: client.backchannel_logout_uri.clone(),
-        backchannel_logout_session_required: client.backchannel_logout_session_required,
-        frontchannel_logout_uri: client.frontchannel_logout_uri.clone(),
-        frontchannel_logout_session_required: client.frontchannel_logout_session_required,
-        service_account_enabled: client.service_account_enabled,
+        backchannel_logout_uri: String::new(),
+        backchannel_logout_session_required: false,
+        frontchannel_logout_uri: String::new(),
+        frontchannel_logout_session_required: false,
+        service_account_enabled,
         service_account_permissions,
-        is_active: client.is_active,
+        is_active: client.active,
     })
 }
 
-fn normalize_profile(profile: &ManifestProfile) -> AppResult<NormalizedProfile> {
-    if profile.permissions.len() > 4096 || profile.roles.len() > 512 {
+fn normalize_client_protocol(value: &str) -> AppResult<String> {
+    let protocol = visible_text(value, 64, "client protocol")?.to_ascii_lowercase();
+    if !matches!(
+        protocol.as_str(),
+        "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
+    ) {
         return Err(AppError::BadRequest(
-            "application discovery profile is too large".to_string(),
+            "v3 client protocol is unsupported".to_string(),
         ));
     }
-    let mut permission_keys = BTreeSet::new();
-    let mut permissions = Vec::with_capacity(profile.permissions.len());
-    for permission in &profile.permissions {
-        let key = normalize_permission_key(&permission.key)?;
-        if !permission_keys.insert(key.clone()) {
-            return Err(AppError::BadRequest(
-                "application discovery repeats a permission".to_string(),
-            ));
-        }
-        let label = permission
-            .label
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| key.rsplit(':').next().unwrap_or(&key))
-            .to_string();
-        normalize_display_text(&label, 160, "permission label")?;
-        permissions.push(NormalizedPermission {
-            key,
-            label,
-            description: normalize_description(permission.description.as_deref()),
-        });
-    }
-    let mut role_keys = BTreeSet::new();
-    let mut roles = Vec::with_capacity(profile.roles.len());
-    let mut default_count = 0;
-    for role in &profile.roles {
-        let key = visible_text(&role.key, 128, "role key")?;
-        if !role_keys.insert(key.clone()) {
-            return Err(AppError::BadRequest(
-                "application discovery repeats a role".to_string(),
-            ));
-        }
-        let mut role_permissions = BTreeSet::new();
-        for permission in &role.permissions {
-            let permission = normalize_permission_key(permission)?;
-            if !permission_keys.contains(&permission) {
-                return Err(AppError::BadRequest(
-                    "application discovery role references an undefined permission".to_string(),
-                ));
+    Ok(protocol)
+}
+
+fn normalize_contract_profiles(
+    contract: &ApplicationContract,
+) -> AppResult<BTreeMap<String, NormalizedProfile>> {
+    let all_permission_keys = contract
+        .modules
+        .policies
+        .iter()
+        .flat_map(|policy| policy.permissions.iter().cloned())
+        .chain(
+            contract
+                .modules
+                .roles
+                .iter()
+                .flat_map(|role| role.permissions.iter().cloned()),
+        )
+        .map(|permission| normalize_permission_key(&permission))
+        .collect::<AppResult<BTreeSet<_>>>()?;
+    let build_profile = |allowed_permissions: &BTreeSet<String>| -> AppResult<NormalizedProfile> {
+        let permissions = allowed_permissions
+            .iter()
+            .map(|key| {
+                Ok(NormalizedPermission {
+                    key: key.clone(),
+                    label: key.rsplit(':').next().unwrap_or(key).to_string(),
+                    description: None,
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        let mut roles = Vec::new();
+        for role in &contract.modules.roles {
+            let normalized_role_permissions = role
+                .permissions
+                .iter()
+                .map(|permission| normalize_permission_key(permission))
+                .collect::<AppResult<Vec<_>>>()?;
+            if normalized_role_permissions
+                .iter()
+                .any(|permission| !allowed_permissions.contains(permission))
+            {
+                continue;
             }
-            role_permissions.insert(permission);
+            let key = visible_text(&role.role_id, 128, "role_id")?;
+            roles.push(NormalizedRole {
+                key: key.clone(),
+                name: key,
+                description: None,
+                permissions: normalized_role_permissions,
+                is_default: role.default_role,
+            });
         }
-        if role.is_default {
-            default_count += 1;
+        Ok(NormalizedProfile { permissions, roles })
+    };
+
+    let application_profile = build_profile(&all_permission_keys)?;
+    let mut profiles = BTreeMap::new();
+    profiles.insert("default".to_string(), application_profile);
+    for client in &contract.modules.clients {
+        let is_machine_identity = client
+            .profiles
+            .contains(&IntegrationProfile::MachineIdentity);
+        let mut allowed_permissions = if is_machine_identity {
+            BTreeSet::new()
+        } else {
+            all_permission_keys.clone()
+        };
+        allowed_permissions.extend(
+            contract
+                .modules
+                .policies
+                .iter()
+                .filter(|policy| {
+                    policy
+                        .client_ids
+                        .iter()
+                        .any(|client_id| client_id == &client.client_id)
+                })
+                .flat_map(|policy| policy.permissions.iter().cloned())
+                .map(|permission| normalize_permission_key(&permission))
+                .collect::<AppResult<BTreeSet<_>>>()?,
+        );
+        profiles.insert(client.client_id.clone(), build_profile(&allowed_permissions)?);
+    }
+    Ok(profiles)
+}
+
+fn contract_authorization_module(
+    profiles: &BTreeMap<String, NormalizedProfile>,
+) -> AppResult<Value> {
+    let profile = profiles
+        .get("default")
+        .ok_or_else(|| AppError::BadRequest("v3 must declare a default profile".to_string()))?;
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "default_role".to_string(),
+        profile
+            .roles
+            .iter()
+            .find(|role| role.is_default)
+            .map(|role| Value::String(role.key.clone()))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "roles".to_string(),
+        Value::Array(
+            profile
+                .roles
+                .iter()
+                .map(|role| {
+                    serde_json::json!({
+                        "role_id": role.key,
+                        "permissions": role.permissions,
+                        "default_role": role.is_default
+                    })
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "custom_roles".to_string(),
+        Value::Array(
+            profile
+                .roles
+                .iter()
+                .map(|role| {
+                    serde_json::json!({
+                        "name": role.key,
+                        "description": role.description.clone().unwrap_or_default(),
+                        "permissions": role.permissions
+                    })
+                })
+                .collect(),
+        ),
+    );
+    normalize_module("authorization", &object, "")
+}
+
+fn normalize_contract_protocols(
+    connections: &[crate::application_contract::ConnectionContract],
+    client_protocols: &BTreeMap<String, String>,
+    expected_issuer: &str,
+) -> AppResult<Value> {
+    let mut protocols = serde_json::Map::new();
+    let mut clients_by_protocol = BTreeMap::<String, Vec<String>>::new();
+    for (client_id, protocol) in client_protocols {
+        let module_key = protocol_module_key(protocol);
+        clients_by_protocol
+            .entry(module_key.to_string())
+            .or_default()
+            .push(client_id.clone());
+    }
+    for (module_key, client_ids) in clients_by_protocol {
+        protocols.insert(
+            module_key,
+            serde_json::json!({"enabled": true, "client_ids": client_ids}),
+        );
+    }
+    for connection in connections {
+        let key = match connection.kind.as_str() {
+            "saml2" => "saml2",
+            "cas" => "cas",
+            "jwt" => "jwt",
+            "scim" | "ldap" => continue,
+            other if connection.required => {
+                return Err(AppError::BadRequest(format!(
+                    "v3 connection kind {other} is not supported"
+                )))
+            }
+            _ => continue,
+        };
+        let mut value = connection.settings.clone();
+        value.insert("enabled".to_string(), Value::Bool(true));
+        value.insert(
+            "connection_id".to_string(),
+            Value::String(connection.connection_id.clone()),
+        );
+        let protocol = protocols
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(protocol) = protocol.as_object_mut() else {
+            return Err(AppError::Internal(
+                "protocol module entry is not an object".to_string(),
+            ));
+        };
+        for (field, field_value) in value {
+            protocol.insert(field, field_value);
         }
-        let name = role
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&key);
-        let name = normalize_display_text(name, 160, "role name")?;
-        roles.push(NormalizedRole {
-            key: key.clone(),
-            name,
-            description: normalize_description(role.description.as_deref()),
-            permissions: role_permissions.into_iter().collect(),
-            is_default: role.is_default,
-        });
     }
-    if default_count > 1 {
-        return Err(AppError::BadRequest(
-            "application discovery profile has multiple default roles".to_string(),
-        ));
+    normalize_module("protocols", &protocols, expected_issuer)
+}
+
+fn protocol_module_key(protocol: &str) -> &str {
+    match protocol {
+        "oidc" => "oauth2_oidc",
+        "saml" => "saml2",
+        other => other,
     }
-    Ok(NormalizedProfile { permissions, roles })
+}
+
+fn normalize_directory_sync(
+    connections: &[crate::application_contract::ConnectionContract],
+    expected_issuer: &str,
+) -> AppResult<Value> {
+    let scim = connections.iter().filter(|connection| connection.kind == "scim").collect::<Vec<_>>();
+    let ldap = connections.iter().filter(|connection| connection.kind == "ldap").collect::<Vec<_>>();
+    if scim.len() > 1 {
+        return Err(AppError::BadRequest("v3 declares more than one SCIM connection".to_string()));
+    }
+    let object = serde_json::json!({
+        "enabled": !scim.is_empty() || !ldap.is_empty(),
+        "scim_enabled": !scim.is_empty(),
+        "ldap_provider_ids": ldap.iter().filter_map(|connection| connection.settings.get("provider_id").and_then(Value::as_str)).collect::<Vec<_>>(),
+        "scim_audience": scim.first().and_then(|connection| connection.settings.get("audience")).and_then(Value::as_str).unwrap_or_default()
+    });
+    normalize_module(
+        "directory_sync",
+        object.as_object().ok_or_else(|| AppError::Internal("failed to build directory sync".to_string()))?,
+        expected_issuer,
+    )
 }
 
 fn normalize_module(
@@ -977,19 +888,25 @@ fn validate_protocol_client_bindings(protocols: &Value, clients: &[NewClient]) -
         .iter()
         .map(|client| client.client_id.as_str())
         .collect::<BTreeSet<_>>();
-    let configured = protocols
-        .get("oauth2_oidc")
-        .and_then(Value::as_object)
-        .and_then(|object| object.get("client_ids"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str);
-    for client_id in configured {
-        if !known.contains(client_id) {
-            return Err(AppError::BadRequest(
-                "protocols references an undeclared client".to_string(),
-            ));
+    let Some(protocols) = protocols.as_object() else {
+        return Err(AppError::BadRequest(
+            "protocols module must be an object".to_string(),
+        ));
+    };
+    for protocol in protocols.values() {
+        let Some(client_ids) = protocol
+            .as_object()
+            .and_then(|object| object.get("client_ids"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for client_id in client_ids.iter().filter_map(Value::as_str) {
+            if !known.contains(client_id) {
+                return Err(AppError::BadRequest(
+                    "protocols references an undeclared client".to_string(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1090,7 +1007,7 @@ fn normalize_authorization_bindings(
     ] {
         if object.contains_key(field) {
             return Err(AppError::BadRequest(
-                "website authorization manifests cannot declare user role assignments".to_string(),
+                "v3 authorization contracts cannot declare user role assignments".to_string(),
             ));
         }
     }
@@ -1100,49 +1017,6 @@ fn normalize_authorization_bindings(
         group_mappings,
         organization_role_mappings,
     })
-}
-
-fn redacted_payload(
-    manifest: &ApplicationManifest,
-    protocols: &Value,
-    login_adapters: &Value,
-    directory_sync: &Value,
-    authorization: &Value,
-    profiles: &BTreeMap<String, NormalizedProfile>,
-) -> AppResult<Value> {
-    let clients = manifest
-        .clients
-        .iter()
-        .map(|client| {
-            let mut value = serde_json::to_value(client).map_err(|_| {
-                AppError::Internal("failed to encode discovery snapshot".to_string())
-            })?;
-            if let Some(object) = value.as_object_mut() {
-                object.remove("client_secret");
-            }
-            Ok(value)
-        })
-        .collect::<AppResult<Vec<_>>>()?;
-    Ok(serde_json::json!({
-        "format": FORMAT,
-        "application_id": manifest.application_id,
-        "revision": manifest.revision,
-        "version": manifest.version,
-        "iss": manifest.iss,
-        "aud": manifest.aud,
-        "iat": manifest.iat,
-        "exp": manifest.exp,
-        "clients": clients,
-        "protocols": protocols,
-        "login_adapters": login_adapters,
-        "directory_sync": directory_sync,
-        "authorization": authorization,
-        "profiles": profiles,
-    }))
-}
-
-fn normalize_profile_key(value: &str) -> AppResult<String> {
-    visible_text(value, 255, "profile key")
 }
 
 fn normalize_permission_key(value: &str) -> AppResult<String> {
@@ -1186,16 +1060,6 @@ fn normalize_url_list(values: &[String], field: &str) -> AppResult<Vec<String>> 
     Ok(result)
 }
 
-fn visible_optional_text(value: &str, max_length: usize, field: &str) -> AppResult<String> {
-    if value.trim().is_empty() {
-        return Ok(String::new());
-    }
-    visible_text(value, max_length, field)
-}
-
-/// Human-facing labels may contain spaces. They still cannot contain control
-/// characters or be empty, because Signet stores them in the administrative
-/// catalog and renders them in consent/role-management surfaces.
 fn normalize_display_text(value: &str, max_length: usize, field: &str) -> AppResult<String> {
     let value = value.trim();
     if value.is_empty() || value.len() > max_length || value.chars().any(|ch| ch.is_control()) {
@@ -1217,16 +1081,9 @@ fn visible_text(value: &str, max_length: usize, field: &str) -> AppResult<String
     Ok(value.to_string())
 }
 
-fn normalize_description(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(1024).collect())
-}
-
 /// Fetches and applies one website-owned authorization snapshot. The
 /// network/signature phase is deliberately outside the database transaction;
-/// `Db::apply_website_manifest` only receives an already verified value and
+/// `Db::apply_application_contract` only receives an already verified value and
 /// reconciles it atomically.
 pub async fn sync_application(
     state: &AppState,
@@ -1247,10 +1104,10 @@ pub async fn sync_application(
     }
 
     let result = match sync_application_once(state, &discovery).await {
-        Ok(manifest) => {
+        Ok(contract) => {
             state
                 .db
-                .apply_website_manifest(application_id, manifest)
+                .apply_application_contract(application_id, contract)
                 .await
         }
         Err(error) => Err(error),
@@ -1367,7 +1224,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
 
-    fn signed_manifest() -> (Vec<u8>, String) {
+    fn signed_contract() -> (Vec<u8>, String) {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         let jwks = serde_json::json!({
@@ -1383,41 +1240,66 @@ mod tests {
         .to_string();
         let now = util::now_ts();
         let payload = serde_json::json!({
-            "format": FORMAT,
+            "format": crate::application_contract::FORMAT,
             "application_id": "axon",
-            "revision": 1,
-            "version": "test-1",
+            "revision": 2,
+            "version": "v3-test",
             "iss": "https://axon.example",
             "aud": ["https://sso.example", "signet:application:axon"],
             "iat": now,
             "exp": now + 300,
-            "protocols": {"oauth2_oidc": {"enabled": true, "client_ids": ["web"]}},
-            "clients": [{
-                "client_id": "web",
-                "client_name": "Web",
-                "scopes": ["openid"],
-                "grant_types": ["authorization_code"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "none",
-                "require_pkce": true,
-                "redirect_uris": ["https://axon.example/callback"]
-            }],
-            "authorization": {
-                "inherit_enterprise_roles": true,
-                "default_role": "member",
-                "claims": ["roles", "permissions", "groups"],
-                "custom_roles": [
-                    {"name": "member", "description": "Basic user", "permissions": ["axon.read:owned_resources"]},
-                    {"name": "operator", "description": "Operator", "permissions": ["axon.read:owned_resources"]}
-                ]
-            },
-            "profiles": {"default": {
-                "permissions": [{"key": "axon.read:owned_resources", "label": "Owned resources"}],
-                "roles": [
-                    {"key": "member", "name": "Member", "permissions": ["axon.read:owned_resources"], "is_default": true},
-                    {"key": "operator", "name": "Operator", "permissions": ["axon.read:owned_resources"]}
-                ]
-            }}
+            "modules": {
+                "clients": [{
+                    "client_id": "web",
+                    "protocol": "oidc",
+                    "display_name": "Web",
+                    "profiles": ["web_oidc"],
+                    "redirect_uris": ["https://axon.example/callback"],
+                    "scopes": ["openid", "axon.read"],
+                    "grant_types": ["authorization_code"],
+                    "response_types": ["code"],
+                    "require_pkce": true,
+                    "require_s256_pkce": true
+                }, {
+                    "client_id": "worker",
+                    "protocol": "oidc",
+                    "display_name": "Worker",
+                    "profiles": ["machine_identity", "api_resource"],
+                    "scopes": ["axon.read"],
+                    "audiences": ["https://axon.example/api"],
+                    "grant_types": ["client_credentials"],
+                    "token_endpoint_auth_method": "private_key_jwt",
+                    "jwks": {"keys": [{
+                        "kty": "RSA",
+                        "kid": "worker-1",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "n": "smj1yrPFDZ2_dU44RmLcdAgTfrGY2leozoOhP4li6X4Xcc89yvH3vDtNU7aEshwmu8UBUI698JXDAmQE8sjeV_ZermfSHwmt72HfTInCX-4X_O2h07BBx5N7Kno7YAWaQrcfHzJRFlQa6wbkIrGxzdaRzNVKVyE628_j_jBI_W-KdIK9P96AtBStkcB48WI7M_tKpe4AxvVnAQzex0M_XX04MwyZ3v07Bb7kr-KWUM-A6cDMwtoc3qoQUdcjLh5hRl3iOwJ3wPHElQPyrxRQknWtbwJF0Fw1v25rATNFGqvO4Ddr9CkIg1njpxpG8NxfUbFzGq3GHQYxgUaxZmPBcw",
+                        "e": "AQAB"
+                    }]}
+                }],
+                "connections": [{"connection_id": "sso-saml", "kind": "saml2", "settings": {}}],
+                "policies": [{
+                    "policy_id": "read",
+                    "client_ids": ["web"],
+                    "permissions": ["axon.read"]
+                }, {
+                    "policy_id": "worker-read",
+                    "client_ids": ["worker"],
+                    "audiences": ["https://axon.example/api"],
+                    "permissions": ["axon.read"],
+                    "require_dpop": true
+                }],
+                "roles": [{
+                    "role_id": "member",
+                    "permissions": ["axon.read"],
+                    "default_role": true
+                }, {
+                    "role_id": "operator",
+                    "permissions": ["axon.admin"]
+                }],
+                "lifecycle": {"mode": "replace", "fail_closed": true, "revoke_removed_clients": true}
+            }
         });
         let header =
             URL_SAFE_NO_PAD.encode(serde_json::json!({"alg":"EdDSA","kid":"key-1"}).to_string());
@@ -1430,7 +1312,7 @@ mod tests {
 
     #[test]
     fn ed25519_manifest_verifies_and_normalizes() {
-        let (body, jwks) = signed_manifest();
+        let (body, jwks) = signed_contract();
         let verified = verify_and_normalize(
             &body,
             &jwks,
@@ -1440,10 +1322,64 @@ mod tests {
             "org-1",
         )
         .unwrap();
-        assert_eq!(verified.revision, 1);
+        assert_eq!(verified.revision, 2);
         assert_eq!(verified.clients[0].client_id, "web");
+        assert_eq!(verified.client_protocols["worker"], "oidc");
         assert_eq!(verified.profiles["default"].roles[0].key, "member");
         assert!(verified.authorization.get("custom_roles").is_some());
+    }
+
+    #[test]
+    fn ed25519_v3_contract_verifies_and_normalizes_to_local_snapshot() {
+        let (body, jwks) = signed_contract();
+        let verified = verify_and_normalize(
+            &body,
+            &jwks,
+            "https://axon.example",
+            "axon",
+            "https://sso.example",
+            "org-1",
+        )
+        .unwrap();
+        assert_eq!(verified.revision, 2);
+        assert_eq!(verified.clients[0].client_id, "web");
+        assert_eq!(verified.clients[0].require_s256_pkce, true);
+        let worker = verified
+            .clients
+            .iter()
+            .find(|client| client.client_id == "worker")
+            .unwrap();
+        assert!(worker.require_dpop);
+        assert_eq!(worker.service_account_permissions, vec!["axon.read"]);
+        assert!(verified.profiles["worker"]
+            .permissions
+            .iter()
+            .all(|permission| permission.key != "axon.admin"));
+        assert_eq!(
+            verified.protocols["saml2"]["enabled"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(verified.profiles["default"].roles[0].key, "member");
+        assert!(verified.profiles["default"]
+            .permissions
+            .iter()
+            .any(|permission| permission.key == "axon.read"));
+    }
+
+    #[test]
+    fn v3_connections_reject_unknown_adapters_instead_of_persisting_dead_config() {
+        let error = normalize_contract_protocols(
+            &[crate::application_contract::ConnectionContract {
+                connection_id: "unknown".to_string(),
+                kind: "unsupported".to_string(),
+                required: true,
+                settings: Map::new(),
+            }],
+            &BTreeMap::new(),
+            "https://axon.example",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]
@@ -1485,7 +1421,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_manifest_endpoint_round_trips_through_verifier() {
-        let (body, jwks) = signed_manifest();
+        let (body, jwks) = signed_contract();
         let body = String::from_utf8(body).unwrap();
         let fetch_secret = "fetch-secret".to_string();
         let route_body = body.clone();
@@ -1534,7 +1470,7 @@ mod tests {
 
     #[test]
     fn wrong_signature_is_rejected() {
-        let (mut body, jwks) = signed_manifest();
+        let (mut body, jwks) = signed_contract();
         let last = body.len() - 1;
         body[last] = if body[last] == b'A' { b'B' } else { b'A' };
         assert!(
@@ -1550,32 +1486,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extreme_manifest_timestamps_fail_closed_without_overflowing() {
-        let manifest = ApplicationManifest {
-            format: FORMAT.to_string(),
-            application_id: "axon".to_string(),
-            revision: 1,
-            version: "test".to_string(),
-            iss: "https://axon.example".to_string(),
-            aud: serde_json::json!(["https://sso.example"]),
-            iat: i64::MIN,
-            exp: i64::MAX,
-            clients: Vec::new(),
-            protocols: Map::new(),
-            login_adapters: Map::new(),
-            directory_sync: Map::new(),
-            authorization: Map::new(),
-            profiles: BTreeMap::new(),
-        };
-        assert!(
-            validate_claims(
-                &manifest,
-                "https://axon.example",
-                "axon",
-                "https://sso.example",
-            )
-            .is_err()
-        );
-    }
+
 }

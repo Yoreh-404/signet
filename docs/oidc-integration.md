@@ -6,14 +6,14 @@ Signet 是 OIDC Provider。应用应使用 discovery 文档读取端点和支持
 
 先在控制台“运行配置”中设置实际的公网 Base URL 和 Issuer，例如 `https://sso.example.com`。两者通常相同。应用和浏览器必须都能访问该地址。
 
-## 2. 创建客户端
+## 2. 发布应用契约
 
-以管理员身份打开控制台，在“OIDC 客户端”中创建一个客户端：
+应用通过签名的 `signet-application/v3` 契约声明一个或多个客户端：
 
-- 填写应用名称和唯一的 client ID。
-- 登记精确的 redirect URI，例如 `https://app.example.com/oauth/callback`。
-- 为可保密的服务保存 client secret；浏览器或移动端等公有客户端使用 `none` 并启用 PKCE。
-- 按需选择 scope、grant type、认证方式和是否要求 MFA/账号选择。
+- 每个客户端声明唯一的 `client_id` 和 `protocol`。
+- Web/SPA 客户端登记精确的 redirect URI，并使用 `none` + S256 PKCE。
+- 机器客户端使用 `client_credentials` + `private_key_jwt`，在契约中发布公钥 JWKS；私钥只保留在调用方。
+- 权限通过客户端绑定的 Profile 和 Policy 声明，不在客户端之间隐式共享。
 
 redirect URI 必须精确匹配，不能使用通配符。生产环境不要使用示例配置中的 `demo-secret-change-me`。
 
@@ -46,10 +46,12 @@ GET /oauth2/authorize?
   state=RANDOM_VALUE
 ```
 
-机密客户端换取 token：
+服务端客户端使用私钥签名 assertion 后换取 token：
 
 ```bash
-curl -u YOUR_CLIENT_ID:YOUR_CLIENT_SECRET \
+curl -d client_id=YOUR_CLIENT_ID \
+  -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  -d client_assertion=SIGNED_CLIENT_ASSERTION \
   -d grant_type=authorization_code \
   -d code=AUTHORIZATION_CODE \
   -d redirect_uri=https://app.example.com/oauth/callback \

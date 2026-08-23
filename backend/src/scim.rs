@@ -1985,6 +1985,8 @@ mod tests {
             jti: Some("test-jti".to_string()),
             token_use: "access_token".to_string(),
             client_id: "scim-client".to_string(),
+            application_id: None,
+            authorization_profile_id: None,
             scope: scope.to_string(),
             email: "admin@example.com".to_string(),
             email_verified: true,

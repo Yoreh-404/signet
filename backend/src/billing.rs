@@ -1282,7 +1282,10 @@ struct PaymentOrderView {
     updated_at: i64,
 }
 
-fn payment_order_view(settings: &Settings, order: PaymentOrderRecord) -> AppResult<PaymentOrderView> {
+fn payment_order_view(
+    settings: &Settings,
+    order: PaymentOrderRecord,
+) -> AppResult<PaymentOrderView> {
     let minor_unit = minor_unit(settings, &order.currency)?;
     Ok(PaymentOrderView {
         id: order.id,
@@ -1797,7 +1800,7 @@ async fn billing_application_context(
     }
     if let Some(consent) = state
         .db
-        .find_user_consent(&user.id, &client.client_id)
+        .find_client_grant(&user.id, &client.client_id)
         .await?
     {
         if consent.revoked_at.is_some()

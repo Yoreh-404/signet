@@ -159,11 +159,17 @@ export type TenantApplication = {
   account_selection_mode: "optional" | "required";
   unique_identity_factors: Array<"email" | "phone">;
   is_active: boolean;
-  oidc_clients: Client[];
+  client_bindings: ApplicationClientBinding[];
   modules?: ApplicationModule[];
   authorization_profiles?: ApplicationAuthorizationProfile[];
   created_at: number;
   updated_at: number;
+};
+
+export type ApplicationClientBinding = Client & {
+  protocol: string;
+  authorization_profile_id: string;
+  auth_domain_id: string;
 };
 
 export type BillingWallet = {
@@ -255,9 +261,7 @@ export type ApplicationAuthorizationProfile = {
   profile_key: string;
   connection_kind: string;
   connection_id: string | null;
-  source_mode: "manual" | "signed_manifest" | string;
-  manifest_url: string;
-  signer_client_id: string | null;
+  source_mode: "manual" | "application_discovery" | string;
   remote_version: string | null;
   remote_digest: string | null;
   sync_status: "manual" | "synced" | "no_profile" | "error" | string;

@@ -6,7 +6,11 @@
 
 use crate::{
     AppState,
-    db::{ApplicationModuleRecord, ApplicationRecord, ClientRecord, UserRecord},
+    auth_domain::ClientBinding,
+    db::{
+        ApplicationClientBindingRecord, ApplicationModuleRecord, ApplicationRecord, ClientRecord,
+        UserRecord,
+    },
     error::{AppError, AppResult},
     organizations::normalize_slug,
 };
@@ -66,6 +70,8 @@ pub fn normalize_module_config(module_key: &str, value: Value) -> AppResult<Valu
             validate_protocol_config(object, "cas", &["service_urls", "proxy_callback_urls"])?;
             validate_cas_protocol_config(object)?;
             validate_protocol_config(object, "jwt", &["redirect_uris"])?;
+            validate_protocol_config(object, "iap", &["client_ids"])?;
+            validate_protocol_config(object, "forward_auth", &["client_ids"])?;
             validate_jwt_client_type(object)?;
         }
         "login_adapters" => {
@@ -653,29 +659,27 @@ pub async fn validate_module_bindings(
 ) -> AppResult<()> {
     match module_key {
         "protocols" => {
-            let client_ids = config
-                .get("oauth2_oidc")
-                .and_then(Value::as_object)
-                .and_then(|protocol| protocol.get("client_ids"))
-                .map(|value| {
-                    value
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            for client_id in client_ids {
-                let client = state
-                    .db
-                    .find_client_by_id(client_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::BadRequest("OIDC client does not exist".to_string())
-                    })?;
-                if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
-                    return Err(AppError::Forbidden);
+            for (protocol, protocol_value) in config {
+                let client_ids = protocol_value
+                    .as_object()
+                    .and_then(|protocol| protocol.get("client_ids"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                for client_id in client_ids {
+                    let client = state
+                        .db
+                        .find_client_by_id(client_id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::BadRequest(format!("{protocol} client does not exist"))
+                        })?;
+                    if client.organization_id.as_deref()
+                        != Some(application.organization_id.as_str())
+                    {
+                        return Err(AppError::Forbidden);
+                    }
                 }
             }
         }
@@ -778,7 +782,12 @@ pub async fn application_protocol_enabled(
     }
     let config = module_config(&module)?;
     let config = normalize_module_config("protocols", Value::Object(config))?;
-    let Some(protocol_config) = config.get(protocol).and_then(Value::as_object) else {
+    let protocol_key = match protocol {
+        "oidc" => "oauth2_oidc",
+        "saml" => "saml2",
+        other => other,
+    };
+    let Some(protocol_config) = config.get(protocol_key).and_then(Value::as_object) else {
         return Ok(false);
     };
     Ok(protocol_config
@@ -980,21 +989,53 @@ impl ApplicationRecord {
     }
 }
 
-/// Enforces application eligibility at a protocol boundary. Callers must use
-/// this for authorization, account selection, device approval and token
-/// renewal; merely filtering the browser account picker is insufficient.
-pub async fn authorize_user_for_client(
+pub async fn resolve_application_for_client(
     state: &AppState,
     client: &ClientRecord,
-    user: &UserRecord,
-) -> AppResult<ApplicationRecord> {
+) -> AppResult<(ApplicationRecord, ClientBinding)> {
     let application = state
         .db
         .find_application_for_client(&client.id)
         .await?
         .ok_or_else(|| AppError::Forbidden)?;
+    let binding = state
+        .db
+        .find_application_client_binding(&client.id)
+        .await?
+        .map(client_binding_from_record)
+        .unwrap_or_else(|| ClientBinding {
+            application_id: application.id.clone(),
+            client_db_id: client.id.clone(),
+            protocol: "oidc".to_string(),
+            authorization_profile_id: "default".to_string(),
+            auth_domain_id: format!("auth-domain:{}", application.id),
+            is_active: true,
+        });
+    if binding.application_id != application.id || !binding.is_active {
+        return Err(AppError::Forbidden);
+    }
+    Ok((application, binding))
+}
+
+fn client_binding_from_record(record: ApplicationClientBindingRecord) -> ClientBinding {
+    ClientBinding {
+        application_id: record.application_id,
+        client_db_id: record.client_db_id,
+        protocol: record.protocol,
+        authorization_profile_id: record.authorization_profile_id,
+        auth_domain_id: record.auth_domain_id,
+        is_active: record.is_active == 1,
+    }
+}
+
+pub async fn authorize_user_for_application(
+    state: &AppState,
+    client: &ClientRecord,
+    user: &UserRecord,
+) -> AppResult<(ApplicationRecord, ClientBinding)> {
+    let (application, binding) = resolve_application_for_client(state, client).await?;
     ensure_application_runtime_active(state, &application).await?;
-    if !application_protocol_enabled(state, &application.id, "oauth2_oidc").await? {
+    if !application_protocol_enabled(state, &application.id, &binding.protocol).await? {
         return Err(AppError::Forbidden);
     }
     if !state
@@ -1004,7 +1045,7 @@ pub async fn authorize_user_for_client(
     {
         return Err(AppError::Forbidden);
     }
-    Ok(application)
+    Ok((application, binding))
 }
 
 /// Enforces the live website boundary for grants that do not have a user
@@ -1012,7 +1053,7 @@ pub async fn authorize_user_for_client(
 /// an Application remain platform-level OAuth clients and are deliberately
 /// left alone; an attached client must stop working as soon as its website,
 /// owning enterprise, or OAuth/OIDC module is disabled.
-pub async fn authorize_client_for_protocol(
+pub async fn authorize_application_client(
     state: &AppState,
     client: &ClientRecord,
     protocol: &str,
@@ -1028,7 +1069,7 @@ pub async fn authorize_client_for_protocol(
 }
 
 /// Side-effect-free eligibility probe for account chooser rendering. The
-/// authorization path still calls `authorize_user_for_client` afterwards to
+/// authorization path still calls `authorize_user_for_application` afterwards to
 /// make the final reservation atomically.
 pub async fn user_can_authorize_client(
     state: &AppState,
@@ -1043,7 +1084,7 @@ pub async fn user_can_authorize_client(
     }
     // Application membership and application-local factor reservations are
     // not part of the login boundary.  The chooser is only a preview of the
-    // same active-account check enforced by authorize_user_for_client.
+    // same active-account check enforced by authorize_user_for_application.
     state
         .db
         .user_can_access_application(&application, &user.id)
@@ -1525,13 +1566,13 @@ mod tests {
         // cross-enterprise move must leave the existing binding untouched.
         state
             .db
-            .link_oidc_client_to_application(&application_a.id, &client_a.id)
+            .link_client_to_application(&application_a.id, &client_a.id, "oidc", "default")
             .await
             .unwrap();
         assert!(
             state
                 .db
-                .link_oidc_client_to_application(&application_b.id, &client_a.id)
+                .link_client_to_application(&application_b.id, &client_a.id, "oidc", "default")
                 .await
                 .is_err()
         );
