@@ -4,7 +4,8 @@ use crate::{
     client_policy::AuthorizationRequestSource,
     db::NewPushedAuthorizationRequest,
     error::{AppError, AppResult},
-    oidc::{self, ClientAuthFields, ResolvedAuthorizeRequest},
+    oidc::{self, ResolvedAuthorizeRequest},
+    oidc_client_auth::{ClientAuthFields, ClientAuthForm},
     util,
 };
 use axum::{
@@ -42,10 +43,8 @@ impl StoredRequestKind {
 pub struct PushedAuthorizationRequest {
     request: Option<String>,
     response_type: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
+    #[serde(flatten)]
+    client_auth: ClientAuthForm,
     redirect_uri: Option<String>,
     scope: Option<String>,
     resource: Option<String>,
@@ -63,20 +62,8 @@ pub struct PushedAuthorizationRequest {
 }
 
 impl ClientAuthFields for PushedAuthorizationRequest {
-    fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
-    }
-
-    fn client_secret(&self) -> Option<&str> {
-        self.client_secret.as_deref()
-    }
-
-    fn client_assertion_type(&self) -> Option<&str> {
-        self.client_assertion_type.as_deref()
-    }
-
-    fn client_assertion(&self) -> Option<&str> {
-        self.client_assertion.as_deref()
+    fn client_auth(&self) -> &ClientAuthForm {
+        &self.client_auth
     }
 }
 
@@ -92,7 +79,7 @@ pub async fn pushed_authorization(
     Form(payload): Form<PushedAuthorizationRequest>,
 ) -> AppResult<(StatusCode, Json<PushedAuthorizationResponse>)> {
     let client = oidc::authenticate_client_at(&state, &headers, &payload, "/oauth2/par").await?;
-    if let Some(client_id) = payload.client_id.as_deref()
+    if let Some(client_id) = payload.client_id()
         && client_id != client.client_id
     {
         return Err(AppError::Oidc("client_id mismatch".to_string()));

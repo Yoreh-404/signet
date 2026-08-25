@@ -9,22 +9,20 @@
 
 use crate::{
     AppState, applications,
-    db::{
-        ApplicationRecord, DirectorySyncRunRecord, LdapProviderRecord, NewGroup, NewUser,
-        UserUpdate,
-    },
+    db::{ApplicationRecord, DirectorySyncRunRecord, LdapProviderRecord},
     error::{AppError, AppResult},
     organizations::OrganizationEmailPolicy,
     util,
 };
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry, adapters::PagedResults};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 const PAGE_SIZE: i32 = 500;
 const MAX_RETRIES: usize = 3;
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
+const DIRECTORY_SYNC_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct DirectorySyncConfig {
@@ -323,30 +321,49 @@ pub async fn run_application_ldap_sync_with_provider<P: DirectorySyncProvider>(
         .start_directory_sync_run(application_id, provider_id)
         .await?;
 
-    let snapshot = match snapshot_with_retries(connector, &provider, &config).await {
+    let snapshot = match snapshot_with_lease_heartbeat(
+        state,
+        application_id,
+        provider_id,
+        &run.id,
+        connector,
+        &provider,
+        &config,
+        DIRECTORY_SYNC_HEARTBEAT_INTERVAL,
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let detail = sync_error_detail(&error);
-            let _ = state
-                .db
-                .record_directory_sync_checkpoint(application_id, provider_id, None, false)
-                .await;
-            let _ = finish_failed_run(state, &run, detail).await;
+            let _ = finalize_failed_run(state, application_id, provider_id, &run, detail).await;
             return Err(error);
         }
     };
 
-    let result = reconcile_snapshot(state, &application, &provider, &config, snapshot).await;
+    // The connector may spend a long time paging a large directory.  Renew
+    // only after the immutable snapshot is complete; if another worker
+    // reclaimed an expired lease while this worker was talking to LDAP, fail
+    // closed before publishing any local state.
+    if let Err(error) = state
+        .db
+        .renew_directory_sync_lease(application_id, provider_id, &run.id)
+        .await
+    {
+        let detail = sync_error_detail(&error);
+        let _ = finalize_failed_run(state, application_id, provider_id, &run, detail).await;
+        return Err(error);
+    }
+
+    let result = reconcile_snapshot(state, &application, &provider, &config, &run, snapshot).await;
     match result {
         Ok(stats) => {
             let cursor = Some(util::now_ts().to_string());
-            state
+            let finalized = state
                 .db
-                .record_directory_sync_checkpoint(application_id, provider_id, cursor.clone(), true)
-                .await?;
-            state
-                .db
-                .finish_directory_sync_run(
+                .finalize_directory_sync_run(
+                    application_id,
+                    provider_id,
                     &run.id,
                     "succeeded",
                     stats.total_seen,
@@ -356,15 +373,20 @@ pub async fn run_application_ldap_sync_with_provider<P: DirectorySyncProvider>(
                     None,
                     cursor,
                 )
-                .await
+                .await;
+            match finalized {
+                Ok(run) => Ok(run),
+                Err(error) => {
+                    let detail = sync_error_detail(&error);
+                    let _ =
+                        finalize_failed_run(state, application_id, provider_id, &run, detail).await;
+                    Err(error)
+                }
+            }
         }
         Err(error) => {
             let detail = sync_error_detail(&error);
-            let _ = state
-                .db
-                .record_directory_sync_checkpoint(application_id, provider_id, None, false)
-                .await;
-            let _ = finish_failed_run(state, &run, detail).await;
+            let _ = finalize_failed_run(state, application_id, provider_id, &run, detail).await;
             Err(error)
         }
     }
@@ -404,19 +426,73 @@ async fn snapshot_with_retries<P: DirectorySyncProvider>(
     provider: &LdapProviderRecord,
     config: &DirectorySyncConfig,
 ) -> AppResult<DirectorySnapshot> {
-    let mut last_error = None;
-    for attempt in 0..MAX_RETRIES {
+    let mut attempt = 0;
+    loop {
         match connector.snapshot(provider, config).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => {
-                last_error = Some(error);
-                if attempt + 1 < MAX_RETRIES {
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                attempt += 1;
+                if attempt >= MAX_RETRIES {
+                    return Err(error);
                 }
+                tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| AppError::Internal("directory sync failed".to_string())))
+}
+
+/// Runs the provider snapshot while the current run's lease is renewed.
+///
+/// The heartbeat is deliberately kept as a future in this task instead of a
+/// detached spawned task.  `tokio::select!` drops the heartbeat immediately
+/// when the snapshot finishes or fails, so there is no task to leak when a
+/// request is cancelled.  If a renewal fails, the provider future is dropped
+/// and no snapshot can reach reconciliation.
+async fn snapshot_with_lease_heartbeat<P: DirectorySyncProvider>(
+    state: &AppState,
+    application_id: &str,
+    provider_id: &str,
+    run_id: &str,
+    connector: &P,
+    provider: &LdapProviderRecord,
+    config: &DirectorySyncConfig,
+    heartbeat_interval: Duration,
+) -> AppResult<DirectorySnapshot> {
+    let snapshot = snapshot_with_retries(connector, provider, config);
+    let heartbeat = renew_lease_until_failure(
+        state.db.clone(),
+        application_id.to_string(),
+        provider_id.to_string(),
+        run_id.to_string(),
+        heartbeat_interval,
+    );
+    tokio::pin!(snapshot);
+    tokio::pin!(heartbeat);
+
+    tokio::select! {
+        biased;
+        heartbeat = &mut heartbeat => match heartbeat {
+            Ok(()) => Err(AppError::Internal(
+                "directory synchronization lease heartbeat stopped unexpectedly".to_string(),
+            )),
+            Err(error) => Err(error),
+        },
+        snapshot = &mut snapshot => snapshot,
+    }
+}
+
+async fn renew_lease_until_failure(
+    db: crate::db::Db,
+    application_id: String,
+    provider_id: String,
+    run_id: String,
+    heartbeat_interval: Duration,
+) -> AppResult<()> {
+    loop {
+        tokio::time::sleep(heartbeat_interval).await;
+        db.renew_directory_sync_lease(&application_id, &provider_id, &run_id)
+            .await?;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -432,6 +508,7 @@ async fn reconcile_snapshot(
     application: &ApplicationRecord,
     provider: &LdapProviderRecord,
     config: &DirectorySyncConfig,
+    run: &DirectorySyncRunRecord,
     snapshot: DirectorySnapshot,
 ) -> AppResult<SyncStats> {
     let organization = state
@@ -476,282 +553,83 @@ async fn reconcile_snapshot(
             ));
         }
     }
-    let provider_key = provider.provider_key();
-    let now = util::now_ts();
-    let mut stats = SyncStats {
-        total_seen: users.len() as i64,
-        ..SyncStats::default()
-    };
-    let mut seen_subjects = BTreeSet::new();
-    let mut local_users_by_subject = BTreeMap::new();
-    let mut local_users_by_dn = BTreeMap::new();
 
-    for directory_user in users {
-        let email = crate::security_policy::normalize_login_subject(&directory_user.email);
-        if !organization.allows_email(&email)? {
-            return Err(AppError::Forbidden);
-        }
-        if !seen_subjects.insert(directory_user.subject.clone()) {
-            return Err(AppError::BadRequest(
-                "directory sync contains duplicate user subjects".to_string(),
-            ));
-        }
-        let identity = state
-            .db
-            .find_linked_identity(&provider_key, &directory_user.subject)
-            .await?;
-        let (user, created, had_membership) = if let Some(identity) = identity {
-            let current = state
-                .db
-                .find_user_by_id(&identity.user_id)
-                .await?
-                .ok_or(AppError::Unauthorized)?;
-            if current.archived_at.is_some() {
-                return Err(AppError::BadRequest(
-                    "directory sync cannot reactivate archived accounts".to_string(),
-                ));
-            }
-            let user = state
-                .db
-                .update_user(UserUpdate {
-                    id: &current.id,
-                    email: email.clone(),
+    let plan = crate::db::DirectorySyncSnapshotPlan {
+        users: users
+            .iter()
+            .map(|directory_user| {
+                Ok(crate::db::DirectorySyncUserPlan {
+                    subject: directory_user.subject.clone(),
+                    dn: directory_user.dn.clone(),
+                    email: crate::security_policy::normalize_login_subject(&directory_user.email),
                     username: directory_username(&directory_user.username, &directory_user.subject),
                     display_name: directory_user.display_name.clone(),
                     phone: directory_user.phone.clone(),
-                    is_admin: current.is_admin == 1,
-                    is_active: config.reactivate_users || current.is_active == 1,
+                    password_hash: None,
                 })
-                .await?;
-            let had_membership = state
-                .db
-                .user_belongs_to_organization(&application.organization_id, &user.id)
-                .await?;
-            (user, false, had_membership)
-        } else {
-            let username = directory_username(&directory_user.username, &directory_user.subject);
-            let user = state
-                .db
-                .insert_external_oidc_user(
-                    NewUser {
-                        email: email.clone(),
-                        username,
-                        display_name: directory_user.display_name.clone(),
-                        phone: directory_user.phone.clone(),
-                        password_hash: util::hash_password(&util::random_token(32))?,
-                        email_verified_at: Some(now),
-                        phone_verified_at: None,
-                        is_admin: false,
-                        is_active: true,
-                        archived_at: None,
-                    },
-                    &provider_key,
-                    &directory_user.subject,
-                    Some(email.clone()),
-                    Some(application.organization_id.clone()),
-                    false,
-                )
-                .await?;
-            // insert_external_oidc_user adds a new user to the provider's
-            // organization. The membership did not exist before this sync,
-            // so it must be marked as directory-managed for safe deprovisioning.
-            (user, true, false)
-        };
-        if !created && !had_membership {
-            // A directory source may provision a missing enterprise member,
-            // but it must never rewrite a role that an enterprise manager
-            // already chose manually.
-            state
-                .db
-                .upsert_organization_member(
-                    &application.organization_id,
-                    &user.id,
-                    crate::organizations::ROLE_MEMBER,
-                )
-                .await?;
-        }
-        state
-            .db
-            .upsert_directory_sync_membership(
-                &application.id,
-                &provider.id,
-                &user.id,
-                !had_membership,
-                now,
-            )
-            .await?;
-        if created {
-            stats.created_count += 1;
-        } else {
-            stats.updated_count += 1;
-        }
-        local_users_by_subject.insert(directory_user.subject.clone(), user.id.clone());
-        local_users_by_dn.insert(directory_user.dn, user.id);
-    }
-
-    for membership in state
+            })
+            .collect::<AppResult<Vec<_>>>()?,
+        groups: config
+            .sync_groups
+            .then(|| {
+                groups
+                    .iter()
+                    .map(|directory_group| crate::db::DirectorySyncGroupPlan {
+                        external_id: directory_group.external_id.clone(),
+                        display_name: directory_group.display_name.clone(),
+                        member_subjects: directory_group.member_subjects.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let applied = state
         .db
-        .list_directory_sync_memberships(&application.id, &provider.id)
-        .await?
-    {
-        let identity = state
-            .db
-            .list_linked_identities(&membership.user_id)
-            .await?
-            .into_iter()
-            .any(|identity| {
-                identity.provider_slug == provider_key
-                    && seen_subjects.contains(&identity.external_subject)
-            });
-        if identity {
-            continue;
-        }
-        if membership.managed == 1 {
-            state
-                .db
-                .deprovision_directory_sync_membership(
-                    &application.id,
-                    &provider.id,
-                    &application.organization_id,
-                    &membership.user_id,
-                )
-                .await?;
-            stats.disabled_count += 1;
-        } else {
-            state
-                .db
-                .delete_directory_sync_membership(
-                    &application.id,
-                    &provider.id,
-                    &membership.user_id,
-                )
-                .await?;
-        }
-    }
-
-    if config.sync_groups {
-        reconcile_groups(
-            state,
-            application,
-            provider,
-            groups,
-            &local_users_by_subject,
-            &local_users_by_dn,
-            now,
+        .apply_directory_sync_snapshot(
+            crate::db::DirectorySyncApplyContext {
+                application_id: application.id.clone(),
+                provider_id: provider.id.clone(),
+                run_id: run.id.clone(),
+                provider_key: provider.provider_key(),
+                organization_id: application.organization_id.clone(),
+                provider_display_name: provider.display_name.clone(),
+                reactivate_users: config.reactivate_users,
+                expected_application_updated_at: Some(application.updated_at),
+                expected_provider_updated_at: Some(provider.updated_at),
+                expected_organization_updated_at: Some(organization.updated_at),
+            },
+            plan,
         )
         .await?;
-    }
-    Ok(stats)
+    Ok(SyncStats {
+        total_seen: applied.total_seen,
+        created_count: applied.created_count,
+        updated_count: applied.updated_count,
+        disabled_count: applied.disabled_count,
+    })
 }
 
-async fn reconcile_groups(
+async fn finalize_failed_run(
     state: &AppState,
-    application: &ApplicationRecord,
-    provider: &LdapProviderRecord,
-    groups: Vec<DirectorySyncGroup>,
-    local_users_by_subject: &BTreeMap<String, String>,
-    local_users_by_dn: &BTreeMap<String, String>,
-    now: i64,
-) -> AppResult<()> {
-    let mut seen = BTreeSet::new();
-    for directory_group in groups {
-        let binding = if let Some(binding) = state
-            .db
-            .find_directory_sync_group(&application.id, &provider.id, &directory_group.external_id)
-            .await?
-        {
-            binding
-        } else {
-            let group = state
-                .db
-                .insert_application_scim_group(
-                    &application.id,
-                    NewGroup {
-                        name: directory_group.display_name.clone(),
-                        description: Some(format!("Synchronized from {}", provider.display_name)),
-                    },
-                )
-                .await?;
-            state
-                .db
-                .upsert_directory_sync_group(
-                    &application.id,
-                    &provider.id,
-                    &directory_group.external_id,
-                    &group.id,
-                    now,
-                )
-                .await?;
-            state
-                .db
-                .find_directory_sync_group(
-                    &application.id,
-                    &provider.id,
-                    &directory_group.external_id,
-                )
-                .await?
-                .ok_or(AppError::Internal(
-                    "directory group mapping was not created".to_string(),
-                ))?
-        };
-        let mut member_ids = BTreeSet::new();
-        for subject in directory_group.member_subjects {
-            if let Some(user_id) = local_users_by_subject
-                .get(&subject)
-                .or_else(|| local_users_by_dn.get(&subject))
-            {
-                member_ids.insert(user_id.clone());
-            }
-        }
-        state
-            .db
-            .replace_application_scim_group_members(
-                &application.id,
-                &binding.group_id,
-                member_ids.into_iter().collect(),
-            )
-            .await?;
-        state
-            .db
-            .upsert_directory_sync_group(
-                &application.id,
-                &provider.id,
-                &directory_group.external_id,
-                &binding.group_id,
-                now,
-            )
-            .await?;
-        seen.insert(directory_group.external_id);
-    }
-
-    for binding in state
-        .db
-        .list_directory_sync_groups(&application.id, &provider.id)
-        .await?
-    {
-        if seen.contains(&binding.external_id) {
-            continue;
-        }
-        state
-            .db
-            .delete_application_scim_group(&application.id, &binding.group_id)
-            .await?;
-        state
-            .db
-            .delete_directory_sync_group(&application.id, &provider.id, &binding.external_id)
-            .await?;
-    }
-    Ok(())
-}
-
-async fn finish_failed_run(
-    state: &AppState,
+    application_id: &str,
+    provider_id: &str,
     run: &DirectorySyncRunRecord,
     detail: String,
 ) -> AppResult<DirectorySyncRunRecord> {
     state
         .db
-        .finish_directory_sync_run(&run.id, "failed", 0, 0, 0, 0, Some(detail), None)
+        .finalize_directory_sync_run(
+            application_id,
+            provider_id,
+            &run.id,
+            "failed",
+            0,
+            0,
+            0,
+            0,
+            Some(detail),
+            None,
+        )
         .await
 }
 
@@ -894,6 +772,8 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    #[cfg(feature = "sqlite")]
+    use tokio::sync::Notify;
 
     #[test]
     fn directory_usernames_are_stable_and_safe() {
@@ -959,6 +839,36 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    #[derive(Clone)]
+    struct BlockingDirectorySyncProvider {
+        started: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "sqlite")]
+    struct SnapshotDropMarker(Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(feature = "sqlite")]
+    impl Drop for SnapshotDropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl DirectorySyncProvider for BlockingDirectorySyncProvider {
+        async fn snapshot(
+            &self,
+            _provider: &LdapProviderRecord,
+            _config: &DirectorySyncConfig,
+        ) -> AppResult<DirectorySnapshot> {
+            let _marker = SnapshotDropMarker(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending::<AppResult<DirectorySnapshot>>().await
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
     async fn directory_sync_test_state() -> (AppState, std::path::PathBuf) {
         let mut settings: crate::Settings =
             toml::from_str(include_str!("../../config/default.toml")).unwrap();
@@ -976,6 +886,90 @@ mod tests {
         db.migrate().await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
         (AppState { settings, db, jwt }, path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn snapshot_heartbeat_fails_closed_and_cancels_provider() {
+        let (state, path) = directory_sync_test_state().await;
+        let run = state
+            .db
+            .start_directory_sync_run("heartbeat-app", "heartbeat-provider")
+            .await
+            .unwrap();
+        let provider = LdapProviderRecord {
+            id: "heartbeat-provider".to_string(),
+            slug: "heartbeat-provider".to_string(),
+            display_name: "Heartbeat Provider".to_string(),
+            organization_id: Some("heartbeat-org".to_string()),
+            url: "ldap://directory.example.test".to_string(),
+            starttls: 0,
+            bind_dn: String::new(),
+            bind_password: String::new(),
+            base_dn: "dc=example,dc=test".to_string(),
+            user_filter: "(objectClass=person)".to_string(),
+            user_id_attribute: "uid".to_string(),
+            email_attribute: "mail".to_string(),
+            username_attribute: "uid".to_string(),
+            display_name_attribute: "cn".to_string(),
+            phone_attribute: String::new(),
+            is_active: 1,
+            allow_login: 1,
+            allow_registration: 1,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let config = DirectorySyncConfig {
+            user_filter: "(objectClass=person)".to_string(),
+            group_base_dn: None,
+            group_filter: "(objectClass=group)".to_string(),
+            group_id_attribute: "dn".to_string(),
+            group_name_attribute: "cn".to_string(),
+            group_member_attribute: "member".to_string(),
+            sync_groups: false,
+            reactivate_users: true,
+            max_entries: 10,
+            deprovision_action: "remove_membership".to_string(),
+        };
+        let fake = BlockingDirectorySyncProvider {
+            started: Arc::new(Notify::new()),
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let started = fake.started.clone();
+        let dropped = fake.dropped.clone();
+        let result = {
+            let snapshot = snapshot_with_lease_heartbeat(
+                &state,
+                "heartbeat-app",
+                "heartbeat-provider",
+                &run.id,
+                &fake,
+                &provider,
+                &config,
+                Duration::from_millis(5),
+            );
+            tokio::pin!(snapshot);
+            let started_wait = started.notified();
+            tokio::pin!(started_wait);
+            tokio::select! {
+                _ = &mut started_wait => {}
+                result = &mut snapshot => panic!("snapshot completed before the lease was revoked: {result:?}"),
+            }
+            state
+                .db
+                .finish_directory_sync_run(&run.id, "failed", 0, 0, 0, 0, None, None)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), &mut snapshot)
+                .await
+                .expect("lease heartbeat should fail promptly")
+                .unwrap_err()
+        };
+        assert!(matches!(result, AppError::BadRequest(message) if message.contains("lease")));
+        assert!(dropped.load(Ordering::SeqCst));
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]

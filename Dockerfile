@@ -7,14 +7,30 @@ RUN npm ci --no-audit --fund=false
 COPY frontend/ ./
 RUN npm run build
 
-FROM rust:1.94.1-bookworm AS backend-builder
+FROM rust:1.97.1-bookworm AS backend-builder
 WORKDIR /src
 
+ARG LLVM_VERSION=21
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libmariadb-dev libpq-dev libsqlite3-dev libssl-dev pkg-config \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+        libmariadb-dev libpq-dev libsqlite3-dev libssl-dev openssl pkg-config \
+    && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key \
+    && gpg --dearmor --output /usr/share/keyrings/llvm.gpg /tmp/llvm-snapshot.gpg.key \
+    && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-${LLVM_VERSION} main" > /etc/apt/sources.list.d/llvm.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang-${LLVM_VERSION} lld-${LLVM_VERSION} llvm-${LLVM_VERSION} \
+    && rm -f /tmp/llvm-snapshot.gpg.key \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PATH="/usr/lib/llvm-${LLVM_VERSION}/bin:${PATH}" \
+    CC=clang \
+    CXX=clang++ \
+    AR=llvm-ar \
+    RANLIB=llvm-ranlib
+
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
 COPY backend/ backend/
 COPY --from=frontend-builder /src/frontend/dist frontend/dist
 

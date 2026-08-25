@@ -36,7 +36,7 @@ import {
   UserRound,
   Users
 } from "lucide-react";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Check,
@@ -57,17 +57,34 @@ import {
   LoginMethodSwitcher
 } from "./components/LoginMethod";
 import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
-import { ApplicationWorkspace } from "./features/applications/ApplicationWorkspace";
-import { WalletWorkspace } from "./features/billing/WalletWorkspace";
+import { InvitationRedemptionsModal } from "./features/invitations/InvitationRedemptionsModal";
+import { useInvitationRedemptions } from "./features/invitations/useInvitationRedemptions";
+import { useAccountController } from "./features/admin/use-account-controller";
+import { useApplicationController } from "./features/admin/use-application-controller";
+import { useAdminDataLoader } from "./features/admin/use-admin-data-loader";
+import { useLatestRequest } from "./features/admin/use-latest-request";
+import { useInvitationController } from "./features/admin/use-invitation-controller";
+import { deriveAdminPermissions } from "./features/admin/admin-permissions";
+import { useAdminNavigation } from "./features/navigation/useAdminNavigation";
+import { useOrganizationController } from "./features/admin/use-organization-controller";
+import { useRoleController } from "./features/admin/use-role-controller";
+import { useSettingsController } from "./features/admin/use-settings-controller";
+import { useSessionController } from "./features/session/useSessionController";
+import { PortalSettingsPanel } from "./features/settings/PortalSettingsPanel";
+import { useUserDirectoryCursor } from "./features/users/use-user-directory";
+import { useUserSelection } from "./features/users/use-user-selection";
+import { isDirtyDomain } from "./features/admin/stable-domain-comparator";
+import { useUserController } from "./features/admin/use-user-controller";
+import * as adminApi from "./lib/api/admin";
+import * as accountApi from "./lib/api/account";
+import type { WalletWorkspaceHandle } from "./features/billing/WalletWorkspace";
 import { translations } from "./i18n";
 import type { TranslationKey } from "./i18n";
 import {
   api,
-  ApiError,
-  cachedApi,
-  cachedApiValue,
-  setApiCacheScope
+  ApiError
 } from "./lib/api";
+import * as applicationApi from "./lib/api/applications";
 import {
   applyEmailDomain,
   authContextError,
@@ -82,7 +99,6 @@ import {
 } from "./lib/auth-flow";
 import {
   matchesSearch,
-  sortUsersForDisplay,
   toggleValue
 } from "./lib/collection-utils";
 import {
@@ -98,10 +114,7 @@ import {
   emptyAuditWebhookForm,
   emptyAuthorizationCodeLoginForm,
   emptyApplicationForm,
-  emptyClaimMapperForm,
-  emptyClientForm,
   emptyGroupForm,
-  emptyIapApplicationForm,
   emptyInvitationForm,
   emptyLdapProviderForm,
   emptyOrganizationForm,
@@ -123,7 +136,6 @@ import type {
   AccessGroup,
   ApplicationClientBinding,
   ApplicationModule,
-  ApplicationSection,
   AuditEvent,
   AuditWebhook,
   BrowserAccount,
@@ -133,16 +145,11 @@ import type {
   AuthMode,
   BulkUserImportResult,
   BulkUserImportRow,
-  Bootstrap,
   Client,
-  ClientClaimMapperForm,
   ExternalProvider,
   ExternalProviderDiscovery,
   ExternalProviderTemplate,
-  IapApplication,
   Invitation,
-  InvitationRedemption,
-  InvitationRedemptionsPage,
   LdapProvider,
   Locale,
   LoginAuthorizationCodeLevel,
@@ -151,21 +158,13 @@ import type {
   LoginSettings,
   LoginSettingsDraft,
   LogoutResponse,
-  MfaConfirmResponse,
-  MfaStatus,
-  MyConsent,
-  MySession,
   Organization,
-  OrganizationContext,
   OrganizationMember,
   OrganizationMemberInvitationCreateResponse,
   OrganizationMemberRole,
   OrganizationOption,
   OidcContinuationLoginResponse,
   Overview,
-  Passkey,
-  PasskeyAuthenticationStart,
-  PasskeyRegistrationStart,
   PendingConfirmation,
   PermissionInfo,
   QuickLink,
@@ -178,13 +177,23 @@ import type {
   Tab,
   Theme,
   TenantApplication,
-  TotpSetup,
   User,
   UserAccess,
   UserDetail,
   UserFilter,
-  UserOrganization
+  UserOption,
 } from "./types";
+
+const ApplicationWorkspace = lazy(() =>
+  import("./features/applications/ApplicationWorkspace").then(({ ApplicationWorkspace }) => ({
+    default: ApplicationWorkspace
+  }))
+);
+const WalletWorkspace = lazy(() =>
+  import("./features/billing/WalletWorkspace").then(({ WalletWorkspace }) => ({
+    default: WalletWorkspace
+  }))
+);
 
 const AUTHORIZATION_CODES_API = "/api/admin/authorization-codes";
 const BULK_USER_IMPORT_API = "/api/admin/users/import-csv";
@@ -212,26 +221,6 @@ const emptyEnterpriseForm: EnterpriseFormState = {
   description: "",
   allowed_email_domains: ""
 };
-
-function timestampAtDayEnd(value: string): number | null {
-  const timestamp = toTimestamp(value);
-  return timestamp === null ? null : timestamp + 86_400;
-}
-
-function isDomesticLoginIp(value: string | null): boolean {
-  if (!value) return false;
-  const ip = value.trim().toLowerCase();
-  // Local/private addresses are common in self-hosted deployments and should
-  // remain visible under the domestic view. Public addresses can be enriched
-  // with a country code by an upstream proxy in the "cn:<ip>" form.
-  return ip.startsWith("cn:")
-    || ip === "localhost"
-    || ip === "::1"
-    || /^127\./.test(ip)
-    || /^10\./.test(ip)
-    || /^192\.168\./.test(ip)
-    || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
-}
 
 function lifecycleStateForUser(user: Pick<User, "is_active" | "archived_at">): UserLifecycleState {
   if (user.archived_at !== null) return "archived";
@@ -340,179 +329,299 @@ export function App() {
     return err instanceof Error ? err.message : t(fallback);
   };
 
-  const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
-  const [user, setUser] = useState<User | null | undefined>(undefined);
-  const [tab, setTab] = useState<Tab>(initialNavigationState.tab);
-  const [applicationNavigationId, setApplicationNavigationId] = useState<string | null>(initialNavigationState.applicationId);
-  const [applicationNavigationSection, setApplicationNavigationSection] = useState<ApplicationSection | null>(initialNavigationState.applicationSection);
-  const [billingOrderReference, setBillingOrderReference] = useState<string | null>(initialNavigationState.billingOrder);
-  const [applicationWorkspaceDirty, setApplicationWorkspaceDirty] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-  const [adminLoading, setAdminLoading] = useState(false);
+  const applicationCreateMutationRef = useRef<{
+    fingerprint: string;
+    key: string;
+  } | null>(null);
+  const applicationDeleteMutationRef = useRef<{
+    applicationId: string;
+    organizationId: string | null;
+    scopeKey: string | null;
+    key: string;
+  } | null>(null);
+  const bulkLifecycleMutationRef = useRef<{
+    action: adminApi.UserLifecycleBatchAction;
+    userIds: string[];
+    key: string;
+  } | null>(null);
+  const walletWorkspaceRef = useRef<WalletWorkspaceHandle | null>(null);
   const [initialLoadError, setInitialLoadError] = useState("");
-  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
-  const adminLoadId = useRef(0);
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [users, setUsers] = useState<User[]>([]);
-  const [clients, setClients] = useState<Client[]>([]);
-  const [applications, setApplications] = useState<TenantApplication[]>([]);
-  const [iapApplications, setIapApplications] = useState<IapApplication[]>([]);
-  const [invitations, setInvitations] = useState<Invitation[]>([]);
-  const [registrationSettings, setRegistrationSettings] = useState<RegistrationSettings | null>(null);
-  const [registrationSettingsBaseline, setRegistrationSettingsBaseline] = useState<RegistrationSettings | null>(null);
-  const [providers, setProviders] = useState<ExternalProvider[]>([]);
-  const [providerTemplates, setProviderTemplates] = useState<ExternalProviderTemplate[]>([]);
-  const [ldapProviders, setLdapProviders] = useState<LdapProvider[]>([]);
-  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
-  const [auditWebhooks, setAuditWebhooks] = useState<AuditWebhook[]>([]);
-  const [permissionCatalog, setPermissionCatalog] = useState<PermissionInfo[]>([]);
-  const [roles, setRoles] = useState<Role[]>([]);
-  const [groups, setGroups] = useState<AccessGroup[]>([]);
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
-  const [organizationOptions, setOrganizationOptions] = useState<OrganizationOption[]>([]);
-  const [myOrganizations, setMyOrganizations] = useState<UserOrganization[]>([]);
-  const [organizationContext, setOrganizationContext] = useState<UserOrganization | null>(null);
-  const [enterpriseContextReady, setEnterpriseContextReady] = useState(false);
-  const [mfaStatus, setMfaStatus] = useState<MfaStatus | null>(null);
-  const [totpSetup, setTotpSetup] = useState<TotpSetup | null>(null);
-  const [totpSetupCode, setTotpSetupCode] = useState("");
-  const [newRecoveryCodes, setNewRecoveryCodes] = useState<string[]>([]);
-  const [passkeys, setPasskeys] = useState<Passkey[]>([]);
-  const [passkeyName, setPasskeyName] = useState("");
-  const [myConsents, setMyConsents] = useState<MyConsent[]>([]);
-  const [mySessions, setMySessions] = useState<MySession[]>([]);
-  const [securityPolicy, setSecurityPolicy] = useState<SecurityPolicy | null>(null);
-  const [signingKeys, setSigningKeys] = useState<SigningKey[]>([]);
-  const [signingKeyKid, setSigningKeyKid] = useState("");
-  const [settings, setSettings] = useState<SettingsSummary | null>(null);
-  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
-  const [runtimeSettingsBaseline, setRuntimeSettingsBaseline] = useState<RuntimeSettings | null>(null);
-  const [loginSettings, setLoginSettings] = useState<LoginSettings | null>(null);
-  const [loginSettingsBaseline, setLoginSettingsBaseline] = useState<LoginSettingsDraft | null>(null);
-  const [securityPolicyBaseline, setSecurityPolicyBaseline] = useState<SecurityPolicy | null>(null);
-  const [selectedUser, setSelectedUser] = useState<UserDetail | null>(null);
-  const [userFilter, setUserFilter] = useState<UserFilter>("live");
-  const [userOrganizationFilter, setUserOrganizationFilter] = useState("");
-  const [userFiltersExpanded, setUserFiltersExpanded] = useState(false);
-  const [userEmailFilter, setUserEmailFilter] = useState("");
-  const [userRoleFilter, setUserRoleFilter] = useState<UserRoleFilter>("all");
-  const [userRegistrationFrom, setUserRegistrationFrom] = useState("");
-  const [userRegistrationTo, setUserRegistrationTo] = useState("");
-  const [userLastLoginFrom, setUserLastLoginFrom] = useState("");
-  const [userLastLoginTo, setUserLastLoginTo] = useState("");
-  const [userPhoneFilter, setUserPhoneFilter] = useState("");
-  const [userLoginRegionFilter, setUserLoginRegionFilter] = useState<UserLoginRegionFilter>("all");
-  const [userLinkedIdentityFilter, setUserLinkedIdentityFilter] = useState<UserLinkedIdentityFilter>("all");
-  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
-  const [userForm, setUserForm] = useState(emptyUserForm);
-  const [userFormBaseline, setUserFormBaseline] = useState<typeof emptyUserForm | null>(null);
-  const [bulkImportOpen, setBulkImportOpen] = useState(false);
-  const [bulkImportCsv, setBulkImportCsv] = useState("");
-  const [bulkImportFileName, setBulkImportFileName] = useState("");
-  const [bulkImportDryRun, setBulkImportDryRun] = useState(true);
-  const [bulkImportCommitConfirmed, setBulkImportCommitConfirmed] = useState(false);
-  const [bulkImportResult, setBulkImportResult] = useState<BulkUserImportResult | null>(null);
-  const [bulkImportError, setBulkImportError] = useState("");
-  const [registerForm, setRegisterForm] = useState(emptyRegisterForm);
-  const [registrationCodeInspection, setRegistrationCodeInspection] = useState<AuthorizationCodeInspection | null>(null);
-  const [registrationCodeInspecting, setRegistrationCodeInspecting] = useState(false);
-  const [passwordResetForm, setPasswordResetForm] = useState(emptyPasswordResetForm);
-  const [clientForm, setClientForm] = useState(emptyClientForm);
-  const [clientFormBaseline, setClientFormBaseline] = useState<typeof emptyClientForm | null>(null);
-  const [clientFormErrors, setClientFormErrors] = useState<string[]>([]);
-  const [clientFieldErrors, setClientFieldErrors] = useState<Record<string, string>>({});
-  const [applicationForm, setApplicationForm] = useState(emptyApplicationForm);
-  const [applicationFormBaseline, setApplicationFormBaseline] = useState<typeof emptyApplicationForm | null>(null);
-  const [enterpriseForm, setEnterpriseForm] = useState<EnterpriseFormState>(emptyEnterpriseForm);
-  const [enterpriseFormBaseline, setEnterpriseFormBaseline] = useState<EnterpriseFormState | null>(null);
-  const [enterpriseMemberEmail, setEnterpriseMemberEmail] = useState("");
-  const [enterpriseMemberRole, setEnterpriseMemberRole] = useState<OrganizationMemberRole>("member");
-  const [organizationMemberInvitations, setOrganizationMemberInvitations] = useState<Invitation[]>([]);
-  const [organizationMemberInvitationForm, setOrganizationMemberInvitationForm] = useState({
-    email: "",
-    display_name: "",
-    description: "",
-    expires_at: "",
-    organization_role: "member" as OrganizationMemberRole,
-    is_active: true
+  const accountController = useAccountController({
+    initialAuth,
+    initialError: authContextError(initialAuth, t)
   });
-  const [revealedOrganizationMemberInvitation, setRevealedOrganizationMemberInvitation] = useState<OrganizationMemberInvitationCreateResponse | null>(null);
-  const [iapApplicationForm, setIapApplicationForm] = useState(emptyIapApplicationForm);
-  const [iapApplicationFormBaseline, setIapApplicationFormBaseline] = useState<typeof emptyIapApplicationForm | null>(null);
-  const [invitationForm, setInvitationForm] = useState(emptyInvitationForm);
-  const [invitationFormBaseline, setInvitationFormBaseline] = useState<typeof emptyInvitationForm | null>(null);
-  const [revealedInvitation, setRevealedInvitation] = useState<Invitation | null>(null);
-  const [revealedInvitationCode, setRevealedInvitationCode] = useState("");
-  const [revealingInvitationId, setRevealingInvitationId] = useState("");
-  const [invitationRevealError, setInvitationRevealError] = useState("");
-  const [redemptionsInvitation, setRedemptionsInvitation] = useState<Invitation | null>(null);
-  const [invitationRedemptions, setInvitationRedemptions] = useState<InvitationRedemption[]>([]);
-  const [invitationRedemptionsNextCursor, setInvitationRedemptionsNextCursor] = useState<string | null>(null);
-  const [invitationRedemptionsLoading, setInvitationRedemptionsLoading] = useState(false);
-  const [invitationRedemptionsError, setInvitationRedemptionsError] = useState("");
-  const invitationRedemptionsLoadId = useRef(0);
-  const [roleForm, setRoleForm] = useState(emptyRoleForm);
-  const [roleFormBaseline, setRoleFormBaseline] = useState<typeof emptyRoleForm | null>(null);
-  const [groupForm, setGroupForm] = useState(emptyGroupForm);
-  const [groupFormBaseline, setGroupFormBaseline] = useState<typeof emptyGroupForm | null>(null);
-  const [organizationForm, setOrganizationForm] = useState(emptyOrganizationForm);
-  const [organizationFormBaseline, setOrganizationFormBaseline] = useState<typeof emptyOrganizationForm | null>(null);
-  const [organizationMemberRolesBaseline, setOrganizationMemberRolesBaseline] = useState<Record<string, string> | null>(null);
-  const [organizationMemberRoles, setOrganizationMemberRoles] = useState<Record<string, string>>({});
-  const [organizationMembers, setOrganizationMembers] = useState<OrganizationMember[]>([]);
-  const [organizationMembersLoading, setOrganizationMembersLoading] = useState(false);
-  const organizationMembersLoadId = useRef(0);
-  const [selectedAccessUserId, setSelectedAccessUserId] = useState("");
-  const [userAccess, setUserAccess] = useState<UserAccess | null>(null);
-  const [providerForm, setProviderForm] = useState(emptyProviderForm);
-  const [providerFormBaseline, setProviderFormBaseline] = useState<typeof emptyProviderForm | null>(null);
-  const [providerTemplateId, setProviderTemplateId] = useState("");
-  const [ldapProviderForm, setLdapProviderForm] = useState(emptyLdapProviderForm);
-  const [ldapProviderFormBaseline, setLdapProviderFormBaseline] = useState<typeof emptyLdapProviderForm | null>(null);
-  const [auditWebhookForm, setAuditWebhookForm] = useState(emptyAuditWebhookForm);
-  const [auditWebhookFormBaseline, setAuditWebhookFormBaseline] = useState<typeof emptyAuditWebhookForm>(emptyAuditWebhookForm);
-  const [editor, setEditor] = useState<
-    "user" | "organization" | "enterprise" | "application" | "client" | "iap" | "invitation" | "provider" | "ldap" | "role" | "group" | null
-  >(null);
-  const [loginSettingsDraft, setLoginSettingsDraft] = useState<LoginSettingsDraft>({
-    brand_logo_url: "",
-    email_domains: "",
-    quick_links: []
+  const {
+    mfaStatus,
+    setMfaStatus,
+    totpSetup,
+    setTotpSetup,
+    totpSetupCode,
+    setTotpSetupCode,
+    newRecoveryCodes,
+    setNewRecoveryCodes,
+    passkeys,
+    setPasskeys,
+    passkeyName,
+    setPasskeyName,
+    myConsents,
+    setMyConsents,
+    mySessions,
+    setMySessions,
+    signingKeyKid,
+    setSigningKeyKid,
+    accountLoadId,
+    accountAbortController,
+    registerForm,
+    setRegisterForm,
+    registrationCodeInspection,
+    setRegistrationCodeInspection,
+    registrationCodeInspecting,
+    setRegistrationCodeInspecting,
+    passwordResetForm,
+    setPasswordResetForm,
+    authEmail,
+    setAuthEmail,
+    loginMethod,
+    setLoginMethod,
+    authorizationCodeLoginForm,
+    setAuthorizationCodeLoginForm,
+    loginPassword,
+    setLoginPassword,
+    loginMfaChallengeId,
+    setLoginMfaChallengeId,
+    loginMfaCode,
+    setLoginMfaCode,
+    loginRecoveryAvailable,
+    setLoginRecoveryAvailable,
+    loginCaptchaChallengeId,
+    setLoginCaptchaChallengeId,
+    loginCaptchaPrompt,
+    setLoginCaptchaPrompt,
+    loginCaptchaAnswer,
+    setLoginCaptchaAnswer,
+    loginCustomDomain,
+    setLoginCustomDomain,
+    registerCustomDomain,
+    setRegisterCustomDomain,
+    resetCustomDomain,
+    setResetCustomDomain,
+    authMode,
+    setAuthMode,
+    authReturnTo,
+    accountLoginExpanded,
+    setAccountLoginExpanded,
+    accountLoginFlow,
+    setAccountLoginFlow,
+    browserAccountsContext,
+    setBrowserAccountsContext,
+    selectedBrowserAccount,
+    setSelectedBrowserAccount,
+    continueWithBrowserAccount,
+    setContinueWithBrowserAccount,
+    browserAccountContinuing,
+    setBrowserAccountContinuing,
+    lastInvitationCode,
+    setLastInvitationCode,
+    verificationMessage,
+    setVerificationMessage,
+    error,
+    setError,
+    busy,
+    setBusy,
+    authModeHeadingRef,
+    pendingConfirmation,
+    setPendingConfirmation
+  } = accountController;
+
+  const {
+    selectedUser,
+    setSelectedUser,
+    userFilter,
+    setUserFilter,
+    userOrganizationFilter,
+    setUserOrganizationFilter,
+    userFiltersExpanded,
+    setUserFiltersExpanded,
+    userEmailFilter,
+    setUserEmailFilter,
+    userRoleFilter,
+    setUserRoleFilter,
+    userRegistrationFrom,
+    setUserRegistrationFrom,
+    userRegistrationTo,
+    setUserRegistrationTo,
+    userLastLoginFrom,
+    setUserLastLoginFrom,
+    userLastLoginTo,
+    setUserLastLoginTo,
+    userPhoneFilter,
+    setUserPhoneFilter,
+    userLoginRegionFilter,
+    setUserLoginRegionFilter,
+    userLinkedIdentityFilter,
+    setUserLinkedIdentityFilter,
+    userDirectoryPage,
+    setUserDirectoryPage,
+    userDirectoryPageSize,
+    userDirectoryCursorHistory,
+    setUserDirectoryCursorHistory,
+    selectedUserIds,
+    setSelectedUserIds,
+    userForm,
+    setUserForm,
+    userFormBaseline,
+    setUserFormBaseline,
+    bulkImportOpen,
+    setBulkImportOpen,
+    bulkImportCsv,
+    setBulkImportCsv,
+    bulkImportFileName,
+    setBulkImportFileName,
+    bulkImportDryRun,
+    setBulkImportDryRun,
+    bulkImportCommitConfirmed,
+    setBulkImportCommitConfirmed,
+    bulkImportResult,
+    setBulkImportResult,
+    bulkImportError,
+    setBulkImportError
+  } = useUserController();
+
+  const {
+    applicationForm,
+    setApplicationForm,
+    applicationFormBaseline,
+    setApplicationFormBaseline
+  } = useApplicationController();
+  const organizationController = useOrganizationController();
+  const {
+    enterpriseForm,
+    setEnterpriseForm,
+    enterpriseFormBaseline,
+    setEnterpriseFormBaseline,
+    enterpriseMemberEmail,
+    setEnterpriseMemberEmail,
+    enterpriseMemberRole,
+    setEnterpriseMemberRole,
+    organizationMemberInvitationForm,
+    setOrganizationMemberInvitationForm,
+    revealedOrganizationMemberInvitation,
+    setRevealedOrganizationMemberInvitation,
+    organizationForm,
+    setOrganizationForm,
+    organizationFormBaseline,
+    setOrganizationFormBaseline,
+    organizationMemberRolesBaseline,
+    setOrganizationMemberRolesBaseline,
+    organizationMemberRoles,
+    setOrganizationMemberRoles,
+    organizationMembers,
+    setOrganizationMembers,
+    organizationMemberInvitations,
+    setOrganizationMemberInvitations,
+    organizationMembersLoading,
+    setOrganizationMembersLoading,
+    organizationMembersLoadId
+  } = organizationController;
+  const {
+    invitationForm,
+    setInvitationForm,
+    invitationFormBaseline,
+    setInvitationFormBaseline,
+    revealedInvitation,
+    setRevealedInvitation,
+    revealedInvitationCode,
+    setRevealedInvitationCode,
+    revealingInvitationId,
+    setRevealingInvitationId,
+    invitationRevealError,
+    setInvitationRevealError
+  } = useInvitationController();
+  const {
+    roleForm,
+    setRoleForm,
+    roleFormBaseline,
+    setRoleFormBaseline,
+    groupForm,
+    setGroupForm,
+    groupFormBaseline,
+    setGroupFormBaseline,
+    selectedAccessUserId,
+    setSelectedAccessUserId,
+    userAccess,
+    setUserAccess
+  } = useRoleController();
+  const {
+    providerForm,
+    setProviderForm,
+    providerFormBaseline,
+    setProviderFormBaseline,
+    providerTemplateId,
+    setProviderTemplateId,
+    ldapProviderForm,
+    setLdapProviderForm,
+    ldapProviderFormBaseline,
+    setLdapProviderFormBaseline,
+    auditWebhookForm,
+    setAuditWebhookForm,
+    auditWebhookFormBaseline,
+    setAuditWebhookFormBaseline,
+    editor,
+    setEditor,
+    loginSettingsDraft,
+    setLoginSettingsDraft,
+    quickLinkForm,
+    setQuickLinkForm,
+    quickLinkFormBaseline,
+    setQuickLinkFormBaseline,
+    providerDiscoveryRequest
+  } = useSettingsController();
+
+  const userDetailsRequest = useLatestRequest();
+  const userAccessRequest = useLatestRequest();
+
+  const session = useSessionController({ returnTo: authReturnTo });
+  const {
+    bootstrap,
+    user,
+    myOrganizations,
+    organizationContext,
+    cacheScope,
+    organizationContextReady: enterpriseContextReady,
+    initialize: initializeSession,
+    loadBootstrap: loadSessionBootstrap,
+    loadOrganizationContext: loadSessionOrganizationContext,
+    switchOrganization: switchSessionOrganization,
+    transitionToAuthenticated,
+    transitionToAnonymous
+  } = session;
+  const invitationRedemptions = useInvitationRedemptions();
+  const invitationRedemptionsError = invitationRedemptions.error
+    ? messageOr(invitationRedemptions.error, "loadAuthorizationCodeRedemptionsFailed")
+    : "";
+
+  const {
+    tab,
+    applicationId: applicationNavigationId,
+    applicationSection: applicationNavigationSection,
+    billingOrder: billingOrderReference,
+    dirtyNavigation,
+    navigateToTab
+  } = useAdminNavigation({
+    initialState: initialNavigationState,
+    confirmNavigation: () => window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`),
+    onAccepted: () => {
+      resetUserDirectoryQueryState();
+      setSearchQuery("");
+      setSidebarOpen(false);
+    }
   });
-  const [quickLinkForm, setQuickLinkForm] = useState(emptyQuickLinkForm);
-  const [authEmail, setAuthEmail] = useState(initialAuth.loginHint || "");
-  const [loginMethod, setLoginMethod] = useState<LoginMethod>("password");
-  const [authorizationCodeLoginForm, setAuthorizationCodeLoginForm] = useState(emptyAuthorizationCodeLoginForm);
-  const [loginPassword, setLoginPassword] = useState("");
-  const [loginMfaChallengeId, setLoginMfaChallengeId] = useState("");
-  const [loginMfaCode, setLoginMfaCode] = useState("");
-  const [loginRecoveryAvailable, setLoginRecoveryAvailable] = useState(false);
-  const [loginCaptchaChallengeId, setLoginCaptchaChallengeId] = useState("");
-  const [loginCaptchaPrompt, setLoginCaptchaPrompt] = useState("");
-  const [loginCaptchaAnswer, setLoginCaptchaAnswer] = useState("");
-  const [loginCustomDomain, setLoginCustomDomain] = useState("");
-  const [registerCustomDomain, setRegisterCustomDomain] = useState("");
-  const [resetCustomDomain, setResetCustomDomain] = useState("");
-  const [authMode, setAuthMode] = useState<AuthMode>(initialAuth.mode);
-  const [authReturnTo] = useState(initialAuth.returnTo);
-  const [accountLoginExpanded, setAccountLoginExpanded] = useState(
-    () => Boolean(initialAuth.accountFlow)
-  );
-  const [accountLoginFlow, setAccountLoginFlow] = useState<string | null>(null);
-  const [browserAccountsContext, setBrowserAccountsContext] = useState<BrowserAccountsContext | null>(null);
-  const [selectedBrowserAccount, setSelectedBrowserAccount] = useState<BrowserAccount | null>(null);
-  const [continueWithBrowserAccount, setContinueWithBrowserAccount] = useState<BrowserAccountContinuation | null>(null);
-  const [browserAccountContinuing, setBrowserAccountContinuing] = useState(false);
-  const [lastInvitationCode, setLastInvitationCode] = useState("");
-  const [verificationMessage, setVerificationMessage] = useState("");
-  const [error, setError] = useState(() => authContextError(initialAuth, t));
-  const [busy, setBusy] = useState(false);
-  const authModeHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
   const userPermissions = user?.permissions ?? [];
   const isTrialEnrollmentSession = user?.session_kind === "trial_enrollment"
@@ -534,37 +643,198 @@ export function App() {
   );
   const effectiveAccountFlow = accountLoginFlow ?? initialAuth.accountFlow;
   const authFormsVisible = accountLoginExpanded || !selectedBrowserAccount;
-  const hasPermission = (...permissions: string[]) =>
-    permissions.some((permission) => userPermissions.includes(permission));
-  const canManageActiveOrganization = Boolean(
-    organizationContext
-    && (
-      hasPermission("organizations.manage")
-      || (
-        organizationContext.kind !== "system"
-        && (organizationContext.role === "owner" || organizationContext.role === "admin")
-      )
-    )
-  );
-  const hasGlobalConsolePermission = userPermissions.length > 0;
-  const canAdmin = !isRestrictedLoginCodeSession && (hasGlobalConsolePermission || canManageActiveOrganization);
-  const canReadUsers = hasPermission("users.read", "users.manage", "organizations.manage", "security.manage");
-  const canManageUsers = hasPermission("users.manage");
-  const canReadClients = hasPermission("clients.read", "clients.manage") || canManageActiveOrganization;
-  const canManageClients = hasPermission("clients.manage") || canManageActiveOrganization;
-  const canReadIap = hasPermission("iap.read", "iap.manage");
-  const canManageIap = hasPermission("iap.manage");
-  const canReadOrganizations = hasPermission(
-    "organizations.read",
-    "organizations.manage"
-  );
-  const canManageOrganizations = hasPermission("organizations.manage");
-  const canManageAuthorizationCodes = hasPermission("authorization_codes.manage");
-  const canManageSettings = hasPermission("settings.manage");
-  const canManagePlatformProviders = hasPermission("providers.manage");
-  const canManageProviders = canManagePlatformProviders || canManageActiveOrganization;
-  const canReadAudit = hasPermission("audit.read");
-  const canManageSecurity = hasPermission("security.manage");
+  const {
+    hasGlobalConsolePermission,
+    canAdmin,
+    canReadUsers,
+    canManageUsers,
+    canManageActiveOrganization,
+    canReadOrganizations,
+    canManageOrganizations,
+    canManageAuthorizationCodes,
+    canManageSettings,
+    canManagePlatformProviders,
+    canManageProviders,
+    canReadAudit,
+    canManageSecurity
+  } = deriveAdminPermissions({
+    permissions: userPermissions,
+    organization: organizationContext,
+    restrictedLoginCodeSession: isRestrictedLoginCodeSession
+  });
+
+  const {
+    overview,
+    setOverview,
+    userOptions,
+    setUserOptions,
+    clients,
+    setClients,
+    applications,
+    setApplications,
+    invitations,
+    setInvitations,
+    registrationSettings,
+    setRegistrationSettings,
+    registrationSettingsBaseline,
+    setRegistrationSettingsBaseline,
+    providers,
+    setProviders,
+    providerTemplates,
+    setProviderTemplates,
+    ldapProviders,
+    setLdapProviders,
+    auditEvents,
+    setAuditEvents,
+    auditWebhooks,
+    setAuditWebhooks,
+    permissionCatalog,
+    setPermissionCatalog,
+    roles,
+    setRoles,
+    groups,
+    setGroups,
+    organizations,
+    setOrganizations,
+    organizationOptions,
+    setOrganizationOptions,
+    signingKeys,
+    setSigningKeys,
+    settings,
+    setSettings,
+    runtimeSettings,
+    setRuntimeSettings,
+    runtimeSettingsBaseline,
+    setRuntimeSettingsBaseline,
+    loginSettings,
+    setLoginSettings,
+    loginSettingsBaseline,
+    setLoginSettingsBaseline,
+    securityPolicy,
+    setSecurityPolicy,
+    securityPolicyBaseline,
+    setSecurityPolicyBaseline,
+    adminLoading,
+    loadAdminData,
+    invalidateAdminLoad
+  } = useAdminDataLoader({
+    tab,
+    session: session.controller,
+    scopeKey: cacheScope,
+    onLoginSettingsLoaded: setLoginSettingsDraft,
+    canAdmin,
+    canReadUsers,
+    canManageActiveOrganization,
+    canReadOrganizations,
+    canManageOrganizations,
+    canManageAuthorizationCodes,
+    canManageSettings,
+    canManagePlatformProviders,
+    canManageProviders,
+    canManageSecurity,
+    canReadAudit
+  });
+
+  const userDirectoryFilterKey = useMemo(() => JSON.stringify({
+    searchQuery,
+    userFilter,
+    userOrganizationFilter,
+    userLinkedIdentityFilter,
+    userEmailFilter,
+    userRoleFilter,
+    userRegistrationFrom,
+    userRegistrationTo,
+    userLastLoginFrom,
+    userLastLoginTo,
+    userPhoneFilter,
+    userLoginRegionFilter
+  }), [
+    searchQuery,
+    userEmailFilter,
+    userFilter,
+    userLastLoginFrom,
+    userLastLoginTo,
+    userLinkedIdentityFilter,
+    userLoginRegionFilter,
+    userOrganizationFilter,
+    userPhoneFilter,
+    userRegistrationFrom,
+    userRegistrationTo,
+    userRoleFilter
+  ]);
+  const previousUserDirectoryFilterKey = useRef(userDirectoryFilterKey);
+  const userDirectoryFilterTransition = previousUserDirectoryFilterKey.current !== userDirectoryFilterKey;
+  useEffect(() => {
+    previousUserDirectoryFilterKey.current = userDirectoryFilterKey;
+  }, [userDirectoryFilterKey]);
+
+  const userDirectoryQuery = useMemo(() => ({
+    // Filter changes are reconciled by the following effect, but the query
+    // must switch to the first keyset page during the same render. Otherwise
+    // the cursor from the previous filter set can issue one stale request.
+    page: userDirectoryFilterTransition ? 1 : userDirectoryPage,
+    page_size: userDirectoryPageSize,
+    cursor: userDirectoryFilterTransition
+      ? undefined
+      : userDirectoryCursorHistory[userDirectoryPage - 1] ?? undefined,
+    status: userFilter,
+    search: searchQuery,
+    organization_id: userOrganizationFilter,
+    linked_identity: userLinkedIdentityFilter === "all" ? undefined : userLinkedIdentityFilter,
+    email: userEmailFilter,
+    phone: userPhoneFilter,
+    role: userRoleFilter === "all" ? undefined : userRoleFilter,
+    registration_from: userRegistrationFrom,
+    registration_to: userRegistrationTo,
+    last_login_from: userLastLoginFrom,
+    last_login_to: userLastLoginTo,
+    login_region: userLoginRegionFilter === "all" ? undefined : userLoginRegionFilter
+  }), [
+    searchQuery,
+    userDirectoryCursorHistory,
+    userDirectoryFilterKey,
+    userDirectoryFilterTransition,
+    userDirectoryPage,
+    userEmailFilter,
+    userFilter,
+    userLastLoginFrom,
+    userLastLoginTo,
+    userLinkedIdentityFilter,
+    userLoginRegionFilter,
+    userOrganizationFilter,
+    userPhoneFilter,
+    userRegistrationFrom,
+    userRegistrationTo,
+    userRoleFilter
+  ]);
+  const userDirectory = useUserDirectoryCursor({
+    endpoint: "/api/admin/users/cursor",
+    query: userDirectoryQuery,
+    enabled: canAdmin && canReadUsers && !initialAuth.isAuthPage && tab === "users",
+    scopeKey: cacheScope
+  });
+
+  // The cursor query is the sole owner of the visible page. Keeping a second
+  // controller-owned users/next-cursor mirror creates a stale render window
+  // whenever a filter, account, or organization scope changes.
+  const users = userDirectory.data?.items ?? [];
+  const userDirectoryNextCursor = userDirectory.data?.next_cursor ?? null;
+
+  useEffect(() => {
+    if (userDirectory.data?.items.length === 0 && userDirectoryPage > 1) {
+      // A mutation can remove the only row on the current cursor page. Go
+      // back to the retained predecessor instead of leaving a dead end.
+      setUserDirectoryPage((page) => Math.max(1, page - 1));
+    }
+    if (tab === "users" && userDirectory.data) setError("");
+  }, [setError, tab, userDirectory.data, userDirectoryPage]);
+
+  useEffect(() => {
+    if (tab !== "users") return;
+    if (userDirectory.error) setError(messageOr(userDirectory.error, "loadFailed"));
+  }, [tab, userDirectory.error, userDirectory.loading]);
+
+  const adminViewLoading = adminLoading || userDirectory.loading;
 
   function setSharedAuthEmail(value: string) {
     setAuthEmail(value);
@@ -653,7 +923,10 @@ export function App() {
   }
 
   function finishInteractiveAuth(nextUser: User): boolean {
-    setUser(nextUser);
+    // Session ownership lives in the controller. Loading the organization
+    // context here also closes the old login path where a newly authenticated
+    // account retained the previous account's enterprise/cache scope.
+    void transitionToAuthenticated(nextUser).catch(() => undefined);
     if (!authReturnTo) {
       // Explicit auth routes deliberately keep the unified chooser visible
       // for an already authenticated visitor. Once this page itself has just
@@ -697,9 +970,7 @@ export function App() {
   }
 
   async function loadBootstrap() {
-    const target = authReturnTo ? `?return_to=${encodeURIComponent(authReturnTo)}` : "";
-    const next = await api<Bootstrap>(`/api/public/bootstrap${target}`);
-    setBootstrap(next);
+    const next = await loadSessionBootstrap(authReturnTo);
     if (!localStorage.getItem("gpt-sso-locale") && next.default_locale === "en-US") {
       setLocale("en-US");
     }
@@ -708,278 +979,78 @@ export function App() {
     }
   }
 
-  async function loadMe() {
-    const me = await api<User | null>("/api/me");
-    setApiCacheScope(me?.id ?? null);
-    setUser(me);
-    return me;
+  async function loadEnterpriseContext(userId?: string) {
+    return loadSessionOrganizationContext(userId);
   }
 
-  async function loadEnterpriseContext(userId?: string) {
-    try {
-      const [nextOrganizations, nextContext] = await Promise.all([
-        api<UserOrganization[]>("/api/me/organizations"),
-        api<OrganizationContext>("/api/me/organization-context")
-      ]);
-      setMyOrganizations(nextOrganizations);
-      setOrganizationContext(nextContext.organization);
-      setApiCacheScope(`${userId ?? user?.id ?? "anonymous"}:${nextContext.organization?.id ?? "none"}`);
-    } finally {
-      setEnterpriseContextReady(true);
-    }
+  function invalidateAccountLoad() {
+    accountLoadId.current += 1;
+    accountAbortController.current?.abort();
+    accountAbortController.current = null;
   }
 
   async function loadAccountData() {
-    if (!user) {
-      setMfaStatus(null);
-      setPasskeys([]);
-      setMyConsents([]);
-      setMySessions([]);
-      return;
-    }
-    const [nextMfaStatus, nextPasskeys, nextConsents, nextSessions] = await Promise.all([
-      api<MfaStatus>("/api/mfa/status"),
-      api<Passkey[]>("/api/passkeys"),
-      api<MyConsent[]>("/api/me/consents"),
-      api<MySession[]>("/api/me/sessions")
-    ]);
-    setMfaStatus(nextMfaStatus);
-    setPasskeys(nextPasskeys);
-    setMyConsents(nextConsents);
-    setMySessions(nextSessions);
-  }
-
-  function usersListPath() {
-    const params = new URLSearchParams({ status: userFilter });
-    if (userOrganizationFilter) params.set("organization_id", userOrganizationFilter);
-    if (userLinkedIdentityFilter !== "all") params.set("linked_identity", userLinkedIdentityFilter);
-    return `/api/admin/users?${params.toString()}`;
-  }
-
-  function hasCachedAdminTab(targetTab: Tab): boolean {
-    switch (targetTab) {
-      case "overview": return cachedApiValue<Overview>("/api/admin/overview") !== undefined;
-      case "users": return cachedApiValue<User[]>(usersListPath()) !== undefined;
-      case "applications": return cachedApiValue<TenantApplication[]>("/api/admin/applications") !== undefined;
-      case "clients": return cachedApiValue<Client[]>("/api/admin/clients") !== undefined;
-      case "iap": return cachedApiValue<IapApplication[]>("/api/admin/iap-applications") !== undefined;
-      case "organizations": return cachedApiValue<Organization[]>("/api/admin/organizations") !== undefined;
-      case "invitations": return cachedApiValue<Invitation[]>(AUTHORIZATION_CODES_API) !== undefined;
-      case "registration": return cachedApiValue<RegistrationSettings>("/api/admin/registration-settings") !== undefined;
-      case "providers": return cachedApiValue<ExternalProvider[]>("/api/admin/external-oidc-providers") !== undefined;
-      case "portal": return cachedApiValue<LoginSettings>("/api/admin/login-settings") !== undefined;
-      case "security": return (
-        (canManageSecurity && cachedApiValue<SecurityPolicy>("/api/admin/security-policy") !== undefined)
-        || (canReadAudit && cachedApiValue<AuditEvent[]>("/api/admin/audit-events") !== undefined)
-        || cachedApiValue<AuditWebhook[]>("/api/admin/audit-webhooks") !== undefined
-      );
-      case "settings": return cachedApiValue<RuntimeSettings>("/api/admin/runtime-settings") !== undefined;
-      case "billing": return false;
-      case "account": return false;
-    }
-  }
-
-  async function loadAdminData(targetTab: Tab = tab, options: { force?: boolean } = {}) {
-    if (!canAdmin || targetTab === "account") return;
-    const loadId = ++adminLoadId.current;
-    const isCurrent = () => adminLoadId.current === loadId;
-    const cacheAvailable = !options.force && hasCachedAdminTab(targetTab);
-    setAdminLoading(!cacheAvailable);
-
-    async function loadCached<T>(path: string, apply: (value: T) => void): Promise<T> {
-      const cached = cachedApiValue<T>(path);
-      if (cached !== undefined && isCurrent()) apply(cached);
-      const result = await cachedApi<T>(path, { force: options.force });
-      if (isCurrent() && (result.changed || cached === undefined)) apply(result.value);
-      return result.value;
-    }
+    const requestId = ++accountLoadId.current;
+    accountAbortController.current?.abort();
+    const controller = new AbortController();
+    accountAbortController.current = controller;
+    const started = session.controller.getSnapshot();
+    const startedUserId = started.user?.id ?? null;
+    const startedOrganizationId = started.organizationContext?.id ?? null;
+    const startedScope = started.cacheScope;
+    const startedSessionGeneration = session.controller.getGeneration();
+    const isCurrent = () => {
+      const current = session.controller.getSnapshot();
+      return accountLoadId.current === requestId
+        && !controller.signal.aborted
+        && session.controller.getGeneration() === startedSessionGeneration
+        && current.cacheScope === startedScope
+        && (current.user?.id ?? null) === startedUserId
+        && (current.organizationContext?.id ?? null) === startedOrganizationId;
+    };
 
     try {
-      switch (targetTab) {
-        case "overview": {
-          await loadCached<Overview>("/api/admin/overview", setOverview);
-          break;
-        }
-        case "users": {
-          if (!canReadUsers) break;
-          await Promise.all([
-            loadCached<User[]>(usersListPath(), (next) => setUsers(sortUsersForDisplay(next))),
-            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions).catch(() => undefined)
-          ]);
-          break;
-        }
-        case "clients": {
-          if (!canReadClients) break;
-          await Promise.all([
-            loadCached<Client[]>("/api/admin/clients", setClients),
-            // A client is only the protocol connection. Load the current
-            // enterprise applications beside it so the client list can make
-            // its governing access policy visible and reachable.
-            canManageActiveOrganization
-              ? loadCached<TenantApplication[]>("/api/admin/applications", setApplications).catch(() => undefined)
-              : Promise.resolve(undefined),
-            hasPermission("clients.manage")
-              ? loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
-              : Promise.resolve(undefined)
-          ]);
-          break;
-        }
-        case "applications": {
-          if (!canManageActiveOrganization) break;
-          await Promise.all([
-            loadCached<TenantApplication[]>("/api/admin/applications", setApplications),
-            loadCached<Client[]>("/api/admin/clients", setClients).catch(() => undefined),
-            loadCached<ExternalProvider[]>("/api/admin/external-oidc-providers", setProviders).catch(() => undefined),
-            canManagePlatformProviders
-              ? loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders).catch(() => undefined)
-              : Promise.resolve(undefined),
-            organizationContext
-              ? Promise.all([
-                  loadCached<OrganizationMember[]>(`/api/admin/organizations/${organizationContext.id}/members`, setOrganizationMembers),
-                  loadCached<Invitation[]>(`/api/admin/organizations/${organizationContext.id}/member-invitations`, setOrganizationMemberInvitations)
-                ]).catch(() => undefined)
-              : Promise.resolve(undefined)
-          ]);
-          break;
-        }
-        case "iap": {
-          if (!canReadIap) break;
-          await Promise.all([
-            loadCached<IapApplication[]>("/api/admin/iap-applications", setIapApplications),
-            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
-          ]);
-          break;
-        }
-        case "organizations": {
-          if (!canReadOrganizations) break;
-          await Promise.all([
-            loadCached<Organization[]>("/api/admin/organizations", (next) => {
-              setOrganizations(next);
-              setOrganizationOptions(next.map(({ id, slug, name, kind, is_active }) => ({ id, slug, name, kind, is_active })));
-            }),
-            canManageOrganizations
-              ? loadCached<User[]>("/api/admin/users?status=live", (next) => setUsers(sortUsersForDisplay(next)))
-              : Promise.resolve(undefined)
-          ]);
-          break;
-        }
-        case "invitations": {
-          if (!canManageAuthorizationCodes) break;
-          await Promise.all([
-            loadCached<Invitation[]>(AUTHORIZATION_CODES_API, setInvitations),
-            // An authorization-code manager needs only minimal organization
-            // metadata. Older servers may deny these two optional lists.
-            loadCached<Client[]>("/api/admin/clients", setClients).catch(() => undefined),
-            loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions).catch(() => undefined)
-          ]);
-          break;
-        }
-        case "registration": {
-          if (!canManageSettings) break;
-          await loadCached<RegistrationSettings>("/api/admin/registration-settings", (next) => {
-            setRegistrationSettings(next);
-            setRegistrationSettingsBaseline(next);
-          });
-          break;
-        }
-        case "providers": {
-          if (!canManageProviders) break;
-          const requests: Promise<unknown>[] = [
-            loadCached<ExternalProvider[]>("/api/admin/external-oidc-providers", setProviders),
-            loadCached<ExternalProviderTemplate[]>("/api/admin/external-oidc-provider-templates", setProviderTemplates)
-          ];
-          if (canManagePlatformProviders) {
-            requests.push(
-              loadCached<LdapProvider[]>("/api/admin/ldap-providers", setLdapProviders),
-              loadCached<OrganizationOption[]>("/api/admin/organization-options", setOrganizationOptions)
-            );
-          }
-          await Promise.all(requests);
-          break;
-        }
-        case "portal": {
-          if (!canManageSettings) break;
-          await loadCached<LoginSettings>("/api/admin/login-settings", (next) => {
-            setLoginSettings(next);
-            const draft = {
-              brand_logo_url: next.brand_logo_url,
-              email_domains: next.email_domains.join("\n"),
-              quick_links: next.quick_links
-            };
-            setLoginSettingsDraft(draft);
-            setLoginSettingsBaseline(draft);
-          });
-          break;
-        }
-        case "security": {
-          if (!canManageSecurity && !canReadAudit) break;
-          await Promise.all([
-            canManageSecurity
-              ? loadCached<SecurityPolicy>("/api/admin/security-policy", (next) => {
-                  setSecurityPolicy(next);
-                  setSecurityPolicyBaseline(next);
-                })
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<SigningKey[]>("/api/admin/signing-keys", setSigningKeys)
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<PermissionInfo[]>("/api/admin/access/permissions", setPermissionCatalog)
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<Role[]>("/api/admin/access/roles", setRoles)
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<AccessGroup[]>("/api/admin/access/groups", setGroups)
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<User[]>("/api/admin/users?status=live", (next) => setUsers(sortUsersForDisplay(next)))
-              : Promise.resolve(undefined),
-            canReadAudit
-              ? loadCached<AuditEvent[]>("/api/admin/audit-events", setAuditEvents)
-              : Promise.resolve(undefined),
-            loadCached<AuditWebhook[]>("/api/admin/audit-webhooks", setAuditWebhooks)
-          ]);
-          break;
-        }
-        case "settings": {
-          if (!canManageSettings) break;
-          await Promise.all([
-            loadCached<RuntimeSettings>("/api/admin/runtime-settings", (next) => {
-              setRuntimeSettings(next);
-              setRuntimeSettingsBaseline(next);
-            }),
-            loadCached<SettingsSummary>("/api/admin/settings", setSettings)
-          ]);
-          break;
-        }
+      if (!started.user) {
+        if (!isCurrent()) return;
+        setMfaStatus(null);
+        setPasskeys([]);
+        setMyConsents([]);
+        setMySessions([]);
+        return;
       }
-    } catch (err) {
-      // Preserve a usable stale view when the optional background validation
-      // is temporarily offline. Authorization and validation failures still
-      // surface immediately instead of leaving a now-forbidden view visible.
-      if (
-        cacheAvailable
-        && !options.force
-        && (!(err instanceof ApiError) || err.status === 0 || err.status >= 500)
-      ) return;
-      throw err;
+      const [nextMfaStatus, nextPasskeys, nextConsents, nextSessions] = await Promise.all([
+        accountApi.getMfaStatus({ signal: controller.signal }),
+        accountApi.listPasskeys({ signal: controller.signal }),
+        accountApi.listConsents({ signal: controller.signal }),
+        accountApi.listSessions({ signal: controller.signal })
+      ]);
+      if (!isCurrent()) return;
+      setMfaStatus(nextMfaStatus);
+      setPasskeys(nextPasskeys);
+      setMyConsents(nextConsents);
+      setMySessions(nextSessions);
+    } catch (error) {
+      // A request that belongs to an older account, organization, or session
+      // is expected to lose the race; it must not surface as a new-page error.
+      if (!isCurrent()) return;
+      throw error;
     } finally {
-      if (isCurrent()) setAdminLoading(false);
+      if (accountAbortController.current === controller) accountAbortController.current = null;
     }
   }
 
+  // Admin read lifecycle is owned by useAdminDataLoader. App only composes
+  // the read model with form state and mutation commands.
   async function initialize() {
     setInitialLoadError("");
     try {
-      const [, me] = await Promise.all([loadBootstrap(), loadMe()]);
-      if (me) await loadEnterpriseContext(me.id);
-      else setEnterpriseContextReady(true);
+      const next = await initializeSession({ returnTo: authReturnTo });
+      if (!localStorage.getItem("gpt-sso-locale") && next.bootstrap?.default_locale === "en-US") {
+        setLocale("en-US");
+      }
+      if (!next.bootstrap?.has_users) setAuthMode("register");
     } catch (err) {
-      setUser(null);
-      setMyOrganizations([]);
-      setOrganizationContext(null);
-      setEnterpriseContextReady(true);
+      transitionToAnonymous();
       setInitialLoadError(messageOr(err, "loadFailed"));
     }
   }
@@ -1004,16 +1075,47 @@ export function App() {
   }, [authCanCompleteWithCurrentUser, authReturnTo]);
 
   useEffect(() => {
-    if (initialAuth.isAuthPage) return;
-    loadAccountData().catch((err) => setError(messageOr(err, "loadFailed")));
-  }, [initialAuth.isAuthPage, user?.id]);
+    if (initialAuth.isAuthPage) {
+      invalidateAccountLoad();
+      return;
+    }
+    void loadAccountData().catch((err) => setError(messageOr(err, "loadFailed")));
+    return () => {
+      invalidateAccountLoad();
+    };
+  }, [initialAuth.isAuthPage, user?.id, cacheScope]);
 
   useEffect(() => {
-    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || tab === "billing" || (tab === "overview" && !hasGlobalConsolePermission)) return;
-    loadAdminData(tab).catch((err) =>
-      setError(messageOr(err, "loadFailed"))
-    );
-  }, [canAdmin, canManageActiveOrganization, hasGlobalConsolePermission, initialAuth.isAuthPage, tab, userFilter, userOrganizationFilter, userLinkedIdentityFilter, organizationContext?.id]);
+    // Clear data immediately when the scope changes. The render-time guard
+    // above prevents in-flight responses from repopulating this cleared view.
+    setOrganizationMembers([]);
+    setOrganizationMemberInvitations([]);
+    setSelectedUser(null);
+    setSelectedUserIds([]);
+    setUserAccess(null);
+  }, [cacheScope, setOrganizationMemberInvitations, setOrganizationMembers]);
+
+  useEffect(() => {
+    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || tab === "billing" || (tab === "overview" && !hasGlobalConsolePermission)) {
+      invalidateAdminLoad();
+      return;
+    }
+    const loadScope = cacheScope;
+    loadAdminData(tab).catch((err) => {
+      if (cacheScope === loadScope) setError(messageOr(err, "loadFailed"));
+    });
+    return () => invalidateAdminLoad();
+  }, [
+    canAdmin,
+    canManageActiveOrganization,
+    hasGlobalConsolePermission,
+    initialAuth.isAuthPage,
+    tab,
+    organizationContext?.id,
+    cacheScope,
+    loadAdminData,
+    invalidateAdminLoad
+  ]);
 
   useEffect(() => {
     const authorizationCode = registerForm.authorization_code.trim();
@@ -1053,6 +1155,7 @@ export function App() {
   useEffect(() => {
     setSelectedUserIds([]);
   }, [
+    userDirectoryPage,
     searchQuery,
     userFilter,
     userOrganizationFilter,
@@ -1067,22 +1170,31 @@ export function App() {
     userLoginRegionFilter
   ]);
 
+  // Cursor positions belong to one exact filter set. A filter change starts a
+  // fresh keyset walk instead of reusing a position from another result set.
   useEffect(() => {
-    const handleHashChange = () => {
-      const navigation = initialNavigation();
-      setTab(navigation.tab);
-      setApplicationNavigationId(navigation.applicationId);
-      setApplicationNavigationSection(navigation.applicationSection);
-      setBillingOrderReference(navigation.billingOrder);
-      setSidebarOpen(false);
-    };
-    window.addEventListener("hashchange", handleHashChange);
-    window.addEventListener("popstate", handleHashChange);
-    return () => {
-      window.removeEventListener("hashchange", handleHashChange);
-      window.removeEventListener("popstate", handleHashChange);
-    };
-  }, []);
+    setUserDirectoryPage(1);
+    setUserDirectoryCursorHistory([null]);
+  }, [
+    searchQuery,
+    userEmailFilter,
+    userFilter,
+    userLastLoginFrom,
+    userLastLoginTo,
+    userLinkedIdentityFilter,
+    userLoginRegionFilter,
+    userOrganizationFilter,
+    userPhoneFilter,
+    userRegistrationFrom,
+    userRegistrationTo,
+    userRoleFilter
+  ]);
+
+  useEffect(() => {
+    setUserDirectoryPage(1);
+    setUserDirectoryCursorHistory([null]);
+    setSelectedUserIds([]);
+  }, [cacheScope]);
 
   useEffect(() => {
     if (!sidebarOpen || !sidebarRef.current) return;
@@ -1246,21 +1358,17 @@ export function App() {
       if (!navigator.credentials?.get || !window.PublicKeyCredential) {
         throw new Error(t("passkeyLoginFailed"));
       }
-      const start = await api<PasskeyAuthenticationStart>("/api/passkeys/authentication/start", {
-        method: "POST",
-        body: JSON.stringify({ email, account_flow: effectiveAccountFlow })
-      });
+      const start = await accountApi.startPasskeyAuthentication(email, effectiveAccountFlow);
       const credential = await navigator.credentials.get(passkeyRequestOptions(start.public_key));
       if (!credential || credential.type !== "public-key") {
         throw new Error(t("passkeyLoginFailed"));
       }
-      const result = await api<{ user: User } | OidcContinuationLoginResponse>("/api/passkeys/authentication/finish", {
-        method: "POST",
-        body: JSON.stringify({
-          challenge_id: start.challenge_id,
-          credential: authenticationCredentialJson(credential as PublicKeyCredential),
-          account_flow: effectiveAccountFlow
-        })
+      const result = await accountApi.finishPasskeyAuthentication<
+        { user: User } | OidcContinuationLoginResponse
+      >({
+        challengeId: start.challenge_id,
+        credential: authenticationCredentialJson(credential as PublicKeyCredential),
+        accountFlow: effectiveAccountFlow
       });
       if ("continue_to" in result) {
         window.location.assign(result.continue_to);
@@ -1449,7 +1557,7 @@ export function App() {
     await runUiAction(async () => {
       const result = await api<LogoutResponse>("/api/logout", { method: "POST" });
       deliverFrontchannelLogout(result.frontchannel_logout_frames);
-      setUser(null);
+      transitionToAnonymous();
       await loadBootstrap();
     });
   }
@@ -1489,7 +1597,7 @@ export function App() {
       setUserFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
+      await userDirectory.reload();
     } catch (err) {
       setError(messageOr(err, "saveUserFailed"));
     } finally {
@@ -1557,7 +1665,7 @@ export function App() {
       setBulkImportResult(result);
       if (result.committed) {
         setVerificationMessage(t("bulkImportCompleted"));
-        await loadAdminData("users");
+        await userDirectory.reload();
       } else {
         setVerificationMessage(t("bulkImportDryRunComplete"));
       }
@@ -1575,157 +1683,39 @@ export function App() {
 
   async function showUserDetails(id: string) {
     await runUiAction(async () => {
-      setSelectedUser(await api<UserDetail>(`/api/admin/users/${id}`));
+      const request = userDetailsRequest.begin();
+      try {
+        const detail = await adminApi.getAdminUserDetail(id, {
+          signal: request.signal,
+          force: true
+        });
+        if (request.isCurrent()) setSelectedUser(detail);
+      } catch (error) {
+        // A newer account selection owns the error surface. Abort and stale
+        // responses must not overwrite the current modal or global error.
+        if (request.isCurrent()) throw error;
+      }
     });
   }
 
   async function enableUser(id: string) {
     const completed = await runUiAction(async () => {
-      await api(`/api/admin/users/${id}/enable`, { method: "POST" });
-      await loadAdminData();
+      await adminApi.enableAdminUser(id);
+      await userDirectory.reload();
       if (selectedUser?.user.id === id) setSelectedUser(null);
     });
     if (completed) setVerificationMessage(t("operationCompleted"));
   }
 
   async function advanceUserLifecycle(id: string) {
-    await api(`/api/admin/users/${id}`, { method: "DELETE" });
-    await loadAdminData();
+    await adminApi.advanceAdminUserLifecycle(id);
+    setSelectedUserIds((current) => current.filter((selectedId) => selectedId !== id));
+    await userDirectory.reload();
     if (selectedUser?.user.id === id) setSelectedUser(null);
     if (userForm.id === id) {
       setUserForm(emptyUserForm);
       setUserFormBaseline(null);
     }
-  }
-
-  async function saveClient(event: FormEvent) {
-    event.preventDefault();
-    const isNewClient = !clientForm.id;
-    const validationErrors: string[] = [];
-    const fieldErrors: Record<string, string> = {};
-    const fieldLabels: Record<string, string> = {
-      client_id: t("clientId"),
-      client_name: t("clientName"),
-      redirect_uris: t("redirectUris"),
-      post_logout_redirect_uris: t("postLogoutUris"),
-      require_s256_pkce: t("requireS256Pkce")
-    };
-    const addFieldError = (field: string, message: string) => {
-      validationErrors.push(`${fieldLabels[field] ?? field} · ${message}`);
-      if (!fieldErrors[field]) fieldErrors[field] = message;
-    };
-    if (!clientForm.client_id.trim()) addFieldError("client_id", t("requiredField"));
-    if (!clientForm.client_name.trim()) addFieldError("client_name", t("requiredField"));
-    const redirectValues = splitList(clientForm.redirect_uris);
-    if (redirectValues.length === 0) {
-      addFieldError("redirect_uris", t("requiredField"));
-    } else {
-      redirectValues.forEach((value) => {
-        try {
-          const url = new URL(value);
-          if (!matchesHttpUrl(url)) throw new Error("invalid");
-        } catch {
-          addFieldError("redirect_uris", `${value} · ${t("invalidUrl")}`);
-        }
-      });
-    }
-    if (clientForm.post_logout_redirect_uris.trim()) {
-      splitList(clientForm.post_logout_redirect_uris).forEach((value) => {
-        try {
-          const url = new URL(value);
-          if (!matchesHttpUrl(url)) throw new Error("invalid");
-        } catch {
-          addFieldError("post_logout_redirect_uris", `${value} · ${t("invalidUrl")}`);
-        }
-      });
-    }
-    if (clientForm.require_s256_pkce && !clientForm.require_pkce) {
-      addFieldError("require_s256_pkce", t("requirePkce"));
-    }
-    if (validationErrors.length > 0) {
-      setClientFormErrors(validationErrors);
-      setClientFieldErrors(fieldErrors);
-      window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".form-error-summary")?.focus());
-      return;
-    }
-    setBusy(true);
-    setError("");
-    setClientFormErrors([]);
-    setClientFieldErrors({});
-    try {
-      const body = JSON.stringify({
-        client_id: clientForm.client_id,
-        client_name: clientForm.client_name,
-        logo_uri: clientForm.logo_uri,
-        organization_id: clientForm.organization_id || null,
-        client_secret: clientForm.client_secret || null,
-        redirect_uris: splitList(clientForm.redirect_uris),
-        post_logout_redirect_uris: splitList(clientForm.post_logout_redirect_uris),
-        scopes: splitList(clientForm.scopes),
-        grant_types: splitList(clientForm.grant_types),
-        response_types: splitList(clientForm.response_types),
-        token_endpoint_auth_method: clientForm.token_endpoint_auth_method,
-        require_pkce: clientForm.require_pkce,
-        require_mfa: clientForm.require_mfa,
-        require_pushed_authorization_requests: clientForm.require_pushed_authorization_requests,
-        require_s256_pkce: clientForm.require_s256_pkce,
-        require_confidential_client: clientForm.require_confidential_client,
-        require_dpop: clientForm.require_dpop,
-        require_account_selection: clientForm.require_account_selection,
-        trust_email_verified: clientForm.trust_email_verified,
-        authorization_details_types: splitList(clientForm.authorization_details_types),
-        subject_type: clientForm.subject_type,
-        sector_identifier_uri: clientForm.sector_identifier_uri,
-        jwks_uri: clientForm.jwks_uri,
-        jwks: clientForm.jwks,
-        backchannel_logout_uri: clientForm.backchannel_logout_uri,
-        backchannel_logout_session_required: clientForm.backchannel_logout_session_required,
-        frontchannel_logout_uri: clientForm.frontchannel_logout_uri,
-        frontchannel_logout_session_required: clientForm.frontchannel_logout_session_required,
-        service_account_enabled: clientForm.service_account_enabled,
-        service_account_permissions: splitList(clientForm.service_account_permissions),
-        is_active: clientForm.is_active,
-        claim_mappers: clientForm.claim_mappers
-          .filter((mapper) => mapper.claim_name.trim())
-          .map((mapper, index) => ({
-            claim_name: mapper.claim_name.trim(),
-            source: mapper.source,
-            source_value: mapper.source_value.trim(),
-            value_type: mapper.value_type,
-            include_in_id_token: mapper.include_in_id_token,
-            include_in_access_token: mapper.include_in_access_token,
-            include_in_userinfo: mapper.include_in_userinfo,
-            is_active: mapper.is_active,
-            sort_order: index
-          }))
-      });
-      if (clientForm.id) {
-        await api<Client>(`/api/admin/clients/${clientForm.id}`, { method: "PUT", body });
-      } else {
-        await api<Client>("/api/admin/clients", { method: "POST", body });
-      }
-      setClientForm(emptyClientForm);
-      setClientFormBaseline(null);
-      setClientFormErrors([]);
-      setClientFieldErrors({});
-      setEditor(null);
-      setVerificationMessage(t(isNewClient ? "clientCreatedApplicationHint" : "changesSaved"));
-      await loadAdminData();
-      if (isNewClient) await loadAdminData("applications", { force: true });
-    } catch (err) {
-      setError(messageOr(err, "saveClientFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteClient(id: string) {
-    await api(`/api/admin/clients/${id}`, { method: "DELETE" });
-    if (clientForm.id === id) {
-      setClientForm(emptyClientForm);
-      setEditor(null);
-    }
-    await loadAdminData("clients");
   }
 
   async function editApplication(application: TenantApplication) {
@@ -1751,38 +1741,78 @@ export function App() {
 
   async function saveApplication(event: FormEvent) {
     event.preventDefault();
+    const creatingApplication = !applicationForm.id;
     setBusy(true);
     setError("");
     try {
-      const body = JSON.stringify({
+      const input = {
         slug: applicationForm.slug,
         name: applicationForm.name,
+        website_url: applicationForm.website_url.trim() || null,
         description: applicationForm.description || null,
         account_selection_mode: applicationForm.account_selection_mode,
         unique_identity_factors: applicationForm.unique_identity_factors,
         is_active: applicationForm.is_active
-      });
-      const application = applicationForm.id
-        ? await api<TenantApplication>(`/api/admin/applications/${applicationForm.id}`, { method: "PUT", body })
-        : await api<TenantApplication>("/api/admin/applications", { method: "POST", body });
-      const currentProtocolModule = application.modules?.find((module) => module.module_key === "protocols");
-      const currentProtocolConfig = currentProtocolModule?.config ?? {};
-      await api<ApplicationModule>(`/api/admin/applications/${application.id}/modules/protocols`, {
-        method: "PUT",
-        body: JSON.stringify({
+      };
+      let application: TenantApplication;
+      if (applicationForm.id) {
+        application = await applicationApi.updateApplication(applicationForm.id, input);
+        const currentProtocolModule = application.modules?.find((module) => module.module_key === "protocols");
+        const currentProtocolConfig = currentProtocolModule?.config ?? {};
+        await applicationApi.updateApplicationModule(application.id, "protocols", {
           config: {
             ...(currentProtocolConfig && typeof currentProtocolConfig === "object" ? currentProtocolConfig : {}),
             website_url: applicationForm.website_url
           },
           is_enabled: currentProtocolModule?.is_enabled ?? Boolean(application.client_bindings.length)
-        })
-      });
+        });
+      } else {
+        const fingerprint = JSON.stringify(input);
+        const existingMutation = applicationCreateMutationRef.current;
+        const idempotencyKey = existingMutation?.fingerprint === fingerprint
+          ? existingMutation.key
+          : `ui-application-create-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+        applicationCreateMutationRef.current = { fingerprint, key: idempotencyKey };
+        application = await applicationApi.createApplication(input, { idempotencyKey });
+        applicationCreateMutationRef.current = null;
+        // Creation and the initial protocols module commit atomically on the
+        // server. There is no second module request to partially fail.
+        setApplicationForm((current) => ({ ...current, id: application.id }));
+      }
       setApplicationForm(emptyApplicationForm);
       setApplicationFormBaseline(null);
       setEditor(null);
       setVerificationMessage(t("changesSaved"));
       await loadAdminData("applications", { force: true });
     } catch (err) {
+      // The first write may already have committed even when a later phase or
+      // the response failed. Reconcile the collection before exposing the
+      // error so a newly created application is visible and can be retried.
+      if (
+        creatingApplication
+        && err instanceof ApiError
+        && (err.code === "network_error" || err.status >= 500)
+      ) {
+        try {
+          const recoveredApplications = await applicationApi.listApplications({ force: true });
+          const recovered = recoveredApplications.find((candidate) => (
+            candidate.organization_id === organizationContext?.id
+            && candidate.slug === applicationForm.slug.trim()
+            && candidate.name === applicationForm.name.trim()
+          ));
+          if (recovered) {
+            setApplicationForm((current) => ({ ...current, id: recovered.id }));
+          }
+        } catch {
+          // The normal collection reconciliation below remains the fallback.
+        }
+      }
+      try {
+        await loadAdminData("applications", { force: true });
+      } catch {
+        // Preserve the original mutation error when reconciliation is also
+        // unavailable.
+      }
       setError(messageOr(err, "saveApplicationFailed"));
     } finally {
       setBusy(false);
@@ -1790,13 +1820,61 @@ export function App() {
   }
 
   async function deleteApplication(id: string) {
-    await api(`/api/admin/applications/${id}`, { method: "DELETE" });
-    if (applicationForm.id === id) {
-      setApplicationForm(emptyApplicationForm);
-      setApplicationFormBaseline(null);
-      setEditor(null);
+    const organizationId = organizationContext?.id ?? null;
+    const scopeKey = cacheScope;
+    const target = applications.find((application) => application.id === id);
+    if (target && organizationId && target.organization_id !== organizationId) {
+      throw new Error("application does not belong to the active organization");
     }
-    await loadAdminData("applications", { force: true });
+    const existingMutation = applicationDeleteMutationRef.current;
+    const idempotencyKey = existingMutation
+      && existingMutation.applicationId === id
+      && existingMutation.organizationId === organizationId
+      && existingMutation.scopeKey === scopeKey
+      ? existingMutation.key
+      : `ui-application-delete-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+    applicationDeleteMutationRef.current = {
+      applicationId: id,
+      organizationId,
+      scopeKey,
+      key: idempotencyKey
+    };
+
+    const clearDeletedApplication = () => {
+      setApplications((current) => current.filter((application) => application.id !== id));
+      if (applicationForm.id === id) {
+        setApplicationForm(emptyApplicationForm);
+        setApplicationFormBaseline(null);
+        setEditor(null);
+      }
+      if (applicationNavigationId === id) {
+        navigateToTab("applications", { applicationId: null, applicationSection: null });
+      }
+    };
+
+    try {
+      await applicationApi.deleteApplication(id, { idempotencyKey });
+      clearDeletedApplication();
+      await loadAdminData("applications", { force: true });
+      applicationDeleteMutationRef.current = null;
+    } catch (error) {
+      // A lost response must not make the operator repeat a destructive
+      // command with a new key. Reconcile the scoped collection first; if the
+      // target is gone, the original delete committed and is safe to treat as
+      // success even when the refresh endpoint itself failed afterward.
+      try {
+        const recovered = await applicationApi.listApplications({ force: true });
+        setApplications(recovered);
+        if (!recovered.some((application) => application.id === id)) {
+          clearDeletedApplication();
+          applicationDeleteMutationRef.current = null;
+          return;
+        }
+      } catch {
+        // Keep the original error and the stable idempotency key for retry.
+      }
+      throw error;
+    }
   }
 
   function updateApplicationModuleInState(
@@ -1814,6 +1892,43 @@ export function App() {
         ...application,
         modules,
         ...(clientBindings ? { client_bindings: clientBindings } : {})
+      };
+    }));
+  }
+
+  function updateApplicationOidcClientsInState(applicationId: string, nextClients: Client[]) {
+    const previousApplicationClientIds = new Set(
+      applications
+        .find((application) => application.id === applicationId)
+        ?.client_bindings
+        .filter((binding) => binding.protocol === "oidc")
+        .map((binding) => binding.id) ?? []
+    );
+    setClients((current) => {
+      // `nextClients` is the complete application projection. Remove the
+      // previous projection first so a deleted client cannot remain in the
+      // global read model and reappear in invitation selectors.
+      const retained = current.filter((client) => !previousApplicationClientIds.has(client.id));
+      return [...retained, ...nextClients];
+    });
+    setApplications((current) => current.map((application) => {
+      if (application.id !== applicationId) return application;
+      const previousOidcBindings = application.client_bindings.filter((binding) => binding.protocol === "oidc");
+      const oidcBindings = nextClients.map((client) => {
+        const previous = previousOidcBindings.find((binding) => binding.id === client.id);
+        return {
+          ...client,
+          protocol: "oidc",
+          authorization_profile_id: previous?.authorization_profile_id ?? "default",
+          auth_domain_id: previous?.auth_domain_id ?? `auth-domain:${applicationId}`
+        };
+      });
+      return {
+        ...application,
+        client_bindings: [
+          ...application.client_bindings.filter((binding) => binding.protocol !== "oidc"),
+          ...oidcBindings
+        ]
       };
     }));
   }
@@ -1889,104 +2004,6 @@ export function App() {
     setRevealedOrganizationMemberInvitation((current) =>
       current?.invitation.id === invitationId ? null : current
     );
-  }
-
-  function addClientClaimMapper() {
-    setClientForm({
-      ...clientForm,
-      claim_mappers: [
-        ...clientForm.claim_mappers,
-        emptyClaimMapperForm(clientForm.claim_mappers.length)
-      ]
-    });
-  }
-
-  function updateClientClaimMapper(index: number, patch: Partial<ClientClaimMapperForm>) {
-    setClientForm({
-      ...clientForm,
-      claim_mappers: clientForm.claim_mappers.map((mapper, mapperIndex) =>
-        mapperIndex === index ? { ...mapper, ...patch } : mapper
-      )
-    });
-  }
-
-  function removeClientClaimMapper(index: number) {
-    setClientForm({
-      ...clientForm,
-      claim_mappers: clientForm.claim_mappers.filter((_, mapperIndex) => mapperIndex !== index)
-    });
-  }
-
-  async function saveIapApplication(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = JSON.stringify({
-        slug: iapApplicationForm.slug,
-        name: iapApplicationForm.name,
-        description: iapApplicationForm.description || null,
-        external_host: iapApplicationForm.external_host,
-        path_prefix: iapApplicationForm.path_prefix,
-        required_organization_id: iapApplicationForm.required_organization_id || null,
-        required_organization_roles: iapApplicationForm.required_organization_roles,
-        required_permissions: splitList(iapApplicationForm.required_permissions),
-        is_active: iapApplicationForm.is_active
-      });
-      if (iapApplicationForm.id) {
-        await api<IapApplication>(`/api/admin/iap-applications/${iapApplicationForm.id}`, {
-          method: "PUT",
-          body
-        });
-      } else {
-        await api<IapApplication>("/api/admin/iap-applications", { method: "POST", body });
-      }
-      setIapApplicationForm(emptyIapApplicationForm);
-      setIapApplicationFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveIapApplicationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function editIapApplication(application: IapApplication) {
-    setIapApplicationForm({
-      id: application.id,
-      slug: application.slug,
-      name: application.name,
-      description: application.description ?? "",
-      external_host: application.external_host,
-      path_prefix: application.path_prefix,
-      required_organization_id: application.required_organization_id ?? "",
-      required_organization_roles: application.required_organization_roles,
-      required_permissions: application.required_permissions.join("\n"),
-      is_active: application.is_active
-    });
-    setIapApplicationFormBaseline({
-      id: application.id,
-      slug: application.slug,
-      name: application.name,
-      description: application.description ?? "",
-      external_host: application.external_host,
-      path_prefix: application.path_prefix,
-      required_organization_id: application.required_organization_id ?? "",
-      required_organization_roles: application.required_organization_roles,
-      required_permissions: application.required_permissions.join("\n"),
-      is_active: application.is_active
-    });
-  }
-
-  async function deleteIapApplication(id: string) {
-    await api(`/api/admin/iap-applications/${id}`, { method: "DELETE" });
-    if (iapApplicationForm.id === id) {
-      setIapApplicationForm(emptyIapApplicationForm);
-      setIapApplicationFormBaseline(null);
-    }
-    await loadAdminData();
   }
 
   async function saveInvitation(event: FormEvent) {
@@ -2106,49 +2123,6 @@ export function App() {
     setRevealedInvitationCode("");
     setInvitationRevealError("");
     setRevealingInvitationId("");
-  }
-
-  async function loadInvitationRedemptions(invitation: Invitation, cursor: string | null = null) {
-    const loadId = ++invitationRedemptionsLoadId.current;
-    setInvitationRedemptionsLoading(true);
-    setInvitationRedemptionsError("");
-    if (!cursor) {
-      setInvitationRedemptions([]);
-      setInvitationRedemptionsNextCursor(null);
-    }
-    try {
-      const query = new URLSearchParams({ limit: "50" });
-      if (cursor) query.set("cursor", cursor);
-      const result = await api<InvitationRedemptionsPage>(
-        `${AUTHORIZATION_CODES_API}/${encodeURIComponent(invitation.id)}/redemptions?${query.toString()}`
-      );
-      if (loadId !== invitationRedemptionsLoadId.current) return;
-      setInvitationRedemptions((existing) => cursor
-        ? [...existing, ...result.redemptions]
-        : result.redemptions
-      );
-      setInvitationRedemptionsNextCursor(result.next_cursor);
-    } catch (err) {
-      if (loadId === invitationRedemptionsLoadId.current) {
-        setInvitationRedemptionsError(messageOr(err, "loadAuthorizationCodeRedemptionsFailed"));
-      }
-    } finally {
-      if (loadId === invitationRedemptionsLoadId.current) setInvitationRedemptionsLoading(false);
-    }
-  }
-
-  function openInvitationRedemptions(invitation: Invitation) {
-    setRedemptionsInvitation(invitation);
-    void loadInvitationRedemptions(invitation);
-  }
-
-  function closeInvitationRedemptions() {
-    invitationRedemptionsLoadId.current += 1;
-    setRedemptionsInvitation(null);
-    setInvitationRedemptions([]);
-    setInvitationRedemptionsNextCursor(null);
-    setInvitationRedemptionsLoading(false);
-    setInvitationRedemptionsError("");
   }
 
   async function saveRole(event: FormEvent) {
@@ -2362,21 +2336,30 @@ export function App() {
   }
 
   async function loadUserAccess(id: string) {
+    const request = userAccessRequest.begin();
     setSelectedAccessUserId(id);
     setUserAccess(null);
     if (!id) {
       return;
     }
-    setUserAccess(await api<UserAccess>(`/api/admin/users/${id}/access`));
+    try {
+      const access = await adminApi.getAdminUserAccess(id, {
+        signal: request.signal,
+        force: true
+      });
+      if (request.isCurrent()) setUserAccess(access);
+    } catch (error) {
+      if (request.isCurrent()) throw error;
+    }
   }
 
   async function saveUserRoles() {
     if (!selectedAccessUserId || !userAccess) return;
     const completed = await runUiAction(async () => {
-      const updated = await api<UserAccess>(`/api/admin/users/${selectedAccessUserId}/roles`, {
-        method: "PUT",
-        body: JSON.stringify({ role_ids: userAccess.direct_roles.map((role) => role.id) })
-      });
+      const updated = await adminApi.updateAdminUserRoles(
+        selectedAccessUserId,
+        userAccess.direct_roles.map((role) => role.id)
+      );
       setUserAccess(updated);
       await loadAdminData();
     });
@@ -2387,17 +2370,14 @@ export function App() {
     setNewRecoveryCodes([]);
     setTotpSetupCode("");
     await runUiAction(async () => {
-      setTotpSetup(await api<TotpSetup>("/api/mfa/totp", { method: "POST" }));
+      setTotpSetup(await accountApi.startTotpSetup());
     }, "startMfaSetupFailed");
   }
 
   async function confirmTotpSetup() {
     if (!totpSetup) return;
     await runUiAction(async () => {
-      const result = await api<MfaConfirmResponse>("/api/mfa/totp/confirm", {
-        method: "POST",
-        body: JSON.stringify({ setup_id: totpSetup.setup_id, code: totpSetupCode })
-      });
+      const result = await accountApi.confirmTotpSetup(totpSetup.setup_id, totpSetupCode);
       setMfaStatus(result.status);
       setNewRecoveryCodes(result.recovery_codes);
       setTotpSetup(null);
@@ -2408,7 +2388,7 @@ export function App() {
 
   async function rotateRecoveryCodes() {
     await runUiAction(async () => {
-      const result = await api<MfaConfirmResponse>("/api/mfa/recovery-codes/rotate", { method: "POST" });
+      const result = await accountApi.rotateRecoveryCodes();
       setMfaStatus(result.status);
       setNewRecoveryCodes(result.recovery_codes);
       await loadAccountData();
@@ -2418,7 +2398,7 @@ export function App() {
   async function disableMfa() {
     setError("");
     try {
-      const result = await api<MfaStatus>("/api/mfa/totp", { method: "DELETE" });
+      const result = await accountApi.disableMfa();
       setMfaStatus(result);
       setTotpSetup(null);
       setNewRecoveryCodes([]);
@@ -2437,21 +2417,15 @@ export function App() {
       if (!navigator.credentials?.create || !window.PublicKeyCredential) {
         throw new Error(t("registerPasskeyFailed"));
       }
-      const start = await api<PasskeyRegistrationStart>("/api/passkeys/registration/start", {
-        method: "POST",
-        body: JSON.stringify({ name: passkeyName || null })
-      });
+      const start = await accountApi.startPasskeyRegistration(passkeyName || null);
       const credential = await navigator.credentials.create(passkeyCreationOptions(start.public_key));
       if (!credential || credential.type !== "public-key") {
         throw new Error(t("registerPasskeyFailed"));
       }
-      const created = await api<Passkey>("/api/passkeys/registration/finish", {
-        method: "POST",
-        body: JSON.stringify({
-          challenge_id: start.challenge_id,
-          name: passkeyName || null,
-          credential: registrationCredentialJson(credential as PublicKeyCredential)
-        })
+      const created = await accountApi.finishPasskeyRegistration({
+        challengeId: start.challenge_id,
+        name: passkeyName || null,
+        credential: registrationCredentialJson(credential as PublicKeyCredential)
       });
       setPasskeys((current) => [created, ...current.filter((item) => item.id !== created.id)]);
       setPasskeyName("");
@@ -2466,7 +2440,7 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      await api(`/api/passkeys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await accountApi.deletePasskey(id);
       setPasskeys((current) => current.filter((item) => item.id !== id));
     } catch (err) {
       const message = messageOr(err, "deletePasskeyFailed");
@@ -2481,7 +2455,7 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      await api(`/api/me/consents/${encodeURIComponent(clientId)}`, { method: "DELETE" });
+      await accountApi.revokeConsent(clientId);
       await loadAccountData();
     } catch (err) {
       const message = messageOr(err, "revokeAuthorizationFailed");
@@ -2496,7 +2470,7 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      await api(`/api/me/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      await accountApi.revokeSession(sessionId);
       await loadAccountData();
     } catch (err) {
       const message = messageOr(err, "revokeSessionFailed");
@@ -2508,7 +2482,7 @@ export function App() {
   }
 
   async function resetUserMfa(id: string) {
-    await api(`/api/admin/users/${id}/mfa/reset`, { method: "POST" });
+    await adminApi.resetAdminUserMfa(id);
     await loadAdminData();
   }
 
@@ -2654,9 +2628,10 @@ export function App() {
     }
   }
 
-  async function saveLoginSettings(event: FormEvent) {
-    event.preventDefault();
-    await persistLoginSettings(loginSettingsDraft);
+  function resetQuickLinkForm() {
+    const empty = { ...emptyQuickLinkForm };
+    setQuickLinkForm(empty);
+    setQuickLinkFormBaseline(empty);
   }
 
   async function saveQuickLinkDraft() {
@@ -2674,16 +2649,18 @@ export function App() {
       ? loginSettingsDraft.quick_links.map((item) => (item.id === quickLinkForm.id ? link : item))
       : [...loginSettingsDraft.quick_links, link];
     const saved = await persistLoginSettings({ ...loginSettingsDraft, quick_links: nextLinks });
-    if (saved) setQuickLinkForm(emptyQuickLinkForm);
+    if (saved) resetQuickLinkForm();
   }
 
   function editQuickLink(link: QuickLink) {
-    setQuickLinkForm({
+    const nextForm = {
       id: link.id,
       label: link.label,
       url: link.url,
       is_active: link.is_active
-    });
+    };
+    setQuickLinkForm(nextForm);
+    setQuickLinkFormBaseline(nextForm);
   }
 
   async function removeQuickLink(id: string) {
@@ -2692,7 +2669,7 @@ export function App() {
       quick_links: loginSettingsDraft.quick_links.filter((item) => item.id !== id)
     });
     if (!saved) throw new Error(t("saveLoginSettingsFailed"));
-    if (quickLinkForm.id === id) setQuickLinkForm(emptyQuickLinkForm);
+    if (quickLinkForm.id === id) resetQuickLinkForm();
   }
 
   function providerRedirectPath(slug: string): string {
@@ -2702,6 +2679,7 @@ export function App() {
   function applyProviderTemplate() {
     const template = providerTemplates.find((item) => item.id === providerTemplateId);
     if (!template) return;
+    providerDiscoveryRequest.cancel();
     setProviderForm({
       ...providerForm,
       slug: template.slug,
@@ -2713,26 +2691,39 @@ export function App() {
   }
 
   async function discoverProviderEndpoints() {
-    if (!providerForm.issuer.trim()) return;
+    const requestedIssuer = providerForm.issuer.trim();
+    if (!requestedIssuer) return;
+    const request = providerDiscoveryRequest.begin();
     setBusy(true);
     setError("");
     try {
       const discovered = await api<ExternalProviderDiscovery>("/api/admin/external-oidc-provider-discovery", {
         method: "POST",
-        body: JSON.stringify({ issuer: providerForm.issuer })
+        body: JSON.stringify({ issuer: requestedIssuer }),
+        signal: request.signal
       });
-      setProviderForm({
-        ...providerForm,
-        issuer: discovered.issuer,
-        authorization_endpoint: discovered.authorization_endpoint,
-        token_endpoint: discovered.token_endpoint,
-        userinfo_endpoint: discovered.userinfo_endpoint,
-        scopes: joinList(discovered.scopes)
+      setProviderForm((current) => {
+        // Discovery is a patch for the issuer that was requested. Preserve
+        // every field edited while the network call was in flight and ignore
+        // a response that belongs to an older issuer/request.
+        if (!request.isCurrent() || current.issuer.trim() !== requestedIssuer) {
+          return current;
+        }
+        return {
+          ...current,
+          issuer: discovered.issuer,
+          authorization_endpoint: discovered.authorization_endpoint,
+          token_endpoint: discovered.token_endpoint,
+          userinfo_endpoint: discovered.userinfo_endpoint,
+          scopes: joinList(discovered.scopes)
+        };
       });
     } catch (err) {
-      setError(messageOr(err, "discoverProviderFailed"));
+      if (request.isCurrent()) {
+        setError(messageOr(err, "discoverProviderFailed"));
+      }
     } finally {
-      setBusy(false);
+      if (request.isCurrent()) setBusy(false);
     }
   }
 
@@ -2924,8 +2915,12 @@ export function App() {
     setError("");
     setRefreshing(true);
     try {
-      if (tab === "account" || tab === "billing") {
+      if (tab === "billing") {
+        await walletWorkspaceRef.current?.reload();
+      } else if (tab === "account") {
         await loadAccountData();
+      } else if (tab === "users") {
+        await userDirectory.reload();
       } else {
         await loadAdminData(tab, { force: true });
       }
@@ -2945,12 +2940,7 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      const next = await api<OrganizationContext>("/api/me/organization-context", {
-        method: "PUT",
-        body: JSON.stringify({ organization_id: organizationId })
-      });
-      setOrganizationContext(next.organization);
-      setApiCacheScope(`${user?.id ?? "anonymous"}:${next.organization?.id ?? "none"}`);
+      await switchSessionOrganization(organizationId);
       setApplications([]);
       setClients([]);
       setOrganizationMembers([]);
@@ -2989,132 +2979,92 @@ export function App() {
     }
   }
 
-  function navigateToTab(
-    next: Tab,
-    options: { applicationId?: string | null; applicationSection?: ApplicationSection | null } = {}
-  ) {
-    if (next !== tab && configurationFormsDirty() && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
-      return;
-    }
-    setTab(next);
-    setSearchQuery("");
-    setSidebarOpen(false);
-    const applicationId = next === "applications"
-      ? options.applicationId ?? applicationNavigationId
-      : null;
-    const applicationSection = next === "applications"
-      ? options.applicationSection ?? applicationNavigationSection
-      : null;
-    const billingOrder = next === "billing" ? billingOrderReference : null;
-    setApplicationNavigationId(applicationId);
-    setApplicationNavigationSection(applicationSection);
-    setBillingOrderReference(billingOrder);
-    const params = new URLSearchParams();
-    if (applicationId) params.set("application", applicationId);
-    if (applicationSection) params.set("section", applicationSection);
-    if (billingOrder) params.set("billing_order", billingOrder);
-    const query = params.toString();
-    const nextHash = `#/${next}${query ? `?${query}` : ""}`;
-    if (window.location.hash !== nextHash) {
-      window.history.pushState(null, "", nextHash);
-    }
-  }
-
-  function clientDraftIsDirty(): boolean {
-    return clientFormBaseline !== null
-      && JSON.stringify(clientForm) !== JSON.stringify(clientFormBaseline);
-  }
-
   function providerFormIsDirty(): boolean {
     return providerFormBaseline !== null
-      && JSON.stringify(providerForm) !== JSON.stringify(providerFormBaseline);
+      && isDirtyDomain(providerForm, providerFormBaseline);
   }
 
   function ldapProviderFormIsDirty(): boolean {
     return ldapProviderFormBaseline !== null
-      && JSON.stringify(ldapProviderForm) !== JSON.stringify(ldapProviderFormBaseline);
+      && isDirtyDomain(ldapProviderForm, ldapProviderFormBaseline);
   }
 
   function auditWebhookFormIsDirty(): boolean {
-    return JSON.stringify(auditWebhookForm) !== JSON.stringify(auditWebhookFormBaseline);
+    return isDirtyDomain(auditWebhookForm, auditWebhookFormBaseline);
   }
 
   function registrationSettingsIsDirty(): boolean {
     return registrationSettingsBaseline !== null
       && registrationSettings !== null
-      && JSON.stringify(registrationSettings) !== JSON.stringify(registrationSettingsBaseline);
+      && isDirtyDomain(registrationSettings, registrationSettingsBaseline);
   }
 
   function runtimeSettingsIsDirty(): boolean {
     return runtimeSettingsBaseline !== null
       && runtimeSettings !== null
-      && JSON.stringify(runtimeSettings) !== JSON.stringify(runtimeSettingsBaseline);
+      && isDirtyDomain(runtimeSettings, runtimeSettingsBaseline);
   }
 
   function loginSettingsIsDirty(): boolean {
     return loginSettingsBaseline !== null
-      && JSON.stringify(loginSettingsDraft) !== JSON.stringify(loginSettingsBaseline);
+      && isDirtyDomain(loginSettingsDraft, loginSettingsBaseline);
+  }
+
+  function quickLinkFormIsDirty(): boolean {
+    return isDirtyDomain(quickLinkForm, quickLinkFormBaseline);
   }
 
   function applicationFormIsDirty(): boolean {
     return applicationFormBaseline !== null
-      && JSON.stringify(applicationForm) !== JSON.stringify(applicationFormBaseline);
+      && isDirtyDomain(applicationForm, applicationFormBaseline);
   }
 
   function securityPolicyIsDirty(): boolean {
     return securityPolicyBaseline !== null
       && securityPolicy !== null
-      && JSON.stringify(securityPolicy) !== JSON.stringify(securityPolicyBaseline);
+      && isDirtyDomain(securityPolicy, securityPolicyBaseline);
   }
 
   function userFormIsDirty(): boolean {
     return userFormBaseline !== null
-      && JSON.stringify(userForm) !== JSON.stringify(userFormBaseline);
+      && isDirtyDomain(userForm, userFormBaseline);
   }
 
   function enterpriseFormIsDirty(): boolean {
     return enterpriseFormBaseline !== null
-      && JSON.stringify(enterpriseForm) !== JSON.stringify(enterpriseFormBaseline);
-  }
-
-  function iapApplicationFormIsDirty(): boolean {
-    return iapApplicationFormBaseline !== null
-      && JSON.stringify(iapApplicationForm) !== JSON.stringify(iapApplicationFormBaseline);
+      && isDirtyDomain(enterpriseForm, enterpriseFormBaseline);
   }
 
   function invitationFormIsDirty(): boolean {
     return invitationFormBaseline !== null
-      && JSON.stringify(invitationForm) !== JSON.stringify(invitationFormBaseline);
+      && isDirtyDomain(invitationForm, invitationFormBaseline);
   }
 
   function roleFormIsDirty(): boolean {
     return roleFormBaseline !== null
-      && JSON.stringify(roleForm) !== JSON.stringify(roleFormBaseline);
+      && isDirtyDomain(roleForm, roleFormBaseline);
   }
 
   function groupFormIsDirty(): boolean {
     return groupFormBaseline !== null
-      && JSON.stringify(groupForm) !== JSON.stringify(groupFormBaseline);
+      && isDirtyDomain(groupForm, groupFormBaseline);
   }
 
   function organizationFormIsDirty(): boolean {
     const formDirty = organizationFormBaseline !== null
-      && JSON.stringify(organizationForm) !== JSON.stringify(organizationFormBaseline);
+      && isDirtyDomain(organizationForm, organizationFormBaseline);
     const membersDirty = organizationMemberRolesBaseline !== null
-      && JSON.stringify(organizationMemberRoles) !== JSON.stringify(organizationMemberRolesBaseline);
+      && isDirtyDomain(organizationMemberRoles, organizationMemberRolesBaseline);
     return formDirty || membersDirty;
   }
 
   function configurationFormsDirty(): boolean {
-    return applicationWorkspaceDirty
-      || userFormIsDirty()
+    return userFormIsDirty()
       || enterpriseFormIsDirty()
       || organizationFormIsDirty()
-      || clientDraftIsDirty()
       || providerFormIsDirty()
       || ldapProviderFormIsDirty()
       || applicationFormIsDirty()
-      || iapApplicationFormIsDirty()
       || invitationFormIsDirty()
       || roleFormIsDirty()
       || groupFormIsDirty()
@@ -3122,53 +3072,28 @@ export function App() {
       || registrationSettingsIsDirty()
       || runtimeSettingsIsDirty()
       || loginSettingsIsDirty()
+      || quickLinkFormIsDirty()
       || securityPolicyIsDirty();
   }
 
-  function openClientEditor(next: typeof emptyClientForm) {
-    setClientForm(next);
-    setClientFormBaseline(next);
-    setClientFormErrors([]);
-    setClientFieldErrors({});
-    setError("");
-    setEditor("client");
-  }
-
   function closeEditor(force = false): boolean {
-    const editorDirty = editor === "client"
-      ? clientDraftIsDirty()
-      : editor === "application"
-        ? applicationFormIsDirty()
-      : editor === "user"
-        ? userFormIsDirty()
-      : editor === "enterprise"
-        ? enterpriseFormIsDirty()
-      : editor === "organization"
-        ? organizationFormIsDirty()
-      : editor === "iap"
-        ? iapApplicationFormIsDirty()
-      : editor === "invitation"
-        ? invitationFormIsDirty()
-      : editor === "role"
-        ? roleFormIsDirty()
-      : editor === "group"
-        ? groupFormIsDirty()
-      : editor === "provider"
-        ? providerFormIsDirty()
-        : editor === "ldap"
-          ? ldapProviderFormIsDirty()
-          : false;
+    const editorDirty =
+      editor === "application" ? applicationFormIsDirty()
+      : editor === "user" ? userFormIsDirty()
+      : editor === "enterprise" ? enterpriseFormIsDirty()
+      : editor === "organization" ? organizationFormIsDirty()
+      : editor === "invitation" ? invitationFormIsDirty()
+      : editor === "role" ? roleFormIsDirty()
+      : editor === "group" ? groupFormIsDirty()
+      : editor === "provider" ? providerFormIsDirty()
+      : editor === "ldap" ? ldapProviderFormIsDirty()
+      : false;
     if (!force && editorDirty && !window.confirm(`${t("unsavedChanges")}\n${t("discardChanges")}?`)) {
       return false;
     }
     if (editor === "organization") {
       organizationMembersLoadId.current += 1;
       setOrganizationMembersLoading(false);
-    }
-    if (editor === "client") {
-      setClientFormBaseline(null);
-      setClientFormErrors([]);
-      setClientFieldErrors({});
     }
     if (editor === "user") {
       setUserForm(emptyUserForm);
@@ -3185,6 +3110,8 @@ export function App() {
       setOrganizationMemberRolesBaseline(null);
     }
     if (editor === "application") {
+      applicationCreateMutationRef.current = null;
+      applicationDeleteMutationRef.current = null;
       setApplicationForm(emptyApplicationForm);
       setApplicationFormBaseline(null);
     }
@@ -3192,14 +3119,11 @@ export function App() {
       setProviderForm(emptyProviderForm);
       setProviderFormBaseline(null);
       setProviderTemplateId("");
+      providerDiscoveryRequest.cancel();
     }
     if (editor === "ldap") {
       setLdapProviderForm(emptyLdapProviderForm);
       setLdapProviderFormBaseline(null);
-    }
-    if (editor === "iap") {
-      setIapApplicationForm(emptyIapApplicationForm);
-      setIapApplicationFormBaseline(null);
     }
     if (editor === "invitation") {
       setInvitationForm(emptyInvitationForm);
@@ -3253,8 +3177,6 @@ export function App() {
         hasGlobalConsolePermission ? { id: "overview" as const, label: t("overview"), icon: Shield } : null,
         canReadUsers ? { id: "users" as const, label: t("users"), icon: Users } : null,
         canManageActiveOrganization ? { id: "applications" as const, label: t("applications"), icon: Building2 } : null,
-        canReadClients ? { id: "clients" as const, label: t("clients"), icon: KeyRound } : null,
-        canReadIap ? { id: "iap" as const, label: t("iap"), icon: Shield } : null,
         canReadOrganizations ? { id: "organizations" as const, label: t("organizations"), icon: Building2 } : null,
         canManageAuthorizationCodes ? { id: "invitations" as const, label: t("invitations"), icon: Ticket } : null,
         canManageSettings ? { id: "registration" as const, label: t("registration"), icon: UserRound } : null,
@@ -3273,8 +3195,6 @@ export function App() {
       hasGlobalConsolePermission,
       canReadUsers,
       canManageActiveOrganization,
-      canReadClients,
-      canReadIap,
       canReadOrganizations,
       canManageAuthorizationCodes,
       canManageSettings,
@@ -3304,7 +3224,7 @@ export function App() {
         id: "applications",
         label: t("navApplications"),
         hint: t("navApplicationsHint"),
-        ids: ["applications", "clients", "iap"] as Tab[]
+        ids: ["applications"] as Tab[]
       },
       {
         id: "access",
@@ -3333,15 +3253,9 @@ export function App() {
   }, [enterpriseContextReady, tab, tabs, user]);
 
   useEffect(() => {
-    if (!configurationFormsDirty()) return;
-    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+    dirtyNavigation.setSource("app", configurationFormsDirty());
   }, [
-    applicationWorkspaceDirty,
+    dirtyNavigation.setSource,
     userForm,
     userFormBaseline,
     enterpriseForm,
@@ -3350,16 +3264,12 @@ export function App() {
     organizationFormBaseline,
     organizationMemberRoles,
     organizationMemberRolesBaseline,
-    clientForm,
-    clientFormBaseline,
     providerForm,
     providerFormBaseline,
     ldapProviderForm,
     ldapProviderFormBaseline,
     auditWebhookForm,
     auditWebhookFormBaseline,
-    iapApplicationForm,
-    iapApplicationFormBaseline,
     invitationForm,
     invitationFormBaseline,
     roleForm,
@@ -3372,6 +3282,8 @@ export function App() {
     runtimeSettingsBaseline,
     loginSettingsDraft,
     loginSettingsBaseline,
+    quickLinkForm,
+    quickLinkFormBaseline,
     securityPolicy,
     securityPolicyBaseline
   ]);
@@ -3397,63 +3309,55 @@ export function App() {
   }, [accountLoginExpanded, authAccountSwitch, authMode, authReturnTo, initialAuth.forceLogin, initialAuth.isAuthPage, initialAuth.selectAccount, locale, tab, tabs, user]);
 
   const normalizedSearchQuery = searchQuery.trim().toLocaleLowerCase();
-  const normalizedUserEmailFilter = userEmailFilter.trim().toLocaleLowerCase();
-  const normalizedUserPhoneFilter = userPhoneFilter.trim().toLocaleLowerCase();
-  const userRegistrationFromTimestamp = toTimestamp(userRegistrationFrom);
-  const userRegistrationToTimestamp = timestampAtDayEnd(userRegistrationTo);
-  const userLastLoginFromTimestamp = toTimestamp(userLastLoginFrom);
-  const userLastLoginToTimestamp = timestampAtDayEnd(userLastLoginTo);
-  const filteredUsers = users.filter((item) => {
-    if (!matchesSearch(
-      normalizedSearchQuery,
-      item.email,
-      item.username,
-      item.display_name,
-      item.phone
-    )) return false;
-    if (normalizedUserEmailFilter && !item.email.toLocaleLowerCase().includes(normalizedUserEmailFilter)) return false;
-    if (normalizedUserPhoneFilter && !(item.phone ?? "").toLocaleLowerCase().includes(normalizedUserPhoneFilter)) return false;
-    if (userRoleFilter === "admin" && !item.is_admin) return false;
-    if (userRoleFilter === "user" && item.is_admin) return false;
-    if (userRegistrationFromTimestamp !== null && item.created_at < userRegistrationFromTimestamp) return false;
-    if (userRegistrationToTimestamp !== null && item.created_at >= userRegistrationToTimestamp) return false;
-    if (userLastLoginFromTimestamp !== null && (!item.last_login_at || item.last_login_at < userLastLoginFromTimestamp)) return false;
-    if (userLastLoginToTimestamp !== null && (!item.last_login_at || item.last_login_at >= userLastLoginToTimestamp)) return false;
-    if (userLoginRegionFilter === "all") return true;
-    if (!item.last_login_ip) return false;
-    return userLoginRegionFilter === "domestic"
-      ? isDomesticLoginIp(item.last_login_ip)
-      : !isDomesticLoginIp(item.last_login_ip);
-  });
-  const selectedUserIdSet = new Set(selectedUserIds);
-  const allVisibleUsersSelected = filteredUsers.length > 0 && filteredUsers.every((item) => selectedUserIdSet.has(item.id));
-  const filteredClients = clients.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.client_id,
-    item.client_name,
-    item.organization_name,
-    item.scopes.join(" ")
-  ));
-  const applicationByOidcClientId = new Map(
-    applications.flatMap((application) =>
-      application.client_bindings.map((binding) => [binding.id, application] as const)
-    )
+  // The invitation/provider tables resolve these references for every row.
+  // Build indexes once per read-model change instead of scanning the full
+  // client/organization collections inside each rendered cell.
+  const clientsByClientId = useMemo(
+    () => new Map(clients.map((client) => [client.client_id, client])),
+    [clients]
   );
-  const filteredIapApplications = iapApplications.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.slug,
-    item.external_host,
-    item.description
-  ));
-  const filteredOrganizations = organizations.filter((item) => matchesSearch(
+  const organizationOptionsById = useMemo(
+    () => new Map(organizationOptions.map((organization) => [organization.id, organization])),
+    [organizationOptions]
+  );
+  // The directory endpoint is the single owner of user filtering, sorting,
+  // and pagination. Filtering this page again in React makes server totals and
+  // visible rows disagree when the two implementations drift.
+  const filteredUsers = users;
+  const activeUserDirectoryPage = userDirectoryQuery.page;
+  const userPageStart = filteredUsers.length === 0
+    ? 0
+    : (activeUserDirectoryPage - 1) * userDirectoryPageSize + 1;
+  const userPageEnd = userPageStart === 0
+    ? 0
+    : userPageStart + filteredUsers.length - 1;
+  const {
+    selectedIdSet: selectedUserIdSet,
+    selectedUsers: selectedManagedUsers,
+    selectedIdsAreCurrent: selectedUsersAreCurrent,
+    allVisibleSelected: allVisibleUsersSelected,
+    toggle: toggleUserSelection,
+    toggleVisible: toggleVisibleUserSelection
+  } = useUserSelection({
+    users,
+    visibleUsers: filteredUsers,
+    selectedIds: selectedUserIds,
+    setSelectedIds: setSelectedUserIds
+  });
+  const filteredOrganizations = useMemo(() => organizations.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.name,
     item.slug,
     item.description,
     item.allowed_email_domains.join(" ")
-  ));
-  const filteredInvitations = invitations.filter((item) => matchesSearch(
+  )), [normalizedSearchQuery, organizations]);
+  const filteredApplications = useMemo(() => applications.filter((item) => matchesSearch(
+    normalizedSearchQuery,
+    item.name,
+    item.slug,
+    item.description
+  )), [applications, normalizedSearchQuery]);
+  const filteredInvitations = useMemo(() => invitations.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.code_type,
     item.login_code_level,
@@ -3464,40 +3368,40 @@ export function App() {
     item.description,
     item.authorized_email,
     item.authorized_username
-  ));
-  const filteredProviders = providers.filter((item) => matchesSearch(
+  )), [invitations, normalizedSearchQuery]);
+  const filteredProviders = useMemo(() => providers.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.display_name,
     item.slug,
     item.issuer,
     item.email_domains.join(" ")
-  ));
-  const filteredLdapProviders = ldapProviders.filter((item) => matchesSearch(
+  )), [normalizedSearchQuery, providers]);
+  const filteredLdapProviders = useMemo(() => ldapProviders.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.display_name,
     item.slug,
     item.url,
     item.base_dn
-  ));
-  const filteredRoles = roles.filter((item) => matchesSearch(
+  )), [ldapProviders, normalizedSearchQuery]);
+  const filteredRoles = useMemo(() => roles.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.name,
     item.description,
     item.permissions.join(" ")
-  ));
-  const filteredGroups = groups.filter((item) => matchesSearch(
+  )), [normalizedSearchQuery, roles]);
+  const filteredGroups = useMemo(() => groups.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.name,
     item.description
-  ));
-  const filteredAuditWebhooks = auditWebhooks.filter((item) => matchesSearch(
+  )), [groups, normalizedSearchQuery]);
+  const filteredAuditWebhooks = useMemo(() => auditWebhooks.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.name,
     item.url,
     item.actions.join(" "),
     item.last_error
-  ));
-  const filteredAuditEvents = auditEvents.filter((item) => matchesSearch(
+  )), [auditWebhooks, normalizedSearchQuery]);
+  const filteredAuditEvents = useMemo(() => auditEvents.filter((item) => matchesSearch(
     normalizedSearchQuery,
     item.action,
     item.target_kind,
@@ -3505,12 +3409,10 @@ export function App() {
     item.actor_user_id,
     item.actor_client_id,
     item.details
-  ));
+  )), [auditEvents, normalizedSearchQuery]);
   const searchableTabs: Tab[] = [
     "users",
     "applications",
-    "clients",
-    "iap",
     "organizations",
     "invitations",
     "providers",
@@ -3523,8 +3425,6 @@ export function App() {
   const totalClientCount = overview?.clients ?? 0;
   const activeUserRate = totalUserCount > 0 ? Math.round((activeUserCount / totalUserCount) * 100) : 0;
   const activeClientRate = totalClientCount > 0 ? Math.round((activeClientCount / totalClientCount) * 100) : 0;
-  const selectedManagedUsers = users.filter((item) => selectedUserIdSet.has(item.id));
-  const selectedUsersAreCurrent = selectedManagedUsers.length === selectedUserIds.length;
   const selectedLifecycleState = selectedManagedUsers.length > 0
     ? lifecycleStateForUser(selectedManagedUsers[0])
     : null;
@@ -3551,7 +3451,14 @@ export function App() {
     ...(canBulkResetMfa ? ["reset_mfa" as const] : [])
   ];
 
+  function resetUserDirectoryQueryState() {
+    setUserDirectoryPage(1);
+    setUserDirectoryCursorHistory([null]);
+    setSelectedUserIds([]);
+  }
+
   function resetUserFilters() {
+    resetUserDirectoryQueryState();
     setUserFilter("live");
     setUserOrganizationFilter("");
     setUserFiltersExpanded(false);
@@ -3564,20 +3471,6 @@ export function App() {
     setUserPhoneFilter("");
     setUserLoginRegionFilter("all");
     setUserLinkedIdentityFilter("all");
-    setSelectedUserIds([]);
-  }
-
-  function toggleUserSelection(id: string) {
-    setSelectedUserIds((current) => current.includes(id)
-      ? current.filter((item) => item !== id)
-      : [...current, id]);
-  }
-
-  function toggleVisibleUserSelection(selected: boolean) {
-    const visibleIds = filteredUsers.map((item) => item.id);
-    setSelectedUserIds((current) => selected
-      ? [...new Set([...current, ...visibleIds])]
-      : current.filter((id) => !visibleIds.includes(id)));
   }
 
   function bulkUserActionTitle(action: BulkUserAction): string {
@@ -3594,19 +3487,22 @@ export function App() {
     if (!availableBulkUserActions.includes(action)) return;
     const targetIds = selectedManagedUsers.map((item) => item.id);
     if (targetIds.length === 0 || targetIds.length !== selectedUserIds.length) return;
+    const targetIdSet = new Set(targetIds);
     const title = bulkUserActionTitle(action);
+    const existingMutation = bulkLifecycleMutationRef.current;
+    const idempotencyKey = existingMutation
+      && existingMutation.action === action
+      && existingMutation.userIds.length === targetIds.length
+      && existingMutation.userIds.every((id) => targetIdSet.has(id))
+      ? existingMutation.key
+      : `ui-bulk-lifecycle-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+    bulkLifecycleMutationRef.current = { action, userIds: [...targetIds], key: idempotencyKey };
     requestConfirmation(async () => {
-      for (const id of targetIds) {
-        const path = action === "enable"
-          ? `/api/admin/users/${id}/enable`
-          : action === "reset_mfa"
-            ? `/api/admin/users/${id}/mfa/reset`
-            : `/api/admin/users/${id}`;
-        await api(path, { method: action === "enable" || action === "reset_mfa" ? "POST" : "DELETE" });
-      }
-      setSelectedUserIds((current) => current.filter((id) => !targetIds.includes(id)));
-      await loadAdminData("users");
+      await adminApi.applyAdminUserLifecycle(action, targetIds, { idempotencyKey });
+      setSelectedUserIds((current) => current.filter((id) => !targetIdSet.has(id)));
+      await userDirectory.reload();
       setVerificationMessage(t("bulkActionCompleted"));
+      bulkLifecycleMutationRef.current = null;
     }, title);
   }
 
@@ -4174,7 +4070,10 @@ export function App() {
             {searchEnabled && (
               <SearchField
                 value={searchQuery}
-                onChange={setSearchQuery}
+                onChange={(value) => {
+                  resetUserDirectoryQueryState();
+                  setSearchQuery(value);
+                }}
                 placeholder={t("searchCurrentPage")}
                 clearLabel={t("clearSearch")}
               />
@@ -4213,7 +4112,7 @@ export function App() {
             </form>
           </Modal>
         )}
-        {adminLoading && <div className="loading-bar" role="progressbar" aria-label={t("loading")} />}
+        {adminViewLoading && <div className="loading-bar" role="progressbar" aria-label={t("loading")} />}
         {error && !editor && !pendingConfirmation && <div className="error" role="alert">{error}</div>}
         {isRestrictedLoginCodeSession && (
           <div className="info temporary-session-banner" role="status" aria-live="polite">
@@ -4445,7 +4344,9 @@ export function App() {
           </section>
         )}
         {tab === "billing" && user && !isRestrictedLoginCodeSession && (
-          <WalletWorkspace locale={locale} t={t} orderReference={billingOrderReference} />
+          <Suspense fallback={<div className="loading-state">{t("loading")}</div>}>
+            <WalletWorkspace ref={walletWorkspaceRef} locale={locale} t={t} orderReference={billingOrderReference} />
+          </Suspense>
         )}
         {canAdmin && tab === "overview" && (
           <section className="dashboard">
@@ -4457,7 +4358,6 @@ export function App() {
               </div>
               <div className="quick-actions" role="group" aria-label={t("quickActions")}>
                 {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={16} />{t("users")}</button>}
-                {canReadClients && <button type="button" onClick={() => navigateToTab("clients")}><KeyRound size={16} />{t("clients")}</button>}
                 {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={16} />{t("security")}</button>}
               </div>
             </article>
@@ -4492,7 +4392,6 @@ export function App() {
                 </div>
                 <div className="overview-nav-grid">
                   {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={17} /><span>{t("users")}</span><ExternalLink size={14} /></button>}
-                  {canReadClients && <button type="button" onClick={() => navigateToTab("clients")}><KeyRound size={17} /><span>{t("clients")}</span><ExternalLink size={14} /></button>}
                   {canReadOrganizations && <button type="button" onClick={() => navigateToTab("organizations")}><Building2 size={17} /><span>{t("organizations")}</span><ExternalLink size={14} /></button>}
                   {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={17} /><span>{t("security")}</span><ExternalLink size={14} /></button>}
                 </div>
@@ -4668,7 +4567,10 @@ export function App() {
                 </div>
                 <label className="filter-control">
                   <span>{t("userFilter")}</span>
-                  <select value={userFilter} onChange={(event) => setUserFilter(event.target.value as UserFilter)}>
+                  <select value={userFilter} onChange={(event) => {
+                    resetUserDirectoryQueryState();
+                    setUserFilter(event.target.value as UserFilter);
+                  }}>
                     <option value="live">{t("liveUsers")}</option>
                     <option value="active">{t("activeUsers")}</option>
                     <option value="disabled">{t("disabledUsers")}</option>
@@ -4697,11 +4599,17 @@ export function App() {
                 <div className="user-filter-grid user-filter-grid-common">
                   <label className="user-filter-field">
                     <span>{t("filterEmail")}</span>
-                    <input value={userEmailFilter} onChange={(event) => setUserEmailFilter(event.target.value)} />
+                    <input value={userEmailFilter} onChange={(event) => {
+                      resetUserDirectoryQueryState();
+                      setUserEmailFilter(event.target.value);
+                    }} />
                   </label>
                   <label className="user-filter-field">
                     <span>{t("filterRole")}</span>
-                    <select value={userRoleFilter} onChange={(event) => setUserRoleFilter(event.target.value as UserRoleFilter)}>
+                    <select value={userRoleFilter} onChange={(event) => {
+                      resetUserDirectoryQueryState();
+                      setUserRoleFilter(event.target.value as UserRoleFilter);
+                    }}>
                       <option value="all">{t("allRoles")}</option>
                       <option value="admin">{t("admin")}</option>
                       <option value="user">{t("normalUser")}</option>
@@ -4710,9 +4618,15 @@ export function App() {
                   <div className="user-filter-field">
                     <span>{t("filterRegistrationDate")}</span>
                     <div className="user-date-range">
-                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateFrom")}`} type="date" value={userRegistrationFrom} onChange={(event) => setUserRegistrationFrom(event.target.value)} />
+                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateFrom")}`} type="date" value={userRegistrationFrom} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserRegistrationFrom(event.target.value);
+                      }} />
                       <span aria-hidden="true">–</span>
-                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateTo")}`} type="date" value={userRegistrationTo} onChange={(event) => setUserRegistrationTo(event.target.value)} />
+                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateTo")}`} type="date" value={userRegistrationTo} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserRegistrationTo(event.target.value);
+                      }} />
                     </div>
                   </div>
                   <div className="user-filter-field">
@@ -4728,11 +4642,17 @@ export function App() {
                   <div className="user-filter-grid user-filter-grid-advanced">
                     <label className="user-filter-field">
                       <span>{t("filterPhone")}</span>
-                      <input value={userPhoneFilter} onChange={(event) => setUserPhoneFilter(event.target.value)} />
+                      <input value={userPhoneFilter} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserPhoneFilter(event.target.value);
+                      }} />
                     </label>
                     <label className="user-filter-field">
                       <span>{t("filterLoginRegion")}</span>
-                      <select value={userLoginRegionFilter} onChange={(event) => setUserLoginRegionFilter(event.target.value as UserLoginRegionFilter)}>
+                      <select value={userLoginRegionFilter} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserLoginRegionFilter(event.target.value as UserLoginRegionFilter);
+                      }}>
                         <option value="all">{t("allLoginRegions")}</option>
                         <option value="domestic">{t("domestic")}</option>
                         <option value="overseas">{t("overseas")}</option>
@@ -4740,7 +4660,10 @@ export function App() {
                     </label>
                     <label className="user-filter-field">
                       <span>{t("filterOrganization")}</span>
-                      <select value={userOrganizationFilter} onChange={(event) => setUserOrganizationFilter(event.target.value)}>
+                      <select value={userOrganizationFilter} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserOrganizationFilter(event.target.value);
+                      }}>
                         <option value="">{t("allOrganizations")}</option>
                         {userOrganizationFilter && !organizationOptions.some((organization) => organization.id === userOrganizationFilter) && (
                           <option value={userOrganizationFilter}>{userOrganizationFilter}</option>
@@ -4754,7 +4677,10 @@ export function App() {
                     </label>
                     <label className="user-filter-field">
                       <span>{t("filterLinkedIdentity")}</span>
-                      <select value={userLinkedIdentityFilter} onChange={(event) => setUserLinkedIdentityFilter(event.target.value as UserLinkedIdentityFilter)}>
+                      <select value={userLinkedIdentityFilter} onChange={(event) => {
+                        resetUserDirectoryQueryState();
+                        setUserLinkedIdentityFilter(event.target.value as UserLinkedIdentityFilter);
+                      }}>
                         <option value="all">{t("allIdentityStates")}</option>
                         <option value="linked">{t("linkedIdentityOnly")}</option>
                         <option value="unlinked">{t("unlinkedIdentityOnly")}</option>
@@ -4893,7 +4819,45 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {!adminLoading && filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
+              <div className="user-pagination" aria-label={t("users")}>
+                <span>
+                  {t("cursorPageSummary")
+                    .replace("{page}", String(activeUserDirectoryPage))
+                    .replace("{from}", String(userPageStart))
+                    .replace("{to}", String(userPageEnd))}
+                </span>
+                <div className="actions">
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={t("previousPage")}
+                    onClick={() => {
+                      setSelectedUserIds([]);
+                      setUserDirectoryPage((page) => Math.max(1, page - 1));
+                    }}
+                    disabled={adminViewLoading || activeUserDirectoryPage <= 1}
+                  >{t("previousPage")}</button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={t("nextPage")}
+                    onClick={() => {
+                      setSelectedUserIds([]);
+                      const nextCursor = userDirectoryNextCursor;
+                      if (!nextCursor) return;
+                      setUserDirectoryCursorHistory((history) => {
+                        const nextPage = activeUserDirectoryPage + 1;
+                        const nextHistory = history.slice(0, nextPage);
+                        nextHistory[nextPage - 1] = nextCursor;
+                        return nextHistory;
+                      });
+                      setUserDirectoryPage((page) => page + 1);
+                    }}
+                    disabled={adminViewLoading || !userDirectoryNextCursor}
+                  >{t("nextPage")}</button>
+                </div>
+              </div>
+              {!adminViewLoading && filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
               {selectedUser && <Modal title={t("userDetails")} closeLabel={t("close")} onClose={() => setSelectedUser(null)} wide className="user-detail-modal"><UserDetailPanel detail={selectedUser} locale={locale} t={t} /></Modal>}
             </div>
           </section>
@@ -4913,7 +4877,7 @@ export function App() {
                   <div className="info" role="status">{t("loading")}</div>
                 ) : (
                   <div className="checkbox-grid tall">
-                    {users.map((item) => {
+                    {userOptions.map((item) => {
                       const role = organizationMemberRoles[item.id] ?? "";
                       return (
                         <div key={item.id} className="member-row">
@@ -4995,7 +4959,7 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {!adminLoading && filteredOrganizations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Building2 size={22} />} />}
+              {!adminViewLoading && filteredOrganizations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Building2 size={22} />} />}
             </div>
           </section>
         )}
@@ -5030,375 +4994,32 @@ export function App() {
                 </form>
               </Modal>
             )}
-            <ApplicationWorkspace
-              applications={applications}
-              clients={clients}
-              providers={providers}
-              ldapProviders={ldapProviders}
-              locale={locale}
-              canManage={canManageActiveOrganization}
-              onCreateApplication={() => {
-                setApplicationForm(emptyApplicationForm);
-                setApplicationFormBaseline(emptyApplicationForm);
-                setEditor("application");
-              }}
-              onEditApplication={(application) => void editApplication(application)}
-              onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id), t("delete"), t("deleteApplicationDescription"))}
-              onApplicationModuleChanged={updateApplicationModuleInState}
-              initialApplicationId={applicationNavigationId}
-              initialSection={applicationNavigationSection}
-              onNavigationChange={(applicationId, section) => navigateToTab("applications", { applicationId, applicationSection: section })}
-              onDirtyChange={setApplicationWorkspaceDirty}
-              onRequestConfirmation={requestConfirmation}
-            />
+            <Suspense fallback={<div className="loading-state">{t("loading")}</div>}>
+              <ApplicationWorkspace
+                applications={filteredApplications}
+                providers={providers}
+                ldapProviders={ldapProviders}
+                organizationOptions={organizationOptions}
+                locale={locale}
+                canManage={canManageActiveOrganization}
+                onCreateApplication={() => {
+                  applicationCreateMutationRef.current = null;
+                  setApplicationForm(emptyApplicationForm);
+                  setApplicationFormBaseline(emptyApplicationForm);
+                  setEditor("application");
+                }}
+                onEditApplication={(application) => void editApplication(application)}
+                onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id), t("delete"), t("deleteApplicationDescription"))}
+                onApplicationModuleChanged={updateApplicationModuleInState}
+                onApplicationOidcClientsChanged={updateApplicationOidcClientsInState}
+                initialApplicationId={applicationNavigationId}
+                initialSection={applicationNavigationSection}
+                onNavigationChange={(applicationId, section) => navigateToTab("applications", { applicationId, applicationSection: section })}
+                dirtyNavigation={dirtyNavigation.controller}
+                onRequestConfirmation={requestConfirmation}
+              />
+            </Suspense>
           </>
-        )}
-        {canReadClients && tab === "clients" && (
-          <section className="management-list">
-            {canManageClients && editor === "client" && (
-              <Modal title={clientForm.id ? t("save") : t("createClient")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor} wide>
-              <form className="panel" onSubmit={saveClient}>
-                <FormErrorSummary title={t("fixFormErrors")} errors={clientFormErrors} />
-                <SettingsSection title={t("clientBasics")} description={t("clientBasicsHint")} collapsible={false}>
-                  <Field label={t("clientId")} value={clientForm.client_id} onChange={(value) => setClientForm({ ...clientForm, client_id: value })} error={clientFieldErrors.client_id} required />
-                  <Field label={t("clientName")} value={clientForm.client_name} onChange={(value) => setClientForm({ ...clientForm, client_name: value })} error={clientFieldErrors.client_name} required />
-                  <Field label={t("clientLogoUri")} type="url" value={clientForm.logo_uri} onChange={(value) => setClientForm({ ...clientForm, logo_uri: value })} />
-                  <div className="info client-enterprise-lock" role="status">
-                    <strong>{t("clientOrganization")}</strong>
-                    <span>{organizationContext?.name ?? t("noEnterprise")}</span>
-                    <small>{t("clientOrganizationFixed")}</small>
-                  </div>
-                  <SecretField
-                    label={t("clientSecret")}
-                    value={clientForm.client_secret}
-                    onChange={(value) => setClientForm({ ...clientForm, client_secret: value })}
-                    description={clientForm.id ? t("clientSecretHint") : undefined}
-                    revealLabel={t("revealSecret")}
-                    hideLabel={t("hideSecret")}
-                  />
-                </SettingsSection>
-                <SettingsSection title={t("clientRedirects")} description={t("clientRedirectsHint")}>
-                  <ListField
-                    label={t("redirectUris")}
-                    value={clientForm.redirect_uris}
-                    onChange={(value) => setClientForm({ ...clientForm, redirect_uris: value })}
-                    error={clientFieldErrors.redirect_uris}
-                    addLabel={t("addItem")}
-                    removeLabel={t("removeItem")}
-                    type="url"
-                    description={t("clientRedirectListHint")}
-                  />
-                  <ListField
-                    label={t("postLogoutUris")}
-                    value={clientForm.post_logout_redirect_uris}
-                    onChange={(value) => setClientForm({ ...clientForm, post_logout_redirect_uris: value })}
-                    error={clientFieldErrors.post_logout_redirect_uris}
-                    addLabel={t("addItem")}
-                    removeLabel={t("removeItem")}
-                    type="url"
-                  />
-                  <Field label={t("backchannelLogoutUri")} type="url" value={clientForm.backchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_uri: value })} />
-                  <Field label={t("frontchannelLogoutUri")} type="url" value={clientForm.frontchannel_logout_uri} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_uri: value })} />
-                  <div className="check-grid-inline">
-                    <Check label={t("backchannelLogoutSessionRequired")} checked={clientForm.backchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, backchannel_logout_session_required: value })} />
-                    <Check label={t("frontchannelLogoutSessionRequired")} checked={clientForm.frontchannel_logout_session_required} onChange={(value) => setClientForm({ ...clientForm, frontchannel_logout_session_required: value })} />
-                  </div>
-                </SettingsSection>
-                <SettingsSection title={t("clientProtocol")} description={t("clientProtocolHint")}>
-                  <div className="form-grid-2">
-                    <Field label={t("scopes")} value={clientForm.scopes} onChange={(value) => setClientForm({ ...clientForm, scopes: value })} />
-                    <Field label={t("grantTypes")} value={clientForm.grant_types} onChange={(value) => setClientForm({ ...clientForm, grant_types: value })} />
-                    <Field label={t("responseTypes")} value={clientForm.response_types} onChange={(value) => setClientForm({ ...clientForm, response_types: value })} />
-                    <SelectField label={t("tokenAuthMethod")} value={clientForm.token_endpoint_auth_method} onChange={(value) => setClientForm({ ...clientForm, token_endpoint_auth_method: value })}>
-                      <option value="client_secret_basic">client_secret_basic</option>
-                      <option value="client_secret_post">client_secret_post</option>
-                      <option value="client_secret_jwt">client_secret_jwt</option>
-                      <option value="private_key_jwt">private_key_jwt</option>
-                      <option value="none">none</option>
-                    </SelectField>
-                    <SelectField label={t("subjectType")} value={clientForm.subject_type} onChange={(value) => setClientForm({ ...clientForm, subject_type: value })}>
-                      <option value="public">public</option>
-                      <option value="pairwise">pairwise</option>
-                    </SelectField>
-                    <Field label={t("sectorIdentifierUri")} type="url" value={clientForm.sector_identifier_uri} onChange={(value) => setClientForm({ ...clientForm, sector_identifier_uri: value })} />
-                  </div>
-                </SettingsSection>
-                <SettingsSection title={t("clientSecurity")} description={t("clientSecurityHint")}>
-                  <div className="check-grid-inline">
-                    <Check label={t("requirePkce")} checked={clientForm.require_pkce} onChange={(value) => setClientForm({ ...clientForm, require_pkce: value })} />
-                    <Check label={t("requireS256Pkce")} checked={clientForm.require_s256_pkce} error={clientFieldErrors.require_s256_pkce} onChange={(value) => setClientForm({ ...clientForm, require_s256_pkce: value, require_pkce: value ? true : clientForm.require_pkce })} />
-                    <Check label={t("requireClientMfa")} checked={clientForm.require_mfa} onChange={(value) => setClientForm({ ...clientForm, require_mfa: value })} />
-                    <Check label={t("requirePar")} checked={clientForm.require_pushed_authorization_requests} onChange={(value) => setClientForm({ ...clientForm, require_pushed_authorization_requests: value })} />
-                    <Check label={t("requireConfidentialClient")} checked={clientForm.require_confidential_client} onChange={(value) => setClientForm({ ...clientForm, require_confidential_client: value })} />
-                    <Check label={t("requireDpop")} checked={clientForm.require_dpop} onChange={(value) => setClientForm({ ...clientForm, require_dpop: value })} />
-                    <Check label={t("requireAccountSelection")} checked={clientForm.require_account_selection} onChange={(value) => setClientForm({ ...clientForm, require_account_selection: value })} />
-                    <Check label={t("trustEmailVerified")} checked={clientForm.trust_email_verified} onChange={(value) => setClientForm({ ...clientForm, trust_email_verified: value })} />
-                  </div>
-                </SettingsSection>
-                <SettingsSection title={t("clientExtensions")} description={t("clientExtensionsHint")}>
-                  <Field label={t("jwksUri")} type="url" value={clientForm.jwks_uri} onChange={(value) => setClientForm({ ...clientForm, jwks_uri: value })} />
-                  <Field label={t("jwks")} value={clientForm.jwks} onChange={(value) => setClientForm({ ...clientForm, jwks: value })} textarea />
-                  <Field label={t("authorizationDetailsTypes")} textarea value={clientForm.authorization_details_types} onChange={(value) => setClientForm({ ...clientForm, authorization_details_types: value })} />
-                  <Check label={t("serviceAccount")} checked={clientForm.service_account_enabled} onChange={(value) => setClientForm({ ...clientForm, service_account_enabled: value })} />
-                  {clientForm.service_account_enabled && <Field label={t("serviceAccountPermissions")} textarea value={clientForm.service_account_permissions} onChange={(value) => setClientForm({ ...clientForm, service_account_permissions: value })} />}
-                  <Check label={t("active")} checked={clientForm.is_active} onChange={(value) => setClientForm({ ...clientForm, is_active: value })} />
-                </SettingsSection>
-                <SettingsSection title={t("clientClaims")} description={t("clientClaimsHint")}>
-                  <div className="mapper-list">
-                    <div className="mapper-heading">
-                      <h4>{t("claimMappers")}</h4>
-                      <button type="button" onClick={addClientClaimMapper}>
-                        <Plus size={14} />
-                        {t("addClaimMapper")}
-                      </button>
-                    </div>
-                    {clientForm.claim_mappers.length === 0 && <p className="muted">{t("noData")}</p>}
-                    {clientForm.claim_mappers.map((mapper, index) => (
-                      <div className="mapper-card" key={index}>
-                        <div className="mapper-grid">
-                          <Field label={t("claimName")} value={mapper.claim_name} onChange={(value) => updateClientClaimMapper(index, { claim_name: value })} />
-                          <SelectField label={t("claimSource")} value={mapper.source} onChange={(value) => updateClientClaimMapper(index, { source: value })}>
-                            <option value="user_field">{t("userField")}</option>
-                            <option value="static">{t("staticValue")}</option>
-                            <option value="scope">{t("scopeFlag")}</option>
-                            <option value="client">{t("clientField")}</option>
-                          </SelectField>
-                          <Field label={t("sourceValue")} value={mapper.source_value} onChange={(value) => updateClientClaimMapper(index, { source_value: value })} />
-                          <SelectField label={t("valueType")} value={mapper.value_type} onChange={(value) => updateClientClaimMapper(index, { value_type: value })}>
-                            <option value="string">string</option>
-                            <option value="bool">bool</option>
-                            <option value="number">number</option>
-                            <option value="json">json</option>
-                          </SelectField>
-                        </div>
-                        <div className="mapper-targets">
-                          <Check label={t("includeIdToken")} checked={mapper.include_in_id_token} onChange={(value) => updateClientClaimMapper(index, { include_in_id_token: value })} />
-                          <Check label={t("includeAccessToken")} checked={mapper.include_in_access_token} onChange={(value) => updateClientClaimMapper(index, { include_in_access_token: value })} />
-                          <Check label={t("includeUserInfo")} checked={mapper.include_in_userinfo} onChange={(value) => updateClientClaimMapper(index, { include_in_userinfo: value })} />
-                          <Check label={t("active")} checked={mapper.is_active} onChange={(value) => updateClientClaimMapper(index, { is_active: value })} />
-                          <button type="button" onClick={() => removeClientClaimMapper(index)}>
-                            <Trash2 size={14} />
-                            {t("delete")}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </SettingsSection>
-                <FormActions
-                  submitLabel={t("save")}
-                  cancelLabel={t("cancel")}
-                  onCancel={() => closeEditor()}
-                  busy={busy}
-                  dirty={clientDraftIsDirty()}
-                  statusLabel={clientDraftIsDirty() ? t("unsavedChanges") : undefined}
-                  savingLabel={t("saving")}
-                />
-              </form>
-              </Modal>
-            )}
-            <div className="client-list oidc-client-list">
-              {canManageClients && <div className="table-toolbar"><button type="button" onClick={() => openClientEditor({ ...emptyClientForm, organization_id: organizationContext?.id ?? "" })}><Plus size={14} />{t("createClient")}</button></div>}
-              {filteredClients.map((client) => (
-                <article className="client-card" key={client.id}>
-                  <div>
-                    <h3>{client.client_name}</h3>
-                    <p>{client.client_id} · {client.subject_type} · {client.organization_name ?? t("noOrganization")}</p>
-                  </div>
-                  <div className="tag-row">{client.scopes.map((scope) => <span key={scope}>{scope}</span>)}</div>
-                  {(() => {
-                    const application = applicationByOidcClientId.get(client.id);
-                    return application ? (
-                      <div className="application-connection-summary">
-                        <span>{t("applicationConnection")}</span>
-                        <strong>{application.name}</strong>
-                        {canManageActiveOrganization && (
-                          <button className="text-button" type="button" onClick={() => navigateToTab("applications", { applicationId: application.id, applicationSection: "authorization" })}>
-                            <Link2 size={14} />
-                            {t("openApplicationPolicy")}
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <p className="muted application-connection-summary">{t("applicationConnectionUnlinked")}</p>
-                    );
-                  })()}
-                  {client.require_mfa && <div className="tag-row"><span>{t("requireClientMfa")}</span></div>}
-                  {(client.require_pushed_authorization_requests || client.require_s256_pkce || client.require_confidential_client || client.require_dpop || client.require_account_selection || client.trust_email_verified) && (
-                    <div className="tag-row">
-                      {client.require_pushed_authorization_requests && <span>{t("requirePar")}</span>}
-                      {client.require_s256_pkce && <span>{t("requireS256Pkce")}</span>}
-                      {client.require_confidential_client && <span>{t("requireConfidentialClient")}</span>}
-                      {client.require_dpop && <span>{t("requireDpop")}</span>}
-                      {client.require_account_selection && <span>{t("requireAccountSelection")}</span>}
-                      {client.trust_email_verified && <span>{t("trustEmailVerified")}</span>}
-                    </div>
-                  )}
-                  {client.service_account_enabled && (
-                    <div className="tag-row">
-                      <span>{t("serviceAccount")}</span>
-                      {client.service_account_permissions.map((permission) => <span key={permission}>{permission}</span>)}
-                    </div>
-                  )}
-                  {client.authorization_details_types.length > 0 && (
-                    <div className="tag-row">
-                      <span>{t("authorizationDetailsTypes")}</span>
-                      {client.authorization_details_types.map((type) => <span key={type}>{type}</span>)}
-                    </div>
-                  )}
-                  {client.claim_mappers.length > 0 && (
-                    <div className="tag-row">
-                      {client.claim_mappers.map((mapper) => <span key={mapper.id}>{mapper.claim_name}</span>)}
-                    </div>
-                  )}
-                  <small>{client.redirect_uris.join(", ")}</small>
-                  {canManageClients && (
-                    <div className="actions client-card-actions">
-                      <button type="button" onClick={() => openClientEditor({
-                        id: client.id,
-                        client_id: client.client_id,
-                        client_name: client.client_name,
-                        logo_uri: client.logo_uri,
-                        organization_id: client.organization_id ?? "",
-                        client_secret: "",
-                        redirect_uris: client.redirect_uris.join("\n"),
-                        post_logout_redirect_uris: client.post_logout_redirect_uris.join("\n"),
-                        scopes: joinList(client.scopes),
-                        grant_types: joinList(client.grant_types),
-                        response_types: joinList(client.response_types),
-                        token_endpoint_auth_method: client.token_endpoint_auth_method,
-                        require_pkce: client.require_pkce,
-                        require_mfa: client.require_mfa,
-                        require_pushed_authorization_requests: client.require_pushed_authorization_requests,
-                        require_s256_pkce: client.require_s256_pkce,
-                        require_confidential_client: client.require_confidential_client,
-                        require_dpop: client.require_dpop,
-                        require_account_selection: client.require_account_selection,
-                        trust_email_verified: client.trust_email_verified,
-                        authorization_details_types: joinList(client.authorization_details_types),
-                        subject_type: client.subject_type,
-                        sector_identifier_uri: client.sector_identifier_uri,
-                        jwks_uri: client.jwks_uri,
-                        jwks: client.jwks,
-                        backchannel_logout_uri: client.backchannel_logout_uri,
-                        backchannel_logout_session_required: client.backchannel_logout_session_required,
-                        frontchannel_logout_uri: client.frontchannel_logout_uri,
-                        frontchannel_logout_session_required: client.frontchannel_logout_session_required,
-                        service_account_enabled: client.service_account_enabled,
-                        service_account_permissions: client.service_account_permissions.join("\n"),
-                        is_active: client.is_active,
-                        claim_mappers: client.claim_mappers.map((mapper, index) => ({
-                          claim_name: mapper.claim_name,
-                          source: mapper.source,
-                          source_value: mapper.source_value,
-                          value_type: mapper.value_type,
-                          include_in_id_token: mapper.include_in_id_token,
-                          include_in_access_token: mapper.include_in_access_token,
-                          include_in_userinfo: mapper.include_in_userinfo,
-                          is_active: mapper.is_active,
-                          sort_order: mapper.sort_order ?? index
-                        }))
-                      })}>{t("edit")}</button>
-                      <button className="danger-button" type="button" onClick={() => requestConfirmation(() => deleteClient(client.id))} disabled={busy}>
-                        <Trash2 size={14} />
-                        {t("delete")}
-                      </button>
-                    </div>
-                  )}
-                </article>
-              ))}
-              {!adminLoading && filteredClients.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<KeyRound size={22} />} />}
-            </div>
-          </section>
-        )}
-        {canReadIap && tab === "iap" && (
-          <section className="management-list">
-            {canManageIap && editor === "iap" && (
-              <Modal title={iapApplicationForm.id ? t("updateIapApplication") : t("createIapApplication")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
-              <form className="panel" onSubmit={saveIapApplication}>
-                <Field label={t("slug")} value={iapApplicationForm.slug} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, slug: value })} />
-                <Field label={t("iapApplication")} value={iapApplicationForm.name} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, name: value })} />
-                <Field label={t("description")} value={iapApplicationForm.description} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, description: value })} textarea />
-                <Field label={t("externalHost")} value={iapApplicationForm.external_host} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, external_host: value })} />
-                <Field label={t("pathPrefix")} value={iapApplicationForm.path_prefix} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, path_prefix: value })} />
-                <SelectField label={t("requiredOrganization")} value={iapApplicationForm.required_organization_id} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, required_organization_id: value })}>
-                  <option value="">{t("noOrganization")}</option>
-                  {organizationOptions.map((organization) => (
-                    <option key={organization.id} value={organization.id}>
-                      {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
-                    </option>
-                  ))}
-                </SelectField>
-                <label>{t("requiredOrganizationRoles")}</label>
-                <div className="checkbox-grid">
-                  {["owner", "admin", "member"].map((role) => (
-                    <Check
-                      key={role}
-                      label={role}
-                      checked={iapApplicationForm.required_organization_roles.includes(role)}
-                      onChange={() => setIapApplicationForm({
-                        ...iapApplicationForm,
-                        required_organization_roles: toggleValue(iapApplicationForm.required_organization_roles, role)
-                      })}
-                    />
-                  ))}
-                </div>
-                <Field
-                  label={t("requiredPermissions")}
-                  textarea
-                  value={iapApplicationForm.required_permissions}
-                  onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, required_permissions: value })}
-                />
-                <Check label={t("active")} checked={iapApplicationForm.is_active} onChange={(value) => setIapApplicationForm({ ...iapApplicationForm, is_active: value })} />
-                <FormActions
-                  submitLabel={iapApplicationForm.id ? t("save") : t("create")}
-                  cancelLabel={t("cancel")}
-                  onCancel={closeEditor}
-                  busy={busy}
-                  dirty={iapApplicationFormIsDirty()}
-                  statusLabel={iapApplicationFormIsDirty() ? t("unsavedChanges") : undefined}
-                  savingLabel={t("saving")}
-                />
-              </form>
-              </Modal>
-            )}
-            <div className="client-list">
-              {canManageIap && <div className="table-toolbar"><button type="button" onClick={() => { setIapApplicationForm(emptyIapApplicationForm); setIapApplicationFormBaseline(emptyIapApplicationForm); setEditor("iap"); }}><Plus size={14} />{t("createIapApplication")}</button></div>}
-              {filteredIapApplications.map((application) => {
-                const organization = organizationOptions.find((item) => item.id === application.required_organization_id);
-                return (
-                  <article className="client-card" key={application.id}>
-                    <div>
-                      <h3>{application.name}</h3>
-                      <p>{application.external_host}{application.path_prefix} · {application.is_active ? t("active") : t("disabled")}</p>
-                    </div>
-                    <small>{application.description ?? "-"}</small>
-                    <div className="tag-row">
-                      <span>{t("forwardAuthEndpoint")}: /api/iap/forward-auth</span>
-                    </div>
-                    <div className="tag-row">
-                      <span>{t("slug")}: {application.slug}</span>
-                      {organization && <span>{organization.name}</span>}
-                      {application.required_organization_roles.map((role) => <span key={role}>{role}</span>)}
-                    </div>
-                    {application.required_permissions.length > 0 && (
-                      <div className="tag-row">
-                        {application.required_permissions.map((permission) => <span key={permission}>{permission}</span>)}
-                      </div>
-                    )}
-                    <small>{t("updatedAt")}: {formatTime(application.updated_at, locale)}</small>
-                    {canManageIap && (
-                      <div className="actions">
-                        <button type="button" onClick={() => { editIapApplication(application); setEditor("iap"); }}>{t("edit")}</button>
-                        <button type="button" onClick={() => requestConfirmation(() => deleteIapApplication(application.id))}>{t("delete")}</button>
-                      </div>
-                    )}
-                  </article>
-                );
-              })}
-              {!adminLoading && filteredIapApplications.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Shield size={22} />} />}
-            </div>
-          </section>
         )}
         {canManageAuthorizationCodes && tab === "invitations" && (
           <section className="management-list">
@@ -5625,47 +5246,18 @@ export function App() {
                 </div>
               </Modal>
             )}
-            {redemptionsInvitation && (
-              <Modal
-                title={t("authorizationCodeRedemptionsTitle")}
-                closeLabel={t("close")}
+            {invitationRedemptions.invitation && (
+              <InvitationRedemptionsModal
+                invitation={invitationRedemptions.invitation}
+                items={invitationRedemptions.items}
+                nextCursor={invitationRedemptions.nextCursor}
+                loading={invitationRedemptions.loading}
                 error={invitationRedemptionsError}
-                onClose={closeInvitationRedemptions}
-                className="invitation-redemptions-modal"
-              >
-                <div className="invitation-redemptions-content">
-                  <div className="invitation-redemptions-summary">
-                    <code>{redemptionsInvitation.code_prefix}...</code>
-                    <span>{redemptionsInvitation.uses_count}/{redemptionsInvitation.max_uses ?? t("unlimited")}</span>
-                  </div>
-                  {invitationRedemptionsLoading && invitationRedemptions.length === 0 ? (
-                    <div className="muted">{t("loading")}</div>
-                  ) : invitationRedemptions.length === 0 ? (
-                    <EmptyState title={t("noAuthorizationCodeRedemptions")} icon={<Ticket size={22} />} />
-                  ) : (
-                    <div className="invitation-redemption-list">
-                      {invitationRedemptions.map((redemption) => (
-                        <article className="invitation-redemption-row" key={redemption.id}>
-                          <strong>{redemption.user_email ?? redemption.user_username ?? redemption.user_id}</strong>
-                          <span>{formatTime(redemption.redeemed_at, locale)}</span>
-                        </article>
-                      ))}
-                    </div>
-                  )}
-                  {invitationRedemptionsNextCursor && (
-                    <button
-                      type="button"
-                      onClick={() => void loadInvitationRedemptions(
-                        redemptionsInvitation,
-                        invitationRedemptionsNextCursor
-                      )}
-                      disabled={invitationRedemptionsLoading}
-                    >
-                      {invitationRedemptionsLoading ? t("loading") : t("loadMore")}
-                    </button>
-                  )}
-                </div>
-              </Modal>
+                locale={locale}
+                t={t}
+                onClose={invitationRedemptions.close}
+                onLoadMore={() => void invitationRedemptions.loadMore()}
+              />
             )}
             <div className="table-panel">
               <div className="table-toolbar">
@@ -5720,7 +5312,7 @@ export function App() {
                       <td>
                         {item.code_type === "login" && item.login_code_level === "trial_enrollment" ? (
                           <div className="token-list">
-                            <span>{organizationOptions.find((organization) => organization.id === item.organization_id)?.name ?? item.organization_id ?? "-"}</span>
+                            <span>{organizationOptionsById.get(item.organization_id ?? "")?.name ?? item.organization_id ?? "-"}</span>
                             <span>{t("enrollmentOrganizationRole")}: {t(
                               item.organization_role === "owner"
                                 ? "organizationRoleOwner"
@@ -5730,7 +5322,7 @@ export function App() {
                             )}</span>
                             {(item.allowed_client_ids ?? []).map((clientId) => (
                               <span key={clientId}>
-                                {clients.find((client) => client.client_id === clientId)?.client_name ?? clientId}
+                                {clientsByClientId.get(clientId)?.client_name ?? clientId}
                               </span>
                             ))}
                           </div>
@@ -5738,7 +5330,7 @@ export function App() {
                           <div className="token-list">
                             {(item.allowed_client_ids ?? []).map((clientId) => (
                               <span key={clientId}>
-                                {clients.find((client) => client.client_id === clientId)?.client_name ?? clientId}
+                                {clientsByClientId.get(clientId)?.client_name ?? clientId}
                               </span>
                             ))}
                             {(item.allowed_client_ids ?? []).length === 0 && <span>-</span>}
@@ -5750,7 +5342,7 @@ export function App() {
                       <td>{item.expires_at ? formatTime(item.expires_at, locale) : t("permanent")}</td>
                       <td className="invitation-usage-cell">
                         <span>{item.uses_count}/{item.max_uses ?? t("unlimited")}</span>
-                        <button type="button" className="link-button" onClick={() => openInvitationRedemptions(item)}>
+                        <button type="button" className="link-button" onClick={() => invitationRedemptions.open(item)}>
                           <Clock3 size={14} />
                           {t("viewRedemptions")}
                         </button>
@@ -5784,7 +5376,7 @@ export function App() {
                   ))}
                 </tbody>
               </table>
-              {!adminLoading && filteredInvitations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Ticket size={22} />} />}
+              {!adminViewLoading && filteredInvitations.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Ticket size={22} />} />}
             </div>
           </section>
         )}
@@ -5855,7 +5447,10 @@ export function App() {
                     )}
                   </SettingsSection>
                   <SettingsSection title={t("providerConnection")} description={t("providerConnectionHint")}>
-                    <Field label={t("issuer")} type="url" value={providerForm.issuer} onChange={(value) => setProviderForm({ ...providerForm, issuer: value })} />
+                    <Field label={t("issuer")} type="url" value={providerForm.issuer} onChange={(value) => {
+                      providerDiscoveryRequest.cancel();
+                      setProviderForm({ ...providerForm, issuer: value });
+                    }} />
                     <div className="actions">
                       <button type="button" onClick={() => void discoverProviderEndpoints()} disabled={busy || !providerForm.issuer.trim()}>
                         <RefreshCw size={14} />
@@ -5911,6 +5506,7 @@ export function App() {
                   <p className="muted">{t("externalLogin")}</p>
                 </div>
                 <button type="button" onClick={() => {
+                  providerDiscoveryRequest.cancel();
                   setProviderForm(emptyProviderForm);
                   setProviderFormBaseline(emptyProviderForm);
                   setProviderTemplateId("");
@@ -5921,7 +5517,9 @@ export function App() {
               {filteredProviders.map((provider) => (
                 <article className="client-card" key={provider.id}>
                   {(() => {
-                    const organization = organizationOptions.find((item) => item.id === provider.organization_id)
+                    const organization = (provider.organization_id
+                      ? organizationOptionsById.get(provider.organization_id)
+                      : undefined)
                       ?? (provider.organization_id === organizationContext?.id ? organizationContext : undefined);
                     return (
                       <>
@@ -5939,6 +5537,7 @@ export function App() {
                   </div>
                   <div className="actions">
                     <button type="button" onClick={() => {
+                      providerDiscoveryRequest.cancel();
                       const nextForm = {
                         id: provider.id,
                         slug: provider.slug,
@@ -5970,7 +5569,7 @@ export function App() {
                   })()}
                 </article>
               ))}
-              {!adminLoading && filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
+              {!adminViewLoading && filteredProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Link2 size={22} />} />}
               </div>
             </section>
             {canManagePlatformProviders && editor === "ldap" && (
@@ -6077,80 +5676,37 @@ export function App() {
                   </div>
                 </article>
               ))}
-              {!adminLoading && filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
+              {!adminViewLoading && filteredLdapProviders.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
             </div>
           </section>
             )}
           </section>
         )}
-        {canManageSettings && tab === "portal" && loginSettings && (
-          <section className="split wide">
-            <form className="panel configuration-form" onSubmit={saveLoginSettings}>
-              <h3>{t("loginSettings")}</h3>
-              <p className="muted">{t("loginSettingsHint")}</p>
-              <SettingsSection title={t("loginSettings")} description={t("loginSettingsHint")} collapsible={false}>
-                <Field
-                  label={t("brandLogoUrl")}
-                  type="url"
-                  autoComplete="url"
-                  value={loginSettingsDraft.brand_logo_url}
-                  onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, brand_logo_url: value })}
-                />
-                <Field
-                  label={t("companyEmailDomains")}
-                  textarea
-                  value={loginSettingsDraft.email_domains}
-                  onChange={(value) => setLoginSettingsDraft({ ...loginSettingsDraft, email_domains: value })}
-                />
-              </SettingsSection>
-              <FormActions
-                submitLabel={t("save")}
-                busy={busy}
-                dirty={loginSettingsIsDirty()}
-                statusLabel={loginSettingsIsDirty() ? t("unsavedChanges") : undefined}
-                savingLabel={t("saving")}
-              />
-            </form>
-            <form
-              className="table-panel"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void saveQuickLinkDraft();
-              }}
-            >
-              <h3>{quickLinkForm.id ? t("updateQuickLink") : t("createQuickLink")}</h3>
-              <SettingsSection title={t("quickLinks")} description={t("loginSettingsHint")} collapsible={false}>
-                <Field label={t("linkLabel")} value={quickLinkForm.label} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, label: value })} />
-                <Field label={t("linkUrl")} type="url" value={quickLinkForm.url} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, url: value })} />
-                <Check label={t("active")} checked={quickLinkForm.is_active} onChange={(value) => setQuickLinkForm({ ...quickLinkForm, is_active: value })} />
-                <div className="actions">
-                  <button type="submit" disabled={busy}>
-                    <Plus size={14} />
-                    {quickLinkForm.id ? t("save") : t("create")}
-                  </button>
-                  {quickLinkForm.id && (
-                    <button type="button" onClick={() => setQuickLinkForm(emptyQuickLinkForm)} disabled={busy}>{t("refresh")}</button>
-                  )}
-                </div>
-              </SettingsSection>
-              <table>
-                <thead><tr><th>{t("linkLabel")}</th><th>{t("linkUrl")}</th><th>{t("status")}</th><th></th></tr></thead>
-                <tbody>
-                  {loginSettingsDraft.quick_links.map((link) => (
-                    <tr key={link.id}>
-                      <td>{link.label}</td>
-                      <td>{link.url}</td>
-                      <td>{link.is_active ? t("active") : t("disabled")}</td>
-                      <td className="actions">
-                        <button type="button" onClick={() => editQuickLink(link)} disabled={busy}>{t("edit")}</button>
-                        <button type="button" onClick={() => requestConfirmation(() => removeQuickLink(link.id))} disabled={busy}>{t("delete")}</button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </form>
-          </section>
+        {tab === "portal" && loginSettings && (
+          <PortalSettingsPanel
+            state={{
+              loginSettingsDraft,
+              quickLinkForm
+            }}
+            actions={{
+              updateLoginSettingsDraft: setLoginSettingsDraft,
+              updateQuickLinkForm: setQuickLinkForm,
+              persistLoginSettings,
+              saveQuickLinkDraft,
+              editQuickLink,
+              deleteQuickLink: (id) => requestConfirmation(() => removeQuickLink(id)),
+              resetQuickLinkForm
+            }}
+            access={{
+              busy,
+              canManageSettings
+            }}
+            i18n={{ t }}
+            dirty={{
+              loginSettings: loginSettingsIsDirty(),
+              quickLinkForm: quickLinkFormIsDirty()
+            }}
+          />
         )}
         {(canManageSecurity || canReadAudit) && tab === "security" && (
           <section className="security-page wide">
@@ -6422,7 +5978,7 @@ export function App() {
                     </div>
                     <label>{t("groupMembers")}</label>
                     <div className="checkbox-grid tall">
-                      {users.map((item) => (
+                      {userOptions.map((item) => (
                         <Check
                           key={item.id}
                           label={`${item.email} · ${item.username}`}
@@ -6462,7 +6018,7 @@ export function App() {
                         ))}
                       </tbody>
                     </table>
-                    {!adminLoading && filteredRoles.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                    {!adminViewLoading && filteredRoles.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                   </section>
 
                   <section className="panel security-user-access-panel">
@@ -6474,7 +6030,7 @@ export function App() {
                       onChange={(value) => void runUiAction(() => loadUserAccess(value))}
                     >
                       <option value="">-</option>
-                      {users.map((item) => (
+                      {userOptions.map((item) => (
                         <option key={item.id} value={item.id}>{item.email}</option>
                       ))}
                     </SelectField>
@@ -6528,7 +6084,7 @@ export function App() {
                         ))}
                       </tbody>
                     </table>
-                    {!adminLoading && filteredGroups.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                    {!adminViewLoading && filteredGroups.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                   </section>
                 </div>
               </>
@@ -6622,7 +6178,7 @@ export function App() {
                       ))}
                     </tbody>
                   </table>
-                  {!adminLoading && filteredAuditWebhooks.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                  {!adminViewLoading && filteredAuditWebhooks.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
                 </section>
               )}
             </div>
@@ -6644,7 +6200,7 @@ export function App() {
                     ))}
                   </tbody>
                 </table>
-                {!adminLoading && filteredAuditEvents.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
+                {!adminViewLoading && filteredAuditEvents.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} />}
               </section>
             )}
           </section>

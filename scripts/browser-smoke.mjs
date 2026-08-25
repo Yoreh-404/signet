@@ -256,6 +256,43 @@ async function main() {
           admin,
           user("alice-id", "alice@mock.example", "alice", "Alice"),
         ];
+        const legacyUserListResponse = new URLSearchParams(location.search).get("smoke_legacy_user_list") === "1";
+        const userListResponse = (requestUrl) => {
+          const status = requestUrl.searchParams.get("status") || "live";
+          const search = (requestUrl.searchParams.get("search") ?? requestUrl.searchParams.get("q") ?? "")
+            .trim()
+            .toLocaleLowerCase();
+          const statusUsers = managedUsers.filter((candidate) => {
+            if (status === "active") return candidate.is_active && !candidate.archived_at;
+            if (status === "disabled") return !candidate.is_active && !candidate.archived_at;
+            if (status === "archived") return Boolean(candidate.archived_at);
+            if (status === "all") return true;
+            return !candidate.archived_at;
+          });
+          const filteredUsers = search
+            ? statusUsers.filter((candidate) => [candidate.email, candidate.username, candidate.display_name, candidate.phone]
+              .filter(Boolean)
+              .join(" ")
+              .toLocaleLowerCase()
+              .includes(search))
+            : statusUsers;
+          const requestedPageSize = Number(requestUrl.searchParams.get("page_size") ?? requestUrl.searchParams.get("limit") ?? "25");
+          const pageSize = Number.isSafeInteger(requestedPageSize) && requestedPageSize > 0 ? requestedPageSize : 25;
+          const requestedPage = Number(requestUrl.searchParams.get("page"));
+          const requestedOffset = Number(requestUrl.searchParams.get("offset"));
+          const page = Number.isSafeInteger(requestedPage) && requestedPage > 0
+            ? requestedPage
+            : Number.isSafeInteger(requestedOffset) && requestedOffset >= 0
+              ? Math.floor(requestedOffset / pageSize) + 1
+              : 1;
+          const payload = {
+            items: filteredUsers.slice((page - 1) * pageSize, page * pageSize),
+            page,
+            page_size: pageSize,
+            total: filteredUsers.length,
+          };
+          return legacyUserListResponse ? payload.items : payload;
+        };
         const response = (body, status = 200) => new Response(
           body === undefined ? null : JSON.stringify(body),
           { status, headers: { "content-type": "application/json" } },
@@ -383,7 +420,9 @@ async function main() {
             if (resource === "client-bindings") return response(application.client_bindings);
             return response([]);
           }
-          if (path === "/api/admin/users" && method === "GET") return response(managedUsers);
+          if ((path === "/api/admin/users" || path === "/api/admin/users/page") && method === "GET") {
+            return response(userListResponse(requestUrl));
+          }
           if (path === "/api/admin/users/import-csv" && method === "POST") {
             const rawCsv = typeof init.body === "string" ? init.body : "";
             const dryRun = requestUrl.searchParams.get("dry_run") !== "false";
@@ -683,6 +722,18 @@ async function main() {
     text: row.innerText,
     buttons: [...row.querySelectorAll('button')].map((button) => button.textContent.trim()),
   })))()`);
+
+  const userListQueries = async () => evaluate(`(() => performance.getEntriesByType('resource')
+    .map((entry) => {
+      try {
+        const url = new URL(entry.name);
+        if (url.pathname !== '/api/admin/users') return null;
+        return Object.fromEntries(url.searchParams.entries());
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean))()`);
 
   const clickUserRowButton = async (email, text) => {
     const clicked = await evaluate(`(() => {
@@ -1013,16 +1064,18 @@ async function main() {
     );
     await screenshot("auth-ui-mock-application-workspace-desktop", 1280, 900);
 
-    await navigate("/?smoke_admin=1#/clients");
+    // Client management now lives under the application protocol module. Keep
+    // the smoke flow on the canonical route so it verifies the same ownership
+    // boundary users see in production instead of the removed top-level page.
+    await navigate("/?smoke_admin=1#/applications?application=application-one&section=protocols");
     await waitFor(
       async () => evaluate(`(() => {
-        const card = [...document.querySelectorAll('.client-card')]
+        const card = [...document.querySelectorAll('.application-oidc-client-card')]
           .find((candidate) => candidate.textContent?.includes('App One'));
-        return card?.textContent?.includes('所属应用')
-          && card.textContent.includes('Member Portal')
-          && [...card.querySelectorAll('button')].some((button) => button.textContent?.includes('打开应用策略'));
+        return document.body.innerText.includes('Member Portal')
+          && card?.textContent?.includes('App One');
       })()`),
-      "OIDC connection to application policy bridge",
+      "OIDC connection in application protocol module",
     );
     await navigate("/?smoke_admin=1&smoke_trial_form=1#/invitations");
     await waitFor(
@@ -1152,8 +1205,27 @@ async function main() {
       "immutable trial-enrollment scope",
     );
 
-    await navigate("/?smoke_admin=1#/users");
+    await clearMockRequests();
+    await navigate("/?smoke_admin=1&smoke_reset=1#/users");
     await waitFor(async () => evaluate("document.body.innerText.includes('批量开通账户')"), "bulk provisioning toolbar");
+    await waitFor(async () => evaluate("document.querySelectorAll('tbody tr').length === 2"), "paginated mock user list");
+    const userListRequests = await mockRequests();
+    const userListRequest = userListRequests.find((request) => request.path.startsWith("/api/admin/users?") && request.method === "GET");
+    const userListParams = userListRequest ? new URL(userListRequest.path, appBase).searchParams : null;
+    const userListEnvelope = await evaluate(`fetch("/api/admin/users?page=1&page_size=25&status=live").then((response) => response.json())`);
+    if (
+      !userListRequest
+      || userListParams?.get("page") !== "1"
+      || userListParams?.get("page_size") !== "25"
+      || userListParams?.get("status") !== "live"
+      || !userListEnvelope
+      || !Array.isArray(userListEnvelope.items)
+      || userListEnvelope.page !== 1
+      || userListEnvelope.page_size !== 25
+      || userListEnvelope.total !== 2
+    ) {
+      throw new Error(`Paginated mock user-list contract is incorrect: ${JSON.stringify({ userListRequest, userListEnvelope })}`);
+    }
     await clickText("批量开通账户");
     await waitFor(async () => evaluate("document.body.innerText.includes('先预演，再原子提交')"), "bulk provisioning modal");
     const filledCsv = await evaluate(`(() => {
@@ -1174,6 +1246,13 @@ async function main() {
     const bulkRequest = bulkRequests.find((request) => request.path === "/api/admin/users/import-csv?dry_run=true" && request.method === "POST");
     if (!bulkRequest || bulkRequest.headers["content-type"] !== "text/csv" || !String(bulkRequest.body).includes("organization_role")) {
       throw new Error(`Bulk provisioning request contract is incorrect: ${JSON.stringify(bulkRequest)}`);
+    }
+
+    await navigate("/?smoke_admin=1&smoke_legacy_user_list=1&smoke_reset=1#/users");
+    await waitFor(async () => evaluate("document.querySelectorAll('tbody tr').length === 2"), "legacy array user-list compatibility");
+    const legacyUserList = await evaluate(`fetch("/api/admin/users?page=1&page_size=25&status=live").then((response) => response.json())`);
+    if (!Array.isArray(legacyUserList) || legacyUserList.length !== 2) {
+      throw new Error(`Legacy user-list array compatibility regressed: ${JSON.stringify(legacyUserList)}`);
     }
 
     await navigate("/?smoke_admin=1#/users");
@@ -1490,6 +1569,19 @@ async function main() {
   }
 
   if (scenario === "lifecycle") {
+    const assertUserListEnvelope = (value, label) => {
+      if (
+        !value
+        || Array.isArray(value)
+        || !Array.isArray(value.items)
+        || !Number.isInteger(value.page)
+        || !Number.isInteger(value.page_size)
+        || !Number.isInteger(value.total)
+      ) {
+        throw new Error(`${label} did not return the pagination envelope: ${JSON.stringify(value)}`);
+      }
+      return value;
+    };
     await navigate("/?auth=register");
     await waitFor(async () => evaluate("document.body.innerText.includes('Signet')"), "lifecycle page shell");
     if (!(await evaluate("document.body.innerText.includes('首次启动')"))) {
@@ -1545,9 +1637,26 @@ async function main() {
       origin: "https://attacker.invalid",
       "x-csrf-token": csrfToken,
     });
-    const usersAfterCsrfProbes = await api("/api/admin/users?status=all");
-    if (usersAfterCsrfProbes.some((user) => user.email === csrfProbeEmail)) {
+    const usersAfterCsrfProbes = assertUserListEnvelope(
+      await api("/api/admin/users?status=all"),
+      "CSRF probe user list",
+    );
+    if (usersAfterCsrfProbes.page !== 1 || usersAfterCsrfProbes.page_size !== 25) {
+      throw new Error(`Default user-list pagination changed: ${JSON.stringify(usersAfterCsrfProbes)}`);
+    }
+    if (usersAfterCsrfProbes.items.some((user) => user.email === csrfProbeEmail)) {
       throw new Error("A CSRF-rejected request still changed the database");
+    }
+    const offsetLimitUsers = assertUserListEnvelope(
+      await api("/api/admin/users?status=all&offset=0&limit=25"),
+      "offset/limit compatibility user list",
+    );
+    if (
+      offsetLimitUsers.page !== 1
+      || offsetLimitUsers.page_size !== 25
+      || offsetLimitUsers.total !== usersAfterCsrfProbes.total
+    ) {
+      throw new Error(`Offset/limit compatibility query returned the wrong page: ${JSON.stringify(offsetLimitUsers)}`);
     }
 
     const protocolProbes = [
@@ -1590,8 +1699,15 @@ async function main() {
 
     await navigate("/");
     await waitFor(async () => evaluate("document.body.innerText.includes('admin@smoke.example')"), "administrator page reload");
+    await evaluate("performance.clearResourceTimings()");
     await clickText("用户");
     await waitFor(async () => evaluate("document.querySelectorAll('tbody tr').length >= 3"), "live user list");
+    const initialUserListQuery = (await userListQueries()).find((query) =>
+      query.page === "1" && query.page_size === "25" && query.status === "live"
+    );
+    if (!initialUserListQuery) {
+      throw new Error(`Initial user-list query omitted pagination parameters: ${JSON.stringify(await userListQueries())}`);
+    }
     const userTabHash = await evaluate("window.location.hash");
     if (userTabHash !== "#/users") throw new Error(`User tab deep link is incorrect: ${userTabHash}`);
     await setPageSearch(disabledUser.email);
@@ -1599,8 +1715,23 @@ async function main() {
       const rows = await userRows();
       return rows.length === 1 && rows[0].text.includes(disabledUser.email);
     }, "user page search");
+    const searchedUserListQuery = (await userListQueries()).find((query) =>
+      query.page === "1"
+      && query.page_size === "25"
+      && query.status === "live"
+      && query.search === disabledUser.email
+    );
+    if (!searchedUserListQuery) {
+      throw new Error(`User search was not sent as a query parameter: ${JSON.stringify(await userListQueries())}`);
+    }
     await setPageSearch("");
     await waitFor(async () => evaluate("document.querySelectorAll('tbody tr').length >= 3"), "cleared user page search");
+    const clearedSearchUserListQuery = (await userListQueries()).find((query) =>
+      query.page === "1" && query.page_size === "25" && query.status === "live" && query.search === undefined
+    );
+    if (!clearedSearchUserListQuery) {
+      throw new Error(`Clearing user search did not remove its query parameter: ${JSON.stringify(await userListQueries())}`);
+    }
     const liveRows = await userRows();
     const activeRow = liveRows.find((row) => row.text.includes(activeUser.email));
     const disabledRow = liveRows.find((row) => row.text.includes(disabledUser.email));
@@ -1613,6 +1744,12 @@ async function main() {
 
     await selectUserFilter("all");
     await waitFor(async () => evaluate("document.body.innerText.includes('archived@smoke.example')"), "archived user in all filter");
+    const allUserListQuery = (await userListQueries()).find((query) =>
+      query.page === "1" && query.page_size === "25" && query.status === "all"
+    );
+    if (!allUserListQuery) {
+      throw new Error(`All-users filter omitted the status query parameter: ${JSON.stringify(await userListQueries())}`);
+    }
     const allRows = await userRows();
     const archivedRow = allRows.find((row) => row.text.includes(archivedUser.email));
     if (!archivedRow?.buttons.includes("启用") || !archivedRow.buttons.includes("删除") || archivedRow.buttons.includes("编辑")) {

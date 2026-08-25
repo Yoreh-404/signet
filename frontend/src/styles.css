@@ -1885,6 +1885,12 @@ nav button,
   color: var(--text-soft);
 }
 
+.app-shell > aside nav button,
+.app-shell > aside .nav-group-label,
+.app-shell > aside .account-card {
+  font-size: 14px;
+}
+
 nav button:hover,
 .ghost:hover {
   color: var(--brand);
@@ -5713,6 +5719,87 @@ tbody tr:hover {
 .application-choice-list {
   display: grid;
   gap: 7px;
+}
+
+.application-oidc-manager,
+.application-iap-editor,
+.application-wallet-panel {
+  gap: 12px;
+}
+
+.application-client-editor,
+.application-iap-rule-form,
+.application-wallet-transfer {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-muted);
+}
+
+.application-oidc-client-cards,
+.application-iap-rule-list,
+.application-wallet-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.application-oidc-client-card,
+.application-iap-rule-card,
+.application-wallet-card {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-solid);
+}
+
+.application-oidc-client-card-heading,
+.application-iap-rule-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.application-oidc-client-card-heading > div,
+.application-iap-rule-card > div:first-child,
+.application-wallet-card {
+  min-width: 0;
+}
+
+.application-oidc-client-card-heading div,
+.application-iap-rule-card > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.application-oidc-client-card small,
+.application-iap-rule-card small,
+.application-wallet-card small {
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.application-wallet-panel {
+  display: grid;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
+.application-wallet-grid {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.application-wallet-card strong {
+  color: var(--text);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
 }
 
 .directory-sync-provider-row {

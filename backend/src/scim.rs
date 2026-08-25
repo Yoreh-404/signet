@@ -1,19 +1,21 @@
 use crate::{
     AppState,
     access::{Authorizer, Permission},
-    applications, archived_accounts,
+    applications,
     audit::{self, AuditSink},
     db::{
-        ApplicationRecord, GroupRecord, NewBulkProvisionedUser, NewGroup, NewUser, UserListScope,
-        UserRecord, UserUpdate,
+        ApplicationRecord, GroupListFilter, GroupPatchPlan, GroupRecord, NewBulkProvisionedUser,
+        NewUser, ScimApplicationContext, ScimGroupMemberRecord, ScimUserMutationPlan,
+        ScimUserMutationScope,
+        UserListFilter, UserListScope, UserRecord,
     },
     error::AppError,
     security_policy::{self, PasswordPolicy, PasswordSubject},
-    service_accounts::ServiceAccountProfile,
     util,
 };
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -22,7 +24,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
@@ -123,6 +125,7 @@ struct ScimMeta {
     created: String,
     last_modified: String,
     location: String,
+    version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +157,54 @@ struct ScimUserInput {
     emails: Option<Vec<ScimEmail>>,
     phone_numbers: Option<Vec<ScimPhone>>,
     password: Option<String>,
+}
+
+/// Mutable in-memory representation used while folding one SCIM request.
+/// Nothing is persisted until every operation has been parsed and validated.
+#[derive(Debug, Clone)]
+struct ScimUserMutationDraft {
+    email: String,
+    username: String,
+    display_name: Option<String>,
+    phone: Option<String>,
+    is_admin: bool,
+    is_active: bool,
+    password: Option<String>,
+}
+
+impl ScimUserMutationDraft {
+    fn from_user(user: &UserRecord) -> Self {
+        Self {
+            email: user.email.clone(),
+            username: user.username.clone(),
+            display_name: user.display_name.clone(),
+            phone: user.phone.clone(),
+            is_admin: user.is_admin == 1,
+            is_active: user.is_active == 1,
+            password: None,
+        }
+    }
+
+    fn into_plan(
+        self,
+        id: &str,
+        password_hash: Option<String>,
+        expected_version: String,
+        scope: Option<ScimUserMutationScope>,
+    ) -> ScimUserMutationPlan {
+        ScimUserMutationPlan {
+            id: id.to_string(),
+            expected_version,
+            email: self.email,
+            username: self.username,
+            display_name: self.display_name,
+            phone: self.phone,
+            is_admin: self.is_admin,
+            is_active: self.is_active,
+            password_hash,
+            scope,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +349,7 @@ impl ScimUserMapper for UserRecord {
                 created: iso_ts(self.created_at),
                 last_modified: iso_ts(self.updated_at),
                 location,
+                version: self.scim_concurrency_version(),
             },
         }
     }
@@ -309,25 +361,43 @@ async fn group_to_scim(
     group: &GroupRecord,
     principal: &ScimPrincipal,
 ) -> Result<ScimGroup, ScimError> {
+    let members = list_scim_group_members(state, principal, &group.id)
+        .await?
+        .into_iter()
+        .map(|user| ScimGroupMemberRecord {
+            group_id: group.id.clone(),
+            user_id: user.id,
+            username: user.username,
+            display_name: user.display_name,
+        })
+        .collect();
+    Ok(group_to_scim_with_members(state, headers, group, members))
+}
+
+fn group_to_scim_with_members(
+    state: &AppState,
+    headers: &HeaderMap,
+    group: &GroupRecord,
+    members: Vec<ScimGroupMemberRecord>,
+) -> ScimGroup {
     let location = format!(
         "{}/scim/v2/Groups/{}",
         scim_base_url(state, headers),
         group.id
     );
-    let members = list_scim_group_members(state, principal, &group.id)
-        .await?
+    let members = members
         .into_iter()
-        .map(|user| ScimMember {
+        .map(|member| ScimMember {
             ref_: Some(format!(
                 "{}/scim/v2/Users/{}",
                 scim_base_url(state, headers),
-                user.id
+                member.user_id
             )),
-            display: user.display_name.clone().or(Some(user.username.clone())),
-            value: user.id,
+            display: member.display_name.or(Some(member.username)),
+            value: member.user_id,
         })
         .collect();
-    Ok(ScimGroup {
+    ScimGroup {
         schemas: vec![GROUP_SCHEMA],
         id: group.id.clone(),
         display_name: group.name.clone(),
@@ -337,20 +407,9 @@ async fn group_to_scim(
             created: iso_ts(group.created_at),
             last_modified: iso_ts(group.updated_at),
             location,
+            version: group.version.to_string(),
         },
-    })
-}
-
-trait UserFilter {
-    fn matches(&self, user: &UserRecord) -> bool;
-
-    fn list_scope(&self) -> UserListScope {
-        UserListScope::Live
     }
-}
-
-trait GroupFilter {
-    fn matches(&self, group: &GroupRecord) -> bool;
 }
 
 enum ScimUserFilter {
@@ -367,7 +426,7 @@ enum ScimGroupFilter {
     DisplayName(String),
 }
 
-impl UserFilter for ScimUserFilter {
+impl ScimUserFilter {
     fn list_scope(&self) -> UserListScope {
         match self {
             ScimUserFilter::Active(true) => UserListScope::Active,
@@ -379,25 +438,25 @@ impl UserFilter for ScimUserFilter {
         }
     }
 
-    fn matches(&self, user: &UserRecord) -> bool {
+    fn db_filter(&self) -> Option<UserListFilter> {
         match self {
-            ScimUserFilter::All => true,
-            ScimUserFilter::UserName(value) => user.username.eq_ignore_ascii_case(value),
-            ScimUserFilter::Email(value) => user.email.eq_ignore_ascii_case(value),
-            ScimUserFilter::Id(value) => user.id == *value,
-            ScimUserFilter::Active(value) => {
-                (user.is_active == 1 && user.archived_at.is_none()) == *value
-            }
+            ScimUserFilter::All => None,
+            ScimUserFilter::UserName(value) => Some(UserListFilter::UserName(value.clone())),
+            ScimUserFilter::Email(value) => Some(UserListFilter::Email(value.clone())),
+            ScimUserFilter::Id(value) => Some(UserListFilter::Id(value.clone())),
+            ScimUserFilter::Active(value) => Some(UserListFilter::Active(*value)),
         }
     }
 }
 
-impl GroupFilter for ScimGroupFilter {
-    fn matches(&self, group: &GroupRecord) -> bool {
+impl ScimGroupFilter {
+    fn db_filter(&self) -> Option<GroupListFilter> {
         match self {
-            ScimGroupFilter::All => true,
-            ScimGroupFilter::Id(value) => group.id == *value,
-            ScimGroupFilter::DisplayName(value) => group.name.eq_ignore_ascii_case(value),
+            ScimGroupFilter::All => None,
+            ScimGroupFilter::Id(value) => Some(GroupListFilter::Id(value.clone())),
+            ScimGroupFilter::DisplayName(value) => {
+                Some(GroupListFilter::DisplayName(value.clone()))
+            }
         }
     }
 }
@@ -413,7 +472,7 @@ async fn service_provider_config() -> impl IntoResponse {
         },
         change_password: FeatureFlag { supported: true },
         sort: FeatureFlag { supported: false },
-        etag: FeatureFlag { supported: false },
+        etag: FeatureFlag { supported: true },
         authentication_schemes: vec![AuthScheme {
             name: "OAuth Bearer Token",
             description: "Use a Signet access token for an administrator or a user with SCIM permissions.",
@@ -487,22 +546,24 @@ async fn list_users(
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersRead, ScimAccess::Read).await?;
     let filter = parse_user_filter(query.filter.as_deref())?;
-    let users = scoped_scim_users(&state, &principal, filter.list_scope())
-        .await?
-        .into_iter()
-        .filter(|user| filter.matches(user))
-        .collect::<Vec<_>>();
     let start_index = query.start_index.unwrap_or(1).max(1);
     let count = query.count.unwrap_or(100).min(200);
+    let (total_results, users) = scoped_scim_users_page(
+        &state,
+        &principal,
+        filter.list_scope(),
+        filter.db_filter(),
+        start_index.saturating_sub(1),
+        count,
+    )
+    .await?;
     let resources = users
         .iter()
-        .skip(start_index - 1)
-        .take(count)
         .map(|user| user.to_scim_user(&state, &headers))
         .collect::<Vec<_>>();
     Ok(scim_json(ListResponse {
         schemas: vec![LIST_SCHEMA],
-        total_results: users.len(),
+        total_results: total_results as usize,
         start_index,
         items_per_page: resources.len(),
         resources,
@@ -602,6 +663,11 @@ async fn replace_user(
             .await?;
     let current = editable_user(&state, &id).await?;
     ensure_scim_user_scope(&state, &principal, &current).await?;
+    ensure_if_match(
+        &headers,
+        &etag_for_serializable(&current.to_scim_user(&state, &headers)),
+    )?;
+    let expected_version = current.scim_concurrency_version();
     let email = primary_email(&payload)?;
     let username = normalize_required(&payload.user_name, "userName")?;
     let display_name = payload.display_name.clone().or_else(|| {
@@ -611,35 +677,36 @@ async fn replace_user(
             .and_then(|name| name.formatted.clone())
     });
     let phone = primary_phone(&payload);
-    let user = state
-        .db
-        .update_user(UserUpdate {
-            id: &id,
-            email: security_policy::normalize_login_subject(&email),
-            username,
-            display_name,
-            phone,
-            is_admin: current.is_admin == 1,
-            is_active: current.is_active == 1,
-        })
-        .await?;
-    if let Some(password) = payload
+    let is_active = payload.active.unwrap_or(current.is_active == 1);
+    let password = payload
         .password
         .as_deref()
         .filter(|value| !value.is_empty())
-    {
-        validate_password_for_subject(&state, password, &user.email, &user.username).await?;
-        state
-            .db
-            .set_user_password(&id, util::hash_password(password)?)
-            .await?;
+        .map(ToOwned::to_owned);
+    let email = security_policy::normalize_login_subject(&email);
+    if let Some(password) = password.as_deref() {
+        validate_password_for_subject(&state, password, &email, &username).await?;
     }
-    apply_active(&state, &id, payload.active).await?;
     let user = state
         .db
-        .find_user_by_id(&id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("user not found"))?;
+        .apply_scim_user_mutation(
+            ScimUserMutationDraft {
+                email,
+                username,
+                display_name,
+                phone,
+                is_admin: current.is_admin == 1,
+                is_active,
+                password: password.clone(),
+            }
+            .into_plan(
+                &id,
+                password.as_deref().map(util::hash_password).transpose()?,
+                expected_version,
+                scim_user_mutation_scope(&principal),
+            ),
+        )
+        .await?;
     ensure_scim_user_scope(&state, &principal, &user).await?;
     audit_scim(
         &state,
@@ -661,23 +728,35 @@ async fn patch_user(
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
             .await?;
-    let mut user = editable_user(&state, &id).await?;
+    let user = editable_user(&state, &id).await?;
     ensure_scim_user_scope(&state, &principal, &user).await?;
+    ensure_if_match(
+        &headers,
+        &etag_for_serializable(&user.to_scim_user(&state, &headers)),
+    )?;
+    let expected_version = user.scim_concurrency_version();
+    let mut draft = ScimUserMutationDraft::from_user(&user);
     for operation in payload.operations {
-        let op = operation.op.to_ascii_lowercase();
-        if op != "replace" && op != "add" {
-            return Err(ScimError::bad_request(
-                "mutability",
-                "only add/replace are supported",
-            ));
-        }
-        apply_patch_operation(&state, &id, &mut user, operation).await?;
-        user = state
-            .db
-            .find_user_by_id(&id)
-            .await?
-            .ok_or_else(|| ScimError::not_found("user not found"))?;
+        fold_user_patch_operation(&mut draft, operation)?;
     }
+    if let Some(password) = draft.password.as_deref() {
+        validate_password_for_subject(&state, password, &draft.email, &draft.username).await?;
+    }
+    let user = state
+        .db
+        .apply_scim_user_mutation(
+            draft.clone().into_plan(
+                &id,
+                draft
+                    .password
+                    .as_deref()
+                    .map(util::hash_password)
+                    .transpose()?,
+                expected_version,
+                scim_user_mutation_scope(&principal),
+            ),
+        )
+        .await?;
     audit_scim(
         &state,
         &principal,
@@ -709,7 +788,10 @@ async fn delete_user(
             "archived users cannot be changed through SCIM",
         ));
     }
-    state.db.disable_user(&id).await?;
+    state
+        .db
+        .disable_scim_user(&id, scim_user_mutation_scope(&principal).unwrap_or_default())
+        .await?;
     audit_scim(
         &state,
         &principal,
@@ -735,20 +817,55 @@ async fn list_groups(
     .await?;
     ensure_scim_groups_enabled(&principal)?;
     let filter = parse_group_filter(query.filter.as_deref())?;
-    let groups = scoped_scim_groups(&state, &principal)
-        .await?
-        .into_iter()
-        .filter(|group| filter.matches(group))
-        .collect::<Vec<_>>();
     let start_index = query.start_index.unwrap_or(1).max(1);
     let count = query.count.unwrap_or(100).min(200);
-    let mut resources = Vec::new();
-    for group in groups.iter().skip(start_index - 1).take(count) {
-        resources.push(group_to_scim(&state, &headers, group, &principal).await?);
+    let application_id = principal
+        .application
+        .as_ref()
+        .map(|application| application.id.as_str());
+    let db_filter = filter.db_filter();
+    let (total_results, groups) = scoped_scim_groups_page(
+        &state,
+        &principal,
+        db_filter.clone(),
+        start_index.saturating_sub(1),
+        count,
+    )
+    .await?;
+    let member_refs = if groups.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .db
+            .list_scim_group_member_refs_page(
+                application_id,
+                db_filter,
+                start_index.saturating_sub(1),
+                count,
+            )
+            .await?
+    };
+    let mut members_by_group = BTreeMap::<String, Vec<ScimGroupMemberRecord>>::new();
+    for member in member_refs {
+        members_by_group
+            .entry(member.group_id.clone())
+            .or_default()
+            .push(member);
     }
+    let resources = groups
+        .iter()
+        .map(|group| {
+            group_to_scim_with_members(
+                &state,
+                &headers,
+                group,
+                members_by_group.remove(&group.id).unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
     Ok(scim_json(ListResponse {
         schemas: vec![LIST_SCHEMA],
-        total_results: groups.len(),
+        total_results: total_results as usize,
         start_index,
         items_per_page: resources.len(),
         resources,
@@ -790,36 +907,22 @@ async fn create_group(
     .await?;
     ensure_scim_groups_enabled(&principal)?;
     let requested_members = payload.members.map(member_ids).unwrap_or_default();
-    let new_group = NewGroup {
-        name: normalize_required(&payload.display_name, "displayName")?,
-        description: None,
-    };
-    let group = if let Some(application) = principal.application.as_ref() {
-        state
-            .db
-            .insert_application_scim_group(&application.id, new_group)
-            .await?
-    } else {
-        state.db.insert_group(new_group).await?
-    };
-    if !requested_members.is_empty() {
-        if let Err(error) =
-            replace_scim_group_members(&state, &principal, &group.id, requested_members).await
-        {
-            if let Some(application) = principal.application.as_ref() {
-                let _ = state
-                    .db
-                    .delete_application_scim_group(&application.id, &group.id)
-                    .await;
-            } else {
-                let _ = state.db.delete_group(&group.id).await;
-            }
-            return Err(error);
-        }
-    }
-    let group = find_scim_group(&state, &principal, &group.id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("group not found"))?;
+    // Group creation, application binding, member scope validation and
+    // membership replacement must share one transaction. A compensating
+    // delete can leave an observable empty group (or fail independently).
+    let group = state
+        .db
+        .apply_group_patch_plan(GroupPatchPlan {
+            application_id: principal.application.as_ref().map(|app| app.id.clone()),
+            group_id: uuid::Uuid::new_v4().to_string(),
+            name: normalize_required(&payload.display_name, "displayName")?,
+            description: None,
+            member_ids: requested_members,
+            create: true,
+            expected_version: None,
+        })
+        .await
+        .map_err(ScimError::from)?;
     audit_scim(
         &state,
         &principal,
@@ -852,23 +955,30 @@ async fn replace_group(
     let existing = find_scim_group(&state, &principal, &id)
         .await?
         .ok_or_else(|| ScimError::not_found("group not found"))?;
+    let current = group_to_scim(&state, &headers, &existing, &principal).await?;
+    ensure_if_match(&headers, &etag_for_serializable(&current))?;
+    let member_ids = if let Some(members) = payload.members {
+        member_ids(members)
+    } else {
+        list_scim_group_members(&state, &principal, &id)
+            .await?
+            .into_iter()
+            .map(|user| user.id)
+            .collect()
+    };
     let group = state
         .db
-        .update_group(
-            &id,
-            NewGroup {
-                name: normalize_required(&payload.display_name, "displayName")?,
-                description: existing.description.clone(),
-            },
-        )
-        .await?;
-    if let Some(members) = payload.members {
-        let member_ids = member_ids(members);
-        replace_scim_group_members(&state, &principal, &id, member_ids).await?;
-    }
-    let group = find_scim_group(&state, &principal, &group.id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("group not found"))?;
+        .apply_group_patch_plan(GroupPatchPlan {
+            application_id: principal.application.as_ref().map(|app| app.id.clone()),
+            group_id: id.clone(),
+            name: normalize_required(&payload.display_name, "displayName")?,
+            description: existing.description.clone(),
+            member_ids,
+            create: false,
+            expected_version: Some(existing.version),
+        })
+        .await
+        .map_err(ScimError::from)?;
     audit_scim(
         &state,
         &principal,
@@ -899,12 +1009,38 @@ async fn patch_group(
     let mut group = find_scim_group(&state, &principal, &id)
         .await?
         .ok_or_else(|| ScimError::not_found("group not found"))?;
+    let existing_members = list_scim_group_members(&state, &principal, &id).await?;
+    let current_members = existing_members
+        .iter()
+        .map(|user| ScimGroupMemberRecord {
+            group_id: group.id.clone(),
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            display_name: user.display_name.clone(),
+        })
+        .collect();
+    let current = group_to_scim_with_members(&state, &headers, &group, current_members);
+    ensure_if_match(&headers, &etag_for_serializable(&current))?;
+    let mut member_ids = existing_members
+        .into_iter()
+        .map(|user| user.id)
+        .collect::<BTreeSet<_>>();
     for operation in payload.operations {
-        apply_group_patch_operation(&state, &principal, &id, &mut group, operation).await?;
-        group = find_scim_group(&state, &principal, &id)
-            .await?
-            .ok_or_else(|| ScimError::not_found("group not found"))?;
+        fold_group_patch_operation(&mut group.name, &mut member_ids, operation)?;
     }
+    group = state
+        .db
+        .apply_group_patch_plan(GroupPatchPlan {
+            application_id: principal.application.as_ref().map(|app| app.id.clone()),
+            group_id: id.clone(),
+            name: group.name.clone(),
+            description: group.description.clone(),
+            member_ids: member_ids.into_iter().collect(),
+            create: false,
+            expected_version: Some(group.version),
+        })
+        .await
+        .map_err(ScimError::from)?;
     audit_scim(
         &state,
         &principal,
@@ -953,121 +1089,104 @@ async fn delete_group(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn apply_patch_operation(
-    state: &AppState,
-    id: &str,
-    user: &mut UserRecord,
+fn fold_user_patch_operation(
+    draft: &mut ScimUserMutationDraft,
     operation: PatchOperation,
 ) -> Result<(), ScimError> {
+    let op = operation.op.to_ascii_lowercase();
+    if op != "replace" && op != "add" {
+        return Err(ScimError::bad_request(
+            "mutability",
+            "only add/replace are supported",
+        ));
+    }
     match operation.path.as_deref().map(normalize_path) {
         Some(path) if path == "active" => {
             let active = operation
                 .value
                 .as_bool()
                 .ok_or_else(|| ScimError::bad_request("invalidValue", "active must be boolean"))?;
-            apply_active(state, id, Some(active)).await
+            draft.is_active = active;
         }
         Some(path) if path == "username" => {
             let username = json_string(&operation.value, "userName")?;
-            replace_user_fields(state, id, user, Some(username), None, None, None).await
+            draft.username = normalize_required(&username, "userName")?;
         }
         Some(path) if path == "displayname" || path == "name.formatted" => {
             let display_name = json_string(&operation.value, "displayName")?;
-            replace_user_fields(state, id, user, None, None, Some(display_name), None).await
+            draft.display_name = Some(display_name);
         }
         Some(path) if path == "emails" || path == "emails.value" => {
             let email = patch_email_value(&operation.value)?;
-            replace_user_fields(state, id, user, None, Some(email), None, None).await
+            draft.email = security_policy::normalize_login_subject(&email);
         }
         Some(path) if path == "phonenumbers" || path == "phonenumbers.value" => {
             let phone = patch_phone_value(&operation.value);
-            replace_user_fields(state, id, user, None, None, None, Some(phone)).await
+            draft.phone = phone;
         }
-        Some(path) => Err(ScimError::bad_request(
-            "invalidPath",
-            format!("unsupported path: {path}"),
-        )),
-        None => apply_patch_object(state, id, user, operation.value).await,
+        Some(path) if path == "password" => {
+            let password = json_string(&operation.value, "password")?;
+            if password.is_empty() {
+                return Err(ScimError::bad_request(
+                    "invalidValue",
+                    "password cannot be empty",
+                ));
+            }
+            draft.password = Some(password);
+        }
+        Some(path) => {
+            return Err(ScimError::bad_request(
+                "invalidPath",
+                format!("unsupported path: {path}"),
+            ));
+        }
+        None => fold_user_patch_object(draft, operation.value)?,
     }
+    Ok(())
 }
 
-async fn apply_patch_object(
-    state: &AppState,
-    id: &str,
-    user: &mut UserRecord,
+fn fold_user_patch_object(
+    draft: &mut ScimUserMutationDraft,
     value: Value,
 ) -> Result<(), ScimError> {
     let object = value
         .as_object()
         .ok_or_else(|| ScimError::bad_request("invalidValue", "patch value must be an object"))?;
-    if let Some(active) = object.get("active").and_then(Value::as_bool) {
-        apply_active(state, id, Some(active)).await?;
+    if let Some(value) = object.get("active") {
+        draft.is_active = value
+            .as_bool()
+            .ok_or_else(|| ScimError::bad_request("invalidValue", "active must be boolean"))?;
     }
-    let username = object
-        .get("userName")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let email = object.get("emails").map(patch_email_value).transpose()?;
-    let display_name = object
-        .get("displayName")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            object
-                .get("name")
-                .and_then(|value| value.get("formatted"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        });
-    let phone = object.get("phoneNumbers").map(patch_phone_value);
-    if username.is_some() || email.is_some() || display_name.is_some() || phone.is_some() {
-        replace_user_fields(state, id, user, username, email, display_name, phone).await?;
+    if let Some(value) = object.get("userName") {
+        draft.username = normalize_required(json_string(value, "userName")?.as_str(), "userName")?;
     }
-    Ok(())
-}
-
-async fn replace_user_fields(
-    state: &AppState,
-    id: &str,
-    user: &UserRecord,
-    username: Option<String>,
-    email: Option<String>,
-    display_name: Option<String>,
-    phone: Option<Option<String>>,
-) -> Result<(), ScimError> {
-    let next_email = email
-        .map(|value| security_policy::normalize_login_subject(&value))
-        .unwrap_or_else(|| user.email.clone());
-    let next_username = username.unwrap_or_else(|| user.username.clone());
-    state
-        .db
-        .update_user(UserUpdate {
-            id,
-            email: next_email,
-            username: next_username,
-            display_name: display_name.or_else(|| user.display_name.clone()),
-            phone: phone.unwrap_or_else(|| user.phone.clone()),
-            is_admin: user.is_admin == 1,
-            is_active: user.is_active == 1,
-        })
-        .await?;
-    Ok(())
-}
-
-async fn apply_active(state: &AppState, id: &str, active: Option<bool>) -> Result<(), ScimError> {
-    match active {
-        Some(true) => state.db.enable_user(id).await?,
-        Some(false) => state.db.disable_user(id).await?,
-        None => {}
+    if let Some(value) = object.get("emails") {
+        draft.email = security_policy::normalize_login_subject(&patch_email_value(value)?);
+    }
+    if let Some(value) = object.get("displayName") {
+        draft.display_name = Some(json_string(value, "displayName")?);
+    } else if let Some(value) = object.get("name").and_then(|value| value.get("formatted")) {
+        draft.display_name = Some(json_string(value, "displayName")?);
+    }
+    if let Some(value) = object.get("phoneNumbers") {
+        draft.phone = patch_phone_value(value);
+    }
+    if let Some(value) = object.get("password") {
+        let password = json_string(value, "password")?;
+        if password.is_empty() {
+            return Err(ScimError::bad_request(
+                "invalidValue",
+                "password cannot be empty",
+            ));
+        }
+        draft.password = Some(password);
     }
     Ok(())
 }
 
-async fn apply_group_patch_operation(
-    state: &AppState,
-    principal: &ScimPrincipal,
-    id: &str,
-    group: &mut GroupRecord,
+fn fold_group_patch_operation(
+    group_name: &mut String,
+    members: &mut BTreeSet<String>,
     operation: PatchOperation,
 ) -> Result<(), ScimError> {
     let op = operation.op.to_ascii_lowercase();
@@ -1079,39 +1198,21 @@ async fn apply_group_patch_operation(
                     "displayName only supports add/replace",
                 ));
             }
-            let display_name = json_string(&operation.value, "displayName")?;
-            state
-                .db
-                .update_group(
-                    id,
-                    NewGroup {
-                        name: display_name,
-                        description: group.description.clone(),
-                    },
-                )
-                .await?;
+            *group_name = json_string(&operation.value, "displayName")?;
             Ok(())
         }
         Some(path) if path == "members" => {
-            let next = match op.as_str() {
-                "replace" => member_ids(patch_members_value(&operation.value)?),
-                "add" => {
-                    let mut ids = list_scim_group_members(state, principal, id)
-                        .await?
+            match op.as_str() {
+                "replace" => {
+                    *members = member_ids(patch_members_value(&operation.value)?)
                         .into_iter()
-                        .map(|user| user.id)
-                        .collect::<Vec<_>>();
-                    ids.extend(member_ids(patch_members_value(&operation.value)?));
-                    ids
+                        .collect();
                 }
+                "add" => members.extend(member_ids(patch_members_value(&operation.value)?)),
                 "remove" => {
-                    let remove = member_ids(patch_members_value(&operation.value)?);
-                    list_scim_group_members(state, principal, id)
-                        .await?
-                        .into_iter()
-                        .map(|user| user.id)
-                        .filter(|user_id| !remove.iter().any(|item| item == user_id))
-                        .collect()
+                    for user_id in member_ids(patch_members_value(&operation.value)?) {
+                        members.remove(&user_id);
+                    }
                 }
                 _ => {
                     return Err(ScimError::bad_request(
@@ -1119,8 +1220,7 @@ async fn apply_group_patch_operation(
                         "members supports add/replace/remove",
                     ));
                 }
-            };
-            replace_scim_group_members(state, principal, id, next).await?;
+            }
             Ok(())
         }
         Some(path) => Err(ScimError::bad_request(
@@ -1128,25 +1228,22 @@ async fn apply_group_patch_operation(
             format!("unsupported path: {path}"),
         )),
         None => {
+            if op != "add" && op != "replace" {
+                return Err(ScimError::bad_request(
+                    "mutability",
+                    "object patches only support add/replace",
+                ));
+            }
             let object = operation.value.as_object().ok_or_else(|| {
                 ScimError::bad_request("invalidValue", "patch value must be an object")
             })?;
             if let Some(value) = object.get("displayName") {
-                let display_name = json_string(value, "displayName")?;
-                state
-                    .db
-                    .update_group(
-                        id,
-                        NewGroup {
-                            name: display_name,
-                            description: group.description.clone(),
-                        },
-                    )
-                    .await?;
+                *group_name = json_string(value, "displayName")?;
             }
             if let Some(value) = object.get("members") {
-                let member_ids = member_ids(patch_members_value(value)?);
-                replace_scim_group_members(state, principal, id, member_ids).await?;
+                *members = member_ids(patch_members_value(value)?)
+                    .into_iter()
+                    .collect();
             }
             Ok(())
         }
@@ -1242,19 +1339,16 @@ async fn application_scim_token_principal(
     access: ScimAccess,
 ) -> Result<Option<ScimPrincipal>, ScimError> {
     let token_hash = util::token_hash(raw_token);
-    let Some(token) = state
+    let Some(context) = state
         .db
-        .find_active_application_scim_token(&token_hash)
+        .find_scim_application_token_context(&token_hash)
         .await?
     else {
         return Ok(None);
     };
-    let application = state
-        .db
-        .find_application_by_id(&token.application_id)
-        .await?
-        .ok_or_else(|| ScimError::bearer_invalid("SCIM application no longer exists"))?;
-    let config = ensure_application_scim_enabled(state, &application).await?;
+    let config = ensure_application_scim_enabled(&context.application)?;
+    let token = context.token;
+    let application = context.application.application;
     let scopes: Vec<String> = util::from_json(&token.scopes).map_err(ScimError::from)?;
     if !scopes.iter().any(|scope| scope == access.scope()) {
         return Err(ScimError::insufficient_scope(access.scope()));
@@ -1291,12 +1385,14 @@ async fn application_scim_principal(
     if claims.sub != expected_subject {
         return Ok(None);
     }
-    let client = state
+    let Some(context) = state
         .db
-        .find_client_by_client_id(&claims.client_id)
+        .find_scim_service_account_context(&claims.client_id)
         .await?
-        .ok_or_else(|| ScimError::bearer_invalid("SCIM client is not registered"))?;
-    if client.is_active != 1 || !client.service_account_enabled() {
+    else {
+        return Err(ScimError::bearer_invalid("SCIM client is not registered"));
+    };
+    if !context.client_active || !context.service_account_enabled {
         return Err(ScimError::bearer_invalid(
             "SCIM service account is disabled",
         ));
@@ -1308,12 +1404,23 @@ async fn application_scim_principal(
     {
         return Err(ScimError::insufficient_scope(access.scope()));
     }
-    let Some(application) = state.db.find_application_for_client(&client.id).await? else {
+    let application_context = context.application;
+    let application = application_context.application.clone();
+    // SCIM is an application directory capability, not a generic service
+    // account capability. The repository proves ownership and returns the
+    // active binding, but the protocol is still an independent boundary: a
+    // SAML/CAS/JWT client must not become a SCIM principal merely by receiving
+    // client-credentials and users.* permissions.
+    let binding = &context.binding;
+    if binding.application_id != application.id
+        || binding.is_active != 1
+        || binding.protocol != "oidc"
+    {
         return Err(ScimError::bearer_invalid(
-            "SCIM client is not attached to an application",
+            "SCIM client is not bound to the OIDC application protocol",
         ));
-    };
-    let config = ensure_application_scim_enabled(state, &application).await?;
+    }
+    let config = ensure_application_scim_enabled(&application_context)?;
     let expected_audience = config
         .get("scim_audience")
         .and_then(Value::as_str)
@@ -1342,8 +1449,8 @@ async fn application_scim_principal(
         ScimAccess::Read => Permission::UsersRead,
         ScimAccess::Write => Permission::UsersManage,
     };
-    if !client
-        .service_account_permissions()?
+    if !util::from_json::<Vec<String>>(&context.service_account_permissions)
+        .map_err(ScimError::from)?
         .iter()
         .any(|permission| permission == required_permission.as_str())
     {
@@ -1352,7 +1459,7 @@ async fn application_scim_principal(
     let organization_id = application.organization_id.clone();
     Ok(Some(ScimPrincipal {
         user: None,
-        client_id: Some(client.client_id),
+        client_id: Some(context.client_id),
         application: Some(application),
         token_id: None,
         groups_enabled: config
@@ -1375,23 +1482,30 @@ fn ensure_scim_groups_enabled(principal: &ScimPrincipal) -> Result<(), ScimError
     }
 }
 
-async fn ensure_application_scim_enabled(
-    state: &AppState,
-    application: &ApplicationRecord,
+fn ensure_application_scim_enabled(
+    context: &ScimApplicationContext,
 ) -> Result<serde_json::Map<String, Value>, ScimError> {
-    applications::ensure_application_runtime_active(state, application)
-        .await
-        .map_err(|error| match error {
-            AppError::Forbidden => ScimError::bearer_invalid("SCIM application is disabled"),
-            other => ScimError::from(other),
-        })?;
-    let Some(config) =
-        applications::enabled_module_config(state, &application.id, "directory_sync").await?
-    else {
+    if !context.runtime_active() {
+        return Err(ScimError::bearer_invalid("SCIM application is disabled"));
+    }
+    if context.module.is_enabled != 1 {
         return Err(ScimError::bearer_invalid(
             "SCIM is not enabled for application",
         ));
     };
+    let raw_config =
+        serde_json::from_str::<Value>(&context.module.config_json).map_err(|error| {
+            AppError::Internal(format!("application module config is invalid: {error}"))
+        })?;
+    let config = applications::normalize_module_config("directory_sync", raw_config)
+        .map_err(ScimError::from)?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            ScimError::from(AppError::Internal(
+                "application module config is not an object".to_string(),
+            ))
+        })?;
     if config.get("scim_enabled").and_then(Value::as_bool) != Some(true) {
         return Err(ScimError::bearer_invalid(
             "SCIM is not enabled for application",
@@ -1447,19 +1561,25 @@ async fn editable_user(state: &AppState, id: &str) -> Result<UserRecord, ScimErr
     }
 }
 
-async fn scoped_scim_users(
+async fn scoped_scim_users_page(
     state: &AppState,
     principal: &ScimPrincipal,
     scope: UserListScope,
-) -> Result<Vec<UserRecord>, ScimError> {
-    match principal.organization_id.as_deref() {
-        Some(organization_id) => state
-            .db
-            .list_users_for_organization(organization_id, scope)
-            .await
-            .map_err(ScimError::from),
-        None => state.db.list_users(scope).await.map_err(ScimError::from),
-    }
+    filter: Option<UserListFilter>,
+    offset: usize,
+    limit: usize,
+) -> Result<(i64, Vec<UserRecord>), ScimError> {
+    state
+        .db
+        .list_users_page(
+            scope,
+            principal.organization_id.as_deref(),
+            filter,
+            offset,
+            limit,
+        )
+        .await
+        .map_err(ScimError::from)
 }
 
 async fn ensure_scim_user_scope(
@@ -1481,18 +1601,34 @@ async fn ensure_scim_user_scope(
     }
 }
 
-async fn scoped_scim_groups(
+fn scim_user_mutation_scope(principal: &ScimPrincipal) -> Option<ScimUserMutationScope> {
+    let scope = ScimUserMutationScope {
+        application_id: principal.application.as_ref().map(|application| application.id.clone()),
+        organization_id: principal.organization_id.clone(),
+    };
+    (scope.application_id.is_some() || scope.organization_id.is_some()).then_some(scope)
+}
+
+async fn scoped_scim_groups_page(
     state: &AppState,
     principal: &ScimPrincipal,
-) -> Result<Vec<GroupRecord>, ScimError> {
-    match principal.application.as_ref() {
-        Some(application) => state
-            .db
-            .list_application_scim_groups(&application.id)
-            .await
-            .map_err(ScimError::from),
-        None => state.db.list_groups().await.map_err(ScimError::from),
-    }
+    filter: Option<GroupListFilter>,
+    offset: usize,
+    limit: usize,
+) -> Result<(i64, Vec<GroupRecord>), ScimError> {
+    state
+        .db
+        .list_groups_page(
+            principal
+                .application
+                .as_ref()
+                .map(|application| application.id.as_str()),
+            filter,
+            offset,
+            limit,
+        )
+        .await
+        .map_err(ScimError::from)
 }
 
 async fn find_scim_group(
@@ -1531,71 +1667,6 @@ async fn list_scim_group_members(
             .await
             .map_err(ScimError::from),
     }
-}
-
-async fn replace_scim_group_members(
-    state: &AppState,
-    principal: &ScimPrincipal,
-    group_id: &str,
-    requested_user_ids: Vec<String>,
-) -> Result<(), ScimError> {
-    ensure_group_members_syncable(state, principal, group_id, &requested_user_ids).await?;
-    if let Some(application) = principal.application.as_ref() {
-        state
-            .db
-            .replace_application_scim_group_members(&application.id, group_id, requested_user_ids)
-            .await
-            .map_err(ScimError::from)
-    } else {
-        state
-            .db
-            .replace_group_members(group_id, requested_user_ids)
-            .await
-            .map_err(ScimError::from)
-    }
-}
-
-async fn ensure_group_members_syncable(
-    state: &AppState,
-    principal: &ScimPrincipal,
-    group_id: &str,
-    requested_user_ids: &[String],
-) -> Result<(), ScimError> {
-    let existing_members = list_scim_group_members(state, principal, group_id).await?;
-    let requested_user_ids = archived_accounts::normalize_user_ids(requested_user_ids);
-    let allowed_archived_user_ids = archived_accounts::ensure_archived_group_members_preserved(
-        &existing_members,
-        &requested_user_ids,
-    )?;
-    ensure_assignable_group_user_ids(
-        state,
-        principal,
-        &requested_user_ids,
-        &allowed_archived_user_ids,
-    )
-    .await
-}
-
-async fn ensure_assignable_group_user_ids(
-    state: &AppState,
-    principal: &ScimPrincipal,
-    requested_user_ids: &BTreeSet<String>,
-    allowed_archived_user_ids: &BTreeSet<String>,
-) -> Result<(), ScimError> {
-    for user_id in requested_user_ids {
-        let user = state
-            .db
-            .find_user_by_id(user_id)
-            .await?
-            .ok_or_else(|| AppError::BadRequest(format!("unknown user: {user_id}")))?;
-        archived_accounts::ensure_assignable_user_record(
-            &user,
-            allowed_archived_user_ids,
-            "SCIM groups",
-        )?;
-        ensure_scim_user_scope(state, principal, &user).await?;
-    }
-    Ok(())
 }
 
 async fn validate_password_for_subject(
@@ -1882,11 +1953,54 @@ fn iso_ts(value: i64) -> String {
         .to_rfc3339()
 }
 
+fn etag_for_serializable<T: Serialize>(value: &T) -> String {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    format!(
+        "\"{}\"",
+        util::sha256_base64url(&String::from_utf8_lossy(&body))
+    )
+}
+
+/// SCIM writes use the representation ETag returned by the preceding GET.
+/// Missing If-Match remains compatible with older provisioning clients; the
+/// database CAS still protects the request-start snapshot in that case.
+fn ensure_if_match(headers: &HeaderMap, current_etag: &str) -> Result<(), ScimError> {
+    let Some(raw) = headers.get(header::IF_MATCH) else {
+        return Ok(());
+    };
+    let value = raw
+        .to_str()
+        .map_err(|_| ScimError::bad_request("invalidValue", "If-Match is not valid ASCII"))?;
+    if value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == current_etag)
+    {
+        Ok(())
+    } else {
+        Err(ScimError::conflict(
+            "the SCIM resource changed; refetch it and retry with its current ETag",
+        ))
+    }
+}
+
 fn scim_json<T: Serialize>(value: T) -> Response {
-    let mut response = Json(value).into_response();
+    let body = match serde_json::to_vec(&value) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize SCIM response");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let etag = etag_for_serializable(&value);
+    let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/scim+json"),
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("SCIM digest ETag is a valid header value"),
     );
     response
 }
@@ -1926,6 +2040,10 @@ impl ScimError {
     fn bad_request(scim_type: &'static str, detail: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, Some(scim_type), detail)
     }
+
+    fn conflict(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, Some("versionMismatch"), detail)
+    }
 }
 
 impl IntoResponse for ScimError {
@@ -1958,10 +2076,15 @@ impl From<AppError> for ScimError {
         }
         let scim_type = match &value {
             AppError::BadRequest(_) | AppError::Oidc(_) => Some("invalidValue"),
+            AppError::OAuth { error, .. } if error == "resource_conflict" => {
+                Some("versionMismatch")
+            }
             _ => None,
         };
         let detail = if is_internal {
             "internal server error".to_string()
+        } else if let AppError::OAuth { description, .. } = &value {
+            description.clone()
         } else {
             value.to_string()
         };
@@ -1973,6 +2096,7 @@ impl From<AppError> for ScimError {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use tower::ServiceExt;
 
     fn token_claims(audience: &str, scope: &str) -> crate::jwt::TokenClaims {
@@ -2111,6 +2235,83 @@ mod tests {
         assert_eq!(bearer_token("Bearer first second"), None);
     }
 
+    #[test]
+    fn scim_if_match_accepts_current_etag_and_rejects_stale_etag() {
+        let current_etag = etag_for_serializable(&serde_json::json!({
+            "id": "user-1",
+            "meta": {"version": "v2"}
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, current_etag.parse().unwrap());
+        assert!(ensure_if_match(&headers, &current_etag).is_ok());
+
+        headers.insert(header::IF_MATCH, "\"stale\"".parse().unwrap());
+        assert!(matches!(
+            ensure_if_match(&headers, &current_etag),
+            Err(ScimError {
+                status: StatusCode::CONFLICT,
+                scim_type: Some("versionMismatch"),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scim_application_context_keeps_module_and_lifecycle_gates_together() {
+        let application = ApplicationRecord {
+            id: "scim-context-app".to_string(),
+            organization_id: "scim-context-org".to_string(),
+            slug: "scim-context".to_string(),
+            name: "SCIM context".to_string(),
+            description: None,
+            access_mode: applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+            registration_mode: applications::REGISTRATION_DISABLED.to_string(),
+            account_selection_mode: applications::ACCOUNT_SELECTION_OPTIONAL.to_string(),
+            unique_identity_factors: "[]".to_string(),
+            is_active: 1,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let mut context = ScimApplicationContext {
+            application,
+            module: crate::db::ApplicationModuleRecord {
+                application_id: "scim-context-app".to_string(),
+                module_key: "directory_sync".to_string(),
+                config_json: serde_json::json!({
+                    "enabled": true,
+                    "scim_enabled": true,
+                    "sync_groups": true,
+                    "scim_audience": "https://signet.example/scim/v2"
+                })
+                .to_string(),
+                is_enabled: 1,
+                created_at: 0,
+                updated_at: 0,
+            },
+            organization_active: true,
+            discovery: None,
+        };
+        assert!(ensure_application_scim_enabled(&context).is_ok());
+
+        context.module.is_enabled = 0;
+        assert!(matches!(
+            ensure_application_scim_enabled(&context),
+            Err(ScimError {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+        context.module.is_enabled = 1;
+        context.organization_active = false;
+        assert!(matches!(
+            ensure_application_scim_enabled(&context),
+            Err(ScimError {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+    }
+
     #[cfg(feature = "sqlite")]
     async fn http_test_state() -> (AppState, std::path::PathBuf) {
         let mut settings: crate::Settings =
@@ -2220,12 +2421,7 @@ mod tests {
         scope: &str,
         resource: Option<&str>,
     ) -> String {
-        let mut form = vec![
-            ("grant_type", "client_credentials"),
-            ("client_id", client_id),
-            ("client_secret", secret),
-            ("scope", scope),
-        ];
+        let mut form = vec![("grant_type", "client_credentials"), ("scope", scope)];
         if let Some(resource) = resource {
             form.push(("resource", resource));
         }
@@ -2235,6 +2431,10 @@ mod tests {
                 Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/oauth2/token")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}"))),
+                    )
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .body(Body::from(serde_urlencoded::to_string(form).unwrap()))
                     .unwrap(),
@@ -2302,6 +2502,127 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scim_group_patch_is_all_or_nothing_when_a_later_member_is_invalid() {
+        let (state, path) = http_test_state().await;
+        let organization = state
+            .db
+            .insert_organization(http_test_organization("scim-patch-atomic-org"))
+            .await
+            .unwrap();
+        let application = state
+            .db
+            .insert_application(http_test_application(
+                &organization.id,
+                "scim-patch-atomic-app",
+            ))
+            .await
+            .unwrap();
+        add_scim_module(&state, &application.id).await;
+
+        let user = state
+            .db
+            .insert_user(crate::db::NewUser {
+                email: "scim-patch-atomic@example.com".to_string(),
+                username: "scim-patch-atomic".to_string(),
+                display_name: Some("SCIM Patch Atomic".to_string()),
+                phone: None,
+                password_hash: "test-hash".to_string(),
+                email_verified_at: Some(util::now_ts()),
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: true,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_organization_member(
+                &organization.id,
+                &user.id,
+                crate::organizations::ROLE_MEMBER,
+            )
+            .await
+            .unwrap();
+
+        let group = state
+            .db
+            .insert_application_scim_group(
+                &application.id,
+                crate::db::NewGroup {
+                    name: "Atomic group before".to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .replace_application_scim_group_members(
+                &application.id,
+                &group.id,
+                vec![user.id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let raw_token = "scim_v1_patch_atomic_token";
+        state
+            .db
+            .insert_application_scim_token(crate::db::NewApplicationScimToken {
+                id: "scim-patch-atomic-token".to_string(),
+                application_id: application.id.clone(),
+                token_prefix: raw_token.chars().take(16).collect(),
+                token_hash: util::token_hash(raw_token),
+                scopes: vec![SCIM_READ_SCOPE.to_string(), SCIM_WRITE_SCOPE.to_string()],
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut app = routes().with_state(state.clone());
+        let response = scim_http_request(
+            &mut app,
+            axum::http::Method::PATCH,
+            &format!("/scim/v2/Groups/{}", group.id),
+            Some(raw_token),
+            Some(serde_json::json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [
+                    {"op": "Replace", "path": "displayName", "value": "Changed before failure"},
+                    {"op": "Add", "path": "members", "value": [{"value": "missing-user"}]}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let unchanged_group = state
+            .db
+            .find_application_scim_group(&application.id, &group.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged_group.name, "Atomic group before");
+        let unchanged_members = state
+            .db
+            .list_application_scim_group_members(&application.id, &group.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged_members
+                .into_iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>(),
+            vec![user.id]
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -2407,6 +2728,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("application/scim+json")
         );
+        assert!(response.headers().get(header::ETAG).is_some());
         let users = response_json(response).await;
         assert_eq!(users["totalResults"], 1);
         assert_eq!(users["Resources"][0]["id"], user.id.clone());

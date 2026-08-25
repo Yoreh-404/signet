@@ -15,7 +15,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
@@ -27,6 +27,7 @@ pub struct JwtManager {
 struct JwtKeySet {
     active_key: Arc<KeyMaterial>,
     keys: Vec<Arc<KeyMaterial>>,
+    keys_by_kid: HashMap<String, Arc<KeyMaterial>>,
 }
 
 struct KeyMaterial {
@@ -174,6 +175,7 @@ impl JwtManager {
 
 fn build_key_set(records: Vec<SigningKeyRecord>) -> AppResult<JwtKeySet> {
     let mut keys = Vec::with_capacity(records.len());
+    let mut keys_by_kid = HashMap::with_capacity(records.len());
     let mut active_key = None;
     let mut seen_kids = BTreeSet::new();
     let mut active_count = 0;
@@ -189,6 +191,7 @@ fn build_key_set(records: Vec<SigningKeyRecord>) -> AppResult<JwtKeySet> {
             active_count += 1;
             active_key = Some(material.clone());
         }
+        keys_by_kid.insert(record.kid.clone(), material.clone());
         keys.push(material);
     }
     if active_count != 1 {
@@ -198,7 +201,11 @@ fn build_key_set(records: Vec<SigningKeyRecord>) -> AppResult<JwtKeySet> {
     }
     let active_key = active_key
         .ok_or_else(|| AppError::Configuration("no active signing key is available".to_string()))?;
-    Ok(JwtKeySet { active_key, keys })
+    Ok(JwtKeySet {
+        active_key,
+        keys,
+        keys_by_kid,
+    })
 }
 
 impl KeyMaterial {
@@ -581,23 +588,17 @@ impl JwtManager {
             .key_set
             .read()
             .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
-        let candidate_keys = if let Some(kid) = header.kid.as_deref() {
-            let matching = key_set
+        let token = if let Some(kid) = header.kid.as_deref() {
+            let key = key_set.keys_by_kid.get(kid).ok_or(AppError::Unauthorized)?;
+            decode::<TokenClaims>(token, &key.decoding_key, &validation)
+                .map_err(|_| AppError::Unauthorized)?
+        } else {
+            key_set
                 .keys
                 .iter()
-                .filter(|key| key.kid == kid)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                return Err(AppError::Unauthorized);
-            }
-            matching
-        } else {
-            key_set.keys.iter().collect::<Vec<_>>()
+                .find_map(|key| decode::<TokenClaims>(token, &key.decoding_key, &validation).ok())
+                .ok_or(AppError::Unauthorized)?
         };
-        let token = candidate_keys
-            .into_iter()
-            .find_map(|key| decode::<TokenClaims>(token, &key.decoding_key, &validation).ok())
-            .ok_or(AppError::Unauthorized)?;
         let now = util::now_ts();
         if token.claims.iat > now + 60 || token.claims.exp < token.claims.iat {
             return Err(AppError::Unauthorized);
@@ -724,13 +725,85 @@ mod tests {
     }
 
     #[test]
+    fn key_set_indexes_kids_to_shared_key_material() {
+        let first_pem = util::generate_rsa_private_key_pem().unwrap();
+        let second_pem = util::generate_rsa_private_key_pem().unwrap();
+        let key_set = super::build_key_set(vec![
+            signing_key("key-a", &first_pem, 1),
+            signing_key("key-b", &second_pem, 0),
+        ])
+        .unwrap();
+
+        let indexed = key_set.keys_by_kid.get("key-b").unwrap();
+        assert!(Arc::ptr_eq(indexed, &key_set.keys[1]));
+        assert_eq!(key_set.keys_by_kid.len(), key_set.keys.len());
+    }
+
+    #[test]
+    fn token_with_known_kid_uses_the_indexed_key() {
+        let first_pem = util::generate_rsa_private_key_pem().unwrap();
+        let second_pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![
+            signing_key("key-a", &first_pem, 1),
+            signing_key("key-b", &second_pem, 0),
+        ]);
+        let token = signed_test_token(Some("key-b"), &second_pem);
+
+        let claims = manager
+            .verify_access_token_with_issuers(&token, &["https://issuer.example"])
+            .unwrap();
+        assert_eq!(claims.jti.as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn token_without_kid_keeps_the_compatibility_fallback() {
+        let first_pem = util::generate_rsa_private_key_pem().unwrap();
+        let second_pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![
+            signing_key("key-a", &first_pem, 1),
+            signing_key("key-b", &second_pem, 0),
+        ]);
+        let token = signed_test_token(None, &second_pem);
+
+        let claims = manager
+            .verify_access_token_with_issuers(&token, &["https://issuer.example"])
+            .unwrap();
+        assert_eq!(claims.jti.as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn key_rotation_keeps_old_kids_verifiable_and_switches_active_key() {
+        let old_pem = util::generate_rsa_private_key_pem().unwrap();
+        let new_pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![signing_key("key-old", &old_pem, 1)]);
+        let old_token = signed_test_token(Some("key-old"), &old_pem);
+
+        manager
+            .reload(vec![
+                signing_key("key-old", &old_pem, 0),
+                signing_key("key-new", &new_pem, 1),
+            ])
+            .unwrap();
+
+        assert_eq!(manager.active_kid(), "key-new");
+        assert!(
+            manager
+                .verify_access_token_with_issuers(&old_token, &["https://issuer.example"])
+                .is_ok()
+        );
+
+        let new_token = signed_test_token(Some("key-new"), &new_pem);
+        assert!(
+            manager
+                .verify_access_token_with_issuers(&new_token, &["https://issuer.example"])
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn token_verification_enforces_audience_and_unknown_kid_is_rejected() {
         let pem = util::generate_rsa_private_key_pem().unwrap();
-        let key_set = super::build_key_set(vec![signing_key("key-a", &pem, 1)]).unwrap();
-        let manager = JwtManager {
-            default_issuer: "https://issuer.example".to_string(),
-            key_set: Arc::new(RwLock::new(key_set)),
-        };
+        let manager = manager_with_keys(vec![signing_key("key-a", &pem, 1)]);
         let user = crate::db::UserRecord {
             id: "user-id".to_string(),
             email: "user@example.test".to_string(),
@@ -823,5 +896,36 @@ mod tests {
             activated_at: (is_active == 1).then_some(1),
             retired_at: (is_active == 1).then_some(0),
         }
+    }
+
+    fn manager_with_keys(records: Vec<SigningKeyRecord>) -> JwtManager {
+        JwtManager {
+            default_issuer: "https://issuer.example".to_string(),
+            key_set: Arc::new(RwLock::new(super::build_key_set(records).unwrap())),
+        }
+    }
+
+    fn signed_test_token(kid: Option<&str>, private_key_pem: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = kid.map(|value| value.to_string());
+        encode(
+            &header,
+            &serde_json::json!({
+                "iss": "https://issuer.example",
+                "sub": "user-id",
+                "aud": "client-id",
+                "exp": util::now_ts() + 300,
+                "iat": util::now_ts(),
+                "jti": "test-token",
+                "token_use": "access_token",
+                "client_id": "client-id",
+                "scope": "openid",
+                "email": "user@example.test",
+                "email_verified": false,
+                "preferred_username": "user"
+            }),
+            &EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
     }
 }

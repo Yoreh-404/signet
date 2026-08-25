@@ -10,8 +10,8 @@ use crate::{
     applications, auth,
     config::{PaymentProviderSettings, Settings},
     db::{
-        ApplicationBillingSettingsRecord, NewPaymentOrder, PaymentOrderRecord, UserRecord,
-        WalletAccountRecord, WalletHoldRecord, WalletTransactionRecord,
+        ApplicationBillingSettingsRecord, NewPaymentOrder, PaymentOrderLease, PaymentOrderRecord,
+        UserRecord, WalletAccountRecord, WalletHoldRecord, WalletTransactionRecord,
     },
     error::{AppError, AppResult},
     util,
@@ -28,7 +28,7 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::{Digest as Md5Digest, Md5};
-use reqwest::Client;
+use reqwest::{Client, Response as ProviderResponse};
 use rsa::{
     Pkcs1v15Sign, RsaPrivateKey,
     pkcs8::{DecodePrivateKey, DecodePublicKey},
@@ -42,6 +42,7 @@ use std::{
     pin::Pin,
     time::Duration,
 };
+use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
 use url::Url;
 use x509_parser::prelude::FromDer;
 
@@ -60,9 +61,72 @@ pub const ACCOUNT_KIND_SETTLEMENT: &str = "application_settlement";
 pub const WALLET_MODE_SHARED: &str = "shared";
 pub const WALLET_MODE_ISOLATED: &str = "isolated";
 
+/// A payment intent is durable before any provider side effect starts.
+pub const PAYMENT_STATUS_CREATING: &str = "creating";
 pub const PAYMENT_STATUS_PENDING: &str = "pending";
 pub const PAYMENT_STATUS_PAID: &str = "paid";
+/// The provider outcome is known to be a failure; the intent is terminal.
+pub const PAYMENT_STATUS_FAILED: &str = "failed";
+/// The provider outcome is unknown and must remain query/reconcile-able.
+pub const PAYMENT_STATUS_RECONCILE: &str = "reconcile";
+/// Kept for compatibility with callers that close an expired checkout.
 pub const PAYMENT_STATUS_CLOSED: &str = "closed";
+
+/// Returns the bounded exponential delay for a claimed reconciliation
+/// attempt. The first attempt waits `base_seconds`; later attempts double the
+/// delay until `max_seconds`. Saturating arithmetic keeps malformed legacy
+/// counters from wrapping a retry into the past.
+pub fn reconcile_retry_delay_seconds(
+    attempt_count: i64,
+    base_seconds: i64,
+    max_seconds: i64,
+) -> i64 {
+    if base_seconds <= 0 || max_seconds <= 0 {
+        return 0;
+    }
+    let exponent = attempt_count.saturating_sub(1).clamp(0, 62) as u32;
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+    base_seconds.saturating_mul(multiplier).min(max_seconds)
+}
+
+pub fn reconcile_next_retry_at(
+    now: i64,
+    attempt_count: i64,
+    base_seconds: i64,
+    max_seconds: i64,
+) -> i64 {
+    now.saturating_add(reconcile_retry_delay_seconds(
+        attempt_count,
+        base_seconds,
+        max_seconds,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiredPaymentOrderPolicy {
+    /// The provider must be queried because local expiry cannot prove that
+    /// money was not accepted.
+    QueryProvider,
+    /// Query the provider but never issue a second create call after a crash
+    /// left the local creating intent without checkout material.
+    QueryProviderWithoutCreate,
+}
+
+fn expired_payment_order_policy(
+    status: &str,
+    checkout_value: &str,
+    expires_at: i64,
+    now: i64,
+) -> Option<ExpiredPaymentOrderPolicy> {
+    if expires_at > now {
+        return None;
+    }
+    if status == PAYMENT_STATUS_CREATING && checkout_value.trim().is_empty() {
+        Some(ExpiredPaymentOrderPolicy::QueryProviderWithoutCreate)
+    } else {
+        Some(ExpiredPaymentOrderPolicy::QueryProvider)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Money {
@@ -423,6 +487,32 @@ fn request_headers_with_json() -> HeaderMap {
     headers
 }
 
+/// Provider HTTP responses are classified at the adapter boundary.  A 4xx
+/// response is a deterministic rejection; a 5xx response is deliberately
+/// unknown because the provider may have accepted the request before failing
+/// to return a response.
+fn provider_response_error(response: &ProviderResponse, operation: &str) -> AppResult<()> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+    if response.status().is_client_error() {
+        return Err(AppError::BadRequest(format!(
+            "{operation} was rejected by the payment provider"
+        )));
+    }
+    Err(provider_outcome_unknown_with_reason(
+        "provider returned 5xx or another non-success response",
+    ))
+}
+
+async fn provider_json_response(response: ProviderResponse, operation: &str) -> AppResult<Value> {
+    provider_response_error(&response, operation)?;
+    response
+        .json()
+        .await
+        .map_err(|_| provider_outcome_unknown_with_reason("provider response JSON is invalid"))
+}
+
 struct EpayProvider {
     config: PaymentProviderSettings,
 }
@@ -494,7 +584,8 @@ impl PaymentProvider for EpayProvider {
             let provider_trade_id = fields
                 .get("trade_no")
                 .cloned()
-                .unwrap_or_else(|| fields.get("out_trade_no").cloned().unwrap_or_default());
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_default();
             notification_from_fields(
                 &fields,
                 amount_minor,
@@ -665,19 +756,45 @@ impl PaymentProvider for AlipayProvider {
                 .send()
                 .await
                 .map_err(provider_http_error)?;
-            let body: Value = response.json().await.map_err(provider_http_error)?;
+            let body = provider_json_response(response, "Alipay payment query").await?;
             let trade = body
                 .get("alipay_trade_query_response")
                 .cloned()
                 .unwrap_or(body);
+            let response_code = trade
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !response_code.is_empty() && response_code != "10000" {
+                // Alipay's documented "交易不存在" response is a terminal
+                // provider observation for this order, not a made-up trade
+                // id.  The reconcile layer will mark the local intent failed.
+                if response_code == "40004" {
+                    return Ok(PaymentQueryResult {
+                        notification: PaymentNotification {
+                            merchant_order_no: order.merchant_order_no.clone(),
+                            provider_trade_id: String::new(),
+                            amount_minor: order.amount_minor,
+                            currency: order.currency.clone(),
+                            paid_at: util::now_ts(),
+                            status: PAYMENT_STATUS_FAILED.to_string(),
+                        },
+                    });
+                }
+                return Err(AppError::BadRequest(
+                    "Alipay payment query was rejected".to_string(),
+                ));
+            }
             let trade_status = trade
                 .get("trade_status")
                 .and_then(Value::as_str)
-                .unwrap_or("WAIT_BUYER_PAY");
+                .ok_or_else(provider_outcome_unknown)?;
             let amount = trade
                 .get("total_amount")
                 .and_then(Value::as_str)
-                .unwrap_or("0");
+                .ok_or_else(provider_outcome_unknown)?;
+            let amount_minor =
+                parse_decimal_to_minor(amount, 2).map_err(|_| provider_outcome_unknown())?;
             Ok(PaymentQueryResult {
                 notification: PaymentNotification {
                     merchant_order_no: order.merchant_order_no.clone(),
@@ -686,13 +803,15 @@ impl PaymentProvider for AlipayProvider {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    amount_minor: parse_decimal_to_minor(amount, 2)?,
+                    amount_minor,
                     currency: CURRENCY_CNY.to_string(),
                     paid_at: util::now_ts(),
                     status: if matches!(trade_status, "TRADE_SUCCESS" | "TRADE_FINISHED") {
-                        "paid"
+                        PAYMENT_STATUS_PAID
+                    } else if trade_status == "TRADE_CLOSED" {
+                        PAYMENT_STATUS_FAILED
                     } else {
-                        "pending"
+                        PAYMENT_STATUS_PENDING
                     }
                     .to_string(),
                 },
@@ -729,7 +848,7 @@ impl PaymentProvider for AlipayProvider {
                 .send()
                 .await
                 .map_err(provider_http_error)?;
-            let body: Value = response.json().await.map_err(provider_http_error)?;
+            let body = provider_json_response(response, "Alipay refund").await?;
             let refund = body
                 .get("alipay_trade_refund_response")
                 .cloned()
@@ -739,14 +858,20 @@ impl PaymentProvider for AlipayProvider {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if code != "10000" {
-                return Err(AppError::Internal("Alipay refund was rejected".to_string()));
+                if code.is_empty() {
+                    return Err(provider_outcome_unknown());
+                }
+                return Err(AppError::BadRequest(
+                    "Alipay refund was rejected".to_string(),
+                ));
             }
+            let provider_refund_id = refund
+                .get("trade_no")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(provider_outcome_unknown)?;
             Ok(ProviderRefundResult {
-                provider_refund_id: refund
-                    .get("trade_no")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&order.merchant_order_no)
-                    .to_string(),
+                provider_refund_id: provider_refund_id.to_string(),
             })
         })
     }
@@ -922,12 +1047,12 @@ impl PaymentProvider for WechatProvider {
                 .send()
                 .await
                 .map_err(provider_http_error)?;
-            let payload: Value = response.json().await.map_err(provider_http_error)?;
+            let payload = provider_json_response(response, "WeChat checkout").await?;
             let code_url = payload
                 .get("code_url")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| AppError::Internal("WeChat did not return code_url".to_string()))?;
+                .ok_or_else(provider_outcome_unknown)?;
             Ok(("qr".to_string(), code_url.to_string()))
         })
     }
@@ -1011,11 +1136,21 @@ impl PaymentProvider for WechatProvider {
                 .send()
                 .await
                 .map_err(provider_http_error)?;
-            let payload: Value = response.json().await.map_err(provider_http_error)?;
+            let payload = provider_json_response(response, "WeChat payment query").await?;
             let trade_state = payload
                 .get("trade_state")
                 .and_then(Value::as_str)
-                .unwrap_or("NOTPAY");
+                .ok_or_else(provider_outcome_unknown)?;
+            let amount_minor = payload
+                .get("amount")
+                .and_then(|value| value.get("total"))
+                .and_then(Value::as_i64)
+                .ok_or_else(provider_outcome_unknown)?;
+            let currency = payload
+                .get("amount")
+                .and_then(|value| value.get("currency"))
+                .and_then(Value::as_str)
+                .ok_or_else(provider_outcome_unknown)?;
             Ok(PaymentQueryResult {
                 notification: PaymentNotification {
                     merchant_order_no: order.merchant_order_no.clone(),
@@ -1024,22 +1159,15 @@ impl PaymentProvider for WechatProvider {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    amount_minor: payload
-                        .get("amount")
-                        .and_then(|value| value.get("total"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(order.amount_minor),
-                    currency: payload
-                        .get("amount")
-                        .and_then(|value| value.get("currency"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(CURRENCY_CNY)
-                        .to_string(),
+                    amount_minor,
+                    currency: currency.to_string(),
                     paid_at: util::now_ts(),
                     status: if trade_state == "SUCCESS" {
-                        "paid"
+                        PAYMENT_STATUS_PAID
+                    } else if matches!(trade_state, "CLOSED" | "REVOKED" | "PAYERROR") {
+                        PAYMENT_STATUS_FAILED
                     } else {
-                        "pending"
+                        PAYMENT_STATUS_PENDING
                     }
                     .to_string(),
                 },
@@ -1072,24 +1200,47 @@ impl PaymentProvider for WechatProvider {
                 .send()
                 .await
                 .map_err(provider_http_error)?;
-            let payload: Value = response.json().await.map_err(provider_http_error)?;
+            let payload = provider_json_response(response, "WeChat refund").await?;
+            let provider_refund_id = payload
+                .get("refund_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(provider_outcome_unknown)?;
             Ok(ProviderRefundResult {
-                provider_refund_id: payload
-                    .get("refund_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&refund_no)
-                    .to_string(),
+                provider_refund_id: provider_refund_id.to_string(),
             })
         })
     }
 }
 
 fn provider_http_error(error: reqwest::Error) -> AppError {
-    if error.is_timeout() {
-        AppError::Internal("billing provider request timed out".to_string())
+    let reason = if error.is_timeout() {
+        "provider request timed out"
+    } else if error.is_connect() || error.is_request() {
+        "provider network/request failed"
     } else {
-        AppError::Internal(format!("billing provider request failed: {error}"))
-    }
+        "provider transport outcome is unknown"
+    };
+    provider_outcome_unknown_with_reason(reason)
+}
+
+fn provider_outcome_unknown() -> AppError {
+    provider_outcome_unknown_with_reason("provider outcome is unknown")
+}
+
+fn provider_outcome_unknown_with_reason(reason: &str) -> AppError {
+    AppError::Internal(format!("billing provider outcome unknown: {reason}"))
+}
+
+fn is_provider_outcome_unknown(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Internal(message) if message.starts_with("billing provider outcome unknown")
+    )
+}
+
+fn provider_error_message(error: &AppError) -> String {
+    error.to_string().chars().take(512).collect()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1174,6 +1325,7 @@ pub fn routes() -> Router<AppState> {
             get(list_recharges).post(create_recharge),
         )
         .route("/api/me/billing/recharges/{id}", get(get_recharge))
+        .route("/api/me/billing/recharges/{id}/query", post(query_recharge))
         .route("/api/me/billing/transfers", post(transfer_wallet))
         .route(
             "/api/billing/providers/{provider}/notify",
@@ -1452,6 +1604,707 @@ async fn get_recharge(
     Ok(Json(payment_order_view(&state.settings, order)?))
 }
 
+fn checkout_request_for_order(
+    base_url: &str,
+    provider_config: &PaymentProviderSettings,
+    order: &PaymentOrderRecord,
+) -> CheckoutRequest {
+    let notify_url = provider_config
+        .notify_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/api/billing/providers/{}/notify",
+                base_url.trim_end_matches('/'),
+                order.provider_slug
+            )
+        });
+    CheckoutRequest {
+        merchant_order_no: order.merchant_order_no.clone(),
+        amount_minor: order.amount_minor,
+        currency: order.currency.clone(),
+        subject: order.subject.clone(),
+        notify_url,
+        return_url: format!(
+            "{}/#/billing?billing_order={}",
+            base_url.trim_end_matches('/'),
+            order.merchant_order_no
+        ),
+        expires_at: order.expires_at,
+    }
+}
+
+async fn persist_provider_create_failure(
+    state: &AppState,
+    order_id: &str,
+    error: &AppError,
+) -> AppResult<()> {
+    let message = provider_error_message(error);
+    if is_provider_outcome_unknown(error) {
+        state
+            .db
+            .mark_payment_order_reconcile(order_id, &message)
+            .await?;
+    } else {
+        state
+            .db
+            .mark_payment_order_failed(order_id, &message)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn create_provider_checkout_for_order(
+    state: &AppState,
+    base_url: &str,
+    order: &PaymentOrderRecord,
+) -> AppResult<PaymentOrderRecord> {
+    if order.status != PAYMENT_STATUS_CREATING || !order.checkout_value.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "payment provider create is allowed only for a new creating intent".to_string(),
+        ));
+    }
+    if order.expires_at <= util::now_ts() {
+        return Err(AppError::BadRequest(
+            "payment intent expired before provider checkout creation".to_string(),
+        ));
+    }
+    let provider_config = match provider_settings(&state.settings, &order.provider_slug) {
+        Ok(config) => config.clone(),
+        Err(error) => {
+            state
+                .db
+                .mark_payment_order_failed(&order.id, &provider_error_message(&error))
+                .await?;
+            return Err(error);
+        }
+    };
+    let provider = match configured_provider(&state.settings, &order.provider_slug) {
+        Ok(provider) => provider,
+        Err(error) => {
+            state
+                .db
+                .mark_payment_order_failed(&order.id, &provider_error_message(&error))
+                .await?;
+            return Err(error);
+        }
+    };
+    let request = checkout_request_for_order(base_url, &provider_config, order);
+    let checkout_result =
+        match tokio::time::timeout(Duration::from_secs(15), provider.create_checkout(&request))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(provider_outcome_unknown_with_reason(
+                "provider checkout creation timed out",
+            )),
+        };
+    let checkout = match checkout_result {
+        Ok(checkout) => checkout,
+        Err(error) => {
+            persist_provider_create_failure(state, &order.id, &error).await?;
+            return Err(error);
+        }
+    };
+    match state
+        .db
+        .set_payment_order_checkout(&order.id, &checkout.0, &checkout.1)
+        .await
+    {
+        Ok(order) => Ok(order),
+        Err(error) => {
+            // Provider checkout creation succeeded, but local persistence did
+            // not.  Keep a reconcile state whenever possible so a callback or
+            // query can still finalize the payment; never invent a checkout or
+            // provider id in the error path.
+            let _ = state
+                .db
+                .mark_payment_order_reconcile(&order.id, &provider_error_message(&error))
+                .await;
+            Err(error)
+        }
+    }
+}
+
+enum ReconcileAttempt {
+    Finalized(Option<PaymentOrderRecord>),
+    Shutdown,
+}
+
+async fn finalize_reconcile_error(
+    state: &AppState,
+    order: &PaymentOrderRecord,
+    fence: &PaymentOrderLease,
+    error: AppError,
+) -> AppResult<Option<PaymentOrderRecord>> {
+    let message = provider_error_message(&error);
+    let next_retry_at = reconcile_next_retry_at(
+        util::now_ts(),
+        order.attempt_count,
+        state.settings.billing.reconcile_retry_base_seconds,
+        state.settings.billing.reconcile_retry_max_seconds,
+    );
+    if state
+        .db
+        .mark_payment_order_reconcile_fenced(&order.id, fence, &message, next_retry_at)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Err(error)
+}
+
+async fn finalize_pending_state(
+    state: &AppState,
+    order: &PaymentOrderRecord,
+    fence: &PaymentOrderLease,
+) -> AppResult<Option<PaymentOrderRecord>> {
+    let next_retry_at = reconcile_next_retry_at(
+        util::now_ts(),
+        order.attempt_count,
+        state.settings.billing.reconcile_retry_base_seconds,
+        state.settings.billing.reconcile_retry_max_seconds,
+    );
+    state
+        .db
+        .mark_payment_order_pending_fenced(&order.id, fence, next_retry_at)
+        .await
+}
+
+async fn finalize_failed_state(
+    state: &AppState,
+    order_id: &str,
+    fence: &PaymentOrderLease,
+) -> AppResult<Option<PaymentOrderRecord>> {
+    state
+        .db
+        .mark_payment_order_failed_fenced(
+            order_id,
+            fence,
+            "payment provider reported a terminal unsuccessful state",
+        )
+        .await
+}
+
+async fn finalize_paid_state(
+    state: &AppState,
+    order: &PaymentOrderRecord,
+    fence: &PaymentOrderLease,
+    provider_trade_id: &str,
+    paid_at: i64,
+) -> AppResult<Option<PaymentOrderRecord>> {
+    state
+        .db
+        .mark_payment_order_paid_fenced(&order.id, provider_trade_id, paid_at, fence)
+        .await
+}
+
+async fn query_provider_with_timeout(
+    provider: &dyn PaymentProvider,
+    order: &PaymentOrderRecord,
+) -> AppResult<PaymentQueryResult> {
+    match tokio::time::timeout(Duration::from_secs(15), provider.query_payment(order)).await {
+        Ok(result) => result,
+        Err(_) => Err(provider_outcome_unknown_with_reason(
+            "provider query timed out",
+        )),
+    }
+}
+
+async fn query_provider_until_shutdown(
+    provider: &dyn PaymentProvider,
+    order: &PaymentOrderRecord,
+    stop_rx: Option<&mut oneshot::Receiver<()>>,
+) -> Result<Option<PaymentQueryResult>, AppError> {
+    let query = query_provider_with_timeout(provider, order);
+    if let Some(stop_rx) = stop_rx {
+        tokio::select! {
+            biased;
+            _ = stop_rx => Ok(None),
+            result = query => result.map(Some),
+        }
+    } else {
+        query.await.map(Some)
+    }
+}
+
+async fn finalize_provider_query(
+    state: &AppState,
+    order: &PaymentOrderRecord,
+    fence: &PaymentOrderLease,
+    query: PaymentQueryResult,
+) -> AppResult<Option<PaymentOrderRecord>> {
+    let notification = query.notification;
+    let currency = match normalize_currency(&notification.currency) {
+        Ok(currency) => currency,
+        Err(error) => return finalize_reconcile_error(state, order, fence, error).await,
+    };
+    if notification.merchant_order_no != order.merchant_order_no
+        || currency != order.currency
+        || notification.amount_minor != order.amount_minor
+    {
+        return finalize_reconcile_error(
+            state,
+            order,
+            fence,
+            AppError::BadRequest("provider query does not match the payment order".to_string()),
+        )
+        .await;
+    }
+    match notification.status.as_str() {
+        PAYMENT_STATUS_PAID => {
+            if notification.provider_trade_id.trim().is_empty() {
+                return finalize_reconcile_error(
+                    state,
+                    order,
+                    fence,
+                    provider_outcome_unknown_with_reason(
+                        "provider query did not return a provider transaction id",
+                    ),
+                )
+                .await;
+            }
+            finalize_paid_state(
+                state,
+                order,
+                fence,
+                &notification.provider_trade_id,
+                notification.paid_at,
+            )
+            .await
+        }
+        PAYMENT_STATUS_FAILED | PAYMENT_STATUS_CLOSED => {
+            finalize_failed_state(state, &order.id, fence).await
+        }
+        PAYMENT_STATUS_PENDING if order.expires_at <= util::now_ts() => {
+            finalize_reconcile_error(
+                state,
+                order,
+                fence,
+                provider_outcome_unknown_with_reason(
+                    "provider remains pending after local payment expiry",
+                ),
+            )
+            .await
+        }
+        PAYMENT_STATUS_PENDING => finalize_pending_state(state, order, fence).await,
+        _ => {
+            finalize_reconcile_error(
+                state,
+                order,
+                fence,
+                provider_outcome_unknown_with_reason(
+                    "provider query returned an unsupported payment state",
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// The single billing command surface for worker, manual, and recovery
+/// reconciliation. A caller must first obtain a durable claim; provider
+/// results are published only through the matching generation fence.
+struct BillingCommandService<'a> {
+    state: &'a AppState,
+}
+
+impl<'a> BillingCommandService<'a> {
+    fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    async fn reconcile_order(&self, order_id: &str, force: bool) -> AppResult<PaymentOrderRecord> {
+        let owner = format!("billing-manual-{}", util::random_token(24));
+        let now = util::now_ts();
+        let Some(order) = self
+            .state
+            .db
+            .claim_payment_order_for_reconcile(
+                order_id,
+                &owner,
+                now,
+                self.state.settings.billing.reconcile_lease_seconds,
+                force,
+            )
+            .await?
+        else {
+            return self
+                .state
+                .db
+                .find_payment_order(order_id)
+                .await?
+                .ok_or(AppError::NotFound);
+        };
+        let fence = payment_order_lease(&order, &owner, now);
+        match self.reconcile_claimed(order, fence, None).await? {
+            ReconcileAttempt::Finalized(Some(order)) => Ok(order),
+            ReconcileAttempt::Finalized(None) => self
+                .state
+                .db
+                .find_payment_order(order_id)
+                .await?
+                .ok_or(AppError::NotFound),
+            ReconcileAttempt::Shutdown => unreachable!("manual reconciliation has no shutdown"),
+        }
+    }
+
+    async fn reconcile_claimed(
+        &self,
+        order: PaymentOrderRecord,
+        fence: PaymentOrderLease,
+        stop_rx: Option<&mut oneshot::Receiver<()>>,
+    ) -> AppResult<ReconcileAttempt> {
+        let Some(fence) = self
+            .state
+            .db
+            .renew_payment_order_reconcile_lease(
+                &order.id,
+                &fence,
+                self.state.settings.billing.reconcile_lease_seconds,
+            )
+            .await?
+        else {
+            return Ok(ReconcileAttempt::Finalized(None));
+        };
+        let provider = match configured_provider(&self.state.settings, &order.provider_slug) {
+            Ok(provider) => provider,
+            Err(error) => {
+                return finalize_reconcile_error(self.state, &order, &fence, error)
+                    .await
+                    .map(ReconcileAttempt::Finalized);
+            }
+        };
+        let query = match query_provider_until_shutdown(provider.as_ref(), &order, stop_rx).await {
+            Ok(Some(query)) => query,
+            Ok(None) => return Ok(ReconcileAttempt::Shutdown),
+            Err(error) => {
+                return finalize_reconcile_error(self.state, &order, &fence, error)
+                    .await
+                    .map(ReconcileAttempt::Finalized);
+            }
+        };
+        finalize_provider_query(self.state, &order, &fence, query)
+            .await
+            .map(ReconcileAttempt::Finalized)
+    }
+}
+
+fn payment_order_lease(
+    order: &PaymentOrderRecord,
+    owner: &str,
+    fallback_now: i64,
+) -> PaymentOrderLease {
+    PaymentOrderLease {
+        owner: owner.to_string(),
+        generation: order.lease_generation,
+        lease_expires_at: order.lease_expires_at.unwrap_or(fallback_now),
+    }
+}
+
+/// Reconciles one durable payment intent through the same fenced command as
+/// the worker. `force=true` is the explicit operator/retry override for
+/// `next_retry_at`; an active lease is still never bypassed.
+pub async fn reconcile_pending_payment_order(
+    state: &AppState,
+    order_id: &str,
+) -> AppResult<PaymentOrderRecord> {
+    billing_enabled(&state.settings)?;
+    BillingCommandService::new(state)
+        .reconcile_order(order_id, true)
+        .await
+}
+
+/// Claims and reconciles due payment intents. No caller receives an
+/// unclaimed row to query, so worker and manual paths share the same fence.
+pub async fn reconcile_pending_payment_orders(
+    state: &AppState,
+    limit: i64,
+) -> AppResult<Vec<PaymentOrderRecord>> {
+    billing_enabled(&state.settings)?;
+    let owner = format!("billing-command-{}", util::random_token(24));
+    let (_stop_tx, mut stop_rx) = oneshot::channel();
+    reconcile_claimed_payment_orders(state, &owner, limit, &mut stop_rx).await
+}
+
+/// Handle for the process-local part of the billing scheduler. The work is
+/// durably claimed, and shutdown cancels the current provider query before
+/// releasing the current and unprocessed claims for immediate recovery.
+pub struct BillingReconcileWorker {
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl BillingReconcileWorker {
+    pub async fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+/// Starts the durable reconciliation scheduler. Returning `None` when
+/// billing is disabled keeps a disabled deployment completely quiet.
+pub fn spawn_reconcile_worker(state: AppState) -> Option<BillingReconcileWorker> {
+    if !state.settings.billing.enabled {
+        return None;
+    }
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let interval = Duration::from_secs(state.settings.billing.reconcile_interval_seconds as u64);
+    let owner = format!("billing-reconcile-{}", util::random_token(24));
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = reconcile_claimed_payment_orders(
+                        &state,
+                        &owner,
+                        state.settings.billing.reconcile_batch_size as i64,
+                        &mut stop_rx,
+                    ).await {
+                        tracing::warn!(error = %error, "billing reconciliation sweep failed");
+                    }
+                }
+            }
+        }
+        tracing::debug!(owner = %owner, "billing reconciliation worker stopped");
+    });
+    Some(BillingReconcileWorker {
+        stop_tx: Some(stop_tx),
+        task,
+    })
+}
+
+async fn reconcile_claimed_payment_orders(
+    state: &AppState,
+    owner: &str,
+    limit: i64,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> AppResult<Vec<PaymentOrderRecord>> {
+    let now = util::now_ts();
+    let claimed = state
+        .db
+        .claim_payment_orders_for_reconcile(
+            owner,
+            now,
+            state.settings.billing.reconcile_lease_seconds,
+            limit,
+        )
+        .await?;
+    if claimed.is_empty() {
+        return Ok(Vec::new());
+    }
+    tracing::debug!(owner = %owner, count = claimed.len(), "billing reconciliation orders claimed");
+    let service = BillingCommandService::new(state);
+    let mut reconciled = Vec::with_capacity(claimed.len());
+    for (index, order) in claimed.iter().enumerate() {
+        let fence = payment_order_lease(order, owner, now);
+        // `expires_at` belongs to the local checkout and is not a provider
+        // outcome. Even an expired `pending`/`reconcile` order must be queried
+        // first so a late provider `paid` result still enters the wallet. An
+        // expired `creating` row with no checkout is query-only recovery: the
+        // worker never creates a second provider intent, and only an explicit
+        // provider terminal failure can close it.
+        if let Some(policy) = expired_payment_order_policy(
+            &order.status,
+            &order.checkout_value,
+            order.expires_at,
+            now,
+        ) {
+            tracing::debug!(
+                order_id = %order.id,
+                ?policy,
+                "billing reconciliation order is locally expired"
+            );
+        }
+        match service
+            .reconcile_claimed(order.clone(), fence.clone(), Some(stop_rx))
+            .await
+        {
+            Ok(ReconcileAttempt::Finalized(Some(updated))) => {
+                reconciled.push(updated.clone());
+                tracing::debug!(
+                order_id = %updated.id,
+                status = %updated.status,
+                attempt_count = updated.attempt_count,
+                "billing payment order reconciled"
+                )
+            }
+            Ok(ReconcileAttempt::Finalized(None)) => {
+                tracing::debug!(
+                    order_id = %order.id,
+                    "billing payment reconciliation result lost its lease fence"
+                );
+                if let Some(current) = state.db.find_payment_order(&order.id).await? {
+                    reconciled.push(current);
+                }
+            }
+            Ok(ReconcileAttempt::Shutdown) => {
+                release_payment_order_claim(state, &order.id, &fence, order.attempt_count, true)
+                    .await;
+                for remaining in claimed.iter().skip(index + 1) {
+                    let remaining_fence = payment_order_lease(remaining, owner, now);
+                    release_payment_order_claim(
+                        state,
+                        &remaining.id,
+                        &remaining_fence,
+                        remaining.attempt_count,
+                        true,
+                    )
+                    .await;
+                }
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    order_id = %order.id,
+                    error = %error,
+                    "billing payment reconciliation attempt did not finalize"
+                );
+                // If the failure happened before a fenced state transition,
+                // release the claim with the same backoff policy. Otherwise a
+                // transient DB/provider error unnecessarily holds the row
+                // until lease expiry.
+                release_payment_order_claim(state, &order.id, &fence, order.attempt_count, false)
+                    .await;
+                if let Some(current) = state.db.find_payment_order(&order.id).await? {
+                    reconciled.push(current);
+                }
+            }
+        }
+    }
+    Ok(reconciled)
+}
+
+async fn release_payment_order_claim(
+    state: &AppState,
+    order_id: &str,
+    fence: &PaymentOrderLease,
+    attempt_count: i64,
+    immediate: bool,
+) {
+    let next_retry_at = if immediate {
+        Some(util::now_ts())
+    } else {
+        Some(reconcile_next_retry_at(
+            util::now_ts(),
+            attempt_count,
+            state.settings.billing.reconcile_retry_base_seconds,
+            state.settings.billing.reconcile_retry_max_seconds,
+        ))
+    };
+    if let Err(error) = state
+        .db
+        .release_payment_order_reconcile_lease(order_id, fence, next_retry_at)
+        .await
+    {
+        tracing::warn!(
+            order_id = %order_id,
+            error = %error,
+            "failed to release billing reconciliation lease"
+        );
+    }
+}
+
+async fn wait_for_payment_order_creation(
+    state: &AppState,
+    order: PaymentOrderRecord,
+) -> AppResult<PaymentOrderRecord> {
+    let mut current = order;
+    // A duplicate request arriving while the creator is inside the provider
+    // call waits briefly for the durable state transition.  If the process
+    // died, the subsequent query below takes over from the creating row.
+    for _ in 0..10 {
+        if current.status != PAYMENT_STATUS_CREATING {
+            return Ok(current);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        current = state
+            .db
+            .find_payment_order(&current.id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    }
+    Ok(current)
+}
+
+async fn recover_recharge_intent(
+    state: &AppState,
+    order: PaymentOrderRecord,
+) -> AppResult<PaymentOrderRecord> {
+    let order = wait_for_payment_order_creation(state, order).await?;
+    if matches!(
+        order.status.as_str(),
+        PAYMENT_STATUS_PAID | PAYMENT_STATUS_FAILED | PAYMENT_STATUS_CLOSED
+    ) {
+        return Ok(order);
+    }
+    if order.status == PAYMENT_STATUS_PENDING
+        && !order.checkout_value.trim().is_empty()
+        && order.expires_at > util::now_ts()
+    {
+        return Ok(order);
+    }
+    // This is an existing durable intent. It is always queried through the
+    // claim/fence command and is never allowed to issue a second provider
+    // create, even when the checkout is missing or locally expired.
+    let queried = BillingCommandService::new(state)
+        .reconcile_order(&order.id, true)
+        .await?;
+    if matches!(
+        queried.status.as_str(),
+        PAYMENT_STATUS_PAID | PAYMENT_STATUS_FAILED | PAYMENT_STATUS_CLOSED
+    ) {
+        return Ok(queried);
+    }
+    if queried.status == PAYMENT_STATUS_PENDING && !queried.checkout_value.trim().is_empty() {
+        return Ok(queried);
+    }
+    if queried.checkout_value.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "payment intent has no persisted provider checkout; reconciliation will continue"
+                .to_string(),
+        ));
+    }
+    Err(AppError::BadRequest(
+        "payment intent is awaiting provider reconciliation".to_string(),
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ReconcileQuery {
+    /// `force=true` is the explicit synchronous retry override. It can ignore
+    /// `next_retry_at`, but the durable claim still refuses an active lease.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn query_recharge(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Query(query): Query<ReconcileQuery>,
+) -> AppResult<Json<PaymentOrderView>> {
+    billing_enabled(&state.settings)?;
+    let current = standard_current_user(&state, &jar).await?;
+    let order = state
+        .db
+        .find_payment_order(&id)
+        .await?
+        .filter(|order| order.user_id == current.user.id)
+        .ok_or(AppError::NotFound)?;
+    let order = BillingCommandService::new(&state)
+        .reconcile_order(&order.id, query.force)
+        .await?;
+    Ok(Json(payment_order_view(&state.settings, order)?))
+}
+
 async fn create_recharge(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -1477,28 +2330,6 @@ async fn create_recharge(
         .or(header_idempotency_key)
         .map(normalize_operation_key)
         .transpose()?;
-    if let Some(idempotency_key) = idempotency_key.as_deref() {
-        if let Some(order) = state
-            .db
-            .find_payment_order_by_idempotency_key(
-                &current.user.id,
-                &provider_slug,
-                idempotency_key,
-            )
-            .await?
-        {
-            recharge_matches_request(
-                &order,
-                &current.user.id,
-                &provider_slug,
-                &currency,
-                input.amount_minor,
-            )?;
-            return Ok(Json(payment_checkout(&state.settings, order)?));
-        }
-    }
-    let provider_config = provider_settings(&state.settings, &provider_slug)?.clone();
-    let provider = configured_provider(&state.settings, &provider_slug)?;
     let base_url = state.effective_public_base_url(&headers).await?;
     let merchant_order_no = idempotency_key
         .as_deref()
@@ -1507,70 +2338,42 @@ async fn create_recharge(
             format!("SGT-IDEM-{}", util::sha256_base64url(&fingerprint))
         })
         .unwrap_or_else(|| format!("SGT-{}-{}", util::now_ts(), util::random_token(12)));
-    let notify_url = provider_config
-        .notify_url
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "{}/api/billing/providers/{}/notify",
-                base_url.trim_end_matches('/'),
-                provider_slug
-            )
-        });
-    let request = CheckoutRequest {
-        merchant_order_no: merchant_order_no.clone(),
-        amount_minor: input.amount_minor,
-        currency: currency.clone(),
-        subject: "Signet 余额充值".to_string(),
-        notify_url,
-        return_url: format!(
-            "{}/#/billing?billing_order={}",
-            base_url.trim_end_matches('/'),
-            merchant_order_no
-        ),
-        expires_at: util::now_ts() + 900,
-    };
-    let (checkout_kind, checkout_value) = provider.create_checkout(&request).await?;
-    let order = match state
+    let (order, created) = state
         .db
-        .insert_payment_order(NewPaymentOrder {
+        .insert_payment_intent(NewPaymentOrder {
             user_id: current.user.id.clone(),
             provider_slug: provider_slug.clone(),
             merchant_order_no,
             idempotency_key: idempotency_key.clone(),
-            currency,
+            currency: currency.clone(),
             amount_minor: input.amount_minor,
-            subject: request.subject,
-            checkout_kind,
-            checkout_value,
-            expires_at: request.expires_at,
+            subject: "Signet 余额充值".to_string(),
+            // The provider checkout is intentionally empty until the
+            // provider call has returned successfully.  This is the durable
+            // creating intent that makes crash recovery possible.
+            checkout_kind: String::new(),
+            checkout_value: String::new(),
+            expires_at: util::now_ts() + 900,
         })
-        .await
+        .await?;
+    recharge_matches_request(
+        &order,
+        &current.user.id,
+        &provider_slug,
+        &currency,
+        input.amount_minor,
+    )?;
+    let order = if created {
+        create_provider_checkout_for_order(&state, &base_url, &order).await?
+    } else if matches!(
+        order.status.as_str(),
+        PAYMENT_STATUS_CREATING | PAYMENT_STATUS_RECONCILE
+    ) || (order.status == PAYMENT_STATUS_PENDING
+        && (order.checkout_value.trim().is_empty() || order.expires_at <= util::now_ts()))
     {
-        Ok(order) => order,
-        Err(error) => {
-            if let Some(idempotency_key) = idempotency_key.as_deref() {
-                if let Some(order) = state
-                    .db
-                    .find_payment_order_by_idempotency_key(
-                        &current.user.id,
-                        &provider_slug,
-                        idempotency_key,
-                    )
-                    .await?
-                {
-                    recharge_matches_request(
-                        &order,
-                        &current.user.id,
-                        &provider_slug,
-                        &request.currency,
-                        request.amount_minor,
-                    )?;
-                    return Ok(Json(payment_checkout(&state.settings, order)?));
-                }
-            }
-            return Err(error);
-        }
+        recover_recharge_intent(&state, order).await?
+    } else {
+        order
     };
     Ok(Json(payment_checkout(&state.settings, order)?))
 }
@@ -1686,7 +2489,7 @@ async fn provider_notify(
     if notification_currency != order.currency || notification.amount_minor != order.amount_minor {
         state
             .db
-            .update_payment_order_error(
+            .mark_payment_order_reconcile(
                 &order.id,
                 "provider notification amount or currency mismatch",
             )
@@ -1697,6 +2500,13 @@ async fn provider_notify(
     }
     if notification.status == PAYMENT_STATUS_PAID {
         if notification.provider_trade_id.trim().is_empty() {
+            state
+                .db
+                .mark_payment_order_reconcile(
+                    &order.id,
+                    "provider notification has no provider transaction id",
+                )
+                .await?;
             return Err(AppError::BadRequest(
                 "provider notification has no trade id".to_string(),
             ));
@@ -1707,6 +2517,17 @@ async fn provider_notify(
                 &order.id,
                 &notification.provider_trade_id,
                 notification.paid_at,
+            )
+            .await?;
+    } else if matches!(
+        notification.status.as_str(),
+        PAYMENT_STATUS_FAILED | PAYMENT_STATUS_CLOSED
+    ) {
+        state
+            .db
+            .mark_payment_order_failed(
+                &order.id,
+                "payment provider reported a terminal unsuccessful state",
             )
             .await?;
     }
@@ -2103,6 +2924,7 @@ async fn query_admin_order(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
+    Query(query): Query<ReconcileQuery>,
 ) -> AppResult<Json<PaymentOrderView>> {
     let _current =
         require_billing_permission(&state, &jar, crate::access::Permission::BillingManage).await?;
@@ -2111,33 +2933,9 @@ async fn query_admin_order(
         .find_payment_order(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let provider = configured_provider(&state.settings, &order.provider_slug)?;
-    let query = provider.query_payment(&order).await?;
-    let currency = normalize_currency(&query.notification.currency)?;
-    if query.notification.merchant_order_no != order.merchant_order_no
-        || currency != order.currency
-        || query.notification.amount_minor != order.amount_minor
-    {
-        return Err(AppError::BadRequest(
-            "provider query does not match the payment order".to_string(),
-        ));
-    }
-    if query.notification.status == PAYMENT_STATUS_PAID {
-        if query.notification.provider_trade_id.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "provider query has no trade id".to_string(),
-            ));
-        }
-        let updated = state
-            .db
-            .mark_payment_order_paid(
-                &order.id,
-                &query.notification.provider_trade_id,
-                query.notification.paid_at,
-            )
-            .await?;
-        return Ok(Json(payment_order_view(&state.settings, updated)?));
-    }
+    let order = BillingCommandService::new(&state)
+        .reconcile_order(&order.id, query.force)
+        .await?;
     Ok(Json(payment_order_view(&state.settings, order)?))
 }
 
@@ -2155,42 +2953,6 @@ async fn refund_admin_order(
         .await?
         .ok_or(AppError::NotFound)?;
     let idempotency_key = normalize_operation_key(&input.idempotency_key)?;
-    if let Some(existing) = state
-        .db
-        .find_payment_refund_by_idempotency_key(&id, &idempotency_key)
-        .await?
-    {
-        return Ok(Json(existing));
-    }
-    if input.amount_minor <= 0 || order.status != PAYMENT_STATUS_PAID {
-        return Err(AppError::BadRequest(
-            "payment order is not refundable".to_string(),
-        ));
-    }
-    let refunds = state.db.list_payment_refunds(&id).await?;
-    let refunded = refunds
-        .iter()
-        .filter(|refund| refund.status == "succeeded")
-        .map(|refund| refund.amount_minor)
-        .sum::<i64>();
-    if input.amount_minor > order.amount_minor.saturating_sub(refunded) {
-        return Err(AppError::BadRequest(
-            "billing refund exceeds the refundable payment amount".to_string(),
-        ));
-    }
-    let wallet = state
-        .db
-        .ensure_user_wallet_account(&order.user_id, &order.currency)
-        .await?;
-    if wallet.available_minor < input.amount_minor {
-        return Err(AppError::BadRequest(
-            "billing refund would make the wallet balance negative".to_string(),
-        ));
-    }
-    let provider = configured_provider(&state.settings, &order.provider_slug)?;
-    let provider_refund = provider
-        .refund_payment(&order, input.amount_minor, &idempotency_key)
-        .await?;
     let reason = input
         .reason
         .as_deref()
@@ -2198,17 +2960,73 @@ async fn refund_admin_order(
         .filter(|value| !value.is_empty())
         .unwrap_or("Signet billing refund")
         .to_string();
+    // Reserve before any external side effect.  A pending intent occupies
+    // the order's refundable amount and survives a process crash, so a
+    // replay with the same key can safely retry the provider operation.
+    let intent = state
+        .db
+        .reserve_payment_refund(
+            &order.id,
+            input.amount_minor,
+            Some(&current.user.id),
+            &reason,
+            &idempotency_key,
+        )
+        .await?;
+    if intent.status != "pending" {
+        return Ok(Json(intent));
+    }
+
+    let provider = match configured_provider(&state.settings, &order.provider_slug) {
+        Ok(provider) => provider,
+        Err(error) => {
+            // No provider call happened, so this intent is a known failure.
+            // If cancellation itself fails, preserve that database error: the
+            // pending row remains recoverable on the next same-key replay.
+            let canceled = state
+                .db
+                .cancel_payment_refund(&order.id, &intent.id)
+                .await?;
+            if canceled.status == "succeeded" {
+                return Ok(Json(canceled));
+            }
+            return Err(error);
+        }
+    };
+    let provider_refund = match provider
+        .refund_payment(&order, input.amount_minor, &idempotency_key)
+        .await
+    {
+        Ok(provider_refund) => provider_refund,
+        Err(error) => {
+            // A timeout, transport failure, malformed success response, or
+            // provider 5xx has an unknown outcome: the provider may already
+            // have accepted the refund. Keep the intent pending so the same
+            // provider idempotency key can recover it later.
+            if is_provider_outcome_unknown(&error) {
+                return Err(error);
+            }
+            // This adapter reports a known provider failure.  A crash or a
+            // local finalize failure takes the other path and leaves pending
+            // so the provider idempotency key can be replayed safely.
+            let canceled = state
+                .db
+                .cancel_payment_refund(&order.id, &intent.id)
+                .await?;
+            if canceled.status == "succeeded" {
+                return Ok(Json(canceled));
+            }
+            return Err(error);
+        }
+    };
+
+    // Finalize is deliberately not followed by cancellation on error.  If
+    // the provider accepted the refund but this transaction failed, the
+    // pending intent is the durable recovery record.
     Ok(Json(
         state
             .db
-            .refund_payment_order(
-                &order.id,
-                input.amount_minor,
-                &provider_refund.provider_refund_id,
-                Some(&current.user.id),
-                &reason,
-                &idempotency_key,
-            )
+            .finalize_payment_refund(&order.id, &intent.id, &provider_refund.provider_refund_id)
             .await?,
     ))
 }
@@ -2273,6 +3091,59 @@ mod tests {
         assert!(parse_decimal_to_minor("12.345", 2).is_err());
         assert!(parse_decimal_to_minor("-1", 2).is_err());
         assert_eq!(format_minor(1230, 2), "12.30");
+    }
+
+    #[test]
+    fn reconciliation_retry_backoff_is_exponential_and_bounded() {
+        assert_eq!(reconcile_retry_delay_seconds(0, 10, 900), 10);
+        assert_eq!(reconcile_retry_delay_seconds(1, 10, 900), 10);
+        assert_eq!(reconcile_retry_delay_seconds(2, 10, 900), 20);
+        assert_eq!(reconcile_retry_delay_seconds(4, 10, 900), 80);
+        assert_eq!(reconcile_retry_delay_seconds(20, 10, 900), 900);
+        assert_eq!(reconcile_next_retry_at(100, 3, 10, 900), 140);
+    }
+
+    #[test]
+    fn local_expiry_never_skips_provider_confirmation() {
+        assert_eq!(
+            expired_payment_order_policy(PAYMENT_STATUS_PENDING, "qr", 99, 100),
+            Some(ExpiredPaymentOrderPolicy::QueryProvider)
+        );
+        assert_eq!(
+            expired_payment_order_policy(PAYMENT_STATUS_RECONCILE, "", 99, 100),
+            Some(ExpiredPaymentOrderPolicy::QueryProvider)
+        );
+        assert_eq!(
+            expired_payment_order_policy(PAYMENT_STATUS_CREATING, "", 99, 100),
+            Some(ExpiredPaymentOrderPolicy::QueryProviderWithoutCreate)
+        );
+        assert_eq!(
+            expired_payment_order_policy(PAYMENT_STATUS_PENDING, "", 101, 100),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_unknown_outcomes_are_reconcileable_and_ids_are_never_fabricated() {
+        for reason in [
+            "provider request timed out",
+            "provider network/request failed",
+            "provider returned 5xx or another non-success response",
+            "provider response JSON is invalid",
+        ] {
+            let error = provider_outcome_unknown_with_reason(reason);
+            assert!(is_provider_outcome_unknown(&error));
+            assert!(provider_error_message(&error).contains(reason));
+        }
+        let notification = notification_from_fields(
+            &BTreeMap::from([("out_trade_no".to_string(), "merchant-order".to_string())]),
+            100,
+            CURRENCY_CNY,
+            String::new(),
+            PAYMENT_STATUS_PAID,
+        )
+        .unwrap();
+        assert!(notification.provider_trade_id.is_empty());
     }
 
     #[test]

@@ -24,7 +24,70 @@ jobs:
         working-directory: frontend
       - run: npm audit --audit-level=moderate
         working-directory: frontend
-      - run: node --check scripts/browser-smoke.mjs
+      - name: Set up Chrome for browser smoke
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Start frontend preview
+        run: |
+          set -euo pipefail
+          npm run preview -- --host 127.0.0.1 --port 4173 > "$RUNNER_TEMP/signet-preview.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/signet-preview.pid"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4173/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/signet-preview.log"
+          exit 1
+        working-directory: frontend
+      - name: Run browser smoke
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          test -x "$CHROME_PATH"
+          "$CHROME_PATH" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-dev-shm-usage \
+            --no-first-run \
+            --no-default-browser-check \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port=9222 \
+            --user-data-dir="$RUNNER_TEMP/signet-chrome-profile" \
+            about:blank > "$RUNNER_TEMP/signet-chrome.log" 2>&1 &
+          chrome_pid=$!
+          cleanup() {
+            kill "$chrome_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9222/json/version >/dev/null; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$chrome_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/signet-chrome.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/signet-chrome.log"
+            exit 1
+          fi
+
+          APP_URL=http://127.0.0.1:4173 \
+          CDP_URL=http://127.0.0.1:9222 \
+          SCENARIO=auth-ui-mock \
+          SCREENSHOT_DIR="$RUNNER_TEMP/signet-smoke-screenshots" \
+          node scripts/browser-smoke.mjs
 
   backend:
     runs-on: ubuntu-latest
@@ -35,11 +98,38 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy,rustfmt
       - name: Install native database and TLS libraries
-        run: sudo apt-get update && sudo apt-get install -y libmariadb-dev libpq-dev libsqlite3-dev libssl-dev pkg-config
+        env:
+          LLVM_VERSION: "21"
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg \
+            libmariadb-dev libpq-dev libsqlite3-dev libssl-dev openssl pkg-config
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm-snapshot.gpg.key"
+          gpg --dearmor --output "$RUNNER_TEMP/llvm.gpg" "$RUNNER_TEMP/llvm-snapshot.gpg.key"
+          sudo install -m 0644 "$RUNNER_TEMP/llvm.gpg" /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-${LLVM_VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-${LLVM_VERSION} lld-${LLVM_VERSION} llvm-${LLVM_VERSION}
+          echo "/usr/lib/llvm-${LLVM_VERSION}/bin" >> "$GITHUB_PATH"
+          {
+            echo "CC=clang"
+            echo "CXX=clang++"
+            echo "AR=llvm-ar"
+            echo "RANLIB=llvm-ranlib"
+            echo "CC_x86_64_unknown_linux_gnu=clang"
+            echo "CXX_x86_64_unknown_linux_gnu=clang++"
+            echo "AR_x86_64_unknown_linux_gnu=llvm-ar"
+            echo "RANLIB_x86_64_unknown_linux_gnu=llvm-ranlib"
+          } >> "$GITHUB_ENV"
       - run: npm ci --no-audit --fund=false
         working-directory: frontend
       - run: npm run build

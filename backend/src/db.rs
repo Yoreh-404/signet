@@ -10,6 +10,7 @@ use crate::{
     },
     util,
 };
+use axum::http::StatusCode;
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl,
     connection::SimpleConnection,
@@ -24,6 +25,19 @@ use std::{
     time::Duration,
 };
 use tracing::warn;
+
+const DIRECTORY_SYNC_LEASE_TTL_SECONDS: i64 = 60 * 60;
+const APPLICATION_DISCOVERY_LEASE_TTL_SECONDS: i64 = 15 * 60;
+const AUDIT_WEBHOOK_OUTBOX_LEASE_TTL_SECONDS: i64 = 60;
+const SCIM_TOKEN_USAGE_TOUCH_INTERVAL_SECONDS: i64 = 60;
+
+fn optimistic_concurrency_conflict(detail: impl Into<String>) -> AppError {
+    AppError::OAuth {
+        error: "resource_conflict".to_string(),
+        description: detail.into(),
+        status: StatusCode::CONFLICT,
+    }
+}
 
 #[cfg(feature = "mysql")]
 use diesel::MysqlConnection;
@@ -95,6 +109,135 @@ macro_rules! with_conn {
         .await
     }};
 }
+
+mod billing;
+pub use billing::{
+    ApplicationBillingSettingsRecord, NewApplicationBillingSettings, NewPaymentOrder,
+    NewWalletOperation, PaymentOrderLease, PaymentOrderRecord, PaymentRefundRecord,
+    WalletAccountRecord, WalletHoldRecord, WalletTransactionRecord,
+};
+
+mod authorization;
+pub use authorization::{
+    ApplicationOrganizationRoleAssignmentRecord,
+    ApplicationProfileOrganizationRoleAssignmentRecord, ApplicationProfileRoleAssignmentRecord,
+    AuthorizationPolicySnapshot,
+};
+
+mod directory_sync;
+pub use directory_sync::{
+    DirectorySyncApplyContext, DirectorySyncApplyStats, DirectorySyncGroupPlan,
+    DirectorySyncSnapshotPlan, DirectorySyncUserPlan,
+};
+
+mod scim;
+pub use scim::{
+    ScimApplicationContext, ScimApplicationTokenContext, ScimDiscoveryState,
+    ScimServiceAccountContext, ScimUserMutationScope,
+};
+
+mod mutation_receipts;
+pub use mutation_receipts::MutationReceiptRecord;
+
+/// Inserts an audit record on the connection owned by the caller.
+///
+/// Audit writes that belong to a business mutation must use this macro from
+/// inside the same `Connection::transaction` closure as the mutation. The
+/// outbox row is committed with the audit row, so a webhook worker can never
+/// observe an event that was rolled back. Post-commit call sites only provide
+/// a best-effort wake-up hint; the durable outbox remains authoritative.
+macro_rules! insert_audit_event_on_conn {
+    ($conn:expr, $kind:expr, $event:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let event = $event;
+        let record = AuditEventRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            actor_user_id: event.actor_user_id,
+            actor_client_id: event.actor_client_id,
+            action: event.action,
+            target_kind: event.target_kind,
+            target_id: event.target_id,
+            outcome: event.outcome.as_str().to_string(),
+            ip_address: event.ip_address,
+            user_agent: event.user_agent,
+            details: util::to_json(&event.details)?,
+            created_at: util::now_ts(),
+        };
+        let sql = format!(
+            "INSERT INTO audit_events (id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6),
+            ph($kind, 7),
+            ph($kind, 8),
+            ph($kind, 9),
+            ph($kind, 10),
+            ph($kind, 11)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(&record.id)
+            .bind::<Nullable<Text>, _>(&record.actor_user_id)
+            .bind::<Nullable<Text>, _>(&record.actor_client_id)
+            .bind::<Text, _>(&record.action)
+            .bind::<Text, _>(&record.target_kind)
+            .bind::<Nullable<Text>, _>(&record.target_id)
+            .bind::<Text, _>(&record.outcome)
+            .bind::<Nullable<Text>, _>(&record.ip_address)
+            .bind::<Nullable<Text>, _>(&record.user_agent)
+            .bind::<Text, _>(&record.details)
+            .bind::<BigInt, _>(record.created_at)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        let outbox_sql = format!(
+            "INSERT INTO audit_webhook_outbox (id, event_id, state, attempts, next_attempt_at, lease_owner, lease_expires_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6),
+            ph($kind, 7),
+            ph($kind, 8),
+            ph($kind, 9),
+            ph($kind, 10),
+        );
+        sql_query(outbox_sql)
+            .bind::<Text, _>(&record.id)
+            .bind::<Text, _>(&record.id)
+            .bind::<Text, _>("pending")
+            .bind::<Integer, _>(0)
+            .bind::<BigInt, _>(record.created_at)
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<BigInt, _>(record.created_at)
+            .bind::<BigInt, _>(record.created_at)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        Ok::<AuditEventRecord, AppError>(record)
+    }};
+}
+
+// This module uses the audit macro above from inside its aggregate
+// transaction. Keep its declaration after the macro so Rust's lexical macro
+// visibility includes the module.
+mod authorization_bindings;
+pub use authorization_bindings::{
+    AuthorizationBindingPermissionOverride, AuthorizationBindingPermissionOverrideSnapshot,
+    AuthorizationBindingsSnapshot, AuthorizationBindingsUpdate, AuthorizationUserBindingSnapshot,
+};
+
+mod authorization_profiles;
+
+mod user_lifecycle;
+pub use user_lifecycle::UserLifecycleBatchAction;
+
+mod mfa;
+
+mod organizations;
 
 macro_rules! ensure_user_identity_available {
     ($conn:expr, $kind:expr, $candidate:expr, $message:expr) => {{
@@ -242,6 +385,8 @@ macro_rules! clear_user_auth_state_for_conn {
     }};
 }
 
+mod account_credentials;
+
 macro_rules! revoke_trial_enrollment_auth_state_for_invitation {
     ($conn:expr, $kind:expr, $invitation_id:expr) => {{
         for table in ["session_credentials", "browser_context_accounts"] {
@@ -358,6 +503,43 @@ pub struct UserRecord {
     pub updated_at: i64,
 }
 
+impl UserRecord {
+    /// Returns an opaque digest of the complete row snapshot used by SCIM
+    /// optimistic concurrency.  The password hash is included only as input
+    /// to the digest; it is never returned to a caller.  Hashing the full row
+    /// also catches changes to login/authentication state that do not change
+    /// the SCIM-visible representation.
+    pub fn scim_concurrency_version(&self) -> String {
+        util::sha256_base64url(&serde_json::to_string(self).unwrap_or_default())
+    }
+}
+
+/// Minimal projection used by administrative selectors.  Keep this separate
+/// from `UserRecord`: selector reads must never hydrate password hashes,
+/// login metadata, or other fields that are not needed to identify an account.
+#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
+pub struct UserOptionRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub email: String,
+    #[diesel(sql_type = Text)]
+    pub username: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub display_name: Option<String>,
+}
+
+/// Minimal lifecycle projection used when validating bulk assignments.  It
+/// intentionally excludes credentials and login metadata while retaining the
+/// one state bit needed by archived-account invariants.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct UserAssignmentStateRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub archived_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicUser {
     pub id: String,
@@ -421,7 +603,7 @@ impl UserRegistrationSource {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserListScope {
     Live,
     Active,
@@ -429,6 +611,95 @@ pub enum UserListScope {
     Archived,
     AuthorizationCode,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserListLinkedIdentityFilter {
+    #[default]
+    All,
+    Linked,
+    Unlinked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UserListRoleFilter {
+    #[default]
+    Any,
+    Admin,
+    User,
+    Named(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserListLoginRegion {
+    #[default]
+    All,
+    Domestic,
+    Overseas,
+}
+
+/// SQL-backed filters for the administrative user directory.  All fields are
+/// optional so the same predicate can be used for both COUNT and page reads.
+/// The organization and linked-identity fields are deliberately represented
+/// here instead of being applied to a loaded Rust vector.
+#[derive(Debug, Clone, Default)]
+pub struct UserListFilters {
+    pub organization_id: Option<String>,
+    pub linked_identity: UserListLinkedIdentityFilter,
+    pub search: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub role: UserListRoleFilter,
+    pub created_from: Option<i64>,
+    pub created_to: Option<i64>,
+    pub last_login_from: Option<i64>,
+    pub last_login_to: Option<i64>,
+    pub login_region: UserListLoginRegion,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserListPage {
+    pub total: i64,
+    pub offset: usize,
+    pub limit: usize,
+    pub users: Vec<UserRecord>,
+}
+
+/// Stable keyset position for the administrative user directory.  The cursor
+/// is typed rather than interpolated into SQL; a transport may serialize it
+/// as an opaque token, but the data layer always binds each component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserDirectoryCursor {
+    pub archived: bool,
+    pub archived_at: Option<i64>,
+    pub is_active: i32,
+    pub created_at: i64,
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserDirectoryCursorPage {
+    pub limit: usize,
+    pub users: Vec<UserRecord>,
+    pub next_cursor: Option<UserDirectoryCursor>,
+}
+
+/// Exact-match filters used by bounded directory reads.  Keeping this small
+/// value object in the data layer lets callers push filtering into SQL without
+/// exposing SQL fragments or making the SCIM transport depend on a query
+/// builder.
+#[derive(Debug, Clone)]
+pub enum UserListFilter {
+    UserName(String),
+    Email(String),
+    Id(String),
+    Active(bool),
+}
+
+#[derive(Debug, Clone)]
+pub enum GroupListFilter {
+    Id(String),
+    DisplayName(String),
 }
 
 impl UserListScope {
@@ -445,12 +716,37 @@ impl UserListScope {
 
     fn order_sql(self) -> &'static str {
         match self {
-            UserListScope::Archived => "archived_at DESC, created_at DESC",
+            UserListScope::Archived => "archived_at DESC, created_at DESC, id ASC",
             UserListScope::AuthorizationCode | UserListScope::All => {
-                "archived_at IS NOT NULL ASC, is_active DESC, created_at DESC"
+                "archived_at IS NOT NULL ASC, is_active DESC, created_at DESC, id ASC"
             }
             UserListScope::Live | UserListScope::Active | UserListScope::Disabled => {
-                "is_active DESC, created_at DESC"
+                "is_active DESC, created_at DESC, id ASC"
+            }
+        }
+    }
+
+    fn qualified_predicate_sql(self) -> &'static str {
+        match self {
+            UserListScope::Live => "users.archived_at IS NULL",
+            UserListScope::Active => "users.archived_at IS NULL AND users.is_active = 1",
+            UserListScope::Disabled => "users.archived_at IS NULL AND users.is_active = 0",
+            UserListScope::Archived => "users.archived_at IS NOT NULL",
+            UserListScope::AuthorizationCode => "users.registration_source = 'authorization_code'",
+            UserListScope::All => "1 = 1",
+        }
+    }
+
+    fn qualified_order_sql(self) -> &'static str {
+        match self {
+            UserListScope::Archived => {
+                "users.archived_at DESC, users.created_at DESC, users.id ASC"
+            }
+            UserListScope::AuthorizationCode | UserListScope::All => {
+                "users.archived_at IS NOT NULL ASC, users.is_active DESC, users.created_at DESC, users.id ASC"
+            }
+            UserListScope::Live | UserListScope::Active | UserListScope::Disabled => {
+                "users.is_active DESC, users.created_at DESC, users.id ASC"
             }
         }
     }
@@ -855,6 +1151,8 @@ pub struct NewClientClaimMapper {
 pub struct IapApplicationRecord {
     #[diesel(sql_type = Text)]
     pub id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub application_id: Option<String>,
     #[diesel(sql_type = Text)]
     pub slug: String,
     #[diesel(sql_type = Text)]
@@ -882,6 +1180,7 @@ pub struct IapApplicationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicIapApplication {
     pub id: String,
+    pub application_id: Option<String>,
     pub slug: String,
     pub name: String,
     pub description: Option<String>,
@@ -899,6 +1198,7 @@ impl IapApplicationRecord {
     pub fn public(self) -> AppResult<PublicIapApplication> {
         Ok(PublicIapApplication {
             id: self.id,
+            application_id: self.application_id,
             slug: self.slug,
             name: self.name,
             description: self.description,
@@ -924,6 +1224,7 @@ impl IapApplicationRecord {
 
 #[derive(Debug, Clone)]
 pub struct NewIapApplication {
+    pub application_id: String,
     pub slug: String,
     pub name: String,
     pub description: Option<String>,
@@ -990,6 +1291,18 @@ pub struct BrowserContextAccountRecord {
     pub added_at: i64,
     #[diesel(sql_type = Nullable<BigInt>)]
     pub last_selected_at: Option<i64>,
+}
+
+/// Set-based chooser read model. Browser account selection needs the account,
+/// live session, trial provenance, and recovery-code capability together; a
+/// caller should not resolve those relations once per remembered account.
+#[derive(Debug, Clone)]
+pub struct BrowserContextAccountOption {
+    pub account: BrowserContextAccountRecord,
+    pub user: UserRecord,
+    pub session: SessionRecord,
+    pub trial_enrollment: Option<TrialEnrollmentRecord>,
+    pub has_authorization_code_redemption: bool,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -1308,6 +1621,23 @@ pub struct NewDeviceAuthorization {
     pub authorization_details: Option<String>,
     pub expires_at: i64,
     pub interval_seconds: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAuthorizationStatus {
+    Pending,
+    Authorized,
+    Denied,
+    Consumed,
+    Expired,
+    SlowDown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceAuthorizationTransition {
+    pub status: DeviceAuthorizationStatus,
+    pub changed: bool,
+    pub record: DeviceAuthorizationRecord,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -2160,6 +2490,31 @@ pub struct AuditEventRecord {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName)]
+#[allow(dead_code)]
+pub(crate) struct AuditWebhookOutboxRecord {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub event_id: String,
+    #[diesel(sql_type = Text)]
+    pub state: String,
+    #[diesel(sql_type = Integer)]
+    pub attempts: i32,
+    #[diesel(sql_type = BigInt)]
+    pub next_attempt_at: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub lease_owner: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub lease_expires_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub last_error: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
 pub struct AuditWebhookRecord {
     #[diesel(sql_type = Text)]
@@ -2283,6 +2638,130 @@ pub struct GroupRecord {
     pub created_at: i64,
     #[diesel(sql_type = BigInt)]
     pub updated_at: i64,
+    /// Monotonic resource version used by SCIM compare-and-swap updates.
+    #[diesel(sql_type = BigInt)]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct GroupMemberPublicRow {
+    #[diesel(sql_type = Text)]
+    group_id: String,
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    email: String,
+    #[diesel(sql_type = Text)]
+    username: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    display_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    phone: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    email_verified_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    phone_verified_at: Option<i64>,
+    #[diesel(sql_type = Integer)]
+    is_admin: i32,
+    #[diesel(sql_type = Integer)]
+    is_active: i32,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    archived_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    registration_source: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    last_login_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_login_ip: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_oidc_client_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct GroupRoleJoinRow {
+    #[diesel(sql_type = Text)]
+    group_id: String,
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    description: Option<String>,
+    #[diesel(sql_type = Integer)]
+    is_system: i32,
+    #[diesel(sql_type = BigInt)]
+    created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct RoleIdRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct RolePermissionJoinRow {
+    #[diesel(sql_type = Text)]
+    role_id: String,
+    #[diesel(sql_type = Text)]
+    permission: String,
+}
+
+impl GroupRoleJoinRow {
+    fn role(self) -> RoleRecord {
+        RoleRecord {
+            id: self.id,
+            name: self.name,
+            description: self.description,
+            is_system: self.is_system,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+impl GroupMemberPublicRow {
+    fn public(self) -> PublicUser {
+        PublicUser {
+            id: self.id,
+            email: self.email,
+            username: self.username,
+            display_name: self.display_name,
+            phone: self.phone,
+            email_verified_at: self.email_verified_at,
+            phone_verified_at: self.phone_verified_at,
+            is_admin: self.is_admin == 1,
+            is_active: self.is_active == 1,
+            archived_at: self.archived_at,
+            registration_source: self.registration_source,
+            last_login_at: self.last_login_at,
+            last_login_ip: self.last_login_ip,
+            last_oidc_client_id: self.last_oidc_client_id,
+            last_login_method: self.last_login_method,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct ScimGroupMemberRecord {
+    #[diesel(sql_type = Text)]
+    pub group_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub username: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -2578,214 +3057,6 @@ pub struct ApplicationModuleRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct ApplicationBillingSettingsRecord {
-    #[diesel(sql_type = Text)]
-    pub application_id: String,
-    #[diesel(sql_type = Integer)]
-    pub accept_signet_balance: i32,
-    #[diesel(sql_type = Text)]
-    pub wallet_mode: String,
-    #[diesel(sql_type = Text)]
-    pub supported_currencies: String,
-    #[diesel(sql_type = Nullable<BigInt>)]
-    pub mode_locked_at: Option<i64>,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct WalletAccountRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub account_kind: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub user_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub application_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub currency: String,
-    #[diesel(sql_type = BigInt)]
-    pub available_minor: i64,
-    #[diesel(sql_type = BigInt)]
-    pub reserved_minor: i64,
-    #[diesel(sql_type = BigInt)]
-    pub version: i64,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct WalletHoldRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub hold_kind: String,
-    #[diesel(sql_type = Text)]
-    pub wallet_id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub user_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub application_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub currency: String,
-    #[diesel(sql_type = BigInt)]
-    pub amount_minor: i64,
-    #[diesel(sql_type = Text)]
-    pub status: String,
-    #[diesel(sql_type = Text)]
-    pub reference: String,
-    #[diesel(sql_type = Text)]
-    pub idempotency_key: String,
-    #[diesel(sql_type = BigInt)]
-    pub expires_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct WalletTransactionRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub kind: String,
-    #[diesel(sql_type = Text)]
-    pub status: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub user_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub application_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub currency: String,
-    #[diesel(sql_type = BigInt)]
-    pub amount_minor: i64,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub source_wallet_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub destination_wallet_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub hold_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub idempotency_key: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub external_provider: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub external_order_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub metadata: String,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct PaymentOrderRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub user_id: String,
-    #[diesel(sql_type = Text)]
-    pub provider_slug: String,
-    #[diesel(sql_type = Text)]
-    pub merchant_order_no: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub idempotency_key: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub provider_trade_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub currency: String,
-    #[diesel(sql_type = BigInt)]
-    pub amount_minor: i64,
-    #[diesel(sql_type = Text)]
-    pub subject: String,
-    #[diesel(sql_type = Text)]
-    pub status: String,
-    #[diesel(sql_type = Text)]
-    pub checkout_kind: String,
-    #[diesel(sql_type = Text)]
-    pub checkout_value: String,
-    #[diesel(sql_type = BigInt)]
-    pub expires_at: i64,
-    #[diesel(sql_type = Nullable<BigInt>)]
-    pub paid_at: Option<i64>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub last_error: Option<String>,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct PaymentRefundRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub payment_order_id: String,
-    #[diesel(sql_type = BigInt)]
-    pub amount_minor: i64,
-    #[diesel(sql_type = Text)]
-    pub status: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub provider_refund_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub requested_by: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub reason: String,
-    #[diesel(sql_type = Text)]
-    pub idempotency_key: String,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewApplicationBillingSettings {
-    pub application_id: String,
-    pub accept_signet_balance: bool,
-    pub wallet_mode: String,
-    pub supported_currencies: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewPaymentOrder {
-    pub user_id: String,
-    pub provider_slug: String,
-    pub merchant_order_no: String,
-    pub idempotency_key: Option<String>,
-    pub currency: String,
-    pub amount_minor: i64,
-    pub subject: String,
-    pub checkout_kind: String,
-    pub checkout_value: String,
-    pub expires_at: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewWalletOperation {
-    pub kind: String,
-    pub user_id: Option<String>,
-    pub application_id: Option<String>,
-    pub currency: String,
-    pub amount_minor: i64,
-    pub source_wallet_id: Option<String>,
-    pub destination_wallet_id: Option<String>,
-    pub hold_id: Option<String>,
-    pub idempotency_key: String,
-    pub external_provider: Option<String>,
-    pub external_order_id: Option<String>,
-    pub metadata: serde_json::Value,
-}
-
 /// An application authorization profile is the policy boundary for one
 /// protocol connection.  OIDC clients attached to the same website may
 /// therefore expose different permission vocabularies without sharing role
@@ -2871,6 +3142,81 @@ pub struct ApplicationDiscoveryRecord {
     pub created_at: i64,
     #[diesel(sql_type = BigInt)]
     pub updated_at: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub lease_owner: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub lease_expires_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    pub lease_generation: i64,
+}
+
+/// Joined read model used by the discovery reconciler.  Discovery records are
+/// always consumed together with their application, so loading the two rows
+/// one application at a time creates an avoidable 1+2D query pattern.
+#[derive(Debug, diesel::QueryableByName)]
+struct ApplicationDiscoveryJoinRecord {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    organization_id: String,
+    #[diesel(sql_type = Text)]
+    slug: String,
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    description: Option<String>,
+    #[diesel(sql_type = Text)]
+    access_mode: String,
+    #[diesel(sql_type = Text)]
+    registration_mode: String,
+    #[diesel(sql_type = Text)]
+    account_selection_mode: String,
+    #[diesel(sql_type = Text)]
+    unique_identity_factors: String,
+    #[diesel(sql_type = Integer)]
+    is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    updated_at: i64,
+    #[diesel(sql_type = Text)]
+    discovery_management_mode: String,
+    #[diesel(sql_type = Text)]
+    discovery_website_url: String,
+    #[diesel(sql_type = Text)]
+    fetch_secret_ciphertext: String,
+    #[diesel(sql_type = Text)]
+    signing_public_jwks: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    last_verified_revision: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_verified_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_verified_digest: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    last_verified_expires_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    discovery_sync_status: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    last_fetched_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    last_success_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    discovery_last_error: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    snapshot_json: Option<String>,
+    #[diesel(sql_type = Integer)]
+    operator_disabled: i32,
+    #[diesel(sql_type = BigInt)]
+    discovery_created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    discovery_updated_at: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    discovery_lease_owner: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    discovery_lease_expires_at: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    discovery_lease_generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2890,6 +3236,39 @@ pub struct NewApplicationDiscovery {
     pub last_error: Option<String>,
     pub snapshot_json: Option<String>,
     pub operator_disabled: bool,
+}
+
+/// Durable cross-process lease returned to the discovery reconciler.  The
+/// generation is incremented on every reclaim and must accompany every
+/// renew/release/commit call; the owner token alone is intentionally not
+/// treated as a reusable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationDiscoveryLease {
+    pub application_id: String,
+    pub owner_token: String,
+    pub lease_expires_at: i64,
+    pub lease_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplicationDiscoveryIdempotencyClaim {
+    Claimed { claim_token: String },
+    Completed { application_id: String },
+    InProgress,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct ApplicationDiscoveryIdempotencyRecord {
+    #[diesel(sql_type = Text)]
+    request_hash: String,
+    #[diesel(sql_type = Text)]
+    origin: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    application_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    status: String,
+    #[diesel(sql_type = BigInt)]
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
@@ -2946,6 +3325,21 @@ pub struct ApplicationProfileRoleRecord {
     pub created_at: i64,
     #[diesel(sql_type = BigInt)]
     pub updated_at: i64,
+}
+
+/// The read side of an application aggregate.  Each collection is loaded in
+/// one bounded query on one connection; callers can assemble the graph in
+/// memory without opening a new connection for every client or profile.
+#[derive(Debug, Clone)]
+pub struct ApplicationGraphRecordSet {
+    pub bindings: Vec<ApplicationClientBindingRecord>,
+    pub clients: Vec<ClientRecord>,
+    pub claim_mappers: Vec<ClientClaimMapperRecord>,
+    pub organizations: Vec<OrganizationRecord>,
+    pub modules: Vec<ApplicationModuleRecord>,
+    pub profiles: Vec<ApplicationAuthorizationProfileRecord>,
+    pub permission_definitions: Vec<ApplicationPermissionDefinitionRecord>,
+    pub profile_roles: Vec<ApplicationProfileRoleRecord>,
 }
 
 impl ApplicationProfileRoleRecord {
@@ -3207,90 +3601,6 @@ pub struct NewApplicationJwtClient {
     pub is_active: bool,
 }
 
-#[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
-pub struct ApplicationRoleRecord {
-    #[diesel(sql_type = Text)]
-    pub id: String,
-    #[diesel(sql_type = Text)]
-    pub application_id: String,
-    #[diesel(sql_type = Text)]
-    pub name: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    pub description: Option<String>,
-    #[diesel(sql_type = Text)]
-    pub permissions: String,
-    #[diesel(sql_type = Integer)]
-    pub is_default: i32,
-    #[diesel(sql_type = Integer)]
-    pub is_active: i32,
-    #[diesel(sql_type = BigInt)]
-    pub created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    pub updated_at: i64,
-}
-
-impl ApplicationRoleRecord {
-    pub fn permission_keys(&self) -> AppResult<Vec<String>> {
-        util::from_json(&self.permissions)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NewApplicationRole {
-    pub name: String,
-    pub description: Option<String>,
-    pub permissions: Vec<String>,
-    pub is_default: bool,
-    pub is_active: bool,
-}
-
-fn normalize_application_role_fields(
-    role: NewApplicationRole,
-) -> AppResult<(String, Option<String>, String, bool, bool)> {
-    let name = role.name.trim().to_string();
-    if name.is_empty() || name.len() > 128 || name.chars().any(|ch| ch.is_control()) {
-        return Err(AppError::BadRequest(
-            "application role name must be 1-128 characters".to_string(),
-        ));
-    }
-    let description = role
-        .description
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let permissions = util::to_json(&normalize_application_entitlement_keys(role.permissions)?)?;
-    Ok((
-        name,
-        description,
-        permissions,
-        role.is_default,
-        role.is_active,
-    ))
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-pub struct ApplicationRoleAssignmentRecord {
-    #[diesel(sql_type = Text)]
-    pub application_id: String,
-    #[diesel(sql_type = Text)]
-    pub subject_id: String,
-    #[diesel(sql_type = Text)]
-    pub application_role_id: String,
-    #[diesel(sql_type = Integer)]
-    pub is_active: i32,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-pub struct ApplicationPermissionOverrideRecord {
-    #[diesel(sql_type = Text)]
-    pub application_id: String,
-    #[diesel(sql_type = Text)]
-    pub user_id: String,
-    #[diesel(sql_type = Text)]
-    pub permission: String,
-    #[diesel(sql_type = Text)]
-    pub effect: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct NewApplicationMember {
     pub user_id: String,
@@ -3320,6 +3630,49 @@ pub struct NewGroup {
     pub description: Option<String>,
 }
 
+/// Final state of a SCIM group mutation.  SCIM parses and folds the protocol
+/// operations into this value; the database applies the group metadata and
+/// membership set together so a later invalid member cannot leave an earlier
+/// operation committed.
+#[derive(Debug, Clone)]
+pub struct GroupPatchPlan {
+    pub application_id: Option<String>,
+    pub group_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub member_ids: Vec<String>,
+    /// Creates the group and its optional application binding inside the same
+    /// transaction as membership validation and replacement. This is used by
+    /// SCIM create so a rejected member list cannot leave an empty group.
+    pub create: bool,
+    /// When present, the aggregate mutation is compare-and-swap guarded by
+    /// this version.  Non-SCIM callers may omit it for legacy unconditional
+    /// updates; SCIM always supplies the version read at request start.
+    pub expected_version: Option<i64>,
+}
+
+/// Fully folded SCIM user state.  The protocol layer is responsible for
+/// parsing and validating operations; the database applies this aggregate in
+/// one transaction so a later password/active transition cannot leave an
+/// earlier profile update committed.
+#[derive(Debug, Clone)]
+pub struct ScimUserMutationPlan {
+    pub id: String,
+    /// Digest of the UserRecord observed before the request was folded.  The
+    /// database checks it again inside the write transaction so a delayed
+    /// PATCH cannot overwrite a newer identity, credential, or lifecycle
+    /// change.
+    pub expected_version: String,
+    pub email: String,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub phone: Option<String>,
+    pub is_admin: bool,
+    pub is_active: bool,
+    pub password_hash: Option<String>,
+    pub scope: Option<ScimUserMutationScope>,
+}
+
 #[derive(Debug, Clone, diesel::QueryableByName)]
 struct PermissionRow {
     #[diesel(sql_type = Text)]
@@ -3330,6 +3683,132 @@ struct PermissionRow {
 struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct GroupMemberLifecycleRow {
+    #[diesel(sql_type = Text)]
+    user_id: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct GroupMemberIdRow {
+    #[diesel(sql_type = Text)]
+    user_id: String,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct UserEmailIdRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    email: String,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct UserIdentityConflictRow {
+    #[diesel(sql_type = Text)]
+    email: String,
+    #[diesel(sql_type = Text)]
+    username: String,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct BrowserContextAccountOptionRow {
+    #[diesel(sql_type = Text)]
+    account_id: String,
+    #[diesel(sql_type = Text)]
+    account_browser_context_id: String,
+    #[diesel(sql_type = Text)]
+    account_user_id: String,
+    #[diesel(sql_type = Text)]
+    account_session_id: String,
+    #[diesel(sql_type = BigInt)]
+    account_added_at: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    account_last_selected_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    user_id: String,
+    #[diesel(sql_type = Text)]
+    user_email: String,
+    #[diesel(sql_type = Text)]
+    user_username: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    user_display_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    user_phone: Option<String>,
+    #[diesel(sql_type = Text)]
+    user_password_hash: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    user_email_verified_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    user_phone_verified_at: Option<i64>,
+    #[diesel(sql_type = Integer)]
+    user_is_admin: i32,
+    #[diesel(sql_type = Integer)]
+    user_is_active: i32,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    user_archived_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    user_registration_source: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    user_last_login_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    user_last_login_ip: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    user_last_oidc_client_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    user_last_login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    user_created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    user_updated_at: i64,
+    #[diesel(sql_type = Text)]
+    session_id: String,
+    #[diesel(sql_type = Text)]
+    session_user_id: String,
+    #[diesel(sql_type = Text)]
+    session_csrf_token: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    session_ip_address: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    session_user_agent: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    session_login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    session_expires_at: i64,
+    #[diesel(sql_type = BigInt)]
+    session_created_at: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    trial_user_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    trial_invitation_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    trial_organization_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    trial_organization_role: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    trial_allowed_client_ids: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    trial_expires_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    trial_revoked_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    trial_created_at: Option<i64>,
+    #[diesel(sql_type = Integer)]
+    has_authorization_code_redemption: i32,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct ApplicationAuthorizationProfileCountRow {
+    #[diesel(sql_type = Text)]
+    profile_id: String,
+    #[diesel(sql_type = BigInt)]
+    permission_count: i64,
+    #[diesel(sql_type = BigInt)]
+    role_count: i64,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -3706,8 +4185,211 @@ fn ph(kind: DatabaseKind, index: usize) -> String {
     }
 }
 
+/// Diesel's unboxed `SqlQuery::bind` changes the query type for every bind.
+/// The boxed form is the intended escape hatch for a variable-length `IN`
+/// list and keeps the application graph batch backend-agnostic.
+fn bind_text_list<Conn>(
+    _connection: &mut Conn,
+    query: diesel::query_builder::SqlQuery,
+    values: &[String],
+) -> diesel::query_builder::BoxedSqlQuery<'static, Conn::Backend, diesel::query_builder::SqlQuery>
+where
+    Conn: Connection,
+    Conn::Backend: diesel::sql_types::HasSqlType<Text>,
+    String: diesel::serialize::ToSql<Text, Conn::Backend> + Send + 'static,
+{
+    let mut query = query.into_boxed::<Conn::Backend>();
+    for value in values {
+        query = query.bind::<Text, _>(value.clone());
+    }
+    query
+}
+
 fn select_user_sql() -> &'static str {
     "SELECT users.id, users.email, users.username, users.display_name, users.phone, users.password_hash, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.registration_source, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM users"
+}
+
+/// Administrative directory responses never need the password hash.  Keep
+/// the legacy `UserRecord` shape for the SCIM/identity paths that still need a
+/// complete account record, but make the directory projection substitute a
+/// typed empty value so the hash column is not read from storage at all.
+fn select_user_directory_sql() -> &'static str {
+    "SELECT users.id, users.email, users.username, users.display_name, users.phone, '' AS password_hash, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.registration_source, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM users"
+}
+
+#[derive(Debug, Clone)]
+struct UserListSqlParams {
+    organization_id: Option<String>,
+    search: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    exact_username: Option<String>,
+    exact_email: Option<String>,
+    exact_id: Option<String>,
+    active: Option<i32>,
+    role_mode: i32,
+    role_name: Option<String>,
+    linked_identity_mode: i32,
+    created_from: Option<i64>,
+    created_to: Option<i64>,
+    last_login_from: Option<i64>,
+    last_login_to: Option<i64>,
+    login_region_mode: i32,
+}
+
+impl UserListSqlParams {
+    fn from_filters(filters: &UserListFilters, exact_filter: Option<&UserListFilter>) -> Self {
+        let (exact_username, exact_email, exact_id, active) = match exact_filter {
+            Some(UserListFilter::UserName(value)) => (Some(value.clone()), None, None, None),
+            Some(UserListFilter::Email(value)) => (None, Some(value.clone()), None, None),
+            Some(UserListFilter::Id(value)) => (None, None, Some(value.clone()), None),
+            Some(UserListFilter::Active(value)) => (None, None, None, Some(i32::from(*value))),
+            None => (None, None, None, None),
+        };
+        let (role_mode, role_name) = match &filters.role {
+            UserListRoleFilter::Any => (0, None),
+            UserListRoleFilter::Admin => (1, None),
+            UserListRoleFilter::User => (2, None),
+            UserListRoleFilter::Named(value) => (3, Some(value.clone())),
+        };
+        let linked_identity_mode = match filters.linked_identity {
+            UserListLinkedIdentityFilter::All => 0,
+            UserListLinkedIdentityFilter::Linked => 1,
+            UserListLinkedIdentityFilter::Unlinked => 2,
+        };
+        let login_region_mode = match filters.login_region {
+            UserListLoginRegion::All => 0,
+            UserListLoginRegion::Domestic => 1,
+            UserListLoginRegion::Overseas => 2,
+        };
+
+        Self {
+            organization_id: filters.organization_id.clone(),
+            search: filters.search.as_deref().map(contains_like_pattern),
+            email: filters.email.as_deref().map(contains_like_pattern),
+            phone: filters.phone.as_deref().map(contains_like_pattern),
+            exact_username,
+            exact_email,
+            exact_id,
+            active,
+            role_mode,
+            role_name,
+            linked_identity_mode,
+            created_from: filters.created_from,
+            created_to: filters.created_to,
+            last_login_from: filters.last_login_from,
+            last_login_to: filters.last_login_to,
+            login_region_mode,
+        }
+    }
+}
+
+fn contains_like_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    pattern.push('%');
+    for ch in value.chars() {
+        if matches!(ch, '!' | '%' | '_') {
+            pattern.push('!');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+fn domestic_login_ip_sql() -> &'static str {
+    "(LOWER(COALESCE(users.last_login_ip, '')) LIKE 'cn:%' OR LOWER(COALESCE(users.last_login_ip, '')) = 'localhost' OR LOWER(COALESCE(users.last_login_ip, '')) = '::1' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '127.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '10.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '192.168.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.16.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.17.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.18.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.19.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.20.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.21.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.22.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.23.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.24.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.25.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.26.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.27.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.28.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.29.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.30.%' OR LOWER(COALESCE(users.last_login_ip, '')) LIKE '172.31.%')"
+}
+
+fn user_list_predicate_sql(kind: DatabaseKind) -> String {
+    let domestic_ip = domestic_login_ip_sql();
+    format!(
+        "({} IS NULL OR EXISTS (SELECT 1 FROM organization_members WHERE organization_members.organization_id = {} AND organization_members.user_id = users.id)) \
+         AND ({} IS NULL OR (LOWER(COALESCE(users.email, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.username, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.display_name, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.phone, '')) LIKE LOWER({}) ESCAPE '!')) \
+         AND ({} IS NULL OR LOWER(users.email) LIKE LOWER({}) ESCAPE '!') \
+         AND ({} IS NULL OR LOWER(COALESCE(users.phone, '')) LIKE LOWER({}) ESCAPE '!') \
+         AND ({} IS NULL OR LOWER(users.username) = LOWER({})) \
+         AND ({} IS NULL OR LOWER(users.email) = LOWER({})) \
+         AND ({} IS NULL OR users.id = {}) \
+         AND ({} IS NULL OR users.is_active = {}) \
+         AND CASE {} WHEN 0 THEN 1 WHEN 1 THEN CASE WHEN users.is_admin = 1 THEN 1 ELSE 0 END WHEN 2 THEN CASE WHEN users.is_admin = 0 THEN 1 ELSE 0 END WHEN 3 THEN CASE WHEN EXISTS (SELECT 1 FROM roles AS role_filter WHERE role_filter.name = {} AND (EXISTS (SELECT 1 FROM user_roles AS role_user_roles WHERE role_user_roles.user_id = users.id AND role_user_roles.role_id = role_filter.id) OR EXISTS (SELECT 1 FROM group_members AS role_group_members INNER JOIN group_roles AS role_group_roles ON role_group_roles.group_id = role_group_members.group_id WHERE role_group_members.user_id = users.id AND role_group_roles.role_id = role_filter.id))) THEN 1 ELSE 0 END ELSE 0 END = 1 \
+         AND CASE {} WHEN 0 THEN 1 WHEN 1 THEN CASE WHEN EXISTS (SELECT 1 FROM linked_identities WHERE linked_identities.user_id = users.id) THEN 1 ELSE 0 END WHEN 2 THEN CASE WHEN NOT EXISTS (SELECT 1 FROM linked_identities WHERE linked_identities.user_id = users.id) THEN 1 ELSE 0 END ELSE 0 END = 1 \
+         AND ({} IS NULL OR users.created_at >= {}) \
+         AND ({} IS NULL OR users.created_at < {}) \
+         AND ({} IS NULL OR users.last_login_at >= {}) \
+         AND ({} IS NULL OR users.last_login_at < {}) \
+         AND CASE {} WHEN 0 THEN 1 WHEN 1 THEN CASE WHEN {} THEN 1 ELSE 0 END WHEN 2 THEN CASE WHEN users.last_login_ip IS NOT NULL AND NOT ({}) THEN 1 ELSE 0 END ELSE 0 END = 1",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5),
+        ph(kind, 6),
+        ph(kind, 7),
+        ph(kind, 8),
+        ph(kind, 9),
+        ph(kind, 10),
+        ph(kind, 11),
+        ph(kind, 12),
+        ph(kind, 13),
+        ph(kind, 14),
+        ph(kind, 15),
+        ph(kind, 16),
+        ph(kind, 17),
+        ph(kind, 18),
+        ph(kind, 19),
+        ph(kind, 20),
+        ph(kind, 21),
+        ph(kind, 22),
+        ph(kind, 23),
+        ph(kind, 24),
+        ph(kind, 25),
+        ph(kind, 26),
+        ph(kind, 27),
+        ph(kind, 28),
+        ph(kind, 29),
+        ph(kind, 30),
+        ph(kind, 31),
+        domestic_ip,
+        domestic_ip,
+    )
+}
+
+macro_rules! bind_user_list_predicate {
+    ($query:expr, $params:expr) => {{
+        $query
+            .bind::<Nullable<Text>, _>($params.organization_id.clone())
+            .bind::<Nullable<Text>, _>($params.organization_id.clone())
+            .bind::<Nullable<Text>, _>($params.search.clone())
+            .bind::<Nullable<Text>, _>($params.search.clone())
+            .bind::<Nullable<Text>, _>($params.search.clone())
+            .bind::<Nullable<Text>, _>($params.search.clone())
+            .bind::<Nullable<Text>, _>($params.search.clone())
+            .bind::<Nullable<Text>, _>($params.email.clone())
+            .bind::<Nullable<Text>, _>($params.email.clone())
+            .bind::<Nullable<Text>, _>($params.phone.clone())
+            .bind::<Nullable<Text>, _>($params.phone.clone())
+            .bind::<Nullable<Text>, _>($params.exact_username.clone())
+            .bind::<Nullable<Text>, _>($params.exact_username.clone())
+            .bind::<Nullable<Text>, _>($params.exact_email.clone())
+            .bind::<Nullable<Text>, _>($params.exact_email.clone())
+            .bind::<Nullable<Text>, _>($params.exact_id.clone())
+            .bind::<Nullable<Text>, _>($params.exact_id.clone())
+            .bind::<Nullable<Integer>, _>($params.active)
+            .bind::<Nullable<Integer>, _>($params.active)
+            .bind::<Integer, _>($params.role_mode)
+            .bind::<Nullable<Text>, _>($params.role_name.clone())
+            .bind::<Integer, _>($params.linked_identity_mode)
+            .bind::<Nullable<BigInt>, _>($params.created_from)
+            .bind::<Nullable<BigInt>, _>($params.created_from)
+            .bind::<Nullable<BigInt>, _>($params.created_to)
+            .bind::<Nullable<BigInt>, _>($params.created_to)
+            .bind::<Nullable<BigInt>, _>($params.last_login_from)
+            .bind::<Nullable<BigInt>, _>($params.last_login_from)
+            .bind::<Nullable<BigInt>, _>($params.last_login_to)
+            .bind::<Nullable<BigInt>, _>($params.last_login_to)
+            .bind::<Integer, _>($params.login_region_mode)
+    }};
 }
 
 fn authorization_code_registration_source_backfill_sql(kind: DatabaseKind) -> String {
@@ -3792,12 +4474,674 @@ fn select_client_claim_mapper_sql() -> &'static str {
     "SELECT id, client_db_id, claim_name, source, source_value, value_type, include_in_id_token, include_in_access_token, include_in_userinfo, is_active, sort_order, created_at, updated_at FROM client_claim_mappers"
 }
 
+macro_rules! insert_client_on_conn {
+    ($conn:expr, $kind:expr, $id:expr, $client:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let id = $id;
+        let client = $client;
+        let now = $now;
+    let redirect_uris = util::to_json(&client.redirect_uris)?;
+    let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
+    let scopes = util::to_json(&client.scopes)?;
+    let audience = client.audience.trim().to_string();
+    let grant_types = util::to_json(&client.grant_types)?;
+    let response_types = util::to_json(&client.response_types)?;
+    let authorization_details_types = util::to_json(&client.authorization_details_types)?;
+    let service_account_permissions = util::to_json(&client.service_account_permissions)?;
+    let sql = format!(
+        "INSERT INTO clients (id, client_id, client_secret_hash, client_name, logo_uri, organization_id, redirect_uris, post_logout_redirect_uris, scopes, audience, grant_types, response_types, token_endpoint_auth_method, require_pkce, require_mfa, require_pushed_authorization_requests, require_s256_pkce, require_confidential_client, require_dpop, require_account_selection, trust_email_verified, authorization_details_types, subject_type, sector_identifier_uri, jwks_uri, jwks, backchannel_logout_uri, backchannel_logout_session_required, frontchannel_logout_uri, frontchannel_logout_session_required, service_account_enabled, service_account_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5),
+        ph(kind, 6),
+        ph(kind, 7),
+        ph(kind, 8),
+        ph(kind, 9),
+        ph(kind, 10),
+        ph(kind, 11),
+        ph(kind, 12),
+        ph(kind, 13),
+        ph(kind, 14),
+        ph(kind, 15),
+        ph(kind, 16),
+        ph(kind, 17),
+        ph(kind, 18),
+        ph(kind, 19),
+        ph(kind, 20),
+        ph(kind, 21),
+        ph(kind, 22),
+        ph(kind, 23),
+        ph(kind, 24),
+        ph(kind, 25),
+        ph(kind, 26),
+        ph(kind, 27),
+        ph(kind, 28),
+        ph(kind, 29),
+        ph(kind, 30),
+        ph(kind, 31),
+        ph(kind, 32),
+        ph(kind, 33),
+        ph(kind, 34),
+        ph(kind, 35)
+    );
+    sql_query(sql)
+        .bind::<Text, _>(id.to_string())
+        .bind::<Text, _>(client.client_id)
+        .bind::<Nullable<Text>, _>(client.client_secret_hash)
+        .bind::<Text, _>(client.client_name)
+        .bind::<Text, _>(client.logo_uri)
+        .bind::<Nullable<Text>, _>(client.organization_id)
+        .bind::<Text, _>(redirect_uris)
+        .bind::<Text, _>(post_logout_redirect_uris)
+        .bind::<Text, _>(scopes)
+        .bind::<Text, _>(audience)
+        .bind::<Text, _>(grant_types)
+        .bind::<Text, _>(response_types)
+        .bind::<Text, _>(client.token_endpoint_auth_method)
+        .bind::<Integer, _>(i32::from(client.require_pkce))
+        .bind::<Integer, _>(i32::from(client.require_mfa))
+        .bind::<Integer, _>(i32::from(client.require_pushed_authorization_requests))
+        .bind::<Integer, _>(i32::from(client.require_s256_pkce))
+        .bind::<Integer, _>(i32::from(client.require_confidential_client))
+        .bind::<Integer, _>(i32::from(client.require_dpop))
+        .bind::<Integer, _>(i32::from(client.require_account_selection))
+        .bind::<Integer, _>(i32::from(client.trust_email_verified))
+        .bind::<Text, _>(authorization_details_types)
+        .bind::<Text, _>(client.subject_type)
+        .bind::<Text, _>(client.sector_identifier_uri)
+        .bind::<Text, _>(client.jwks_uri)
+        .bind::<Text, _>(client.jwks)
+        .bind::<Text, _>(client.backchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.backchannel_logout_session_required))
+        .bind::<Text, _>(client.frontchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.frontchannel_logout_session_required))
+        .bind::<Integer, _>(i32::from(client.service_account_enabled))
+        .bind::<Text, _>(service_account_permissions)
+        .bind::<Integer, _>(i32::from(client.is_active))
+        .bind::<BigInt, _>(now)
+        .bind::<BigInt, _>(now)
+        .execute(conn)
+        .map_err(AppError::from)?;
+
+    let sql = format!("{} WHERE id = {}", select_client_sql(), ph(kind, 1));
+    sql_query(sql)
+        .bind::<Text, _>(id.to_string())
+        .get_result::<ClientRecord>(conn)
+        .map_err(AppError::from)
+    }};
+}
+
+macro_rules! update_client_on_conn {
+    ($conn:expr, $kind:expr, $id:expr, $client:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let id = $id;
+        let client = $client;
+        let now = $now;
+    let redirect_uris = util::to_json(&client.redirect_uris)?;
+    let post_logout_redirect_uris = util::to_json(&client.post_logout_redirect_uris)?;
+    let scopes = util::to_json(&client.scopes)?;
+    let audience = client.audience.trim().to_string();
+    let grant_types = util::to_json(&client.grant_types)?;
+    let response_types = util::to_json(&client.response_types)?;
+    let authorization_details_types = util::to_json(&client.authorization_details_types)?;
+    let service_account_permissions = util::to_json(&client.service_account_permissions)?;
+    let sql = format!(
+        "UPDATE clients SET client_id = {}, client_secret_hash = {}, client_name = {}, logo_uri = {}, organization_id = {}, redirect_uris = {}, post_logout_redirect_uris = {}, scopes = {}, audience = {}, grant_types = {}, response_types = {}, token_endpoint_auth_method = {}, require_pkce = {}, require_mfa = {}, require_pushed_authorization_requests = {}, require_s256_pkce = {}, require_confidential_client = {}, require_dpop = {}, require_account_selection = {}, trust_email_verified = {}, authorization_details_types = {}, subject_type = {}, sector_identifier_uri = {}, jwks_uri = {}, jwks = {}, backchannel_logout_uri = {}, backchannel_logout_session_required = {}, frontchannel_logout_uri = {}, frontchannel_logout_session_required = {}, service_account_enabled = {}, service_account_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
+        ph(kind, 1),
+        ph(kind, 2),
+        ph(kind, 3),
+        ph(kind, 4),
+        ph(kind, 5),
+        ph(kind, 6),
+        ph(kind, 7),
+        ph(kind, 8),
+        ph(kind, 9),
+        ph(kind, 10),
+        ph(kind, 11),
+        ph(kind, 12),
+        ph(kind, 13),
+        ph(kind, 14),
+        ph(kind, 15),
+        ph(kind, 16),
+        ph(kind, 17),
+        ph(kind, 18),
+        ph(kind, 19),
+        ph(kind, 20),
+        ph(kind, 21),
+        ph(kind, 22),
+        ph(kind, 23),
+        ph(kind, 24),
+        ph(kind, 25),
+        ph(kind, 26),
+        ph(kind, 27),
+        ph(kind, 28),
+        ph(kind, 29),
+        ph(kind, 30),
+        ph(kind, 31),
+        ph(kind, 32),
+        ph(kind, 33),
+        ph(kind, 34)
+    );
+    let affected = sql_query(sql)
+        .bind::<Text, _>(client.client_id)
+        .bind::<Nullable<Text>, _>(client.client_secret_hash)
+        .bind::<Text, _>(client.client_name)
+        .bind::<Text, _>(client.logo_uri)
+        .bind::<Nullable<Text>, _>(client.organization_id)
+        .bind::<Text, _>(redirect_uris)
+        .bind::<Text, _>(post_logout_redirect_uris)
+        .bind::<Text, _>(scopes)
+        .bind::<Text, _>(audience)
+        .bind::<Text, _>(grant_types)
+        .bind::<Text, _>(response_types)
+        .bind::<Text, _>(client.token_endpoint_auth_method)
+        .bind::<Integer, _>(i32::from(client.require_pkce))
+        .bind::<Integer, _>(i32::from(client.require_mfa))
+        .bind::<Integer, _>(i32::from(client.require_pushed_authorization_requests))
+        .bind::<Integer, _>(i32::from(client.require_s256_pkce))
+        .bind::<Integer, _>(i32::from(client.require_confidential_client))
+        .bind::<Integer, _>(i32::from(client.require_dpop))
+        .bind::<Integer, _>(i32::from(client.require_account_selection))
+        .bind::<Integer, _>(i32::from(client.trust_email_verified))
+        .bind::<Text, _>(authorization_details_types)
+        .bind::<Text, _>(client.subject_type)
+        .bind::<Text, _>(client.sector_identifier_uri)
+        .bind::<Text, _>(client.jwks_uri)
+        .bind::<Text, _>(client.jwks)
+        .bind::<Text, _>(client.backchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.backchannel_logout_session_required))
+        .bind::<Text, _>(client.frontchannel_logout_uri)
+        .bind::<Integer, _>(i32::from(client.frontchannel_logout_session_required))
+        .bind::<Integer, _>(i32::from(client.service_account_enabled))
+        .bind::<Text, _>(service_account_permissions)
+        .bind::<Integer, _>(i32::from(client.is_active))
+        .bind::<BigInt, _>(now)
+        .bind::<Text, _>(id.to_string())
+        .execute(conn)
+        .map_err(AppError::from)?;
+    if affected == 0 {
+        return Err(AppError::NotFound);
+    }
+    let sql = format!("{} WHERE id = {}", select_client_sql(), ph(kind, 1));
+    sql_query(sql)
+        .bind::<Text, _>(id.to_string())
+        .get_result::<ClientRecord>(conn)
+        .map_err(AppError::from)
+    }};
+}
+
+macro_rules! replace_client_claim_mappers_on_conn {
+    ($conn:expr, $kind:expr, $client_db_id:expr, $mappers:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let client_db_id = $client_db_id;
+        let mappers = $mappers;
+        let now = $now;
+    let sql = format!(
+        "DELETE FROM client_claim_mappers WHERE client_db_id = {}",
+        ph(kind, 1)
+    );
+    sql_query(sql)
+        .bind::<Text, _>(client_db_id.to_string())
+        .execute(&mut *conn)
+        .map_err(AppError::from)?;
+    for mapper in mappers {
+        let sql = format!(
+            "INSERT INTO client_claim_mappers (id, client_db_id, claim_name, source, source_value, value_type, include_in_id_token, include_in_access_token, include_in_userinfo, is_active, sort_order, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8),
+            ph(kind, 9),
+            ph(kind, 10),
+            ph(kind, 11),
+            ph(kind, 12),
+            ph(kind, 13)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+            .bind::<Text, _>(client_db_id.to_string())
+            .bind::<Text, _>(mapper.claim_name)
+            .bind::<Text, _>(mapper.source)
+            .bind::<Text, _>(mapper.source_value)
+            .bind::<Text, _>(mapper.value_type)
+            .bind::<Integer, _>(i32::from(mapper.include_in_id_token))
+            .bind::<Integer, _>(i32::from(mapper.include_in_access_token))
+            .bind::<Integer, _>(i32::from(mapper.include_in_userinfo))
+            .bind::<Integer, _>(i32::from(mapper.is_active))
+            .bind::<Integer, _>(mapper.sort_order)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    let sql = format!(
+        "{} WHERE client_db_id = {} ORDER BY sort_order ASC, created_at ASC",
+        select_client_claim_mapper_sql(),
+        ph(kind, 1)
+    );
+    sql_query(sql)
+        .bind::<Text, _>(client_db_id.to_string())
+        .load::<ClientClaimMapperRecord>(conn)
+        .map_err(AppError::from)
+    }};
+}
+
+macro_rules! write_application_profile_on_conn {
+    ($conn:expr, $kind:expr, $profile:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let profile = $profile;
+        let now = $now;
+    let profile_key = profile.profile_key.trim().to_string();
+    if profile_key.is_empty()
+        || profile_key.len() > 255
+        || profile_key.chars().any(|ch| ch.is_control())
+    {
+        return Err(AppError::BadRequest(
+            "authorization profile key is invalid".to_string(),
+        ));
+    }
+    let existing_by_id_sql = format!(
+        "{} WHERE id = {} AND application_id = {}",
+        select_application_authorization_profile_sql(),
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    let existing_by_id = sql_query(existing_by_id_sql)
+        .bind::<Text, _>(profile.id.clone())
+        .bind::<Text, _>(profile.application_id.clone())
+        .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+        .optional()
+        .map_err(AppError::from)?;
+    let existing_by_key_sql = format!(
+        "{} WHERE application_id = {} AND profile_key = {}",
+        select_application_authorization_profile_sql(),
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    if let Some(existing_by_key) = sql_query(existing_by_key_sql)
+        .bind::<Text, _>(profile.application_id.clone())
+        .bind::<Text, _>(profile_key.clone())
+        .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+        .optional()
+        .map_err(AppError::from)?
+    {
+        if existing_by_key.id != profile.id {
+            return Err(AppError::BadRequest(
+                "authorization profile key is already used by another connection".to_string(),
+            ));
+        }
+    }
+
+    if existing_by_id.is_some() {
+        let sql = format!(
+            "UPDATE application_authorization_profiles SET profile_key = {}, connection_kind = {}, connection_id = {}, source_mode = {}, remote_version = {}, remote_digest = {}, sync_status = {}, last_synced_at = {}, last_error = {}, updated_at = {} WHERE id = {} AND application_id = {}",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8),
+            ph(kind, 9),
+            ph(kind, 10),
+            ph(kind, 11),
+            ph(kind, 12)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(profile_key)
+            .bind::<Text, _>(profile.connection_kind)
+            .bind::<Nullable<Text>, _>(profile.connection_id)
+            .bind::<Text, _>(profile.source_mode)
+            .bind::<Nullable<Text>, _>(profile.remote_version)
+            .bind::<Nullable<Text>, _>(profile.remote_digest)
+            .bind::<Text, _>(profile.sync_status)
+            .bind::<Nullable<BigInt>, _>(profile.last_synced_at)
+            .bind::<Nullable<Text>, _>(profile.last_error)
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(profile.id.clone())
+            .bind::<Text, _>(profile.application_id.clone())
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    } else {
+        let sql = format!(
+            "INSERT INTO application_authorization_profiles (id, application_id, profile_key, connection_kind, connection_id, source_mode, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8),
+            ph(kind, 9),
+            ph(kind, 10),
+            ph(kind, 11),
+            ph(kind, 12),
+            ph(kind, 13)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(profile.id.clone())
+            .bind::<Text, _>(profile.application_id.clone())
+            .bind::<Text, _>(profile_key)
+            .bind::<Text, _>(profile.connection_kind)
+            .bind::<Nullable<Text>, _>(profile.connection_id)
+            .bind::<Text, _>(profile.source_mode)
+            .bind::<Nullable<Text>, _>(profile.remote_version)
+            .bind::<Nullable<Text>, _>(profile.remote_digest)
+            .bind::<Text, _>(profile.sync_status)
+            .bind::<Nullable<BigInt>, _>(profile.last_synced_at)
+            .bind::<Nullable<Text>, _>(profile.last_error)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    let sql = format!(
+        "{} WHERE id = {} AND application_id = {}",
+        select_application_authorization_profile_sql(),
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    sql_query(sql)
+        .bind::<Text, _>(profile.id)
+        .bind::<Text, _>(profile.application_id)
+        .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+        .map_err(AppError::from)
+    }};
+}
+
+/// Makes the application-level authorization boundary explicit. Every
+/// application has one physical `default` profile, including applications
+/// that do not yet expose a client-bound protocol. Runtime adapters resolve
+/// this row instead of falling back to a second application-wide role graph.
+macro_rules! ensure_application_default_profile_on_conn {
+    ($conn:expr, $kind:expr, $application_id:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let application_id = $application_id;
+        let existing_sql = format!(
+            "{} WHERE application_id = {} AND profile_key = {}",
+            select_application_authorization_profile_sql(),
+            ph(kind, 1),
+            ph(kind, 2)
+        );
+        if let Some(existing) = sql_query(existing_sql)
+            .bind::<Text, _>(application_id.to_string())
+            .bind::<Text, _>("default")
+            .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+            .optional()
+            .map_err(AppError::from)?
+        {
+            existing
+        } else {
+            write_application_profile_on_conn!(
+                conn,
+                kind,
+                NewApplicationAuthorizationProfile {
+                    id: format!("application-default-profile:{application_id}"),
+                    application_id: application_id.to_string(),
+                    profile_key: "default".to_string(),
+                    connection_kind: "application".to_string(),
+                    connection_id: None,
+                    source_mode: crate::application_discovery::SOURCE_MODE_MANUAL.to_string(),
+                    remote_version: None,
+                    remote_digest: None,
+                    sync_status: crate::application_discovery::SYNC_STATUS_MANUAL.to_string(),
+                    last_synced_at: None,
+                    last_error: None,
+                },
+                $now,
+            )?
+        }
+    }};
+}
+
+macro_rules! ensure_application_client_binding_on_conn {
+    ($conn:expr, $kind:expr, $application_id:expr, $client_db_id:expr, $protocol:expr, $authorization_profile_id:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let application_id = $application_id;
+        let client_db_id = $client_db_id;
+        let protocol = $protocol;
+        let authorization_profile_id = $authorization_profile_id;
+        let now = $now;
+    let application_count_sql = format!(
+        "SELECT COUNT(*) AS count FROM applications WHERE id = {}",
+        ph(kind, 1)
+    );
+    if sql_query(application_count_sql)
+        .bind::<Text, _>(application_id.to_string())
+        .get_result::<CountRow>(conn)
+        .map_err(AppError::from)?
+        .count
+        == 0
+    {
+        return Err(AppError::NotFound);
+    }
+    let profile_count_sql = format!(
+        "SELECT COUNT(*) AS count FROM application_authorization_profiles WHERE id = {} AND application_id = {}",
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    if sql_query(profile_count_sql)
+        .bind::<Text, _>(authorization_profile_id.to_string())
+        .bind::<Text, _>(application_id.to_string())
+        .get_result::<CountRow>(conn)
+        .map_err(AppError::from)?
+        .count
+        == 0
+    {
+        return Err(AppError::BadRequest(
+            "authorization profile must belong to the application".to_string(),
+        ));
+    }
+    let same_organization_sql = format!(
+        "SELECT COUNT(*) AS count FROM applications INNER JOIN clients ON clients.id = {} WHERE applications.id = {} AND clients.organization_id = applications.organization_id",
+        ph(kind, 1),
+        ph(kind, 2)
+    );
+    if sql_query(same_organization_sql)
+        .bind::<Text, _>(client_db_id.to_string())
+        .bind::<Text, _>(application_id.to_string())
+        .get_result::<CountRow>(conn)
+        .map_err(AppError::from)?
+        .count
+        == 0
+    {
+        return Err(AppError::BadRequest(
+            "OIDC client must belong to the application's organization".to_string(),
+        ));
+    }
+    let existing_binding_sql = format!(
+        "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE client_db_id = {}",
+        ph(kind, 1)
+    );
+    let existing_binding = sql_query(existing_binding_sql)
+        .bind::<Text, _>(client_db_id.to_string())
+        .get_result::<ApplicationClientBindingRecord>(conn)
+        .optional()
+        .map_err(AppError::from)?;
+    if let Some(existing_binding) = existing_binding.as_ref()
+        && existing_binding.application_id != *application_id
+    {
+        return Err(AppError::BadRequest(
+            "OIDC client already belongs to another application".to_string(),
+        ));
+    }
+    let auth_domain_id = format!("auth-domain:{application_id}");
+    let auth_domain_count_sql = format!(
+        "SELECT COUNT(*) AS count FROM application_auth_domains WHERE application_id = {}",
+        ph(kind, 1)
+    );
+    if sql_query(auth_domain_count_sql)
+        .bind::<Text, _>(application_id.to_string())
+        .get_result::<CountRow>(conn)
+        .map_err(AppError::from)?
+        .count
+        == 0
+    {
+        let auth_domain_sql = format!(
+            "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6)
+        );
+        sql_query(auth_domain_sql)
+            .bind::<Text, _>(auth_domain_id.clone())
+            .bind::<Text, _>(application_id.to_string())
+            .bind::<Text, _>("default")
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    if existing_binding.is_some() {
+        let update_binding_sql = format!(
+            "UPDATE application_client_bindings SET protocol = {}, authorization_profile_id = {}, auth_domain_id = {}, is_active = {}, updated_at = {} WHERE application_id = {} AND client_db_id = {}",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7)
+        );
+        sql_query(update_binding_sql)
+            .bind::<Text, _>(protocol.to_string())
+            .bind::<Text, _>(authorization_profile_id.to_string())
+            .bind::<Text, _>(auth_domain_id)
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(application_id.to_string())
+            .bind::<Text, _>(client_db_id.to_string())
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    } else {
+        let binding_sql = format!(
+            "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8)
+        );
+        sql_query(binding_sql)
+            .bind::<Text, _>(application_id.to_string())
+            .bind::<Text, _>(client_db_id.to_string())
+            .bind::<Text, _>(protocol.to_string())
+            .bind::<Text, _>(authorization_profile_id.to_string())
+            .bind::<Text, _>(auth_domain_id)
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    Ok::<(), AppError>(())
+    }};
+}
+
+macro_rules! delete_client_on_conn {
+    ($conn:expr, $kind:expr, $id:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let id = $id;
+    let client_sql = format!("{} WHERE id = {}", select_client_sql(), ph(kind, 1));
+    let client = sql_query(client_sql)
+        .bind::<Text, _>(id.to_string())
+        .get_result::<ClientRecord>(conn)
+        .optional()
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    for (table, column) in [
+        ("authorization_codes", "client_id"),
+        ("refresh_tokens", "client_id"),
+        ("client_grants", "client_id"),
+        ("device_authorizations", "client_id"),
+        ("pushed_authorization_requests", "client_id"),
+        ("oidc_login_grants", "client_id"),
+        ("client_assertion_jtis", "client_id"),
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE {column} IN (SELECT client_id FROM clients WHERE id = {})",
+            ph(kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(id.to_string())
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    for table in ["client_registrations", "client_claim_mappers"] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE client_db_id = {}",
+            ph(kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(id.to_string())
+            .execute(&mut *conn)
+            .map_err(AppError::from)?;
+    }
+    let binding_sql = format!(
+        "DELETE FROM application_client_bindings WHERE client_db_id = {}",
+        ph(kind, 1)
+    );
+    sql_query(binding_sql)
+        .bind::<Text, _>(id.to_string())
+        .execute(&mut *conn)
+        .map_err(AppError::from)?;
+    let sql = format!("DELETE FROM clients WHERE id = {}", ph(kind, 1));
+    let affected = sql_query(sql)
+        .bind::<Text, _>(id.to_string())
+        .execute(&mut *conn)
+        .map_err(AppError::from)?;
+    if affected == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(client)
+    }};
+}
+
 fn select_iap_application_sql() -> &'static str {
-    "SELECT id, slug, name, description, external_host, path_prefix, required_organization_id, required_organization_roles, required_permissions, is_active, created_at, updated_at FROM iap_applications"
+    "SELECT id, application_id, slug, name, description, external_host, path_prefix, required_organization_id, required_organization_roles, required_permissions, is_active, created_at, updated_at FROM iap_applications"
 }
 
 fn select_device_authorization_sql() -> &'static str {
     "SELECT device_code_hash, user_code_hash, user_code_display, client_id, scope, resource, authorization_details, expires_at, interval_seconds, authorized_user_id, authorized_at, denied_at, consumed_at, last_poll_at, created_at FROM device_authorizations"
+}
+
+fn device_authorization_status(
+    record: &DeviceAuthorizationRecord,
+    now: i64,
+) -> DeviceAuthorizationStatus {
+    if record.expires_at <= now {
+        DeviceAuthorizationStatus::Expired
+    } else if record.consumed_at.is_some() {
+        DeviceAuthorizationStatus::Consumed
+    } else if record.denied_at.is_some() {
+        DeviceAuthorizationStatus::Denied
+    } else if record.authorized_user_id.is_some() {
+        DeviceAuthorizationStatus::Authorized
+    } else {
+        DeviceAuthorizationStatus::Pending
+    }
 }
 
 fn select_external_oidc_provider_sql() -> &'static str {
@@ -3842,7 +5186,7 @@ fn select_verification_code_by_id_sql(kind: DatabaseKind) -> String {
 
 fn select_latest_verification_code_sql(kind: DatabaseKind) -> String {
     format!(
-        "{} WHERE channel = {} AND target = {} AND purpose = {} AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        "{} WHERE channel = {} AND target = {} AND purpose = {} AND consumed_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1",
         select_verification_code_sql(),
         ph(kind, 1),
         ph(kind, 2),
@@ -3852,7 +5196,7 @@ fn select_latest_verification_code_sql(kind: DatabaseKind) -> String {
 
 fn select_latest_verification_issue_sql(kind: DatabaseKind) -> String {
     format!(
-        "{} WHERE channel = {} AND target = {} AND purpose = {} ORDER BY created_at DESC LIMIT 1",
+        "{} WHERE channel = {} AND target = {} AND purpose = {} ORDER BY created_at DESC, id DESC LIMIT 1",
         select_verification_code_sql(),
         ph(kind, 1),
         ph(kind, 2),
@@ -3960,6 +5304,10 @@ fn select_application_sql() -> &'static str {
     "SELECT id, organization_id, slug, name, description, access_mode, registration_mode, account_selection_mode, COALESCE(unique_identity_factors, '[]') AS unique_identity_factors, is_active, created_at, updated_at FROM applications"
 }
 
+fn select_group_sql() -> &'static str {
+    "SELECT id, name, description, created_at, updated_at, version FROM access_groups"
+}
+
 fn select_application_member_sql() -> &'static str {
     "SELECT application_id, user_id, role, is_active, created_at, updated_at FROM application_members"
 }
@@ -3972,49 +5320,12 @@ fn select_application_module_sql() -> &'static str {
     "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules"
 }
 
-fn select_application_billing_settings_sql() -> &'static str {
-    "SELECT application_id, accept_signet_balance, wallet_mode, COALESCE(supported_currencies, '[]') AS supported_currencies, mode_locked_at, created_at, updated_at FROM application_billing_settings"
-}
-
-fn select_wallet_account_sql() -> &'static str {
-    "SELECT id, account_kind, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at FROM wallet_accounts"
-}
-
-fn select_wallet_hold_sql() -> &'static str {
-    "SELECT id, hold_kind, wallet_id, user_id, application_id, currency, amount_minor, status, reference, idempotency_key, expires_at, created_at, updated_at FROM wallet_holds"
-}
-
-fn select_wallet_transaction_sql() -> &'static str {
-    "SELECT id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at FROM wallet_transactions"
-}
-
-fn select_payment_order_sql() -> &'static str {
-    "SELECT id, user_id, provider_slug, merchant_order_no, idempotency_key, provider_trade_id, currency, amount_minor, subject, status, checkout_kind, checkout_value, expires_at, paid_at, last_error, created_at, updated_at FROM payment_orders"
-}
-
-fn select_payment_refund_sql() -> &'static str {
-    "SELECT id, payment_order_id, amount_minor, status, provider_refund_id, requested_by, reason, COALESCE(idempotency_key, '') AS idempotency_key, created_at, updated_at FROM payment_refunds"
-}
-
-fn wallet_account_scope_key(
-    account_kind: &str,
-    user_id: Option<&str>,
-    application_id: Option<&str>,
-    currency: &str,
-) -> String {
-    format!(
-        "{account_kind}:{}:{}:{currency}",
-        user_id.unwrap_or("-"),
-        application_id.unwrap_or("-")
-    )
-}
-
 fn select_application_authorization_profile_sql() -> &'static str {
     "SELECT id, application_id, profile_key, connection_kind, connection_id, source_mode, remote_version, remote_digest, sync_status, last_synced_at, last_error, created_at, updated_at FROM application_authorization_profiles"
 }
 
 fn select_application_discovery_sql() -> &'static str {
-    "SELECT application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at FROM application_discovery"
+    "SELECT application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at, lease_owner, lease_expires_at, lease_generation FROM application_discovery"
 }
 
 fn select_application_permission_definition_sql() -> &'static str {
@@ -4027,10 +5338,6 @@ fn select_application_profile_role_sql() -> &'static str {
 
 fn select_application_profile_permission_override_sql() -> &'static str {
     "SELECT profile_id, user_id, permission, effect FROM application_profile_permission_overrides"
-}
-
-fn select_application_role_sql() -> &'static str {
-    "SELECT id, application_id, name, description, permissions, is_default, is_active, created_at, updated_at FROM application_roles"
 }
 
 fn select_application_jwt_client_sql() -> &'static str {
@@ -4055,6 +5362,336 @@ fn select_application_cas_ticket_sql() -> &'static str {
 
 fn select_application_scim_token_sql() -> &'static str {
     "SELECT id, application_id, token_prefix, token_hash, scopes, expires_at, revoked_at, last_used_at, created_at FROM application_scim_tokens"
+}
+
+/// The application aggregate write primitives below intentionally accept an
+/// existing connection.  The public one-operation methods use them directly,
+/// while audited mutation methods compose them with the audit insert inside
+/// one transaction.
+macro_rules! allocate_application_slug_on_conn {
+    ($conn:expr, $kind:expr, $organization_id:expr, $client_id:expr $(,)?) => {{
+        let base_slug = application_slug_base($client_id);
+        let base_sql = format!(
+            "SELECT COUNT(*) AS count FROM applications WHERE organization_id = {} AND slug = {}",
+            ph($kind, 1),
+            ph($kind, 2)
+        );
+        let base_taken = sql_query(base_sql)
+            .bind::<Text, _>($organization_id)
+            .bind::<Text, _>(&base_slug)
+            .get_result::<CountRow>($conn)
+            .map_err(AppError::from)?
+            .count
+            > 0;
+        if !base_taken {
+            base_slug
+        } else {
+            let candidate = application_slug_collision_candidate(&base_slug, $client_id);
+            let candidate_sql = format!(
+                "SELECT COUNT(*) AS count FROM applications WHERE organization_id = {} AND slug = {}",
+                ph($kind, 1),
+                ph($kind, 2)
+            );
+            let candidate_taken = sql_query(candidate_sql)
+                .bind::<Text, _>($organization_id)
+                .bind::<Text, _>(&candidate)
+                .get_result::<CountRow>($conn)
+                .map_err(AppError::from)?
+                .count
+                > 0;
+            if !candidate_taken {
+                candidate
+            } else {
+                // A digest collision is extraordinarily unlikely, but the
+                // database unique key remains the final concurrency guard.
+                let mut prefix = base_slug;
+                prefix.truncate(31);
+                format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+            }
+        }
+    }};
+}
+
+macro_rules! insert_application_on_conn {
+    ($conn:expr, $kind:expr, $id:expr, $application:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let application = $application;
+        let unique_identity_factors = util::to_json(&application.unique_identity_factors)?;
+        let sql = format!(
+            "INSERT INTO applications (id, organization_id, slug, name, description, access_mode, registration_mode, account_selection_mode, unique_identity_factors, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6),
+            ph($kind, 7),
+            ph($kind, 8),
+            ph($kind, 9),
+            ph($kind, 10),
+            ph($kind, 11),
+            ph($kind, 12)
+        );
+        sql_query(sql)
+            .bind::<Text, _>($id)
+            .bind::<Text, _>(&application.organization_id)
+            .bind::<Text, _>(&application.slug)
+            .bind::<Text, _>(&application.name)
+            .bind::<Nullable<Text>, _>(&application.description)
+            .bind::<Text, _>(&application.access_mode)
+            .bind::<Text, _>(&application.registration_mode)
+            .bind::<Text, _>(&application.account_selection_mode)
+            .bind::<Text, _>(unique_identity_factors)
+            .bind::<Integer, _>(i32::from(application.is_active))
+            .bind::<BigInt, _>($now)
+            .bind::<BigInt, _>($now)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        let _ = ensure_application_default_profile_on_conn!(conn, $kind, $id, $now);
+        let sql = format!("{} WHERE id = {}", select_application_sql(), ph($kind, 1));
+        sql_query(sql)
+            .bind::<Text, _>($id)
+            .get_result::<ApplicationRecord>(conn)
+            .map_err(AppError::from)
+    }};
+}
+
+macro_rules! update_application_on_conn {
+    ($conn:expr, $kind:expr, $id:expr, $application:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let application = $application;
+        let unique_identity_factors = util::to_json(&application.unique_identity_factors)?;
+        let sql = format!(
+            "UPDATE applications SET organization_id = {}, slug = {}, name = {}, description = {}, access_mode = {}, registration_mode = {}, account_selection_mode = {}, unique_identity_factors = {}, is_active = {}, updated_at = {} WHERE id = {}",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6),
+            ph($kind, 7),
+            ph($kind, 8),
+            ph($kind, 9),
+            ph($kind, 10),
+            ph($kind, 11)
+        );
+        let affected = sql_query(sql)
+            .bind::<Text, _>(&application.organization_id)
+            .bind::<Text, _>(&application.slug)
+            .bind::<Text, _>(&application.name)
+            .bind::<Nullable<Text>, _>(&application.description)
+            .bind::<Text, _>(&application.access_mode)
+            .bind::<Text, _>(&application.registration_mode)
+            .bind::<Text, _>(&application.account_selection_mode)
+            .bind::<Text, _>(unique_identity_factors)
+            .bind::<Integer, _>(i32::from(application.is_active))
+            .bind::<BigInt, _>($now)
+            .bind::<Text, _>($id)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        if affected == 0 {
+            return Err(AppError::NotFound);
+        }
+        let sql = format!("{} WHERE id = {}", select_application_sql(), ph($kind, 1));
+        sql_query(sql)
+            .bind::<Text, _>($id)
+            .get_result::<ApplicationRecord>(conn)
+            .map_err(AppError::from)
+    }};
+}
+
+macro_rules! upsert_application_module_on_conn {
+    ($conn:expr, $kind:expr, $application_id:expr, $module_key:expr, $config_json:expr, $is_enabled:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let application_id = $application_id;
+        let module_key = $module_key;
+        let config_json = $config_json;
+        let is_enabled = $is_enabled;
+        let lock_sql = format!(
+            "UPDATE applications SET updated_at = updated_at WHERE id = {}",
+            ph($kind, 1)
+        );
+        if sql_query(lock_sql)
+            .bind::<Text, _>(application_id)
+            .execute(conn)
+            .map_err(AppError::from)?
+            == 0
+        {
+            return Err(AppError::NotFound);
+        }
+        let exists_sql = format!(
+            "SELECT COUNT(*) AS count FROM application_modules WHERE application_id = {} AND module_key = {}",
+            ph($kind, 1),
+            ph($kind, 2)
+        );
+        let exists = sql_query(exists_sql)
+            .bind::<Text, _>(application_id)
+            .bind::<Text, _>(module_key)
+            .get_result::<CountRow>(conn)
+            .map_err(AppError::from)?
+            .count
+            > 0;
+        if exists {
+            let update_sql = format!(
+                "UPDATE application_modules SET config_json = {}, is_enabled = {}, updated_at = {} WHERE application_id = {} AND module_key = {}",
+                ph($kind, 1),
+                ph($kind, 2),
+                ph($kind, 3),
+                ph($kind, 4),
+                ph($kind, 5)
+            );
+            sql_query(update_sql)
+                .bind::<Text, _>(config_json)
+                .bind::<Integer, _>(i32::from(is_enabled))
+                .bind::<BigInt, _>($now)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(module_key)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        } else {
+            let insert_sql = format!(
+                "INSERT INTO application_modules (application_id, module_key, config_json, is_enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                ph($kind, 1),
+                ph($kind, 2),
+                ph($kind, 3),
+                ph($kind, 4),
+                ph($kind, 5),
+                ph($kind, 6)
+            );
+            sql_query(insert_sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(module_key)
+                .bind::<Text, _>(config_json)
+                .bind::<Integer, _>(i32::from(is_enabled))
+                .bind::<BigInt, _>($now)
+                .bind::<BigInt, _>($now)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        }
+        let select_sql = format!(
+            "{} WHERE application_id = {} AND module_key = {}",
+            select_application_module_sql(),
+            ph($kind, 1),
+            ph($kind, 2)
+        );
+        sql_query(select_sql)
+            .bind::<Text, _>(application_id)
+            .bind::<Text, _>(module_key)
+            .get_result::<ApplicationModuleRecord>(conn)
+            .map_err(AppError::from)
+    }};
+}
+
+macro_rules! insert_application_scim_token_on_conn {
+    ($conn:expr, $kind:expr, $token:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let token = $token;
+        let scopes = util::to_json(&token.scopes)?;
+        let sql = format!(
+            "INSERT INTO application_scim_tokens (id, application_id, token_prefix, token_hash, scopes, expires_at, revoked_at, last_used_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6),
+            ph($kind, 7),
+            ph($kind, 8),
+            ph($kind, 9)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(&token.id)
+            .bind::<Text, _>(&token.application_id)
+            .bind::<Text, _>(&token.token_prefix)
+            .bind::<Text, _>(&token.token_hash)
+            .bind::<Text, _>(scopes)
+            .bind::<Nullable<BigInt>, _>(token.expires_at)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<BigInt, _>($now)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        let sql = format!(
+            "{} WHERE id = {}",
+            select_application_scim_token_sql(),
+            ph($kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(&token.id)
+            .get_result::<ApplicationScimTokenRecord>(conn)
+            .map_err(AppError::from)
+    }};
+}
+
+macro_rules! rotate_application_jwt_secret_on_conn {
+    ($conn:expr, $kind:expr, $application_id:expr, $client_id:expr, $secret_hash:expr, $grace_seconds:expr, $now:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let client_sql = format!(
+            "{} WHERE application_id = {} AND client_id = {}",
+            select_application_jwt_client_sql(),
+            ph($kind, 1),
+            ph($kind, 2)
+        );
+        let client = sql_query(client_sql)
+            .bind::<Text, _>($application_id)
+            .bind::<Text, _>($client_id)
+            .get_result::<ApplicationJwtClientRecord>(conn)
+            .optional()
+            .map_err(AppError::from)?
+            .ok_or(AppError::NotFound)?;
+        if client.client_type != "confidential" || client.is_active != 1 {
+            return Err(AppError::BadRequest(
+                "JWT secrets require an active confidential client".to_string(),
+            ));
+        }
+        let secret_hash = $secret_hash;
+        if secret_hash.trim().is_empty() || secret_hash.len() > 512 {
+            return Err(AppError::BadRequest(
+                "application JWT secret hash is invalid".to_string(),
+            ));
+        }
+        let expires_at = $now.saturating_add($grace_seconds.clamp(0, 86_400));
+        let update_sql = format!(
+            "UPDATE application_jwt_client_secrets SET expires_at = CASE WHEN expires_at IS NULL OR expires_at > {} THEN {} ELSE expires_at END WHERE jwt_client_id = {} AND revoked_at IS NULL",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3)
+        );
+        sql_query(update_sql)
+            .bind::<BigInt, _>(expires_at)
+            .bind::<BigInt, _>(expires_at)
+            .bind::<Text, _>(&client.id)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        let secret_id = uuid::Uuid::new_v4().to_string();
+        let insert_sql = format!(
+            "INSERT INTO application_jwt_client_secrets (id, jwt_client_id, secret_hash, created_at, expires_at, revoked_at) VALUES ({}, {}, {}, {}, {}, {})",
+            ph($kind, 1),
+            ph($kind, 2),
+            ph($kind, 3),
+            ph($kind, 4),
+            ph($kind, 5),
+            ph($kind, 6)
+        );
+        sql_query(insert_sql)
+            .bind::<Text, _>(&secret_id)
+            .bind::<Text, _>(&client.id)
+            .bind::<Text, _>(secret_hash)
+            .bind::<BigInt, _>($now)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .execute(conn)
+            .map_err(AppError::from)?;
+        let select_sql = format!(
+            "{} WHERE id = {}",
+            select_application_jwt_secret_sql(),
+            ph($kind, 1)
+        );
+        sql_query(select_sql)
+            .bind::<Text, _>(secret_id)
+            .get_result::<ApplicationJwtClientSecretRecord>(conn)
+            .map_err(AppError::from)
+    }};
 }
 
 fn select_security_policy_sql() -> &'static str {
@@ -4175,6 +5812,56 @@ fn normalize_application_entitlement_keys(values: Vec<String>) -> AppResult<Vec<
     Ok(keys.into_iter().collect())
 }
 
+fn application_slug_base(client_id: &str) -> String {
+    let mut base = client_id
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while base.contains("--") {
+        base = base.replace("--", "-");
+    }
+    base = base.trim_matches('-').to_string();
+    if base.len() < 2 {
+        base = format!(
+            "app-{}",
+            util::sha256_base64url(client_id)
+                .chars()
+                .take(10)
+                .collect::<String>()
+        );
+    }
+    base.truncate(54);
+    if client_id.trim() != base {
+        return application_slug_collision_candidate(&base, client_id);
+    }
+    base
+}
+
+/// Produces a deterministic, valid suffix for a sanitized client-id
+/// collision. The previous allocator scanned every numeric suffix up to
+/// 10,000; a short digest keeps the URL readable while making allocation
+/// independent of the number of sibling applications.
+fn application_slug_collision_candidate(base_slug: &str, client_id: &str) -> String {
+    let suffix = util::sha256_base64url(client_id)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(10)
+        .collect::<String>();
+    let mut prefix = base_slug.to_string();
+    prefix.truncate(52);
+    format!("{prefix}-{suffix}")
+}
+
+mod applications;
+
 impl Db {
     pub fn connect(settings: &Settings) -> AppResult<Self> {
         match settings.database.kind {
@@ -4222,6 +5909,11 @@ impl Db {
                 .map_err(|err| AppError::Database(err.to_string()))
         })
     }
+
+    /// Creates the complete Application/OIDC connection aggregate on one
+    /// database connection.  The profile is materialized before the binding
+    /// points at it, so a failed mapper, profile, or binding write rolls back
+    /// the client as well.
 
     pub async fn migrate(&self) -> AppResult<()> {
         with_conn!(self, |conn, kind| {
@@ -4304,13 +5996,14 @@ impl Db {
     async fn migrate_tenant_application_model(&self) -> AppResult<()> {
         let system_organization = self.system_organization().await?;
         let system_organization_id = system_organization.id.clone();
+        let system_organization_id_for_update = system_organization_id.clone();
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "UPDATE clients SET organization_id = {} WHERE organization_id IS NULL OR organization_id = ''",
                 ph(kind, 1)
             );
             sql_query(sql)
-                .bind::<Text, _>(system_organization_id)
+                .bind::<Text, _>(system_organization_id_for_update)
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(AppError::from)
@@ -4320,6 +6013,11 @@ impl Db {
             self.ensure_application_for_client(&client).await?;
         }
         self.migrate_application_binding_storage().await?;
+        self.reconcile_application_client_binding_ownership()
+            .await?;
+        self.migrate_legacy_application_authorization().await?;
+        self.migrate_iap_application_storage(&system_organization_id)
+            .await?;
         self.normalize_application_login_boundary().await?;
         // Every application gets an explicit discovery ownership record. The
         // migration default is Signet-managed, so existing installations keep
@@ -4442,7 +6140,10 @@ impl Db {
                 };
                 if legacy_consent_table_exists {
                     let consent_migration = match kind {
-                        DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                        DatabaseKind::Sqlite => {
+                            "INSERT OR IGNORE INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents"
+                        }
+                        DatabaseKind::Postgres => {
                             "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents ON CONFLICT DO NOTHING"
                         }
                         DatabaseKind::Mysql => {
@@ -4492,7 +6193,10 @@ impl Db {
             };
             if legacy_consent_table_exists {
                 let consent_migration = match kind {
-                    DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                    DatabaseKind::Sqlite => {
+                        "INSERT OR IGNORE INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents"
+                    }
+                    DatabaseKind::Postgres => {
                         "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) SELECT user_id, client_id, 'default', granted_scopes, granted_at, updated_at, revoked_at FROM user_consents ON CONFLICT DO NOTHING"
                     }
                     DatabaseKind::Mysql => {
@@ -4504,6 +6208,112 @@ impl Db {
             }
             Ok(())
         })
+    }
+
+    /// Existing installations may have accumulated the old many-to-many
+    /// client/application rows. Keep the earliest owner deterministically,
+    /// remove later duplicates, and then enforce the one-application invariant
+    /// at the database level for every supported engine.
+    async fn reconcile_application_client_binding_ownership(&self) -> AppResult<()> {
+        let mut owners = BTreeSet::new();
+        for application in self.list_applications(None).await? {
+            for binding in self
+                .list_application_client_bindings(&application.id)
+                .await?
+            {
+                if owners.insert(binding.client_db_id.clone()) {
+                    continue;
+                }
+                let application_id = binding.application_id.clone();
+                let client_db_id = binding.client_db_id.clone();
+                with_conn!(self, |conn, kind| {
+                    let sql = format!(
+                        "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(&client_db_id)
+                        .execute(&mut conn)
+                        .map(|_| ())
+                        .map_err(AppError::from)
+                })?;
+            }
+        }
+
+        with_conn!(self, |conn, kind| {
+            match kind {
+                DatabaseKind::Sqlite | DatabaseKind::Postgres => conn
+                    .batch_execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_application_client_bindings_client ON application_client_bindings(client_db_id)",
+                    )
+                    .map_err(AppError::from),
+                DatabaseKind::Mysql => {
+                    let exists = sql_query(
+                        "SELECT COUNT(*) AS count FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'application_client_bindings' AND index_name = 'uq_application_client_bindings_client'",
+                    )
+                    .get_result::<CountRow>(&mut conn)
+                    .map_err(AppError::from)?
+                    .count
+                        > 0;
+                    if !exists {
+                        conn.batch_execute(
+                            "CREATE UNIQUE INDEX uq_application_client_bindings_client ON application_client_bindings(client_db_id)",
+                        )
+                        .map_err(AppError::from)?;
+                    }
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    async fn migrate_iap_application_storage(&self, system_organization_id: &str) -> AppResult<()> {
+        for legacy in self.list_iap_applications().await? {
+            if legacy.application_id.is_some() {
+                continue;
+            }
+            let application_slug = self
+                .next_legacy_application_slug(
+                    system_organization_id,
+                    &format!("iap-{}", legacy.slug),
+                )
+                .await?;
+            let application = self
+                .insert_application(NewApplication {
+                    organization_id: system_organization_id.to_string(),
+                    slug: application_slug,
+                    name: legacy.name.clone(),
+                    description: Some(format!(
+                        "Application migrated from legacy IAP route {}.",
+                        legacy.slug
+                    )),
+                    access_mode: crate::applications::ACCESS_ALL_SIGNET_USERS.to_string(),
+                    registration_mode: crate::applications::REGISTRATION_DISABLED.to_string(),
+                    account_selection_mode: crate::applications::ACCOUNT_SELECTION_OPTIONAL
+                        .to_string(),
+                    unique_identity_factors: Vec::new(),
+                    is_active: legacy.is_active == 1,
+                })
+                .await?;
+            let legacy_id = legacy.id.clone();
+            let application_id = application.id.clone();
+            with_conn!(self, |conn, kind| {
+                let sql = format!(
+                    "UPDATE iap_applications SET application_id = {} WHERE id = {} AND application_id IS NULL",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&legacy_id)
+                    .execute(&mut conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })?;
+        }
+        Ok(())
     }
 
     async fn normalize_application_login_boundary(&self) -> AppResult<()> {
@@ -4682,46 +6492,31 @@ impl Db {
         organization_id: &str,
         client_id: &str,
     ) -> AppResult<String> {
-        let mut base = client_id
-            .trim()
-            .to_ascii_lowercase()
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        while base.contains("--") {
-            base = base.replace("--", "-");
-        }
-        base = base.trim_matches('-').to_string();
-        if base.len() < 2 {
-            base = format!(
-                "app-{}",
-                util::sha256_base64url(client_id)
-                    .chars()
-                    .take(10)
-                    .collect::<String>()
-            );
-        }
-        base.truncate(54);
-        let existing = self
-            .list_applications(Some(organization_id))
+        let base = application_slug_base(client_id);
+        if self
+            .find_application_by_slug_in_organization(organization_id, &base)
             .await?
-            .into_iter()
-            .map(|application| application.slug)
-            .collect::<BTreeSet<_>>();
-        if !existing.contains(&base) {
+            .is_none()
+        {
             return Ok(base);
         }
-        for suffix in 2..10_000 {
-            let candidate = format!("{base}-{suffix}");
-            if !existing.contains(&candidate) {
-                return Ok(candidate);
-            }
+        let candidate = application_slug_collision_candidate(&base, client_id);
+        if self
+            .find_application_by_slug_in_organization(organization_id, &candidate)
+            .await?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+        let mut prefix = base;
+        prefix.truncate(31);
+        let random_candidate = format!("{prefix}-{}", uuid::Uuid::new_v4().simple());
+        if self
+            .find_application_by_slug_in_organization(organization_id, &random_candidate)
+            .await?
+            .is_none()
+        {
+            return Ok(random_candidate);
         }
         Err(AppError::Internal(
             "could not allocate a unique application slug for migrated OIDC client".to_string(),
@@ -4902,7 +6697,7 @@ impl Db {
         let sync_status = if application.management_mode
             == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
         {
-            if fetch_secret_ciphertext.is_empty() || signing_public_jwks.is_empty() {
+            if signing_public_jwks.is_empty() {
                 crate::application_discovery::SYNC_UNCONFIGURED.to_string()
             } else if reset_snapshot {
                 crate::application_discovery::SYNC_PENDING.to_string()
@@ -5103,6 +6898,80 @@ impl Db {
         })
     }
 
+    /// Resolves email selectors with one bounded projection. Callers that
+    /// already performed authorization should use this for bulk member
+    /// editing instead of hydrating a full `UserRecord` per email.
+    pub async fn find_user_ids_by_emails(
+        &self,
+        emails: &[String],
+    ) -> AppResult<BTreeMap<String, String>> {
+        let emails = dedupe_nonempty(emails.to_vec());
+        if emails.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=emails.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT id, email FROM users WHERE email IN ({placeholders})");
+            let rows = bind_text_list(&mut conn, sql_query(sql), &emails)
+                .load::<UserEmailIdRow>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(rows.into_iter().map(|row| (row.email, row.id)).collect())
+        })
+    }
+
+    /// Finds existing identity conflicts for a whole provisioning batch using
+    /// one minimal projection. The caller can report email and username
+    /// conflicts per input row without issuing two queries per candidate.
+    pub async fn find_existing_user_identities(
+        &self,
+        emails: &[String],
+        usernames: &[String],
+    ) -> AppResult<(BTreeSet<String>, BTreeSet<String>)> {
+        let emails = dedupe_nonempty(emails.to_vec());
+        let usernames = dedupe_nonempty(usernames.to_vec());
+        if emails.is_empty() && usernames.is_empty() {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
+        }
+        with_conn!(self, |conn, kind| {
+            let mut predicates = Vec::new();
+            if !emails.is_empty() {
+                let placeholders = (1..=emails.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                predicates.push(format!("email IN ({placeholders})"));
+            }
+            if !usernames.is_empty() {
+                let start = emails.len() + 1;
+                let placeholders = (start..start + usernames.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                predicates.push(format!("username IN ({placeholders})"));
+            }
+            let sql = format!(
+                "SELECT email, username FROM users WHERE {}",
+                predicates.join(" OR ")
+            );
+            let mut values = emails;
+            values.extend(usernames);
+            let rows = bind_text_list(&mut conn, sql_query(sql), &values)
+                .load::<UserIdentityConflictRow>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(rows.into_iter().fold(
+                (BTreeSet::new(), BTreeSet::new()),
+                |(mut existing_emails, mut existing_usernames), row| {
+                    existing_emails.insert(row.email);
+                    existing_usernames.insert(row.username);
+                    (existing_emails, existing_usernames)
+                },
+            ))
+        })
+    }
+
     pub async fn find_user_by_username(&self, username: &str) -> AppResult<Option<UserRecord>> {
         let username = username.to_string();
         with_conn!(self, |conn, kind| {
@@ -5127,6 +6996,82 @@ impl Db {
         })
     }
 
+    /// Resolves a bounded set of account ids with a non-sensitive selector.
+    /// Password hashes, login IPs, and authentication metadata are not read
+    /// from the database, which makes this suitable for admin assignment
+    /// preflight checks.
+    pub async fn find_users_by_ids(&self, ids: &[String]) -> AppResult<Vec<UserOptionRecord>> {
+        const MAX_USER_SELECTOR_IDS: usize = 900;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > MAX_USER_SELECTOR_IDS {
+            return Err(AppError::BadRequest(
+                "too many user ids in selector request".to_string(),
+            ));
+        }
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, email, username, display_name FROM users WHERE id IN ({}) ORDER BY id ASC",
+                (1..=ids.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<UserOptionRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    /// Resolves account lifecycle state for a bounded assignment set without
+    /// hydrating a full UserRecord.  This is the batch counterpart to the
+    /// selector projection above and keeps password/security columns out of
+    /// admin preflight queries.
+    pub async fn find_user_assignment_states(
+        &self,
+        ids: &[String],
+    ) -> AppResult<Vec<UserAssignmentStateRecord>> {
+        const MAX_ASSIGNMENT_IDS: usize = 900;
+        let ids = ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > MAX_ASSIGNMENT_IDS {
+            return Err(AppError::BadRequest(
+                "too many user ids in assignment request".to_string(),
+            ));
+        }
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, archived_at FROM users WHERE id IN ({}) ORDER BY id ASC",
+                (1..=ids.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<UserAssignmentStateRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn list_users(&self, scope: UserListScope) -> AppResult<Vec<UserRecord>> {
         with_conn!(self, |conn, kind| {
             let _ = kind;
@@ -5138,6 +7083,271 @@ impl Db {
             );
             sql_query(sql)
                 .load::<UserRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    async fn fetch_user_list_page(
+        &self,
+        scope: UserListScope,
+        filters: UserListFilters,
+        exact_filter: Option<&UserListFilter>,
+        offset: usize,
+        limit: usize,
+        select_sql: &'static str,
+    ) -> AppResult<UserListPage> {
+        let params = UserListSqlParams::from_filters(&filters, exact_filter);
+        let offset_value = i64::try_from(offset).unwrap_or(i64::MAX);
+        let limit_value = i64::try_from(limit).unwrap_or(i64::MAX);
+        with_conn!(self, |conn, kind| {
+            let predicates = user_list_predicate_sql(kind);
+            let scope_predicate = scope.qualified_predicate_sql();
+            let count_sql = format!(
+                "SELECT COUNT(*) AS count FROM users WHERE {predicates} AND {scope_predicate}"
+            );
+            let count = bind_user_list_predicate!(sql_query(count_sql), &params)
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count;
+            let page_sql = format!(
+                "{} WHERE {predicates} AND {scope_predicate} ORDER BY {} LIMIT {} OFFSET {}",
+                select_sql,
+                scope.order_sql(),
+                ph(kind, 32),
+                ph(kind, 33),
+            );
+            let users = bind_user_list_predicate!(sql_query(page_sql), &params)
+                .bind::<BigInt, _>(limit_value)
+                .bind::<BigInt, _>(offset_value)
+                .load::<UserRecord>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(UserListPage {
+                total: count,
+                offset,
+                limit,
+                users,
+            })
+        })
+    }
+
+    /// Reads one bounded user page and its total in the same connection. This
+    /// compatibility shape is used by SCIM and keeps its exact-match filters;
+    /// the administrative directory uses `list_admin_users_page` below.
+    pub async fn list_users_page(
+        &self,
+        scope: UserListScope,
+        organization_id: Option<&str>,
+        filter: Option<UserListFilter>,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<(i64, Vec<UserRecord>)> {
+        let mut filters = UserListFilters::default();
+        filters.organization_id = organization_id.map(str::to_string);
+        let page = self
+            .fetch_user_list_page(
+                scope,
+                filters,
+                filter.as_ref(),
+                offset,
+                limit,
+                select_user_sql(),
+            )
+            .await?;
+        Ok((page.total, page.users))
+    }
+
+    /// Administrative user-directory read model. Every filter is evaluated in
+    /// SQL and the same predicate is used for the total and page queries.
+    pub async fn list_admin_users_page(
+        &self,
+        scope: UserListScope,
+        filters: UserListFilters,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<UserListPage> {
+        self.fetch_user_list_page(
+            scope,
+            filters,
+            None,
+            offset,
+            limit,
+            select_user_directory_sql(),
+        )
+        .await
+    }
+
+    /// Reads an administrative user page with a stable keyset cursor.  This
+    /// deliberately omits COUNT and OFFSET: deep pages remain bounded even
+    /// when earlier rows are inserted or removed between requests.
+    pub async fn list_admin_users_page_after(
+        &self,
+        scope: UserListScope,
+        filters: UserListFilters,
+        cursor: Option<UserDirectoryCursor>,
+        limit: usize,
+    ) -> AppResult<UserDirectoryCursorPage> {
+        let limit = limit.clamp(1, 200);
+        let page_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let params = UserListSqlParams::from_filters(&filters, None);
+        with_conn!(self, |conn, kind| {
+            let predicates = user_list_predicate_sql(kind);
+            let scope_predicate = scope.qualified_predicate_sql();
+            let (cursor_predicate, limit_index) = match cursor.as_ref() {
+                None => (String::new(), 32),
+                Some(_cursor) => match scope {
+                    UserListScope::Archived => (
+                        format!(
+                            " AND (users.archived_at < {} OR (users.archived_at = {} AND (users.created_at < {} OR (users.created_at = {} AND users.id > {}))))",
+                            ph(kind, 32),
+                            ph(kind, 33),
+                            ph(kind, 34),
+                            ph(kind, 35),
+                            ph(kind, 36),
+                        ),
+                        37,
+                    ),
+                    UserListScope::AuthorizationCode | UserListScope::All => (
+                        format!(
+                            " AND ((CASE WHEN users.archived_at IS NOT NULL THEN 1 ELSE 0 END) > {} OR ((CASE WHEN users.archived_at IS NOT NULL THEN 1 ELSE 0 END) = {} AND (users.is_active < {} OR (users.is_active = {} AND (users.created_at < {} OR (users.created_at = {} AND users.id > {}))))))",
+                            ph(kind, 32),
+                            ph(kind, 33),
+                            ph(kind, 34),
+                            ph(kind, 35),
+                            ph(kind, 36),
+                            ph(kind, 37),
+                            ph(kind, 38),
+                        ),
+                        39,
+                    ),
+                    UserListScope::Live | UserListScope::Active | UserListScope::Disabled => (
+                        format!(
+                            " AND (users.is_active < {} OR (users.is_active = {} AND (users.created_at < {} OR (users.created_at = {} AND users.id > {}))))",
+                            ph(kind, 32),
+                            ph(kind, 33),
+                            ph(kind, 34),
+                            ph(kind, 35),
+                            ph(kind, 36),
+                        ),
+                        37,
+                    ),
+                },
+            };
+            let page_sql = format!(
+                "{} WHERE {predicates} AND {scope_predicate}{cursor_predicate} ORDER BY {} LIMIT {}",
+                select_user_directory_sql(),
+                scope.qualified_order_sql(),
+                ph(kind, limit_index),
+            );
+            let query = bind_user_list_predicate!(sql_query(page_sql), &params);
+            let users = match cursor.as_ref() {
+                None => query
+                    .bind::<BigInt, _>(page_limit)
+                    .load::<UserRecord>(&mut conn)
+                    .map_err(AppError::from)?,
+                Some(cursor) => match scope {
+                    UserListScope::Archived => query
+                        .bind::<BigInt, _>(cursor.archived_at.ok_or_else(|| {
+                            AppError::BadRequest(
+                                "archived user cursor is missing archived_at".to_string(),
+                            )
+                        })?)
+                        .bind::<BigInt, _>(cursor.archived_at.ok_or_else(|| {
+                            AppError::BadRequest(
+                                "archived user cursor is missing archived_at".to_string(),
+                            )
+                        })?)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<Text, _>(&cursor.id)
+                        .bind::<BigInt, _>(page_limit)
+                        .load::<UserRecord>(&mut conn)
+                        .map_err(AppError::from)?,
+                    UserListScope::AuthorizationCode | UserListScope::All => query
+                        .bind::<Integer, _>(i32::from(cursor.archived))
+                        .bind::<Integer, _>(i32::from(cursor.archived))
+                        .bind::<Integer, _>(cursor.is_active)
+                        .bind::<Integer, _>(cursor.is_active)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<Text, _>(&cursor.id)
+                        .bind::<BigInt, _>(page_limit)
+                        .load::<UserRecord>(&mut conn)
+                        .map_err(AppError::from)?,
+                    UserListScope::Live | UserListScope::Active | UserListScope::Disabled => query
+                        .bind::<Integer, _>(cursor.is_active)
+                        .bind::<Integer, _>(cursor.is_active)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<BigInt, _>(cursor.created_at)
+                        .bind::<Text, _>(&cursor.id)
+                        .bind::<BigInt, _>(page_limit)
+                        .load::<UserRecord>(&mut conn)
+                        .map_err(AppError::from)?,
+                },
+            };
+            let mut users = users;
+            let has_more = users.len() > limit;
+            if has_more {
+                users.pop();
+            }
+            let next_cursor =
+                has_more
+                    .then(|| users.last())
+                    .flatten()
+                    .map(|user| UserDirectoryCursor {
+                        archived: user.archived_at.is_some(),
+                        archived_at: user.archived_at,
+                        is_active: user.is_active,
+                        created_at: user.created_at,
+                        id: user.id.clone(),
+                    });
+            Ok(UserDirectoryCursorPage {
+                limit,
+                users,
+                next_cursor,
+            })
+        })
+    }
+
+    /// Returns a bounded, non-sensitive projection for account selectors.
+    /// This intentionally does not reuse `list_admin_users_page`: selector
+    /// consumers do not need a count, pagination metadata, password hash, or
+    /// login/security fields, and should not pay to hydrate them.
+    pub async fn list_user_options(
+        &self,
+        scope: UserListScope,
+        organization_id: Option<&str>,
+        search: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<UserOptionRecord>> {
+        let organization_id = organization_id.map(str::to_string);
+        let search = search.map(contains_like_pattern);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        with_conn!(self, |conn, kind| {
+            // Every occurrence receives its own placeholder index.  This is
+            // required for SQLite/MySQL, where `?` placeholders are positional
+            // even when the same logical value appears more than once.
+            let sql = format!(
+                "SELECT users.id, users.email, users.username, users.display_name FROM users WHERE ({} IS NULL OR EXISTS (SELECT 1 FROM organization_members WHERE organization_members.organization_id = {} AND organization_members.user_id = users.id)) AND ({} IS NULL OR (LOWER(COALESCE(users.email, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.username, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.display_name, '')) LIKE LOWER({}) ESCAPE '!' OR LOWER(COALESCE(users.phone, '')) LIKE LOWER({}) ESCAPE '!')) AND {} ORDER BY users.email ASC, users.id ASC LIMIT {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6),
+                ph(kind, 7),
+                scope.qualified_predicate_sql(),
+                ph(kind, 8),
+            );
+            sql_query(sql)
+                .bind::<Nullable<Text>, _>(organization_id.clone())
+                .bind::<Nullable<Text>, _>(organization_id)
+                .bind::<Nullable<Text>, _>(search.clone())
+                .bind::<Nullable<Text>, _>(search.clone())
+                .bind::<Nullable<Text>, _>(search.clone())
+                .bind::<Nullable<Text>, _>(search.clone())
+                .bind::<Nullable<Text>, _>(search)
+                .bind::<BigInt, _>(limit)
+                .load::<UserOptionRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }
@@ -5158,35 +7368,13 @@ impl Db {
         // `organization_members` has its own timestamps. Qualify every user
         // predicate/order column here so the tenant query remains valid after
         // the JOIN and cannot accidentally sort or filter on membership rows.
-        let user_status = match scope {
-            UserListScope::Live => "users.archived_at IS NULL",
-            UserListScope::Active => "users.archived_at IS NULL AND users.is_active = 1",
-            UserListScope::Disabled => "users.archived_at IS NULL AND users.is_active = 0",
-            UserListScope::Archived => "users.archived_at IS NOT NULL",
-            UserListScope::AuthorizationCode => "users.registration_source = 'authorization_code'",
-            UserListScope::All => "",
-        };
-        let user_order = match scope {
-            UserListScope::Archived => "users.archived_at DESC, users.created_at DESC",
-            UserListScope::AuthorizationCode | UserListScope::All => {
-                "users.archived_at IS NOT NULL ASC, users.is_active DESC, users.created_at DESC"
-            }
-            UserListScope::Live | UserListScope::Active | UserListScope::Disabled => {
-                "users.is_active DESC, users.created_at DESC"
-            }
-        };
         with_conn!(self, |conn, kind| {
-            let status_sql = if user_status.is_empty() {
-                String::new()
-            } else {
-                format!(" AND {user_status}")
-            };
             let sql = format!(
-                "{} INNER JOIN organization_members ON organization_members.user_id = users.id WHERE organization_members.organization_id = {}{} ORDER BY {}",
+                "{} INNER JOIN organization_members ON organization_members.user_id = users.id WHERE organization_members.organization_id = {} AND {} ORDER BY {}",
                 select_user_sql(),
                 ph(kind, 1),
-                status_sql,
-                user_order
+                scope.qualified_predicate_sql(),
+                scope.qualified_order_sql()
             );
             sql_query(sql)
                 .bind::<Text, _>(organization_id)
@@ -5605,6 +7793,212 @@ impl Db {
         })
     }
 
+    /// Applies the final SCIM user representation atomically.
+    ///
+    /// SCIM PUT/PATCH can change identity fields, credentials, and active
+    /// state in one request.  Keeping those writes behind one transaction is
+    /// important for two reasons: an invalid/duplicate identity must not
+    /// leave a partially updated profile, and changing a password or
+    /// deactivating an account must revoke authentication state together with
+    /// the user row.  A password mutation deliberately revokes auth state as
+    /// well, so an old session cannot outlive a SCIM credential replacement.
+    pub async fn apply_scim_user_mutation(
+        &self,
+        plan: ScimUserMutationPlan,
+    ) -> AppResult<UserRecord> {
+        let ScimUserMutationPlan {
+            id,
+            expected_version,
+            email,
+            username,
+            display_name,
+            phone,
+            is_admin,
+            is_active,
+            password_hash,
+            scope,
+        } = plan;
+        let scope = scope.unwrap_or_default();
+        let now = util::now_ts();
+        let identity = UserIdentityCandidate::update(&id, email.clone(), username.clone());
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<UserRecord, AppError, _>(|conn| {
+                let current_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
+                let current = sql_query(current_sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<UserRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                if current.scim_concurrency_version() != expected_version {
+                    return Err(optimistic_concurrency_conflict(
+                        "SCIM user changed while the request was in flight",
+                    ));
+                }
+                if current.archived_at.is_some() {
+                    return Err(AppError::BadRequest(
+                        "archived users cannot be changed through SCIM".to_string(),
+                    ));
+                }
+                ensure_user_identity_available!(
+                    conn,
+                    kind,
+                    identity,
+                    "user email or username already exists"
+                )?;
+
+                let email_changed = current.email != email;
+                let phone_changed = current.phone != phone;
+                if !is_active || password_hash.is_some() {
+                    clear_user_auth_state_for_conn!(conn, kind, &id)?;
+                }
+                if !is_active {
+                    clear_user_application_identity_bindings_for_conn!(conn, kind, &id)?;
+                } else {
+                    if email_changed {
+                        clear_user_application_identity_factor_bindings_for_conn!(
+                            conn,
+                            kind,
+                            &id,
+                            crate::applications::FACTOR_EMAIL
+                        )?;
+                    }
+                    if phone_changed {
+                        clear_user_application_identity_factor_bindings_for_conn!(
+                            conn,
+                            kind,
+                            &id,
+                            crate::applications::FACTOR_PHONE
+                        )?;
+                    }
+                }
+
+                let next_email_verified_at =
+                    (!email_changed).then_some(current.email_verified_at).flatten();
+                let next_phone_verified_at =
+                    (!phone_changed).then_some(current.phone_verified_at).flatten();
+                let mut next_scope_param = 24;
+                let password_guard = if password_hash.is_some() {
+                    let index = next_scope_param;
+                    next_scope_param += 1;
+                    format!(" AND password_hash = {}", ph(kind, index))
+                } else {
+                    String::new()
+                };
+                let mut scope_guard = String::new();
+                if scope.organization_id.is_some() {
+                    let index = next_scope_param;
+                    next_scope_param += 1;
+                    scope_guard.push_str(&format!(
+                        " AND EXISTS (SELECT 1 FROM organization_members WHERE organization_members.user_id = users.id AND organization_members.organization_id = {})",
+                        ph(kind, index)
+                    ));
+                }
+                if scope.application_id.is_some() {
+                    let index = next_scope_param;
+                    scope_guard.push_str(&format!(
+                        " AND EXISTS (SELECT 1 FROM applications INNER JOIN organization_members ON organization_members.organization_id = applications.organization_id WHERE applications.id = {} AND applications.is_active = 1 AND organization_members.user_id = users.id)",
+                        ph(kind, index)
+                    ));
+                }
+                let update_sql = format!(
+                    "UPDATE users SET email = {}, username = {}, display_name = {}, phone = {}, email_verified_at = {}, phone_verified_at = {}, is_admin = {}, is_active = {}, updated_at = {} WHERE id = {} AND archived_at IS NULL AND updated_at = {} AND email = {} AND username = {} AND ((display_name = {}) OR (display_name IS NULL AND {} IS NULL)) AND ((phone = {}) OR (phone IS NULL AND {} IS NULL)) AND ((email_verified_at = {}) OR (email_verified_at IS NULL AND {} IS NULL)) AND ((phone_verified_at = {}) OR (phone_verified_at IS NULL AND {} IS NULL)) AND is_admin = {} AND is_active = {}{password_guard}{scope_guard}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16),
+                    ph(kind, 17),
+                    ph(kind, 18),
+                    ph(kind, 19),
+                    ph(kind, 20),
+                    ph(kind, 21),
+                    ph(kind, 22),
+                    ph(kind, 23)
+                );
+                let mut update_query = sql_query(update_sql)
+                    .into_boxed::<_>()
+                    .bind::<Text, _>(&email)
+                    .bind::<Text, _>(&username)
+                    .bind::<Nullable<Text>, _>(&display_name)
+                    .bind::<Nullable<Text>, _>(&phone)
+                    .bind::<Nullable<BigInt>, _>(next_email_verified_at)
+                    .bind::<Nullable<BigInt>, _>(next_phone_verified_at)
+                    .bind::<Integer, _>(i32::from(is_admin))
+                    .bind::<Integer, _>(i32::from(is_active))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .bind::<BigInt, _>(current.updated_at)
+                    .bind::<Text, _>(&current.email)
+                    .bind::<Text, _>(&current.username)
+                    .bind::<Nullable<Text>, _>(&current.display_name)
+                    .bind::<Nullable<Text>, _>(&current.display_name)
+                    .bind::<Nullable<Text>, _>(&current.phone)
+                    .bind::<Nullable<Text>, _>(&current.phone)
+                    .bind::<Nullable<BigInt>, _>(current.email_verified_at)
+                    .bind::<Nullable<BigInt>, _>(current.email_verified_at)
+                    .bind::<Nullable<BigInt>, _>(current.phone_verified_at)
+                    .bind::<Nullable<BigInt>, _>(current.phone_verified_at)
+                    .bind::<Integer, _>(current.is_admin)
+                    .bind::<Integer, _>(current.is_active);
+                if let Some(password_hash) = password_hash.as_ref() {
+                    update_query = update_query.bind::<Text, _>(password_hash);
+                }
+                if let Some(organization_id) = scope.organization_id.as_ref() {
+                    update_query = update_query.bind::<Text, _>(organization_id);
+                }
+                if let Some(application_id) = scope.application_id.as_ref() {
+                    update_query = update_query.bind::<Text, _>(application_id);
+                }
+                let affected = update_query.execute(conn).map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(optimistic_concurrency_conflict(
+                        "SCIM user changed while the request was being committed",
+                    ));
+                }
+
+                if let Some(password_hash) = password_hash {
+                    let password_sql = format!(
+                        "UPDATE users SET password_hash = {}, updated_at = {} WHERE id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3)
+                    );
+                    sql_query(password_sql)
+                        .bind::<Text, _>(password_hash)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)
+                        .and_then(|affected| {
+                            (affected > 0).then_some(()).ok_or_else(|| {
+                                optimistic_concurrency_conflict(
+                                    "SCIM user changed while the password was being committed",
+                                )
+                            })
+                        })?;
+                }
+
+                let select_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
+                sql_query(select_sql)
+                    .bind::<Text, _>(id)
+                    .get_result::<UserRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
     pub async fn set_user_password(&self, id: &str, password_hash: String) -> AppResult<()> {
         let id = id.to_string();
         let now = util::now_ts();
@@ -5674,6 +8068,64 @@ impl Db {
                     .execute(conn)
                     .map(|_| ())
                     .map_err(AppError::from)
+            })
+        })
+    }
+
+    /// Disables a user only while the SCIM application/organization scope is
+    /// still true. The scope predicates are part of the conditional update,
+    /// not a handler-side preflight, so removing a user from an organization
+    /// cannot be followed by a global account disable from an in-flight SCIM
+    /// request.
+    pub async fn disable_scim_user(
+        &self,
+        id: &str,
+        scope: ScimUserMutationScope,
+    ) -> AppResult<()> {
+        let id = id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let mut next_scope_param = 4;
+                let mut scope_guard = String::new();
+                if scope.organization_id.is_some() {
+                    let index = next_scope_param;
+                    next_scope_param += 1;
+                    scope_guard.push_str(&format!(
+                        " AND EXISTS (SELECT 1 FROM organization_members WHERE organization_members.user_id = users.id AND organization_members.organization_id = {})",
+                        ph(kind, index)
+                    ));
+                }
+                if scope.application_id.is_some() {
+                    let index = next_scope_param;
+                    scope_guard.push_str(&format!(
+                        " AND EXISTS (SELECT 1 FROM applications INNER JOIN organization_members ON organization_members.organization_id = applications.organization_id WHERE applications.id = {} AND applications.is_active = 1 AND organization_members.user_id = users.id)",
+                        ph(kind, index)
+                    ));
+                }
+                let sql = format!(
+                    "UPDATE users SET is_active = {}, updated_at = {} WHERE id = {} AND archived_at IS NULL{scope_guard}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let mut query = sql_query(sql)
+                    .into_boxed::<_>()
+                    .bind::<Integer, _>(0)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id);
+                if let Some(organization_id) = scope.organization_id.as_ref() {
+                    query = query.bind::<Text, _>(organization_id);
+                }
+                if let Some(application_id) = scope.application_id.as_ref() {
+                    query = query.bind::<Text, _>(application_id);
+                }
+                if query.execute(conn).map_err(AppError::from)? == 0 {
+                    return Err(AppError::NotFound);
+                }
+                clear_user_auth_state_for_conn!(conn, kind, &id)?;
+                clear_user_application_identity_bindings_for_conn!(conn, kind, &id)?;
+                Ok(())
             })
         })
     }
@@ -5796,6 +8248,20 @@ impl Db {
         })
     }
 
+    pub async fn count_clients(&self, active_only: bool) -> AppResult<i64> {
+        with_conn!(self, |conn, _kind| {
+            let sql = if active_only {
+                "SELECT COUNT(*) AS count FROM clients WHERE is_active = 1"
+            } else {
+                "SELECT COUNT(*) AS count FROM clients"
+            };
+            sql_query(sql)
+                .get_result::<CountRow>(&mut conn)
+                .map(|row| row.count)
+                .map_err(AppError::from)
+        })
+    }
+
     /// Tenant-scoped protocol connection listing for the management console.
     /// The unscoped variant remains available for protocol metadata and
     /// migration work, never for a tenant-facing API response.
@@ -5854,6 +8320,27 @@ impl Db {
     }
 
     pub async fn insert_client(&self, client: NewClient) -> AppResult<ClientRecord> {
+        self.insert_client_internal(client).await
+    }
+
+    /// Creates an OIDC client inside an existing application. This is the
+    /// application-first management path; it never manufactures a fallback
+    /// application as a side effect.
+    pub async fn insert_client_for_application(
+        &self,
+        application_id: &str,
+        client: NewClient,
+    ) -> AppResult<ClientRecord> {
+        // Keep every application-owned OIDC write on the same aggregate
+        // transaction as the physical profile, binding, and claim mappers.
+        // The compatibility helper has no mapper input, so it intentionally
+        // creates an empty mapper set rather than reopening the old
+        // client-then-link sequence.
+        self.create_application_oidc_client_graph(application_id, client, Vec::new())
+            .await
+    }
+
+    async fn insert_client_internal(&self, client: NewClient) -> AppResult<ClientRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
         let redirect_uris = util::to_json(&client.redirect_uris)?;
@@ -6073,6 +8560,24 @@ impl Db {
         })
     }
 
+    pub async fn list_iap_applications_for_application(
+        &self,
+        application_id: &str,
+    ) -> AppResult<Vec<IapApplicationRecord>> {
+        let application_id = application_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE application_id = {} ORDER BY is_active DESC, name ASC, path_prefix ASC",
+                select_iap_application_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .load::<IapApplicationRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_iap_application_by_id(
         &self,
         id: &str,
@@ -6098,11 +8603,18 @@ impl Db {
     ) -> AppResult<IapApplicationRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
+        if self
+            .find_application_by_id(&app.application_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::NotFound);
+        }
         let roles = util::to_json(&dedupe_nonempty(app.required_organization_roles))?;
         let permissions = util::to_json(&normalize_permission_keys(app.required_permissions)?)?;
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO iap_applications (id, slug, name, description, external_host, path_prefix, required_organization_id, required_organization_roles, required_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "INSERT INTO iap_applications (id, application_id, slug, name, description, external_host, path_prefix, required_organization_id, required_organization_roles, required_permissions, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -6114,10 +8626,12 @@ impl Db {
                 ph(kind, 9),
                 ph(kind, 10),
                 ph(kind, 11),
-                ph(kind, 12)
+                ph(kind, 12),
+                ph(kind, 13)
             );
             sql_query(sql)
                 .bind::<Text, _>(&id)
+                .bind::<Text, _>(app.application_id)
                 .bind::<Text, _>(app.slug)
                 .bind::<Text, _>(app.name)
                 .bind::<Nullable<Text>, _>(app.description)
@@ -6153,6 +8667,20 @@ impl Db {
         let roles = util::to_json(&dedupe_nonempty(app.required_organization_roles))?;
         let permissions = util::to_json(&normalize_permission_keys(app.required_permissions)?)?;
         with_conn!(self, |conn, kind| {
+            let existing_sql = format!(
+                "{} WHERE id = {}",
+                select_iap_application_sql(),
+                ph(kind, 1)
+            );
+            let existing = sql_query(existing_sql)
+                .bind::<Text, _>(&id)
+                .get_result::<IapApplicationRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)?
+                .ok_or(AppError::NotFound)?;
+            if existing.application_id.as_deref() != Some(app.application_id.as_str()) {
+                return Err(AppError::Forbidden);
+            }
             let sql = format!(
                 "UPDATE iap_applications SET slug = {}, name = {}, description = {}, external_host = {}, path_prefix = {}, required_organization_id = {}, required_organization_roles = {}, required_permissions = {}, is_active = {}, updated_at = {} WHERE id = {}",
                 ph(kind, 1),
@@ -6531,6 +9059,122 @@ impl Db {
                 .bind::<BigInt, _>(now)
                 .load::<BrowserContextAccountRecord>(&mut conn)
                 .map_err(AppError::from)
+        })
+    }
+
+    /// Loads all chooser data in one set-based read. Expired sessions are
+    /// excluded in SQL; trial and account-recovery metadata are joined once so
+    /// the browser layer can apply the same lifecycle policy without an N+1
+    /// query loop.
+    pub async fn list_browser_context_account_options(
+        &self,
+        browser_context_id: &str,
+    ) -> AppResult<Vec<BrowserContextAccountOption>> {
+        let browser_context_id = browser_context_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT browser_context_accounts.id AS account_id, browser_context_accounts.browser_context_id AS account_browser_context_id, browser_context_accounts.user_id AS account_user_id, browser_context_accounts.session_id AS account_session_id, browser_context_accounts.added_at AS account_added_at, browser_context_accounts.last_selected_at AS account_last_selected_at, users.id AS user_id, users.email AS user_email, users.username AS user_username, users.display_name AS user_display_name, users.phone AS user_phone, '' AS user_password_hash, users.email_verified_at AS user_email_verified_at, users.phone_verified_at AS user_phone_verified_at, users.is_admin AS user_is_admin, users.is_active AS user_is_active, users.archived_at AS user_archived_at, users.registration_source AS user_registration_source, users.last_login_at AS user_last_login_at, users.last_login_ip AS user_last_login_ip, users.last_oidc_client_id AS user_last_oidc_client_id, users.last_login_method AS user_last_login_method, users.created_at AS user_created_at, users.updated_at AS user_updated_at, sessions.id AS session_id, sessions.user_id AS session_user_id, sessions.csrf_token AS session_csrf_token, sessions.ip_address AS session_ip_address, sessions.user_agent AS session_user_agent, sessions.login_method AS session_login_method, sessions.expires_at AS session_expires_at, sessions.created_at AS session_created_at, trial_enrollments.user_id AS trial_user_id, trial_enrollments.invitation_id AS trial_invitation_id, trial_enrollments.organization_id AS trial_organization_id, trial_enrollments.organization_role AS trial_organization_role, trial_enrollments.allowed_client_ids AS trial_allowed_client_ids, trial_enrollments.expires_at AS trial_expires_at, trial_enrollments.revoked_at AS trial_revoked_at, trial_enrollments.created_at AS trial_created_at, CASE WHEN EXISTS (SELECT 1 FROM invitation_redemptions INNER JOIN invitations ON invitations.id = invitation_redemptions.invitation_id WHERE invitation_redemptions.user_id = users.id AND invitations.code_type = {} AND invitations.login_code_level = {}) THEN 1 ELSE 0 END AS has_authorization_code_redemption FROM browser_context_accounts INNER JOIN sessions ON sessions.id = browser_context_accounts.session_id INNER JOIN users ON users.id = browser_context_accounts.user_id LEFT JOIN trial_enrollments ON trial_enrollments.user_id = users.id WHERE browser_context_accounts.browser_context_id = {} AND sessions.expires_at >= {} ORDER BY sessions.created_at DESC, browser_context_accounts.added_at DESC, browser_context_accounts.id ASC",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+            );
+            let rows = sql_query(sql)
+                .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
+                .bind::<Text, _>(LoginCodeLevel::AccountRecovery.as_str())
+                .bind::<Text, _>(browser_context_id)
+                .bind::<BigInt, _>(now)
+                .load::<BrowserContextAccountOptionRow>(&mut conn)
+                .map_err(AppError::from)?;
+            rows.into_iter()
+                .map(|row| {
+                    let trial_enrollment = match row.trial_user_id.clone() {
+                        Some(user_id) => Some(TrialEnrollmentRecord {
+                            user_id,
+                            invitation_id: row.trial_invitation_id.clone().ok_or_else(|| {
+                                AppError::Configuration(
+                                    "trial enrollment is missing an invitation".to_string(),
+                                )
+                            })?,
+                            organization_id: row.trial_organization_id.clone().ok_or_else(
+                                || {
+                                    AppError::Configuration(
+                                        "trial enrollment is missing an organization".to_string(),
+                                    )
+                                },
+                            )?,
+                            organization_role: row.trial_organization_role.clone().ok_or_else(
+                                || {
+                                    AppError::Configuration(
+                                        "trial enrollment is missing an organization role"
+                                            .to_string(),
+                                    )
+                                },
+                            )?,
+                            allowed_client_ids: row.trial_allowed_client_ids.clone().ok_or_else(
+                                || {
+                                    AppError::Configuration(
+                                        "trial enrollment is missing an allowed client list"
+                                            .to_string(),
+                                    )
+                                },
+                            )?,
+                            expires_at: row.trial_expires_at,
+                            revoked_at: row.trial_revoked_at,
+                            created_at: row.trial_created_at.ok_or_else(|| {
+                                AppError::Configuration(
+                                    "trial enrollment is missing a creation time".to_string(),
+                                )
+                            })?,
+                        }),
+                        None => None,
+                    };
+                    Ok(BrowserContextAccountOption {
+                        account: BrowserContextAccountRecord {
+                            id: row.account_id,
+                            browser_context_id: row.account_browser_context_id,
+                            user_id: row.account_user_id,
+                            session_id: row.account_session_id,
+                            added_at: row.account_added_at,
+                            last_selected_at: row.account_last_selected_at,
+                        },
+                        user: UserRecord {
+                            id: row.user_id,
+                            email: row.user_email,
+                            username: row.user_username,
+                            display_name: row.user_display_name,
+                            phone: row.user_phone,
+                            password_hash: row.user_password_hash,
+                            email_verified_at: row.user_email_verified_at,
+                            phone_verified_at: row.user_phone_verified_at,
+                            is_admin: row.user_is_admin,
+                            is_active: row.user_is_active,
+                            archived_at: row.user_archived_at,
+                            registration_source: row.user_registration_source,
+                            last_login_at: row.user_last_login_at,
+                            last_login_ip: row.user_last_login_ip,
+                            last_oidc_client_id: row.user_last_oidc_client_id,
+                            last_login_method: row.user_last_login_method,
+                            created_at: row.user_created_at,
+                            updated_at: row.user_updated_at,
+                        },
+                        session: SessionRecord {
+                            id: row.session_id,
+                            user_id: row.session_user_id,
+                            csrf_token: row.session_csrf_token,
+                            ip_address: row.session_ip_address,
+                            user_agent: row.session_user_agent,
+                            login_method: row.session_login_method,
+                            expires_at: row.session_expires_at,
+                            created_at: row.session_created_at,
+                        },
+                        trial_enrollment,
+                        has_authorization_code_redemption: row.has_authorization_code_redemption
+                            == 1,
+                    })
+                })
+                .collect()
         })
     }
 
@@ -6988,6 +9632,37 @@ impl Db {
         })
     }
 
+    pub async fn list_client_claim_mappers_by_client_ids(
+        &self,
+        client_db_ids: &[String],
+    ) -> AppResult<BTreeMap<String, Vec<ClientClaimMapperRecord>>> {
+        if client_db_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let client_db_ids = client_db_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE client_db_id IN ({}) ORDER BY client_db_id ASC, sort_order ASC, created_at ASC",
+                select_client_claim_mapper_sql(),
+                (1..=client_db_ids.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let rows = bind_text_list(&mut conn, sql_query(sql), &client_db_ids)
+                .load::<ClientClaimMapperRecord>(&mut conn)
+                .map_err(AppError::from)?;
+            let mut grouped = BTreeMap::new();
+            for mapper in rows {
+                grouped
+                    .entry(mapper.client_db_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(mapper);
+            }
+            Ok(grouped)
+        })
+    }
+
     pub async fn replace_client_claim_mappers(
         &self,
         client_db_id: &str,
@@ -7088,6 +9763,14 @@ impl Db {
                         .execute(conn)
                         .map_err(AppError::from)?;
                 }
+                let binding_sql = format!(
+                    "DELETE FROM application_client_bindings WHERE client_db_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(binding_sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
                 let sql = format!("DELETE FROM clients WHERE id = {}", ph(kind, 1));
                 let affected = sql_query(sql)
                     .bind::<Text, _>(&id)
@@ -8543,24 +11226,74 @@ impl Db {
         })
     }
 
-    pub async fn mark_device_authorization_polled(
+    /// Atomically records a device-code poll.  The interval check belongs in
+    /// the UPDATE predicate so concurrent token requests cannot both pass the
+    /// same polling window.
+    pub async fn poll_device_authorization(
         &self,
         device_code_hash: &str,
         polled_at: i64,
-    ) -> AppResult<()> {
+    ) -> AppResult<DeviceAuthorizationTransition> {
         let device_code_hash = device_code_hash.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE device_authorizations SET last_poll_at = {} WHERE device_code_hash = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<BigInt, _>(polled_at)
-                .bind::<Text, _>(device_code_hash)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            conn.transaction::<DeviceAuthorizationTransition, AppError, _>(|conn| {
+                let select_sql = format!(
+                    "{} WHERE device_code_hash = {}",
+                    select_device_authorization_sql(),
+                    ph(kind, 1)
+                );
+                let record = sql_query(select_sql)
+                    .bind::<Text, _>(&device_code_hash)
+                    .get_result::<DeviceAuthorizationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                let status = device_authorization_status(&record, polled_at);
+                if status != DeviceAuthorizationStatus::Pending {
+                    return Ok(DeviceAuthorizationTransition {
+                        status,
+                        changed: false,
+                        record,
+                    });
+                }
+
+                let update_sql = format!(
+                    "UPDATE device_authorizations SET last_poll_at = {} WHERE device_code_hash = {} AND authorized_user_id IS NULL AND denied_at IS NULL AND consumed_at IS NULL AND expires_at > {} AND (last_poll_at IS NULL OR last_poll_at + interval_seconds <= {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(polled_at)
+                    .bind::<Text, _>(&device_code_hash)
+                    .bind::<BigInt, _>(polled_at)
+                    .bind::<BigInt, _>(polled_at)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let select_sql = format!(
+                    "{} WHERE device_code_hash = {}",
+                    select_device_authorization_sql(),
+                    ph(kind, 1)
+                );
+                let record = sql_query(select_sql)
+                    .bind::<Text, _>(&device_code_hash)
+                    .get_result::<DeviceAuthorizationRecord>(conn)
+                    .map_err(AppError::from)?;
+                let status = device_authorization_status(&record, polled_at);
+                Ok(DeviceAuthorizationTransition {
+                    status: if affected == 1 {
+                        status
+                    } else if status == DeviceAuthorizationStatus::Pending {
+                        DeviceAuthorizationStatus::SlowDown
+                    } else {
+                        status
+                    },
+                    changed: affected == 1,
+                    record,
+                })
+            })
         })
     }
 
@@ -8568,95 +11301,117 @@ impl Db {
         &self,
         user_code_hash: &str,
         user_id: &str,
-    ) -> AppResult<DeviceAuthorizationRecord> {
+    ) -> AppResult<DeviceAuthorizationTransition> {
         let user_code_hash = user_code_hash.to_string();
         let user_id = user_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE device_authorizations SET authorized_user_id = {}, authorized_at = {} WHERE user_code_hash = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&user_code_hash)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!(
-                "{} WHERE user_code_hash = {}",
-                select_device_authorization_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_code_hash)
-                .get_result::<DeviceAuthorizationRecord>(&mut conn)
-                .map_err(AppError::from)
+            conn.transaction::<DeviceAuthorizationTransition, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE device_authorizations SET authorized_user_id = {}, authorized_at = {} WHERE user_code_hash = {} AND authorized_user_id IS NULL AND denied_at IS NULL AND consumed_at IS NULL AND expires_at > {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&user_code_hash)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "{} WHERE user_code_hash = {}",
+                    select_device_authorization_sql(),
+                    ph(kind, 1)
+                );
+                let record = sql_query(select_sql)
+                    .bind::<Text, _>(user_code_hash)
+                    .get_result::<DeviceAuthorizationRecord>(conn)
+                    .map_err(AppError::from)?;
+                Ok(DeviceAuthorizationTransition {
+                    status: device_authorization_status(&record, now),
+                    changed: affected == 1,
+                    record,
+                })
+            })
         })
     }
 
     pub async fn deny_device_authorization(
         &self,
         user_code_hash: &str,
-    ) -> AppResult<DeviceAuthorizationRecord> {
+    ) -> AppResult<DeviceAuthorizationTransition> {
         let user_code_hash = user_code_hash.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE device_authorizations SET denied_at = {} WHERE user_code_hash = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&user_code_hash)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!(
-                "{} WHERE user_code_hash = {}",
-                select_device_authorization_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_code_hash)
-                .get_result::<DeviceAuthorizationRecord>(&mut conn)
-                .map_err(AppError::from)
+            conn.transaction::<DeviceAuthorizationTransition, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE device_authorizations SET denied_at = {} WHERE user_code_hash = {} AND authorized_user_id IS NULL AND denied_at IS NULL AND consumed_at IS NULL AND expires_at > {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&user_code_hash)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "{} WHERE user_code_hash = {}",
+                    select_device_authorization_sql(),
+                    ph(kind, 1)
+                );
+                let record = sql_query(select_sql)
+                    .bind::<Text, _>(user_code_hash)
+                    .get_result::<DeviceAuthorizationRecord>(conn)
+                    .map_err(AppError::from)?;
+                Ok(DeviceAuthorizationTransition {
+                    status: device_authorization_status(&record, now),
+                    changed: affected == 1,
+                    record,
+                })
+            })
         })
     }
 
     pub async fn consume_device_authorization(
         &self,
         device_code_hash: &str,
-    ) -> AppResult<DeviceAuthorizationRecord> {
+    ) -> AppResult<DeviceAuthorizationTransition> {
         let device_code_hash = device_code_hash.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE device_authorizations SET consumed_at = {} WHERE device_code_hash = {} AND consumed_at IS NULL",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            let changed = sql_query(sql)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&device_code_hash)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            if changed == 0 {
-                return Err(AppError::Oidc(
-                    "device code has already been consumed".to_string(),
-                ));
-            }
-            let sql = format!(
-                "{} WHERE device_code_hash = {}",
-                select_device_authorization_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(device_code_hash)
-                .get_result::<DeviceAuthorizationRecord>(&mut conn)
-                .map_err(AppError::from)
+            conn.transaction::<DeviceAuthorizationTransition, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE device_authorizations SET consumed_at = {} WHERE device_code_hash = {} AND authorized_user_id IS NOT NULL AND denied_at IS NULL AND consumed_at IS NULL AND expires_at > {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&device_code_hash)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "{} WHERE device_code_hash = {}",
+                    select_device_authorization_sql(),
+                    ph(kind, 1)
+                );
+                let record = sql_query(select_sql)
+                    .bind::<Text, _>(device_code_hash)
+                    .get_result::<DeviceAuthorizationRecord>(conn)
+                    .map_err(AppError::from)?;
+                Ok(DeviceAuthorizationTransition {
+                    status: device_authorization_status(&record, now),
+                    changed: affected == 1,
+                    record,
+                })
+            })
         })
     }
 
@@ -9384,8 +12139,14 @@ impl Db {
                 "captcha challenge is invalid".to_string(),
             ));
         }
-        self.mark_captcha_challenge_consumed(&record.id, now)
-            .await?;
+        if !self
+            .mark_captcha_challenge_consumed(&record.id, &subject, now)
+            .await?
+        {
+            return Err(AppError::BadRequest(
+                "captcha challenge is invalid".to_string(),
+            ));
+        }
         if util::verify_password(&record.answer_hash, &answer) {
             Ok(())
         } else {
@@ -9395,19 +12156,29 @@ impl Db {
         }
     }
 
-    async fn mark_captcha_challenge_consumed(&self, id: &str, now: i64) -> AppResult<()> {
+    async fn mark_captcha_challenge_consumed(
+        &self,
+        id: &str,
+        subject: &str,
+        now: i64,
+    ) -> AppResult<bool> {
         let id = id.to_string();
+        let subject = subject.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE captcha_challenges SET consumed_at = {} WHERE id = {} AND consumed_at IS NULL",
+                "UPDATE captcha_challenges SET consumed_at = {} WHERE id = {} AND subject = {} AND expires_at > {} AND consumed_at IS NULL",
                 ph(kind, 1),
-                ph(kind, 2)
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4)
             );
             sql_query(sql)
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(id)
+                .bind::<Text, _>(subject)
+                .bind::<BigInt, _>(now)
                 .execute(&mut conn)
-                .map(|_| ())
+                .map(|affected| affected == 1)
                 .map_err(AppError::from)
         })
     }
@@ -10968,7 +13739,7 @@ impl Db {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT id, user_id, login_at, ip_address, user_agent, method, oidc_client_id, external_provider FROM login_events WHERE user_id = {} ORDER BY login_at DESC LIMIT {}",
+                "SELECT id, user_id, login_at, ip_address, user_agent, method, oidc_client_id, external_provider FROM login_events WHERE user_id = {} ORDER BY login_at DESC, id DESC LIMIT {}",
                 ph(kind, 1),
                 ph(kind, 2)
             );
@@ -10981,27 +13752,132 @@ impl Db {
     }
 
     pub async fn insert_audit_event(&self, event: crate::audit::AuditEvent) -> AppResult<()> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let inserted = with_conn!(self, |conn, kind| {
+            insert_audit_event_on_conn!(conn, kind, event)
+        })?;
+        crate::webhooks::spawn_audit_webhook_delivery(self.clone(), inserted);
+        Ok(())
+    }
+
+    /// Claims a bounded batch of durable audit-webhook work.  Claiming uses a
+    /// lease owner token rather than relying on a process-local mutex, so two
+    /// service instances cannot both publish the same row concurrently.
+    pub(crate) async fn claim_audit_webhook_outbox(
+        &self,
+        limit: i64,
+    ) -> AppResult<Vec<AuditWebhookOutboxRecord>> {
+        let limit = limit.clamp(1, 100);
         let now = util::now_ts();
-        let details = util::to_json(&event.details)?;
-        let outcome = event.outcome.as_str().to_string();
-        let record = AuditEventRecord {
-            id,
-            actor_user_id: event.actor_user_id,
-            actor_client_id: event.actor_client_id,
-            action: event.action,
-            target_kind: event.target_kind,
-            target_id: event.target_id,
-            outcome,
-            ip_address: event.ip_address,
-            user_agent: event.user_agent,
-            details,
-            created_at: now,
-        };
-        let inserted = record.clone();
+        let owner_token = uuid::Uuid::new_v4().to_string();
+        let lease_expires_at = now + AUDIT_WEBHOOK_OUTBOX_LEASE_TTL_SECONDS;
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<Vec<AuditWebhookOutboxRecord>, AppError, _>(|conn| {
+                let reclaim_sql = format!(
+                    "UPDATE audit_webhook_outbox SET state = 'pending', lease_owner = {}, lease_expires_at = {}, updated_at = {} WHERE state = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                );
+                sql_query(reclaim_sql)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
+                let select_sql = format!(
+                    "SELECT id, event_id, state, attempts, next_attempt_at, lease_owner, lease_expires_at, last_error, created_at, updated_at FROM audit_webhook_outbox WHERE state = 'pending' AND next_attempt_at <= {} ORDER BY next_attempt_at ASC, created_at ASC, id ASC LIMIT {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                );
+                let candidates = sql_query(select_sql)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(limit)
+                    .load::<AuditWebhookOutboxRecord>(conn)
+                    .map_err(AppError::from)?;
+
+                let mut claimed = Vec::with_capacity(candidates.len());
+                for mut candidate in candidates {
+                    let claim_sql = format!(
+                        "UPDATE audit_webhook_outbox SET state = {}, lease_owner = {}, lease_expires_at = {}, updated_at = {} WHERE id = {} AND state = {} AND (lease_expires_at IS NULL OR lease_expires_at <= {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6),
+                        ph(kind, 7),
+                    );
+                    let affected = sql_query(claim_sql)
+                        .bind::<Text, _>("processing")
+                        .bind::<Text, _>(&owner_token)
+                        .bind::<Nullable<BigInt>, _>(Some(lease_expires_at))
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&candidate.id)
+                        .bind::<Text, _>("pending")
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    if affected == 1 {
+                        candidate.state = "processing".to_string();
+                        candidate.lease_owner = Some(owner_token.clone());
+                        candidate.lease_expires_at = Some(lease_expires_at);
+                        candidate.updated_at = now;
+                        claimed.push(candidate);
+                    }
+                }
+                Ok(claimed)
+            })
+        })
+    }
+
+    pub(crate) async fn complete_audit_webhook_outbox(
+        &self,
+        id: &str,
+        owner_token: &str,
+    ) -> AppResult<bool> {
+        let id = id.to_string();
+        let owner_token = owner_token.to_string();
+        let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "INSERT INTO audit_events (id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                "UPDATE audit_webhook_outbox SET state = 'completed', lease_owner = {}, lease_expires_at = {}, updated_at = {} WHERE id = {} AND state = 'processing' AND lease_owner = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+            );
+            sql_query(sql)
+                .bind::<Nullable<Text>, _>(None::<String>)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(id)
+                .bind::<Text, _>(owner_token)
+                .execute(&mut conn)
+                .map(|affected| affected == 1)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub(crate) async fn retry_audit_webhook_outbox(
+        &self,
+        id: &str,
+        owner_token: &str,
+        attempts: i32,
+        error: String,
+    ) -> AppResult<bool> {
+        let id = id.to_string();
+        let owner_token = owner_token.to_string();
+        let error = error.chars().take(1024).collect::<String>();
+        let now = util::now_ts();
+        let backoff_seconds = (1_i64 << attempts.clamp(0, 10) as u32).min(3_600);
+        let next_attempt_at = now + backoff_seconds;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE audit_webhook_outbox SET state = 'pending', attempts = {}, next_attempt_at = {}, lease_owner = {}, lease_expires_at = {}, last_error = {}, updated_at = {} WHERE id = {} AND state = 'processing' AND lease_owner = {}",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
@@ -11010,33 +13886,41 @@ impl Db {
                 ph(kind, 6),
                 ph(kind, 7),
                 ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11)
             );
             sql_query(sql)
-                .bind::<Text, _>(record.id)
-                .bind::<Nullable<Text>, _>(record.actor_user_id)
-                .bind::<Nullable<Text>, _>(record.actor_client_id)
-                .bind::<Text, _>(record.action)
-                .bind::<Text, _>(record.target_kind)
-                .bind::<Nullable<Text>, _>(record.target_id)
-                .bind::<Text, _>(record.outcome)
-                .bind::<Nullable<Text>, _>(record.ip_address)
-                .bind::<Nullable<Text>, _>(record.user_agent)
-                .bind::<Text, _>(record.details)
-                .bind::<BigInt, _>(record.created_at)
+                .bind::<Integer, _>(attempts.saturating_add(1))
+                .bind::<BigInt, _>(next_attempt_at)
+                .bind::<Nullable<Text>, _>(None::<String>)
+                .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<Nullable<Text>, _>(Some(error))
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(id)
+                .bind::<Text, _>(owner_token)
                 .execute(&mut conn)
+                .map(|affected| affected == 1)
                 .map_err(AppError::from)
-        })?;
-        crate::webhooks::spawn_audit_webhook_delivery(self.clone(), inserted);
-        Ok(())
+        })
+    }
+
+    pub(crate) async fn find_audit_event(&self, id: &str) -> AppResult<Option<AuditEventRecord>> {
+        let id = id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at FROM audit_events WHERE id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(id)
+                .get_result::<AuditEventRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
     }
 
     pub async fn list_audit_events(&self, limit: i64) -> AppResult<Vec<AuditEventRecord>> {
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at FROM audit_events ORDER BY created_at DESC LIMIT {}",
+                "SELECT id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at FROM audit_events ORDER BY created_at DESC, id DESC LIMIT {}",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -11345,7 +14229,12 @@ impl Db {
             return Err(AppError::BadRequest("role name is required".to_string()));
         }
         let description = role.description.map(|value| value.trim().to_string());
-        let permissions = normalize_permission_keys(role.permissions)?;
+        // Enterprise roles can carry application-defined entitlement keys
+        // (for example `docs.read`) in addition to Signet's platform
+        // permissions.  Keep the key-shape validation, but do not route this
+        // aggregate through the platform-only Permission enum; platform
+        // authorization still validates its own enum at the call boundary.
+        let permissions = normalize_application_entitlement_keys(role.permissions)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
@@ -11398,7 +14287,12 @@ impl Db {
             return Err(AppError::BadRequest("role name is required".to_string()));
         }
         let description = role.description.map(|value| value.trim().to_string());
-        let permissions = normalize_permission_keys(role.permissions)?;
+        // Global enterprise roles are also a source for application claims,
+        // so their permission namespace must remain extensible.  Unknown
+        // platform permissions are harmless here because `has_permission`
+        // only checks the typed platform enum, while application entitlement
+        // resolution intentionally preserves custom keys.
+        let permissions = normalize_application_entitlement_keys(role.permissions)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(
@@ -11517,10 +14411,300 @@ impl Db {
         })
     }
 
+    /// Loads permissions for a bounded set of roles in one query.  Entitlement
+    /// resolution commonly needs the direct and group roles of one account;
+    /// resolving each role separately turns a login into an avoidable
+    /// role-count round trip fan-out.
+    pub async fn list_role_permissions_by_role_ids(
+        &self,
+        role_ids: &[String],
+    ) -> AppResult<BTreeMap<String, Vec<String>>> {
+        if role_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let role_ids = role_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT role_id, permission FROM role_permissions WHERE role_id IN ({}) ORDER BY role_id ASC, permission ASC",
+                (1..=role_ids.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let rows = bind_text_list(&mut conn, sql_query(sql), &role_ids)
+                .load::<RolePermissionJoinRow>(&mut conn)
+                .map_err(AppError::from)?;
+            let mut grouped = BTreeMap::new();
+            for row in rows {
+                grouped
+                    .entry(row.role_id)
+                    .or_insert_with(Vec::new)
+                    .push(row.permission);
+            }
+            Ok(grouped)
+        })
+    }
+
+    /// Reads a bounded group page.  `application_id = None` means the global
+    /// directory; otherwise visibility is enforced through the application
+    /// SCIM binding in SQL.
+    pub async fn list_groups_page(
+        &self,
+        application_id: Option<&str>,
+        filter: Option<GroupListFilter>,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<(i64, Vec<GroupRecord>)> {
+        let application_id = application_id.map(str::to_string);
+        let (display_name, id) = match filter {
+            Some(GroupListFilter::DisplayName(value)) => (Some(value), None),
+            Some(GroupListFilter::Id(value)) => (None, Some(value)),
+            None => (None, None),
+        };
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        with_conn!(self, |conn, kind| {
+            let application_param = ph(kind, 1);
+            let application_value = ph(kind, 2);
+            let display_name_param = ph(kind, 3);
+            let display_name_value = ph(kind, 4);
+            let id_param = ph(kind, 5);
+            let id_value = ph(kind, 6);
+            let predicates = format!(
+                "({application_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups WHERE application_scim_groups.application_id = {application_value} AND application_scim_groups.group_id = access_groups.id)) AND ({display_name_param} IS NULL OR LOWER(access_groups.name) = LOWER({display_name_value})) AND ({id_param} IS NULL OR access_groups.id = {id_value})"
+            );
+            let count_sql =
+                format!("SELECT COUNT(*) AS count FROM access_groups WHERE {predicates}");
+            let count = sql_query(count_sql)
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(display_name.clone())
+                .bind::<Nullable<Text>, _>(display_name.clone())
+                .bind::<Nullable<Text>, _>(id.clone())
+                .bind::<Nullable<Text>, _>(id.clone())
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count;
+            let sql = format!(
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups WHERE {predicates} ORDER BY access_groups.name ASC LIMIT {} OFFSET {}",
+                ph(kind, 7),
+                ph(kind, 8),
+            );
+            let groups = sql_query(sql)
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(application_id)
+                .bind::<Nullable<Text>, _>(display_name.clone())
+                .bind::<Nullable<Text>, _>(display_name)
+                .bind::<Nullable<Text>, _>(id.clone())
+                .bind::<Nullable<Text>, _>(id)
+                .bind::<BigInt, _>(limit)
+                .bind::<BigInt, _>(offset)
+                .load::<GroupRecord>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok((count, groups))
+        })
+    }
+
+    /// Returns only the fields needed to render SCIM group members for the
+    /// current page of groups.  The page is selected in a subquery, so this is
+    /// one set-based read instead of one member query per group.
+    pub async fn list_scim_group_member_refs_page(
+        &self,
+        application_id: Option<&str>,
+        filter: Option<GroupListFilter>,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<Vec<ScimGroupMemberRecord>> {
+        let application_id = application_id.map(str::to_string);
+        let (display_name, id) = match filter {
+            Some(GroupListFilter::DisplayName(value)) => (Some(value), None),
+            Some(GroupListFilter::Id(value)) => (None, Some(value)),
+            None => (None, None),
+        };
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        with_conn!(self, |conn, kind| {
+            let application_param = ph(kind, 1);
+            let application_value = ph(kind, 2);
+            let display_name_param = ph(kind, 3);
+            let display_name_value = ph(kind, 4);
+            let id_param = ph(kind, 5);
+            let id_value = ph(kind, 6);
+            let predicates = format!(
+                "({application_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups WHERE application_scim_groups.application_id = {application_value} AND application_scim_groups.group_id = access_groups.id)) AND ({display_name_param} IS NULL OR LOWER(access_groups.name) = LOWER({display_name_value})) AND ({id_param} IS NULL OR access_groups.id = {id_value})"
+            );
+            let page_subquery = format!(
+                "SELECT access_groups.id FROM access_groups WHERE {predicates} ORDER BY access_groups.name ASC LIMIT {} OFFSET {}",
+                ph(kind, 7),
+                ph(kind, 8),
+            );
+            let application_scope_param = ph(kind, 9);
+            let application_scope_value = ph(kind, 10);
+            let organization_scope = format!(
+                "({application_scope_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups AS scoped_groups INNER JOIN applications AS scoped_applications ON scoped_applications.id = scoped_groups.application_id INNER JOIN organization_members AS scoped_members ON scoped_members.organization_id = scoped_applications.organization_id AND scoped_members.user_id = users.id WHERE scoped_groups.application_id = {application_scope_value} AND scoped_groups.group_id = group_members.group_id))"
+            );
+            let sql = format!(
+                "SELECT group_members.group_id, users.id AS user_id, users.username, users.display_name FROM users INNER JOIN group_members ON users.id = group_members.user_id WHERE group_members.group_id IN ({page_subquery}) AND {organization_scope} ORDER BY group_members.group_id ASC, users.email ASC"
+            );
+            sql_query(sql)
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(display_name.clone())
+                .bind::<Nullable<Text>, _>(display_name.clone())
+                .bind::<Nullable<Text>, _>(id.clone())
+                .bind::<Nullable<Text>, _>(id.clone())
+                .bind::<BigInt, _>(limit)
+                .bind::<BigInt, _>(offset)
+                .bind::<Nullable<Text>, _>(application_id.clone())
+                .bind::<Nullable<Text>, _>(application_id)
+                .load::<ScimGroupMemberRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn list_groups(&self) -> AppResult<Vec<GroupRecord>> {
         with_conn!(self, |conn, _kind| {
-            sql_query("SELECT id, name, description, created_at, updated_at FROM access_groups ORDER BY name ASC")
+            sql_query("SELECT id, name, description, created_at, updated_at, version FROM access_groups ORDER BY name ASC")
                 .load::<GroupRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    /// Loads the complete role-permission read model in one query.  Management
+    /// endpoints can join it with `list_roles` in memory instead of resolving
+    /// permissions once per role.
+    pub async fn list_role_permissions_by_role(&self) -> AppResult<BTreeMap<String, Vec<String>>> {
+        #[derive(Debug, diesel::QueryableByName)]
+        struct RolePermissionRow {
+            #[diesel(sql_type = Text)]
+            role_id: String,
+            #[diesel(sql_type = Text)]
+            permission: String,
+        }
+        with_conn!(self, |conn, _kind| {
+            let rows = sql_query(
+                "SELECT role_id, permission FROM role_permissions ORDER BY role_id ASC, permission ASC",
+            )
+            .load::<RolePermissionRow>(&mut conn)
+            .map_err(AppError::from)?;
+            let mut permissions = BTreeMap::new();
+            for row in rows {
+                permissions
+                    .entry(row.role_id)
+                    .or_insert_with(Vec::new)
+                    .push(row.permission);
+            }
+            Ok(permissions)
+        })
+    }
+
+    /// Loads all group-to-role edges in one query for the security management
+    /// read model.  The response layer performs the final grouping.
+    pub async fn list_group_roles_by_group(&self) -> AppResult<BTreeMap<String, Vec<RoleRecord>>> {
+        with_conn!(self, |conn, _kind| {
+            let rows = sql_query(
+                "SELECT group_roles.group_id, roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM group_roles INNER JOIN roles ON roles.id = group_roles.role_id ORDER BY group_roles.group_id ASC, roles.name ASC, roles.id ASC",
+            )
+            .load::<GroupRoleJoinRow>(&mut conn)
+            .map_err(AppError::from)?;
+            let mut grouped = BTreeMap::new();
+            for row in rows {
+                let group_id = row.group_id.clone();
+                grouped
+                    .entry(group_id)
+                    .or_insert_with(Vec::new)
+                    .push(row.role());
+            }
+            Ok(grouped)
+        })
+    }
+
+    /// Loads public group members in one narrow query.  Unlike
+    /// `list_group_members`, this read model never selects password hashes or
+    /// login-security fields that the management response cannot expose.
+    pub async fn list_group_members_public_by_group(
+        &self,
+    ) -> AppResult<BTreeMap<String, Vec<PublicUser>>> {
+        with_conn!(self, |conn, _kind| {
+            let rows = sql_query(
+                "SELECT group_members.group_id, users.id, users.email, users.username, users.display_name, users.phone, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.registration_source, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM group_members INNER JOIN users ON users.id = group_members.user_id ORDER BY group_members.group_id ASC, users.email ASC, users.id ASC",
+            )
+            .load::<GroupMemberPublicRow>(&mut conn)
+            .map_err(AppError::from)?;
+            let mut grouped = BTreeMap::new();
+            for row in rows {
+                let group_id = row.group_id.clone();
+                grouped
+                    .entry(group_id)
+                    .or_insert_with(Vec::new)
+                    .push(row.public());
+            }
+            Ok(grouped)
+        })
+    }
+
+    /// Returns groups that can be used as application authorization subjects.
+    /// The organization boundary is evaluated in SQL and the result is a
+    /// narrow group projection, avoiding the old `list_groups` plus one
+    /// `list_group_members` query per group pattern.
+    pub async fn list_application_authorization_groups(
+        &self,
+        organization_id: &str,
+    ) -> AppResult<Vec<GroupRecord>> {
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups WHERE EXISTS (SELECT 1 FROM group_members INNER JOIN organization_members ON organization_members.user_id = group_members.user_id INNER JOIN users ON users.id = group_members.user_id WHERE group_members.group_id = access_groups.id AND organization_members.organization_id = {} AND users.is_active = 1 AND users.archived_at IS NULL) ORDER BY access_groups.name ASC, access_groups.id ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(organization_id)
+                .load::<GroupRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_authorization_user(
+        &self,
+        application_id: &str,
+        user_id: &str,
+    ) -> AppResult<Option<UserRecord>> {
+        let application_id = application_id.to_string();
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} INNER JOIN organization_members ON organization_members.user_id = users.id INNER JOIN applications ON applications.organization_id = organization_members.organization_id WHERE applications.id = {} AND users.id = {} AND users.is_active = 1 AND users.archived_at IS NULL",
+                select_user_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(user_id)
+                .get_result::<UserRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_authorization_group(
+        &self,
+        application_id: &str,
+        group_id: &str,
+    ) -> AppResult<Option<GroupRecord>> {
+        let application_id = application_id.to_string();
+        let group_id = group_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups WHERE access_groups.id = {} AND EXISTS (SELECT 1 FROM group_members INNER JOIN users ON users.id = group_members.user_id INNER JOIN organization_members ON organization_members.user_id = users.id INNER JOIN applications ON applications.organization_id = organization_members.organization_id WHERE applications.id = {} AND group_members.group_id = access_groups.id AND users.is_active = 1 AND users.archived_at IS NULL)",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(group_id)
+                .bind::<Text, _>(application_id)
+                .get_result::<GroupRecord>(&mut conn)
+                .optional()
                 .map_err(AppError::from)
         })
     }
@@ -11532,7 +14716,7 @@ impl Db {
         let application_id = application_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at FROM access_groups INNER JOIN application_scim_groups ON application_scim_groups.group_id = access_groups.id WHERE application_scim_groups.application_id = {} ORDER BY access_groups.name ASC",
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN application_scim_groups ON application_scim_groups.group_id = access_groups.id WHERE application_scim_groups.application_id = {} ORDER BY access_groups.name ASC",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -11551,7 +14735,7 @@ impl Db {
         let group_id = group_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at FROM access_groups INNER JOIN application_scim_groups ON application_scim_groups.group_id = access_groups.id WHERE application_scim_groups.application_id = {} AND access_groups.id = {}",
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN application_scim_groups ON application_scim_groups.group_id = access_groups.id WHERE application_scim_groups.application_id = {} AND access_groups.id = {}",
                 ph(kind, 1),
                 ph(kind, 2)
             );
@@ -11628,7 +14812,7 @@ impl Db {
                     .map_err(AppError::from)?;
 
                 let select_sql = format!(
-                    "SELECT id, name, description, created_at, updated_at FROM access_groups WHERE id = {}",
+                    "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
                     ph(kind, 1)
                 );
                 sql_query(select_sql)
@@ -11664,20 +14848,19 @@ impl Db {
                     return Err(AppError::NotFound);
                 }
 
-                for table in [
-                    "application_group_roles",
-                    "group_members",
-                    "group_roles",
-                ] {
-                    let sql = format!(
-                        "DELETE FROM {table} WHERE group_id = {}",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&group_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
+                // Remove only this application's role mapping.  Group
+                // membership and the global group/role rows are shared by
+                // other applications and by the admin security domain.
+                let role_sql = format!(
+                    "DELETE FROM application_profile_group_roles WHERE profile_id IN (SELECT id FROM application_authorization_profiles WHERE application_id = {}) AND group_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(role_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&group_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
                 let unbind_sql = format!(
                     "DELETE FROM application_scim_groups WHERE application_id = {} AND group_id = {}",
                     ph(kind, 1),
@@ -11688,14 +14871,57 @@ impl Db {
                     .bind::<Text, _>(&group_id)
                     .execute(conn)
                     .map_err(AppError::from)?;
-                let delete_sql = format!(
-                    "DELETE FROM access_groups WHERE id = {}",
+
+                let scim_reference_sql = format!(
+                    "SELECT COUNT(*) AS count FROM application_scim_groups WHERE group_id = {}",
                     ph(kind, 1)
                 );
-                sql_query(delete_sql)
+                let scim_references = sql_query(scim_reference_sql)
                     .bind::<Text, _>(&group_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count;
+                let profile_role_reference_sql = format!(
+                    "SELECT COUNT(*) AS count FROM application_profile_group_roles WHERE group_id = {}",
+                    ph(kind, 1)
+                );
+                let profile_role_references = sql_query(profile_role_reference_sql)
+                    .bind::<Text, _>(&group_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count;
+                let directory_reference_sql = format!(
+                    "SELECT COUNT(*) AS count FROM directory_sync_groups WHERE group_id = {}",
+                    ph(kind, 1)
+                );
+                let directory_references = sql_query(directory_reference_sql)
+                    .bind::<Text, _>(&group_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count;
+                if scim_references == 0
+                    && profile_role_references == 0
+                    && directory_references == 0
+                {
+                    for table in ["group_members", "group_roles"] {
+                        let sql = format!(
+                            "DELETE FROM {table} WHERE group_id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(sql)
+                            .bind::<Text, _>(&group_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    let delete_sql = format!(
+                        "DELETE FROM access_groups WHERE id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(delete_sql)
+                        .bind::<Text, _>(&group_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
                 Ok(())
             })
         })
@@ -11735,78 +14961,28 @@ impl Db {
     ) -> AppResult<()> {
         let application_id = application_id.to_string();
         let group_id = group_id.to_string();
-        let user_ids = dedupe_nonempty(user_ids);
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let binding_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_scim_groups WHERE application_id = {} AND group_id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if sql_query(binding_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&group_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    == 0
-                {
-                    return Err(AppError::NotFound);
-                }
-
-                for user_id in &user_ids {
-                    let member_sql = format!(
-                        "SELECT COUNT(*) AS count FROM users INNER JOIN organization_members ON organization_members.user_id = users.id INNER JOIN applications ON applications.organization_id = organization_members.organization_id INNER JOIN application_scim_groups ON application_scim_groups.application_id = applications.id AND application_scim_groups.group_id = {} WHERE application_scim_groups.application_id = {} AND users.id = {}",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3)
-                    );
-                    if sql_query(member_sql)
-                        .bind::<Text, _>(&group_id)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(user_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count
-                        == 0
-                    {
-                        return Err(AppError::BadRequest(
-                            "SCIM group members must belong to the application's organization"
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                let delete_sql = format!(
-                    "DELETE FROM group_members WHERE group_id = {}",
-                    ph(kind, 1)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&group_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                for user_id in user_ids {
-                    let insert_sql = format!(
-                        "INSERT INTO group_members (group_id, user_id) VALUES ({}, {})",
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&group_id)
-                        .bind::<Text, _>(user_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
+        let group = self
+            .find_application_scim_group(&application_id, &group_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        self.apply_group_patch_plan(GroupPatchPlan {
+            application_id: Some(application_id),
+            group_id,
+            name: group.name,
+            description: group.description,
+            member_ids: user_ids,
+            create: false,
+            expected_version: Some(group.version),
         })
+        .await
+        .map(|_| ())
     }
 
     pub async fn find_group_by_id(&self, id: &str) -> AppResult<Option<GroupRecord>> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT id, name, description, created_at, updated_at FROM access_groups WHERE id = {}",
+                "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -11818,6 +14994,22 @@ impl Db {
     }
 
     pub async fn insert_group(&self, group: NewGroup) -> AppResult<GroupRecord> {
+        self.insert_group_mutation(group, None).await
+    }
+
+    pub async fn insert_group_with_audit(
+        &self,
+        group: NewGroup,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<GroupRecord> {
+        self.insert_group_mutation(group, Some(event)).await
+    }
+
+    async fn insert_group_mutation(
+        &self,
+        group: NewGroup,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<GroupRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = group.name.trim().to_string();
         if name.is_empty() {
@@ -11825,36 +15017,71 @@ impl Db {
         }
         let description = group.description.map(|value| value.trim().to_string());
         let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO access_groups (id, name, description, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&id)
-                .bind::<Text, _>(name)
-                .bind::<Nullable<Text>, _>(description)
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(id.clone());
+        }
+        let webhook_db = self.clone();
+        let (group, audit_event) = with_conn!(self, |conn, kind| {
+            conn.transaction::<(GroupRecord, Option<AuditEventRecord>), AppError, _>(|conn| {
+                let sql = format!(
+                    "INSERT INTO access_groups (id, name, description, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .bind::<Text, _>(&name)
+                    .bind::<Nullable<Text>, _>(&description)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
 
-            let sql = format!(
-                "SELECT id, name, description, created_at, updated_at FROM access_groups WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<GroupRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
+                let sql = format!(
+                    "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
+                    ph(kind, 1)
+                );
+                let group = sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<GroupRecord>(conn)
+                    .map_err(AppError::from)?;
+                let audit_event = audit
+                    .take()
+                    .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                    .transpose()?;
+                Ok((group, audit_event))
+            })
+        })?;
+        if let Some(audit_event) = audit_event {
+            crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+        }
+        Ok(group)
     }
 
     pub async fn update_group(&self, id: &str, group: NewGroup) -> AppResult<GroupRecord> {
+        self.update_group_mutation(id, group, None).await
+    }
+
+    pub async fn update_group_with_audit(
+        &self,
+        id: &str,
+        group: NewGroup,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<GroupRecord> {
+        self.update_group_mutation(id, group, Some(event)).await
+    }
+
+    async fn update_group_mutation(
+        &self,
+        id: &str,
+        group: NewGroup,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<GroupRecord> {
         let id = id.to_string();
         let name = group.name.trim().to_string();
         if name.is_empty() {
@@ -11862,49 +15089,451 @@ impl Db {
         }
         let description = group.description.map(|value| value.trim().to_string());
         let now = util::now_ts();
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(id.clone());
+        }
+        let webhook_db = self.clone();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE access_groups SET name = {}, description = {}, updated_at = {} WHERE id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(name)
-                .bind::<Nullable<Text>, _>(description)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
+            let (group, audit_event) = conn.transaction::<
+                (GroupRecord, Option<AuditEventRecord>),
+                AppError,
+                _,
+            >(|conn| {
+                let sql = format!(
+                    "UPDATE access_groups SET name = {}, description = {}, updated_at = {}, version = version + 1 WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4)
+                );
+                let affected = sql_query(sql)
+                    .bind::<Text, _>(&name)
+                    .bind::<Nullable<Text>, _>(&description)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(AppError::NotFound);
+                }
 
-            let sql = format!(
-                "SELECT id, name, description, created_at, updated_at FROM access_groups WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<GroupRecord>(&mut conn)
-                .map_err(AppError::from)
+                let sql = format!(
+                    "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
+                    ph(kind, 1)
+                );
+                let group = sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<GroupRecord>(conn)
+                    .map_err(AppError::from)?;
+                let audit_event = audit
+                    .take()
+                    .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                    .transpose()?;
+                Ok((group, audit_event))
+            })?;
+            if let Some(audit_event) = audit_event {
+                crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+            }
+            Ok(group)
+        })
+    }
+
+    /// Applies a fully folded SCIM group mutation atomically. The application
+    /// variant changes only the members visible through that application's
+    /// organization; shared group membership outside that boundary is left
+    /// untouched.
+    pub async fn apply_group_patch_plan(&self, plan: GroupPatchPlan) -> AppResult<GroupRecord> {
+        let application_id = plan.application_id;
+        let group_id = plan.group_id;
+        let name = plan.name.trim().to_string();
+        if name.is_empty() {
+            return Err(AppError::BadRequest("group name is required".to_string()));
+        }
+        let description = plan.description.map(|value| value.trim().to_string());
+        let create = plan.create;
+        let expected_version = plan.expected_version;
+        let user_ids = dedupe_nonempty(plan.member_ids);
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<GroupRecord, AppError, _>(|conn| {
+                if create {
+                    let insert_group = format!(
+                        "INSERT INTO access_groups (id, name, description, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5)
+                    );
+                    sql_query(insert_group)
+                        .bind::<Text, _>(&group_id)
+                        .bind::<Text, _>(&name)
+                        .bind::<Nullable<Text>, _>(&description)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+
+                    if let Some(application_id) = application_id.as_deref() {
+                        let app_sql = format!(
+                            "SELECT COUNT(*) AS count FROM applications WHERE id = {}",
+                            ph(kind, 1)
+                        );
+                        if sql_query(app_sql)
+                            .bind::<Text, _>(application_id)
+                            .get_result::<CountRow>(conn)
+                            .map_err(AppError::from)?
+                            .count
+                            == 0
+                        {
+                            return Err(AppError::NotFound);
+                        }
+                        let binding_sql = format!(
+                            "INSERT INTO application_scim_groups (application_id, group_id, created_at) VALUES ({}, {}, {})",
+                            ph(kind, 1),
+                            ph(kind, 2),
+                            ph(kind, 3)
+                        );
+                        sql_query(binding_sql)
+                            .bind::<Text, _>(application_id)
+                            .bind::<Text, _>(&group_id)
+                            .bind::<BigInt, _>(now)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                }
+                let group_sql = if application_id.is_some() {
+                    format!(
+                        "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN application_scim_groups ON application_scim_groups.group_id = access_groups.id WHERE application_scim_groups.application_id = {} AND access_groups.id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    )
+                } else {
+                    format!(
+                        "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
+                        ph(kind, 1)
+                    )
+                };
+                let existing_group = if let Some(application_id) = application_id.as_deref() {
+                    sql_query(group_sql)
+                        .bind::<Text, _>(application_id)
+                        .bind::<Text, _>(&group_id)
+                        .get_result::<GroupRecord>(conn)
+                        .optional()
+                        .map_err(AppError::from)?
+                } else {
+                    sql_query(group_sql)
+                        .bind::<Text, _>(&group_id)
+                        .get_result::<GroupRecord>(conn)
+                        .optional()
+                        .map_err(AppError::from)?
+                };
+                let Some(existing_group) = existing_group else {
+                    return Err(AppError::NotFound);
+                };
+                if let Some(expected_version) = expected_version {
+                    if existing_group.version != expected_version {
+                        return Err(optimistic_concurrency_conflict(
+                            "SCIM group changed while the request was in flight",
+                        ));
+                    }
+                }
+                let metadata_changed = existing_group.name != name
+                    || existing_group.description != description;
+
+                let existing_member_sql = if application_id.is_some() {
+                    format!(
+                        "SELECT users.id AS user_id, users.archived_at FROM users INNER JOIN group_members ON group_members.user_id = users.id INNER JOIN organization_members ON organization_members.user_id = users.id INNER JOIN applications ON applications.id = {} AND applications.organization_id = organization_members.organization_id INNER JOIN application_scim_groups ON application_scim_groups.application_id = applications.id AND application_scim_groups.group_id = group_members.group_id WHERE application_scim_groups.application_id = {} AND group_members.group_id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3)
+                    )
+                } else {
+                    format!(
+                        "SELECT users.id AS user_id, users.archived_at FROM users INNER JOIN group_members ON group_members.user_id = users.id WHERE group_members.group_id = {}",
+                        ph(kind, 1)
+                    )
+                };
+                let existing_members = if let Some(application_id) = application_id.as_deref() {
+                    sql_query(existing_member_sql)
+                        .bind::<Text, _>(application_id)
+                        .bind::<Text, _>(application_id)
+                        .bind::<Text, _>(&group_id)
+                        .load::<GroupMemberLifecycleRow>(conn)
+                        .map_err(AppError::from)?
+                } else {
+                    sql_query(existing_member_sql)
+                        .bind::<Text, _>(&group_id)
+                        .load::<GroupMemberLifecycleRow>(conn)
+                        .map_err(AppError::from)?
+                };
+                let existing_ids = existing_members
+                    .iter()
+                    .map(|member| member.user_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let archived_existing_ids = existing_members
+                    .iter()
+                    .filter(|member| member.archived_at.is_some())
+                    .map(|member| member.user_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let requested_ids = user_ids.iter().cloned().collect::<BTreeSet<_>>();
+                if let Some(archived_id) = archived_existing_ids
+                    .iter()
+                    .find(|user_id| !requested_ids.contains(*user_id))
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "archived group member cannot be removed: {archived_id}"
+                    )));
+                }
+
+                let valid_members = if user_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    let user_placeholders = (1..=user_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = if application_id.is_some() {
+                        let application_param = ph(kind, user_ids.len() + 1);
+                        format!(
+                            "SELECT users.id AS user_id, users.archived_at FROM users INNER JOIN organization_members ON organization_members.user_id = users.id INNER JOIN applications ON applications.id = {application_param} AND applications.organization_id = organization_members.organization_id INNER JOIN application_scim_groups ON application_scim_groups.application_id = applications.id AND application_scim_groups.group_id = {} WHERE application_scim_groups.application_id = {} AND users.id IN ({user_placeholders})",
+                            ph(kind, user_ids.len() + 2),
+                            ph(kind, user_ids.len() + 3),
+                        )
+                    } else {
+                        format!(
+                            "SELECT users.id AS user_id, users.archived_at FROM users WHERE users.id IN ({user_placeholders})"
+                        )
+                    };
+                    if let Some(application_id) = application_id.as_deref() {
+                        // PostgreSQL binds `$n` by its explicit index, while
+                        // SQLite/MySQL bind `?` by lexical occurrence. The
+                        // SQL keeps the user IDs numbered first for the
+                        // former, so construct the latter's occurrence order
+                        // explicitly instead of silently validating zero
+                        // members on SQLite.
+                        let values = match kind {
+                            DatabaseKind::Postgres => {
+                                let mut values = user_ids.clone();
+                                values.push(application_id.to_string());
+                                values.push(group_id.clone());
+                                values.push(application_id.to_string());
+                                values
+                            }
+                            DatabaseKind::Sqlite | DatabaseKind::Mysql => {
+                                let mut values = vec![
+                                    application_id.to_string(),
+                                    group_id.clone(),
+                                    application_id.to_string(),
+                                ];
+                                values.extend(user_ids.clone());
+                                values
+                            }
+                        };
+                        bind_text_list(conn, sql_query(sql), &values)
+                            .load::<GroupMemberLifecycleRow>(conn)
+                            .map_err(AppError::from)?
+                    } else {
+                        bind_text_list(conn, sql_query(sql), &user_ids)
+                            .load::<GroupMemberLifecycleRow>(conn)
+                            .map_err(AppError::from)?
+                    }
+                };
+                let valid_by_id = valid_members
+                    .iter()
+                    .map(|member| (member.user_id.clone(), member))
+                    .collect::<BTreeMap<_, _>>();
+                if let Some(missing_id) = user_ids
+                    .iter()
+                    .find(|user_id| !valid_by_id.contains_key(*user_id))
+                {
+                    if application_id.is_some() {
+                        return Err(AppError::BadRequest(
+                            "SCIM group members must belong to the application's organization"
+                                .to_string(),
+                        ));
+                    }
+                    return Err(AppError::BadRequest(format!(
+                        "unknown user: {missing_id}"
+                    )));
+                }
+                if let Some(archived_id) = valid_members.iter().find_map(|member| {
+                    (member.archived_at.is_some()
+                        && !archived_existing_ids.contains(&member.user_id))
+                    .then_some(member.user_id.as_str())
+                }) {
+                    return Err(AppError::BadRequest(format!(
+                        "archived users cannot be assigned to SCIM groups: {archived_id}"
+                    )));
+                }
+
+                let removed = existing_ids
+                    .difference(&requested_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let added = requested_ids
+                    .difference(&existing_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !removed.is_empty() {
+                    let placeholders = (2..=removed.len() + 1)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "DELETE FROM group_members WHERE group_id = {} AND user_id IN ({placeholders})",
+                        ph(kind, 1)
+                    );
+                    let mut values = vec![group_id.clone()];
+                    values.extend(removed.iter().cloned());
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                if !added.is_empty() {
+                    let placeholders = (1..=added.len() * 2)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>();
+                    let sql = format!(
+                        "INSERT INTO group_members (group_id, user_id) VALUES {}",
+                        placeholders
+                            .chunks(2)
+                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let mut values = Vec::with_capacity(added.len() * 2);
+                    for user_id in added.iter().cloned() {
+                        values.push(group_id.clone());
+                        values.push(user_id);
+                    }
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+
+                if metadata_changed || !removed.is_empty() || !added.is_empty() {
+                    let version_guard = expected_version
+                        .map(|_| format!(" AND version = {}", ph(kind, 5)))
+                        .unwrap_or_default();
+                    let update_sql = format!(
+                        "UPDATE access_groups SET name = {}, description = {}, updated_at = {}, version = version + 1 WHERE id = {}{version_guard}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4)
+                    );
+                    let affected = if let Some(expected_version) = expected_version {
+                        sql_query(update_sql)
+                            .bind::<Text, _>(&name)
+                            .bind::<Nullable<Text>, _>(&description)
+                            .bind::<BigInt, _>(now)
+                            .bind::<Text, _>(&group_id)
+                            .bind::<BigInt, _>(expected_version)
+                            .execute(conn)
+                            .map_err(AppError::from)?
+                    } else {
+                        sql_query(update_sql)
+                            .bind::<Text, _>(&name)
+                            .bind::<Nullable<Text>, _>(&description)
+                            .bind::<BigInt, _>(now)
+                            .bind::<Text, _>(&group_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?
+                    };
+                    if affected == 0 {
+                        return Err(optimistic_concurrency_conflict(
+                            "SCIM group changed while the request was being committed",
+                        ));
+                    }
+                }
+
+                let select_sql = format!(
+                    "{} WHERE id = {}",
+                    select_group_sql(),
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(existing_group.id)
+                    .get_result::<GroupRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
 
     pub async fn delete_group(&self, id: &str) -> AppResult<()> {
+        self.delete_group_mutation(id, None).await
+    }
+
+    pub async fn delete_group_with_audit(
+        &self,
+        id: &str,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<()> {
+        self.delete_group_mutation(id, Some(event)).await
+    }
+
+    async fn delete_group_mutation(
+        &self,
+        id: &str,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<()> {
         let id = id.to_string();
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(id.clone());
+        }
+        let webhook_db = self.clone();
         with_conn!(self, |conn, kind| {
-            for table in ["group_members", "group_roles"] {
-                let sql = format!("DELETE FROM {table} WHERE group_id = {}", ph(kind, 1));
-                sql_query(sql)
-                    .bind::<Text, _>(&id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
+            let audit_event =
+                conn.transaction::<Option<AuditEventRecord>, AppError, _>(|conn| {
+                    let exists_sql = format!(
+                        "SELECT COUNT(*) AS count FROM access_groups WHERE id = {}",
+                        ph(kind, 1)
+                    );
+                    if sql_query(exists_sql)
+                        .bind::<Text, _>(&id)
+                        .get_result::<CountRow>(conn)
+                        .map_err(AppError::from)?
+                        .count
+                        == 0
+                    {
+                        return Err(AppError::NotFound);
+                    }
+
+                    // A group is shared by enterprise authorization and several
+                    // application protocol projections. Remove every edge before
+                    // deleting the aggregate root so no stale subject can survive
+                    // in a profile or SCIM binding.
+                    for table in [
+                        "application_profile_group_roles",
+                        "application_scim_groups",
+                        "group_members",
+                        "group_roles",
+                    ] {
+                        let sql = format!("DELETE FROM {table} WHERE group_id = {}", ph(kind, 1));
+                        sql_query(sql)
+                            .bind::<Text, _>(&id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                    let sql = format!("DELETE FROM access_groups WHERE id = {}", ph(kind, 1));
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    audit
+                        .take()
+                        .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                        .transpose()
+                })?;
+            if let Some(audit_event) = audit_event {
+                crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
             }
-            let sql = format!("DELETE FROM access_groups WHERE id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            Ok(())
         })
     }
 
@@ -11926,7 +15555,7 @@ impl Db {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at FROM access_groups INNER JOIN group_members ON access_groups.id = group_members.group_id WHERE group_members.user_id = {} ORDER BY access_groups.name ASC",
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN group_members ON access_groups.id = group_members.group_id WHERE group_members.user_id = {} ORDER BY access_groups.name ASC",
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -11940,53 +15569,99 @@ impl Db {
         let user_id = user_id.to_string();
         let role_ids = dedupe_nonempty(role_ids);
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT COUNT(*) AS count FROM users WHERE id = {}",
-                ph(kind, 1)
-            );
-            let count = sql_query(sql)
-                .bind::<Text, _>(&user_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count;
-            if count == 0 {
-                return Err(AppError::NotFound);
-            }
-
-            for role_id in &role_ids {
+            conn.transaction::<(), AppError, _>(|conn| {
                 let sql = format!(
-                    "SELECT COUNT(*) AS count FROM roles WHERE id = {}",
+                    "SELECT COUNT(*) AS count FROM users WHERE id = {}",
                     ph(kind, 1)
                 );
-                let count = sql_query(sql)
-                    .bind::<Text, _>(role_id)
-                    .get_result::<CountRow>(&mut conn)
-                    .map_err(AppError::from)?
-                    .count;
-                if count == 0 {
-                    return Err(AppError::BadRequest(format!("unknown role: {role_id}")));
-                }
-            }
-
-            let sql = format!("DELETE FROM user_roles WHERE user_id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(&user_id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-
-            for role_id in role_ids {
-                let sql = format!(
-                    "INSERT INTO user_roles (user_id, role_id) VALUES ({}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
+                if sql_query(sql)
                     .bind::<Text, _>(&user_id)
-                    .bind::<Text, _>(role_id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
-            Ok(())
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    == 0
+                {
+                    return Err(AppError::NotFound);
+                }
+
+                let requested = role_ids.iter().cloned().collect::<BTreeSet<_>>();
+                let valid = if role_ids.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    let placeholders = (1..=role_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!("SELECT id FROM roles WHERE id IN ({placeholders})");
+                    bind_text_list(conn, sql_query(sql), &role_ids)
+                        .load::<RoleIdRow>(conn)
+                        .map_err(AppError::from)?
+                        .into_iter()
+                        .map(|row| row.id)
+                        .collect::<BTreeSet<_>>()
+                };
+                if let Some(missing_id) = role_ids.iter().find(|role_id| !valid.contains(*role_id))
+                {
+                    return Err(AppError::BadRequest(format!("unknown role: {missing_id}")));
+                }
+
+                let existing_sql = format!(
+                    "SELECT role_id AS id FROM user_roles WHERE user_id = {}",
+                    ph(kind, 1)
+                );
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&user_id)
+                    .load::<RoleIdRow>(conn)
+                    .map_err(AppError::from)?
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect::<BTreeSet<_>>();
+                let removed = existing.difference(&requested).cloned().collect::<Vec<_>>();
+                for chunk in removed.chunks(400) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let placeholders = (2..=chunk.len() + 1)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "DELETE FROM user_roles WHERE user_id = {} AND role_id IN ({placeholders})",
+                        ph(kind, 1)
+                    );
+                    let mut values = vec![user_id.clone()];
+                    values.extend(chunk.iter().cloned());
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let added = requested.difference(&existing).cloned().collect::<Vec<_>>();
+                for chunk in added.chunks(400) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let placeholders = (1..=chunk.len() * 2)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>();
+                    let sql = format!(
+                        "INSERT INTO user_roles (user_id, role_id) VALUES {}",
+                        placeholders
+                            .chunks(2)
+                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let mut values = Vec::with_capacity(chunk.len() * 2);
+                    for role_id in chunk {
+                        values.push(user_id.clone());
+                        values.push(role_id.clone());
+                    }
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -12004,59 +15679,177 @@ impl Db {
         })
     }
 
+    /// Loads role edges for several groups in one query and keeps the group
+    /// key in the result so callers can assemble the subject graph in memory.
+    pub async fn list_group_roles_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> AppResult<BTreeMap<String, Vec<RoleRecord>>> {
+        if group_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let group_ids = group_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT group_roles.group_id, roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN group_roles ON roles.id = group_roles.role_id WHERE group_roles.group_id IN ({}) ORDER BY group_roles.group_id ASC, roles.name ASC, roles.id ASC",
+                (1..=group_ids.len())
+                    .map(|index| ph(kind, index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let rows = bind_text_list(&mut conn, sql_query(sql), &group_ids)
+                .load::<GroupRoleJoinRow>(&mut conn)
+                .map_err(AppError::from)?;
+            let mut grouped = BTreeMap::new();
+            for row in rows {
+                let group_id = row.group_id.clone();
+                grouped
+                    .entry(group_id)
+                    .or_insert_with(Vec::new)
+                    .push(row.role());
+            }
+            Ok(grouped)
+        })
+    }
+
     pub async fn replace_group_roles(
         &self,
         group_id: &str,
         role_ids: Vec<String>,
     ) -> AppResult<()> {
+        self.replace_group_roles_mutation(group_id, role_ids, None)
+            .await
+    }
+
+    pub async fn replace_group_roles_with_audit(
+        &self,
+        group_id: &str,
+        role_ids: Vec<String>,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<()> {
+        self.replace_group_roles_mutation(group_id, role_ids, Some(event))
+            .await
+    }
+
+    async fn replace_group_roles_mutation(
+        &self,
+        group_id: &str,
+        role_ids: Vec<String>,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<()> {
         let group_id = group_id.to_string();
         let role_ids = dedupe_nonempty(role_ids);
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(group_id.clone());
+        }
+        let webhook_db = self.clone();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT COUNT(*) AS count FROM access_groups WHERE id = {}",
-                ph(kind, 1)
-            );
-            let count = sql_query(sql)
-                .bind::<Text, _>(&group_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count;
-            if count == 0 {
-                return Err(AppError::NotFound);
-            }
-
-            for role_id in &role_ids {
+            let audit_event = conn.transaction::<Option<AuditEventRecord>, AppError, _>(|conn| {
                 let sql = format!(
-                    "SELECT COUNT(*) AS count FROM roles WHERE id = {}",
+                    "SELECT COUNT(*) AS count FROM access_groups WHERE id = {}",
                     ph(kind, 1)
                 );
-                let count = sql_query(sql)
-                    .bind::<Text, _>(role_id)
-                    .get_result::<CountRow>(&mut conn)
-                    .map_err(AppError::from)?
-                    .count;
-                if count == 0 {
-                    return Err(AppError::BadRequest(format!("unknown role: {role_id}")));
-                }
-            }
-
-            let sql = format!("DELETE FROM group_roles WHERE group_id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(&group_id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-
-            for role_id in role_ids {
-                let sql = format!(
-                    "INSERT INTO group_roles (group_id, role_id) VALUES ({}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
+                if sql_query(sql)
                     .bind::<Text, _>(&group_id)
-                    .bind::<Text, _>(role_id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    == 0
+                {
+                    return Err(AppError::NotFound);
+                }
+
+                let requested = role_ids.iter().cloned().collect::<BTreeSet<_>>();
+                let valid = if role_ids.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    let placeholders = (1..=role_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!("SELECT id FROM roles WHERE id IN ({placeholders})");
+                    bind_text_list(conn, sql_query(sql), &role_ids)
+                        .load::<RoleIdRow>(conn)
+                        .map_err(AppError::from)?
+                        .into_iter()
+                        .map(|row| row.id)
+                        .collect::<BTreeSet<_>>()
+                };
+                if let Some(missing_id) = role_ids.iter().find(|role_id| !valid.contains(*role_id))
+                {
+                    return Err(AppError::BadRequest(format!("unknown role: {missing_id}")));
+                }
+
+                let existing_sql = format!(
+                    "SELECT role_id AS id FROM group_roles WHERE group_id = {}",
+                    ph(kind, 1)
+                );
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&group_id)
+                    .load::<RoleIdRow>(conn)
+                    .map_err(AppError::from)?
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect::<BTreeSet<_>>();
+                let removed = existing
+                    .difference(&requested)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for chunk in removed.chunks(400) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let placeholders = (2..=chunk.len() + 1)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "DELETE FROM group_roles WHERE group_id = {} AND role_id IN ({placeholders})",
+                        ph(kind, 1)
+                    );
+                    let mut values = vec![group_id.clone()];
+                    values.extend(chunk.iter().cloned());
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let added = requested
+                    .difference(&existing)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for chunk in added.chunks(400) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let placeholders = (1..=chunk.len() * 2)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>();
+                    let sql = format!(
+                        "INSERT INTO group_roles (group_id, role_id) VALUES {}",
+                        placeholders
+                            .chunks(2)
+                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let mut values = Vec::with_capacity(chunk.len() * 2);
+                    for role_id in chunk {
+                        values.push(group_id.clone());
+                        values.push(role_id.clone());
+                    }
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                audit
+                    .take()
+                    .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                    .transpose()
+            })?;
+            if let Some(audit_event) = audit_event {
+                crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
             }
             Ok(())
         })
@@ -12081,54 +15874,161 @@ impl Db {
         group_id: &str,
         user_ids: Vec<String>,
     ) -> AppResult<()> {
+        self.replace_group_members_mutation(group_id, user_ids, None)
+            .await
+    }
+
+    pub async fn replace_group_members_with_audit(
+        &self,
+        group_id: &str,
+        user_ids: Vec<String>,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<()> {
+        self.replace_group_members_mutation(group_id, user_ids, Some(event))
+            .await
+    }
+
+    async fn replace_group_members_mutation(
+        &self,
+        group_id: &str,
+        user_ids: Vec<String>,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<()> {
         let group_id = group_id.to_string();
         let user_ids = dedupe_nonempty(user_ids);
+        let now = util::now_ts();
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(group_id.clone());
+        }
+        let webhook_db = self.clone();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT COUNT(*) AS count FROM access_groups WHERE id = {}",
-                ph(kind, 1)
-            );
-            let count = sql_query(sql)
-                .bind::<Text, _>(&group_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count;
-            if count == 0 {
-                return Err(AppError::NotFound);
-            }
-
-            for user_id in &user_ids {
+            let audit_event = conn.transaction::<Option<AuditEventRecord>, AppError, _>(|conn| {
                 let sql = format!(
-                    "SELECT COUNT(*) AS count FROM users WHERE id = {}",
+                    "SELECT COUNT(*) AS count FROM access_groups WHERE id = {}",
                     ph(kind, 1)
                 );
                 let count = sql_query(sql)
-                    .bind::<Text, _>(user_id)
-                    .get_result::<CountRow>(&mut conn)
+                    .bind::<Text, _>(&group_id)
+                    .get_result::<CountRow>(conn)
                     .map_err(AppError::from)?
                     .count;
                 if count == 0 {
-                    return Err(AppError::BadRequest(format!("unknown user: {user_id}")));
+                    return Err(AppError::NotFound);
                 }
-            }
 
-            let sql = format!("DELETE FROM group_members WHERE group_id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(&group_id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-
-            for user_id in user_ids {
-                let sql = format!(
-                    "INSERT INTO group_members (group_id, user_id) VALUES ({}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2)
+                let existing_sql = format!(
+                    "SELECT group_members.user_id, users.archived_at FROM group_members INNER JOIN users ON users.id = group_members.user_id WHERE group_members.group_id = {}",
+                    ph(kind, 1)
                 );
-                sql_query(sql)
+                let existing_members = sql_query(existing_sql)
                     .bind::<Text, _>(&group_id)
-                    .bind::<Text, _>(user_id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
+                    .load::<GroupMemberLifecycleRow>(conn)
+                    .map_err(AppError::from)?
+                    ;
+                let existing_ids = existing_members
+                    .iter()
+                    .map(|row| row.user_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let requested_ids = user_ids.iter().cloned().collect::<BTreeSet<_>>();
+                if let Some(archived_id) = existing_members.iter().find_map(|row| {
+                    (row.archived_at.is_some() && !requested_ids.contains(&row.user_id))
+                        .then_some(row.user_id.as_str())
+                }) {
+                    return Err(AppError::BadRequest(format!(
+                        "archived group member cannot be removed: {archived_id}"
+                    )));
+                }
+
+                if !user_ids.is_empty() {
+                    let placeholders = (1..=user_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id AS user_id, archived_at FROM users WHERE id IN ({placeholders})"
+                    );
+                    let valid_members = bind_text_list(conn, sql_query(sql), &user_ids)
+                        .load::<GroupMemberLifecycleRow>(conn)
+                        .map_err(AppError::from)?
+                        ;
+                    let valid_ids = valid_members
+                        .iter()
+                        .map(|row| row.user_id.clone())
+                        .collect::<BTreeSet<_>>();
+                    if let Some(missing_id) = user_ids
+                        .iter()
+                        .find(|user_id| !valid_ids.contains(*user_id))
+                    {
+                        return Err(AppError::BadRequest(format!("unknown user: {missing_id}")));
+                    }
+                }
+
+                let removed = existing_ids
+                    .difference(&requested_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !removed.is_empty() {
+                    let placeholders = (2..=removed.len() + 1)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "DELETE FROM group_members WHERE group_id = {} AND user_id IN ({placeholders})",
+                        ph(kind, 1)
+                    );
+                    let mut values = vec![group_id.clone()];
+                    values.extend(removed.iter().cloned());
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+
+                let added = requested_ids
+                    .difference(&existing_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !added.is_empty() {
+                    let placeholders = (1..=added.len() * 2)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>();
+                    let sql = format!(
+                        "INSERT INTO group_members (group_id, user_id) VALUES {}",
+                        placeholders
+                            .chunks(2)
+                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let mut values = Vec::with_capacity(added.len() * 2);
+                    for user_id in added.iter().cloned() {
+                        values.push(group_id.clone());
+                        values.push(user_id);
+                    }
+                    bind_text_list(conn, sql_query(sql), &values)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                if !removed.is_empty() || !added.is_empty() {
+                    let sql = format!(
+                        "UPDATE access_groups SET updated_at = {}, version = version + 1 WHERE id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    );
+                    sql_query(sql)
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&group_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                audit
+                    .take()
+                    .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                    .transpose()
+            })?;
+            if let Some(audit_event) = audit_event {
+                crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
             }
             Ok(())
         })
@@ -12439,24 +16339,62 @@ impl Db {
     }
 
     pub async fn delete_organization(&self, id: &str) -> AppResult<()> {
-        if self
-            .find_organization_by_id(id)
-            .await?
-            .is_some_and(|existing| existing.kind == ORGANIZATION_KIND_SYSTEM)
-        {
-            return Err(AppError::Forbidden);
-        }
-        let application_count = self.list_applications(Some(id)).await?.len();
-        if application_count > 0 {
-            return Err(AppError::BadRequest(
-                "organization cannot be deleted while it owns applications; transfer or delete its applications first"
-                    .to_string(),
-            ));
-        }
+        self.delete_organization_mutation(id, None).await
+    }
+
+    pub async fn delete_organization_with_audit(
+        &self,
+        id: &str,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<()> {
+        self.delete_organization_mutation(id, Some(event)).await
+    }
+
+    async fn delete_organization_mutation(
+        &self,
+        id: &str,
+        mut audit: Option<crate::audit::AuditEvent>,
+    ) -> AppResult<()> {
         let id = id.to_string();
         let now = util::now_ts();
+        if let Some(event) = audit.as_mut()
+            && event.target_id.is_none()
+        {
+            event.target_id = Some(id.clone());
+        }
+        let webhook_db = self.clone();
         with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
+            let audit_event = conn.transaction::<Option<AuditEventRecord>, AppError, _>(|conn| {
+                let organization_sql = format!(
+                    "{} WHERE id = {}",
+                    select_organization_sql(),
+                    ph(kind, 1)
+                );
+                let organization = sql_query(organization_sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<OrganizationRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                if organization.kind == ORGANIZATION_KIND_SYSTEM {
+                    return Err(AppError::Forbidden);
+                }
+                let application_count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM applications WHERE organization_id = {}",
+                    ph(kind, 1)
+                );
+                if sql_query(application_count_sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count
+                    > 0
+                {
+                    return Err(AppError::BadRequest(
+                        "organization cannot be deleted while it owns applications; transfer or delete its applications first"
+                            .to_string(),
+                    ));
+                }
                 let sql = format!(
                     "UPDATE clients SET organization_id = NULL, updated_at = {} WHERE organization_id = {}",
                     ph(kind, 1),
@@ -12467,6 +16405,19 @@ impl Db {
                     .bind::<Text, _>(&id)
                     .execute(conn)
                     .map_err(AppError::from)?;
+                for table in [
+                    "user_organization_contexts",
+                    "application_discovery_idempotency",
+                ] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE organization_id = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
                 // A tenant-owned identity source must not become a
                 // platform-wide source merely because its tenant was
                 // deleted. Provider slugs are reusable, so their identity
@@ -12483,6 +16434,42 @@ impl Db {
                 }
                 let sql = format!(
                     "DELETE FROM external_oidc_providers WHERE organization_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let ldap_provider_key_expression = match kind {
+                    DatabaseKind::Sqlite | DatabaseKind::Postgres => "'ldap:' || slug",
+                    DatabaseKind::Mysql => "CONCAT('ldap:', slug)",
+                };
+                let ldap_identity_sql = format!(
+                    "DELETE FROM linked_identities WHERE provider_slug IN (SELECT {ldap_provider_key_expression} FROM ldap_providers WHERE organization_id = {})",
+                    ph(kind, 1)
+                );
+                sql_query(ldap_identity_sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                for table in [
+                    "directory_sync_leases",
+                    "directory_sync_checkpoints",
+                    "directory_sync_memberships",
+                    "directory_sync_groups",
+                    "directory_sync_runs",
+                ] {
+                    let sql = format!(
+                        "DELETE FROM {table} WHERE provider_id IN (SELECT id FROM ldap_providers WHERE organization_id = {})",
+                        ph(kind, 1)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!(
+                    "DELETE FROM ldap_providers WHERE organization_id = {}",
                     ph(kind, 1)
                 );
                 sql_query(sql)
@@ -12571,8 +16558,15 @@ impl Db {
                 if affected == 0 {
                     return Err(AppError::NotFound);
                 }
-                Ok(())
-            })
+                audit
+                    .take()
+                    .map(|event| insert_audit_event_on_conn!(conn, kind, event))
+                    .transpose()
+            })?;
+            if let Some(audit_event) = audit_event {
+                crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+            }
+            Ok(())
         })
     }
 
@@ -12599,17 +16593,30 @@ impl Db {
                     return Err(AppError::NotFound);
                 }
 
-                for member in &members {
-                    let sql = format!("SELECT COUNT(*) AS count FROM users WHERE id = {}", ph(kind, 1));
-                    let count = sql_query(sql)
-                        .bind::<Text, _>(&member.user_id)
-                        .get_result::<CountRow>(conn)
+                let requested_user_ids = members
+                    .iter()
+                    .map(|member| member.user_id.clone())
+                    .collect::<Vec<_>>();
+                if !requested_user_ids.is_empty() {
+                    let placeholders = (1..=requested_user_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT id AS user_id FROM users WHERE id IN ({placeholders})"
+                    );
+                    let valid_ids = bind_text_list(conn, sql_query(sql), &requested_user_ids)
+                        .load::<GroupMemberIdRow>(conn)
                         .map_err(AppError::from)?
-                        .count;
-                    if count == 0 {
+                        .into_iter()
+                        .map(|row| row.user_id)
+                        .collect::<BTreeSet<_>>();
+                    if let Some(missing_id) = requested_user_ids
+                        .iter()
+                        .find(|user_id| !valid_ids.contains(*user_id))
+                    {
                         return Err(AppError::BadRequest(format!(
-                            "unknown user: {}",
-                            member.user_id
+                            "unknown user: {missing_id}"
                         )));
                     }
                 }
@@ -12634,15 +16641,22 @@ impl Db {
                 // only their own application-local identity leases. Keeping
                 // the leases of members who remain avoids a roster edit
                 // opening a uniqueness bypass for those accounts.
-                for user_id in existing_member_ids.difference(&replacement_member_ids) {
+                let removed_user_ids = existing_member_ids
+                    .difference(&replacement_member_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !removed_user_ids.is_empty() {
+                    let placeholders = (1..=removed_user_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let bindings_sql = format!(
-                        "DELETE FROM application_identity_bindings WHERE user_id = {} AND application_id IN (SELECT id FROM applications WHERE organization_id = {})",
-                        ph(kind, 1),
-                        ph(kind, 2)
+                        "DELETE FROM application_identity_bindings WHERE user_id IN ({placeholders}) AND application_id IN (SELECT id FROM applications WHERE organization_id = {})",
+                        ph(kind, removed_user_ids.len() + 1)
                     );
-                    sql_query(bindings_sql)
-                        .bind::<Text, _>(user_id)
-                        .bind::<Text, _>(&organization_id)
+                    let mut values = removed_user_ids;
+                    values.push(organization_id.clone());
+                    bind_text_list(conn, sql_query(bindings_sql), &values)
                         .execute(conn)
                         .map_err(AppError::from)?;
                 }
@@ -12656,21 +16670,30 @@ impl Db {
                     .execute(conn)
                     .map_err(AppError::from)?;
 
-                for member in members {
+                if !members.is_empty() {
+                    let placeholders = (1..=members.len() * 3)
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>();
                     let sql = format!(
-                        "INSERT INTO organization_members (organization_id, user_id, role, created_at, updated_at) VALUES ({}, {}, {}, {}, {})",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3),
-                        ph(kind, 4),
-                        ph(kind, 5)
+                        "INSERT INTO organization_members (organization_id, user_id, role, created_at, updated_at) VALUES {}",
+                        placeholders
+                            .chunks(3)
+                            .map(|row| {
+                                format!(
+                                    "({}, {}, {}, {now}, {now})",
+                                    row[0], row[1], row[2]
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
-                    sql_query(sql)
-                        .bind::<Text, _>(&organization_id)
-                        .bind::<Text, _>(member.user_id)
-                        .bind::<Text, _>(member.role)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
+                    let mut values = Vec::with_capacity(members.len() * 3);
+                    for member in members {
+                        values.push(organization_id.clone());
+                        values.push(member.user_id);
+                        values.push(member.role);
+                    }
+                    bind_text_list(conn, sql_query(sql), &values)
                         .execute(conn)
                         .map_err(AppError::from)?;
                 }
@@ -12805,1915 +16828,6 @@ impl Db {
         })
     }
 
-    pub async fn list_applications(
-        &self,
-        organization_id: Option<&str>,
-    ) -> AppResult<Vec<ApplicationRecord>> {
-        let organization_id = organization_id.map(ToOwned::to_owned);
-        with_conn!(self, |conn, kind| {
-            if let Some(organization_id) = organization_id {
-                let sql = format!(
-                    "{} WHERE organization_id = {} ORDER BY is_active DESC, name ASC",
-                    select_application_sql(),
-                    ph(kind, 1)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(organization_id)
-                    .load::<ApplicationRecord>(&mut conn)
-                    .map_err(AppError::from)
-            } else {
-                let sql = format!(
-                    "{} ORDER BY organization_id ASC, is_active DESC, name ASC",
-                    select_application_sql()
-                );
-                sql_query(sql)
-                    .load::<ApplicationRecord>(&mut conn)
-                    .map_err(AppError::from)
-            }
-        })
-    }
-
-    pub async fn list_application_modules(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<ApplicationModuleRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {} ORDER BY module_key ASC",
-                select_application_module_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ApplicationModuleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn upsert_application_module(
-        &self,
-        application_id: &str,
-        module_key: &str,
-        config_json: &str,
-        is_enabled: bool,
-    ) -> AppResult<ApplicationModuleRecord> {
-        let application_id = application_id.to_string();
-        let module_key = module_key.to_string();
-        let config_json = config_json.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let exists_sql = format!(
-                "SELECT COUNT(*) AS count FROM application_modules WHERE application_id = {} AND module_key = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            let exists = sql_query(exists_sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&module_key)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                > 0;
-            if exists {
-                let update_sql = format!(
-                    "UPDATE application_modules SET config_json = {}, is_enabled = {}, updated_at = {} WHERE application_id = {} AND module_key = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5)
-                );
-                sql_query(update_sql)
-                    .bind::<Text, _>(&config_json)
-                    .bind::<Integer, _>(i32::from(is_enabled))
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&module_key)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            } else {
-                let insert_sql = format!(
-                    "INSERT INTO application_modules (application_id, module_key, config_json, is_enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&module_key)
-                    .bind::<Text, _>(&config_json)
-                    .bind::<Integer, _>(i32::from(is_enabled))
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
-            let select_sql = format!(
-                "{} WHERE application_id = {} AND module_key = {}",
-                select_application_module_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(select_sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&module_key)
-                .get_result::<ApplicationModuleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn delete_application_module(
-        &self,
-        application_id: &str,
-        module_key: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let module_key = module_key.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "DELETE FROM application_modules WHERE application_id = {} AND module_key = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(module_key)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_billing_settings(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Option<ApplicationBillingSettingsRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {}",
-                select_application_billing_settings_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .get_result::<ApplicationBillingSettingsRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn ensure_application_billing_settings(
-        &self,
-        application_id: &str,
-    ) -> AppResult<ApplicationBillingSettingsRecord> {
-        if let Some(settings) = self
-            .find_application_billing_settings(application_id)
-            .await?
-        {
-            return Ok(settings);
-        }
-        self.upsert_application_billing_settings(NewApplicationBillingSettings {
-            application_id: application_id.to_string(),
-            accept_signet_balance: false,
-            wallet_mode: "shared".to_string(),
-            supported_currencies: Vec::new(),
-        })
-        .await
-    }
-
-    pub async fn upsert_application_billing_settings(
-        &self,
-        settings: NewApplicationBillingSettings,
-    ) -> AppResult<ApplicationBillingSettingsRecord> {
-        let currencies = util::to_json(&settings.supported_currencies)?;
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<ApplicationBillingSettingsRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_billing_settings_sql(),
-                    ph(kind, 1)
-                );
-                let existing = sql_query(existing_sql)
-                    .bind::<Text, _>(&settings.application_id)
-                    .get_result::<ApplicationBillingSettingsRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?;
-                let activity_count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM wallet_transactions WHERE application_id = {}",
-                    ph(kind, 1)
-                );
-                let activity_count = sql_query(activity_count_sql)
-                    .bind::<Text, _>(&settings.application_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count;
-                let mode_locked_at = existing
-                    .as_ref()
-                    .and_then(|value| value.mode_locked_at)
-                    .or_else(|| (activity_count > 0).then_some(now));
-                if existing
-                    .as_ref()
-                    .is_some_and(|value| value.wallet_mode != settings.wallet_mode)
-                    && mode_locked_at.is_some()
-                {
-                    return Err(AppError::BadRequest(
-                        "application wallet mode is locked after the first billing transaction"
-                            .to_string(),
-                    ));
-                }
-                if existing.is_some() {
-                    let update_sql = format!(
-                        "UPDATE application_billing_settings SET accept_signet_balance = {}, wallet_mode = {}, supported_currencies = {}, mode_locked_at = {}, updated_at = {} WHERE application_id = {}",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3),
-                        ph(kind, 4),
-                        ph(kind, 5),
-                        ph(kind, 6)
-                    );
-                    sql_query(update_sql)
-                        .bind::<Integer, _>(i32::from(settings.accept_signet_balance))
-                        .bind::<Text, _>(&settings.wallet_mode)
-                        .bind::<Text, _>(&currencies)
-                        .bind::<Nullable<BigInt>, _>(mode_locked_at)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&settings.application_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                } else {
-                    let insert_sql = format!(
-                        "INSERT INTO application_billing_settings (application_id, accept_signet_balance, wallet_mode, supported_currencies, mode_locked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3),
-                        ph(kind, 4),
-                        ph(kind, 5),
-                        ph(kind, 6),
-                        ph(kind, 7)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&settings.application_id)
-                        .bind::<Integer, _>(i32::from(settings.accept_signet_balance))
-                        .bind::<Text, _>(&settings.wallet_mode)
-                        .bind::<Text, _>(&currencies)
-                        .bind::<Nullable<BigInt>, _>(mode_locked_at)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let select_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_billing_settings_sql(),
-                    ph(kind, 1)
-                );
-                sql_query(select_sql)
-                    .bind::<Text, _>(&settings.application_id)
-                    .get_result::<ApplicationBillingSettingsRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    async fn ensure_wallet_account(
-        &self,
-        account_kind: &str,
-        user_id: Option<&str>,
-        application_id: Option<&str>,
-        currency: &str,
-    ) -> AppResult<WalletAccountRecord> {
-        let account_kind = account_kind.to_string();
-        let user_id = user_id.map(ToOwned::to_owned);
-        let application_id = application_id.map(ToOwned::to_owned);
-        let currency = currency.to_string();
-        let scope_key = wallet_account_scope_key(
-            &account_kind,
-            user_id.as_deref(),
-            application_id.as_deref(),
-            &currency,
-        );
-        with_conn!(self, |conn, kind| {
-            let existing_sql = format!(
-                "{} WHERE scope_key = {}",
-                select_wallet_account_sql(),
-                ph(kind, 1)
-            );
-            if let Some(existing) = sql_query(existing_sql)
-                .bind::<Text, _>(&scope_key)
-                .get_result::<WalletAccountRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)?
-            {
-                return Ok(existing);
-            }
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = util::now_ts();
-            let insert_sql = format!(
-                "INSERT INTO wallet_accounts (id, account_kind, scope_key, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8)
-            );
-            if let Err(error) = sql_query(insert_sql)
-                .bind::<Text, _>(&id)
-                .bind::<Text, _>(&account_kind)
-                .bind::<Text, _>(&scope_key)
-                .bind::<Nullable<Text>, _>(&user_id)
-                .bind::<Nullable<Text>, _>(&application_id)
-                .bind::<Text, _>(&currency)
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-            {
-                // A concurrent account creation may have won the unique
-                // scope_key race. Re-read it before surfacing the database
-                // error so callers remain idempotent.
-                let retry_sql = format!(
-                    "{} WHERE scope_key = {}",
-                    select_wallet_account_sql(),
-                    ph(kind, 1)
-                );
-                if let Some(existing) = sql_query(retry_sql)
-                    .bind::<Text, _>(&scope_key)
-                    .get_result::<WalletAccountRecord>(&mut conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    return Ok(existing);
-                }
-                return Err(AppError::from(error));
-            }
-            let select_sql = format!("{} WHERE id = {}", select_wallet_account_sql(), ph(kind, 1));
-            sql_query(select_sql)
-                .bind::<Text, _>(id)
-                .get_result::<WalletAccountRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn ensure_user_wallet_account(
-        &self,
-        user_id: &str,
-        currency: &str,
-    ) -> AppResult<WalletAccountRecord> {
-        self.ensure_wallet_account("user_global", Some(user_id), None, currency)
-            .await
-    }
-
-    pub async fn ensure_application_wallet_account(
-        &self,
-        user_id: &str,
-        application_id: &str,
-        currency: &str,
-    ) -> AppResult<WalletAccountRecord> {
-        self.ensure_wallet_account(
-            "user_application",
-            Some(user_id),
-            Some(application_id),
-            currency,
-        )
-        .await
-    }
-
-    pub async fn ensure_settlement_wallet_account(
-        &self,
-        application_id: &str,
-        currency: &str,
-    ) -> AppResult<WalletAccountRecord> {
-        self.ensure_wallet_account(
-            "application_settlement",
-            None,
-            Some(application_id),
-            currency,
-        )
-        .await
-    }
-
-    pub async fn find_wallet_account_by_id(
-        &self,
-        wallet_id: &str,
-    ) -> AppResult<Option<WalletAccountRecord>> {
-        let wallet_id = wallet_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE id = {}", select_wallet_account_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(wallet_id)
-                .get_result::<WalletAccountRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_user_wallet_accounts(
-        &self,
-        user_id: &str,
-        currency: Option<&str>,
-    ) -> AppResult<Vec<WalletAccountRecord>> {
-        let user_id = user_id.to_string();
-        let currency = currency.map(ToOwned::to_owned);
-        with_conn!(self, |conn, kind| {
-            let mut sql = format!(
-                "{} WHERE user_id = {}",
-                select_wallet_account_sql(),
-                ph(kind, 1)
-            );
-            if currency.is_some() {
-                sql.push_str(&format!(" AND currency = {}", ph(kind, 2)));
-            }
-            sql.push_str(" ORDER BY currency ASC, account_kind ASC, created_at ASC");
-            if let Some(currency) = currency {
-                sql_query(sql)
-                    .bind::<Text, _>(user_id)
-                    .bind::<Text, _>(currency)
-                    .load::<WalletAccountRecord>(&mut conn)
-                    .map_err(AppError::from)
-            } else {
-                sql_query(sql)
-                    .bind::<Text, _>(user_id)
-                    .load::<WalletAccountRecord>(&mut conn)
-                    .map_err(AppError::from)
-            }
-        })
-    }
-
-    pub async fn list_wallet_transactions_for_user(
-        &self,
-        user_id: &str,
-        limit: i64,
-    ) -> AppResult<Vec<WalletTransactionRecord>> {
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE user_id = {} ORDER BY created_at DESC LIMIT {}",
-                select_wallet_transaction_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .bind::<BigInt, _>(limit.clamp(1, 500))
-                .load::<WalletTransactionRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn insert_payment_order(
-        &self,
-        order: NewPaymentOrder,
-    ) -> AppResult<PaymentOrderRecord> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO payment_orders (id, user_id, provider_slug, merchant_order_no, idempotency_key, provider_trade_id, currency, amount_minor, subject, status, checkout_kind, checkout_value, expires_at, paid_at, last_error, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11),
-                ph(kind, 12),
-                ph(kind, 13),
-                ph(kind, 14),
-                ph(kind, 15),
-                ph(kind, 16),
-                ph(kind, 17)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&id)
-                .bind::<Text, _>(order.user_id)
-                .bind::<Text, _>(order.provider_slug)
-                .bind::<Text, _>(order.merchant_order_no)
-                .bind::<Nullable<Text>, _>(order.idempotency_key)
-                .bind::<Nullable<Text>, _>(None::<String>)
-                .bind::<Text, _>(order.currency)
-                .bind::<BigInt, _>(order.amount_minor)
-                .bind::<Text, _>(order.subject)
-                .bind::<Text, _>("pending")
-                .bind::<Text, _>(order.checkout_kind)
-                .bind::<Text, _>(order.checkout_value)
-                .bind::<BigInt, _>(order.expires_at)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<Nullable<Text>, _>(None::<String>)
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let select_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
-            sql_query(select_sql)
-                .bind::<Text, _>(id)
-                .get_result::<PaymentOrderRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_payment_order(&self, id: &str) -> AppResult<Option<PaymentOrderRecord>> {
-        let id = id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<PaymentOrderRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_payment_order_by_merchant_order_no(
-        &self,
-        provider_slug: &str,
-        merchant_order_no: &str,
-    ) -> AppResult<Option<PaymentOrderRecord>> {
-        let provider_slug = provider_slug.to_string();
-        let merchant_order_no = merchant_order_no.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE provider_slug = {} AND merchant_order_no = {}",
-                select_payment_order_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(provider_slug)
-                .bind::<Text, _>(merchant_order_no)
-                .get_result::<PaymentOrderRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_payment_order_by_idempotency_key(
-        &self,
-        user_id: &str,
-        provider_slug: &str,
-        idempotency_key: &str,
-    ) -> AppResult<Option<PaymentOrderRecord>> {
-        let user_id = user_id.to_string();
-        let provider_slug = provider_slug.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE user_id = {} AND provider_slug = {} AND idempotency_key = {}",
-                select_payment_order_sql(),
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .bind::<Text, _>(provider_slug)
-                .bind::<Text, _>(idempotency_key)
-                .get_result::<PaymentOrderRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_payment_refunds(
-        &self,
-        payment_order_id: &str,
-    ) -> AppResult<Vec<PaymentRefundRecord>> {
-        let payment_order_id = payment_order_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE payment_order_id = {} ORDER BY created_at DESC",
-                select_payment_refund_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(payment_order_id)
-                .load::<PaymentRefundRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_payment_refund_by_idempotency_key(
-        &self,
-        payment_order_id: &str,
-        idempotency_key: &str,
-    ) -> AppResult<Option<PaymentRefundRecord>> {
-        let payment_order_id = payment_order_id.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE payment_order_id = {} AND idempotency_key = {}",
-                select_payment_refund_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(payment_order_id)
-                .bind::<Text, _>(idempotency_key)
-                .get_result::<PaymentRefundRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_payment_orders(
-        &self,
-        user_id: Option<&str>,
-        limit: i64,
-    ) -> AppResult<Vec<PaymentOrderRecord>> {
-        let user_id = user_id.map(ToOwned::to_owned);
-        with_conn!(self, |conn, kind| {
-            let mut sql = select_payment_order_sql().to_string();
-            if user_id.is_some() {
-                sql.push_str(&format!(" WHERE user_id = {}", ph(kind, 1)));
-            }
-            sql.push_str(&format!(
-                " ORDER BY created_at DESC LIMIT {}",
-                ph(kind, if user_id.is_some() { 2 } else { 1 })
-            ));
-            if let Some(user_id) = user_id {
-                sql_query(sql)
-                    .bind::<Text, _>(user_id)
-                    .bind::<BigInt, _>(limit.clamp(1, 500))
-                    .load::<PaymentOrderRecord>(&mut conn)
-                    .map_err(AppError::from)
-            } else {
-                sql_query(sql)
-                    .bind::<BigInt, _>(limit.clamp(1, 500))
-                    .load::<PaymentOrderRecord>(&mut conn)
-                    .map_err(AppError::from)
-            }
-        })
-    }
-
-    pub async fn find_wallet_transaction_by_id(
-        &self,
-        transaction_id: &str,
-    ) -> AppResult<Option<WalletTransactionRecord>> {
-        let transaction_id = transaction_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE id = {}",
-                select_wallet_transaction_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(transaction_id)
-                .get_result::<WalletTransactionRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_wallet_transaction_by_operation(
-        &self,
-        kind_name: &str,
-        idempotency_key: &str,
-    ) -> AppResult<Option<WalletTransactionRecord>> {
-        let kind_name = kind_name.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE kind = {} AND idempotency_key = {}",
-                select_wallet_transaction_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(kind_name)
-                .bind::<Text, _>(idempotency_key)
-                .get_result::<WalletTransactionRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn update_payment_order_error(&self, id: &str, error: &str) -> AppResult<()> {
-        let id = id.to_string();
-        let error = error.chars().take(512).collect::<String>();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE payment_orders SET last_error = {}, updated_at = {} WHERE id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Nullable<Text>, _>(Some(error))
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn mark_payment_order_paid(
-        &self,
-        order_id: &str,
-        provider_trade_id: &str,
-        paid_at: i64,
-    ) -> AppResult<PaymentOrderRecord> {
-        let order_id = order_id.to_string();
-        let provider_trade_id = provider_trade_id.to_string();
-        if provider_trade_id.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "payment provider transaction id is required".to_string(),
-            ));
-        }
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<PaymentOrderRecord, AppError, _>(|conn| {
-                let order_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
-                let order = sql_query(order_sql)
-                    .bind::<Text, _>(&order_id)
-                    .get_result::<PaymentOrderRecord>(conn)
-                    .map_err(AppError::from)?;
-                if order.status == "paid" {
-                    if order.provider_trade_id.as_deref() != Some(provider_trade_id.as_str()) {
-                        return Err(AppError::BadRequest(
-                            "payment order was already paid with a different provider transaction"
-                                .to_string(),
-                        ));
-                    }
-                    return Ok(order);
-                }
-                if order.status != "pending" {
-                    return Err(AppError::BadRequest(
-                        "payment order is not awaiting payment".to_string(),
-                    ));
-                }
-                let scope_key = wallet_account_scope_key(
-                    "user_global",
-                    Some(&order.user_id),
-                    None,
-                    &order.currency,
-                );
-                let wallet_sql = format!(
-                    "{} WHERE scope_key = {}",
-                    select_wallet_account_sql(),
-                    ph(kind, 1)
-                );
-                let wallet = if let Some(wallet) = sql_query(wallet_sql)
-                    .bind::<Text, _>(&scope_key)
-                    .get_result::<WalletAccountRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    wallet
-                } else {
-                    let wallet_id = uuid::Uuid::new_v4().to_string();
-                    let insert_wallet_sql = format!(
-                        "INSERT INTO wallet_accounts (id, account_kind, scope_key, user_id, application_id, currency, available_minor, reserved_minor, version, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3),
-                        ph(kind, 4),
-                        ph(kind, 5),
-                        ph(kind, 6),
-                        ph(kind, 7),
-                        ph(kind, 8)
-                    );
-                    sql_query(insert_wallet_sql)
-                        .bind::<Text, _>(&wallet_id)
-                        .bind::<Text, _>("user_global")
-                        .bind::<Text, _>(&scope_key)
-                        .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
-                        .bind::<Nullable<Text>, _>(None::<String>)
-                        .bind::<Text, _>(&order.currency)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                    let select_wallet_sql = format!(
-                        "{} WHERE id = {}",
-                        select_wallet_account_sql(),
-                        ph(kind, 1)
-                    );
-                    sql_query(select_wallet_sql)
-                        .bind::<Text, _>(wallet_id)
-                        .get_result::<WalletAccountRecord>(conn)
-                        .map_err(AppError::from)?
-                };
-                let update_wallet_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3)
-                );
-                sql_query(update_wallet_sql)
-                    .bind::<BigInt, _>(order.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&wallet.id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let insert_transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16)
-                );
-                sql_query(insert_transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("recharge")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&order.currency)
-                    .bind::<BigInt, _>(order.amount_minor)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(wallet.id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&order.id)
-                    .bind::<Nullable<Text>, _>(Some(order.provider_slug.clone()))
-                    .bind::<Nullable<Text>, _>(Some(order.merchant_order_no.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&wallet.id)
-                    .bind::<BigInt, _>(order.amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let update_order_sql = format!(
-                    "UPDATE payment_orders SET status = {}, provider_trade_id = {}, paid_at = {}, updated_at = {}, last_error = {} WHERE id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                sql_query(update_order_sql)
-                    .bind::<Text, _>("paid")
-                    .bind::<Nullable<Text>, _>(Some(provider_trade_id.to_string()))
-                    .bind::<Nullable<BigInt>, _>(Some(paid_at))
-                    .bind::<BigInt, _>(now)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&order_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(&order_id)
-                    .get_result::<PaymentOrderRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn refund_payment_order(
-        &self,
-        order_id: &str,
-        amount_minor: i64,
-        provider_refund_id: &str,
-        requested_by: Option<&str>,
-        reason: &str,
-        idempotency_key: &str,
-    ) -> AppResult<PaymentRefundRecord> {
-        #[derive(diesel::QueryableByName)]
-        struct TotalRow {
-            #[diesel(sql_type = BigInt)]
-            total: i64,
-        }
-
-        let order_id = order_id.to_string();
-        let provider_refund_id = provider_refund_id.to_string();
-        let requested_by = requested_by.map(ToOwned::to_owned);
-        let reason = reason.chars().take(512).collect::<String>();
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<PaymentRefundRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE payment_order_id = {} AND idempotency_key = {}",
-                    select_payment_refund_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if let Some(existing) = sql_query(existing_sql)
-                    .bind::<Text, _>(&order_id)
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<PaymentRefundRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    return Ok(existing);
-                }
-                if amount_minor <= 0 || provider_refund_id.trim().is_empty() {
-                    return Err(AppError::BadRequest(
-                        "billing refund is invalid".to_string(),
-                    ));
-                }
-                let order_sql = format!(
-                    "{} WHERE id = {}",
-                    select_payment_order_sql(),
-                    ph(kind, 1)
-                );
-                let order = sql_query(order_sql)
-                    .bind::<Text, _>(&order_id)
-                    .get_result::<PaymentOrderRecord>(conn)
-                    .map_err(AppError::from)?;
-                if order.status != "paid" {
-                    return Err(AppError::BadRequest(
-                        "payment order is not paid".to_string(),
-                    ));
-                }
-                let total_sql = format!(
-                    "SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payment_refunds WHERE payment_order_id = {} AND status = 'succeeded'",
-                    ph(kind, 1)
-                );
-                let refunded = sql_query(total_sql)
-                    .bind::<Text, _>(&order_id)
-                    .get_result::<TotalRow>(conn)
-                    .map_err(AppError::from)?
-                    .total;
-                if amount_minor > order.amount_minor.saturating_sub(refunded) {
-                    return Err(AppError::BadRequest(
-                        "billing refund exceeds the refundable payment amount".to_string(),
-                    ));
-                }
-
-                let scope_key = wallet_account_scope_key(
-                    "user_global",
-                    Some(&order.user_id),
-                    None,
-                    &order.currency,
-                );
-                let wallet_sql = format!(
-                    "{} WHERE scope_key = {}",
-                    select_wallet_account_sql(),
-                    ph(kind, 1)
-                );
-                let wallet = sql_query(wallet_sql)
-                    .bind::<Text, _>(&scope_key)
-                    .get_result::<WalletAccountRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or_else(|| {
-                        AppError::BadRequest(
-                            "the user wallet has no refundable balance".to_string(),
-                        )
-                    })?;
-                let debit_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4)
-                );
-                if sql_query(debit_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&wallet.id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest(
-                        "billing refund would make the wallet balance negative".to_string(),
-                    ));
-                }
-
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("recharge_refund")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(Some(order.user_id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&order.currency)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(wallet.id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(Some(order.provider_slug.clone()))
-                    .bind::<Nullable<Text>, _>(Some(order_id.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&wallet.id)
-                    .bind::<BigInt, _>(-amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-
-                let refund_id = uuid::Uuid::new_v4().to_string();
-                let refund_sql = format!(
-                    "INSERT INTO payment_refunds (id, payment_order_id, amount_minor, status, provider_refund_id, requested_by, reason, idempotency_key, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5),
-                    ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10)
-                );
-                sql_query(refund_sql)
-                    .bind::<Text, _>(&refund_id)
-                    .bind::<Text, _>(&order_id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Text, _>("succeeded")
-                    .bind::<Nullable<Text>, _>(Some(provider_refund_id.clone()))
-                    .bind::<Nullable<Text>, _>(requested_by.clone())
-                    .bind::<Text, _>(&reason)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!(
-                    "{} WHERE id = {}",
-                    select_payment_refund_sql(),
-                    ph(kind, 1)
-                );
-                sql_query(select_sql)
-                    .bind::<Text, _>(refund_id)
-                    .get_result::<PaymentRefundRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn reserve_wallet_hold(
-        &self,
-        wallet_id: &str,
-        user_id: &str,
-        application_id: &str,
-        currency: &str,
-        amount_minor: i64,
-        reference: &str,
-        idempotency_key: &str,
-        expires_at: i64,
-    ) -> AppResult<WalletHoldRecord> {
-        let wallet_id = wallet_id.to_string();
-        let user_id = user_id.to_string();
-        let application_id = application_id.to_string();
-        let currency = currency.to_string();
-        let reference = reference.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE hold_kind = {} AND idempotency_key = {}",
-                    select_wallet_hold_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if let Some(existing) = sql_query(existing_sql)
-                    .bind::<Text, _>("spend")
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    return Ok(existing);
-                }
-                if amount_minor <= 0 {
-                    return Err(AppError::BadRequest(
-                        "billing amount must be positive".to_string(),
-                    ));
-                }
-                let update_wallet_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, reserved_minor = reserved_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {} AND available_minor >= {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                let affected = sql_query(update_wallet_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&wallet_id)
-                    .bind::<Text, _>(&currency)
-                    .bind::<BigInt, _>(amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                if affected == 0 {
-                    return Err(AppError::BadRequest(
-                        "billing balance is insufficient or wallet is unavailable".to_string(),
-                    ));
-                }
-                let hold_id = uuid::Uuid::new_v4().to_string();
-                let insert_hold_sql = format!(
-                    "INSERT INTO wallet_holds (id, hold_kind, wallet_id, user_id, application_id, currency, amount_minor, status, reference, idempotency_key, expires_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13)
-                );
-                sql_query(insert_hold_sql)
-                    .bind::<Text, _>(&hold_id)
-                    .bind::<Text, _>("spend")
-                    .bind::<Text, _>(&wallet_id)
-                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(application_id.clone()))
-                    .bind::<Text, _>(&currency)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Text, _>("pending")
-                    .bind::<Text, _>(&reference)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<BigInt, _>(expires_at)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let insert_transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(insert_transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("reserve")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(application_id.clone()))
-                    .bind::<Text, _>(&currency)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(reference.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&wallet_id)
-                    .bind::<BigInt, _>(-amount_minor)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(hold_id)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn find_wallet_hold(&self, hold_id: &str) -> AppResult<Option<WalletHoldRecord>> {
-        let hold_id = hold_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(hold_id)
-                .get_result::<WalletHoldRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn commit_wallet_hold(
-        &self,
-        hold_id: &str,
-        settlement_wallet_id: &str,
-        idempotency_key: &str,
-    ) -> AppResult<WalletHoldRecord> {
-        let hold_id = hold_id.to_string();
-        let settlement_wallet_id = settlement_wallet_id.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
-                let hold_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-                let hold = sql_query(hold_sql)
-                    .bind::<Text, _>(&hold_id)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .map_err(AppError::from)?;
-                let existing_operation_sql = format!(
-                    "{} WHERE kind = 'commit' AND idempotency_key = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1)
-                );
-                if let Some(existing) = sql_query(existing_operation_sql)
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    if existing.hold_id.as_deref() != Some(hold_id.as_str()) {
-                        return Err(AppError::BadRequest(
-                            "billing idempotency_key is already used for another commit"
-                                .to_string(),
-                        ));
-                    }
-                    return Ok(hold);
-                }
-                if hold.status == "committed" {
-                    return Ok(hold);
-                }
-                if hold.status != "pending" {
-                    return Err(AppError::BadRequest("billing hold is not pending".to_string()));
-                }
-                if hold.expires_at <= now {
-                    return Err(AppError::BadRequest("billing hold has expired".to_string()));
-                }
-                let source_sql = format!(
-                    "UPDATE wallet_accounts SET reserved_minor = reserved_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND reserved_minor >= {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
-                );
-                if sql_query(source_sql)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&hold.wallet_id)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest("billing hold source is unavailable".to_string()));
-                }
-                let destination_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
-                );
-                if sql_query(destination_sql)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&settlement_wallet_id)
-                    .bind::<Text, _>(&hold.currency)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest("billing settlement wallet is unavailable".to_string()));
-                }
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let insert_transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(insert_transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("commit")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(hold.user_id.clone())
-                    .bind::<Nullable<Text>, _>(hold.application_id.clone())
-                    .bind::<Text, _>(&hold.currency)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(settlement_wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(hold.reference.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&hold.wallet_id)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(-hold.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&settlement_wallet_id)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let update_hold_sql = format!(
-                    "UPDATE wallet_holds SET status = {}, updated_at = {} WHERE id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                );
-                sql_query(update_hold_sql)
-                    .bind::<Text, _>("committed")
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&hold_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(&hold_id)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn release_wallet_hold(
-        &self,
-        hold_id: &str,
-        idempotency_key: &str,
-    ) -> AppResult<WalletHoldRecord> {
-        let hold_id = hold_id.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletHoldRecord, AppError, _>(|conn| {
-                let hold_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-                let hold = sql_query(hold_sql)
-                    .bind::<Text, _>(&hold_id)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .map_err(AppError::from)?;
-                let existing_operation_sql = format!(
-                    "{} WHERE kind = 'release' AND idempotency_key = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1)
-                );
-                if let Some(existing) = sql_query(existing_operation_sql)
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    if existing.hold_id.as_deref() != Some(hold_id.as_str()) {
-                        return Err(AppError::BadRequest(
-                            "billing idempotency_key is already used for another release"
-                                .to_string(),
-                        ));
-                    }
-                    return Ok(hold);
-                }
-                if hold.status == "released" {
-                    return Ok(hold);
-                }
-                if hold.status != "pending" {
-                    return Err(AppError::BadRequest("billing hold is not pending".to_string()));
-                }
-                let update_wallet_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, reserved_minor = reserved_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND reserved_minor >= {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
-                );
-                if sql_query(update_wallet_sql)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&hold.wallet_id)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest("billing hold source is unavailable".to_string()));
-                }
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let insert_transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(insert_transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("release")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(hold.user_id.clone())
-                    .bind::<Nullable<Text>, _>(hold.application_id.clone())
-                    .bind::<Text, _>(&hold.currency)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(hold.wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(hold_id.clone()))
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(hold.reference.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&hold.wallet_id)
-                    .bind::<BigInt, _>(hold.amount_minor)
-                    .bind::<BigInt, _>(-hold.amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let update_hold_sql = format!(
-                    "UPDATE wallet_holds SET status = {}, updated_at = {} WHERE id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                );
-                sql_query(update_hold_sql)
-                    .bind::<Text, _>("released")
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&hold_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_hold_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(&hold_id)
-                    .get_result::<WalletHoldRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn transfer_wallets(
-        &self,
-        user_id: &str,
-        source_wallet_id: &str,
-        destination_wallet_id: &str,
-        currency: &str,
-        amount_minor: i64,
-        application_id: Option<&str>,
-        idempotency_key: &str,
-    ) -> AppResult<WalletTransactionRecord> {
-        let user_id = user_id.to_string();
-        let source_wallet_id = source_wallet_id.to_string();
-        let destination_wallet_id = destination_wallet_id.to_string();
-        let currency = currency.to_string();
-        let application_id = application_id.map(ToOwned::to_owned);
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE kind = {} AND idempotency_key = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if let Some(existing) = sql_query(existing_sql)
-                    .bind::<Text, _>("transfer")
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    return Ok(existing);
-                }
-                if amount_minor <= 0 || source_wallet_id == destination_wallet_id {
-                    return Err(AppError::BadRequest("billing transfer is invalid".to_string()));
-                }
-                let source_sql = format!(
-                    "{} WHERE id = {} AND account_kind IN ('user_global', 'user_application') AND user_id = {} AND currency = {}",
-                    select_wallet_account_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3)
-                );
-                let source = sql_query(source_sql)
-                    .bind::<Text, _>(&source_wallet_id)
-                    .bind::<Text, _>(&user_id)
-                    .bind::<Text, _>(&currency)
-                    .get_result::<WalletAccountRecord>(conn)
-                    .map_err(AppError::from)?;
-                let destination_sql = format!(
-                    "{} WHERE id = {} AND account_kind IN ('user_global', 'user_application') AND user_id = {} AND currency = {}",
-                    select_wallet_account_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3)
-                );
-                let destination = sql_query(destination_sql)
-                    .bind::<Text, _>(&destination_wallet_id)
-                    .bind::<Text, _>(&user_id)
-                    .bind::<Text, _>(&currency)
-                    .get_result::<WalletAccountRecord>(conn)
-                    .map_err(AppError::from)?;
-                let debit_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
-                );
-                if sql_query(debit_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&source.id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest("billing balance is insufficient".to_string()));
-                }
-                let credit_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                );
-                sql_query(credit_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&destination.id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let transaction_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(transaction_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("transfer")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
-                    .bind::<Nullable<Text>, _>(application_id.clone())
-                    .bind::<Text, _>(&currency)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(source.id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(destination.id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&source.id)
-                    .bind::<BigInt, _>(-amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&destination.id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(transaction_id)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn refund_committed_charge(
-        &self,
-        transaction_id: &str,
-        user_id: &str,
-        amount_minor: i64,
-        idempotency_key: &str,
-    ) -> AppResult<WalletTransactionRecord> {
-        #[derive(diesel::QueryableByName)]
-        struct TotalRow {
-            #[diesel(sql_type = BigInt)]
-            total: i64,
-        }
-
-        let transaction_id = transaction_id.to_string();
-        let user_id = user_id.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE kind = {} AND idempotency_key = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if let Some(existing) = sql_query(existing_sql)
-                    .bind::<Text, _>("charge_refund")
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    if existing.external_order_id.as_deref() != Some(transaction_id.as_str()) {
-                        return Err(AppError::BadRequest(
-                            "billing idempotency_key is already used for another refund"
-                                .to_string(),
-                        ));
-                    }
-                    return Ok(existing);
-                }
-                let original_sql = format!(
-                    "{} WHERE id = {} AND kind = 'commit' AND status = 'committed' AND user_id = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let original = sql_query(original_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&user_id)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .map_err(AppError::from)?;
-                if amount_minor <= 0 || amount_minor > original.amount_minor {
-                    return Err(AppError::BadRequest("billing refund amount is invalid".to_string()));
-                }
-                let refunded_sql = format!(
-                    "SELECT COALESCE(SUM(amount_minor), 0) AS total FROM wallet_transactions WHERE kind = 'charge_refund' AND status = 'committed' AND external_order_id = {}",
-                    ph(kind, 1)
-                );
-                let refunded = sql_query(refunded_sql)
-                    .bind::<Nullable<Text>, _>(Some(transaction_id.clone()))
-                    .get_result::<TotalRow>(conn)
-                    .map_err(AppError::from)?
-                    .total;
-                if amount_minor > original.amount_minor.saturating_sub(refunded) {
-                    return Err(AppError::BadRequest(
-                        "billing refund exceeds the refundable charge amount".to_string(),
-                    ));
-                }
-                let settlement_id = original
-                    .destination_wallet_id
-                    .clone()
-                    .ok_or_else(|| AppError::Internal("billing commit has no settlement wallet".to_string()))?;
-                let user_wallet_id = original
-                    .source_wallet_id
-                    .clone()
-                    .ok_or_else(|| AppError::Internal("billing commit has no source wallet".to_string()))?;
-                let debit_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND available_minor >= {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
-                );
-                if sql_query(debit_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&settlement_id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .execute(conn)
-                    .map_err(AppError::from)?
-                    == 0
-                {
-                    return Err(AppError::BadRequest("application settlement balance is insufficient".to_string()));
-                }
-                let credit_sql = format!(
-                    "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                );
-                sql_query(credit_sql)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&user_wallet_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let refund_id = uuid::Uuid::new_v4().to_string();
-                let insert_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&refund_id)
-                    .bind::<Text, _>("charge_refund")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(Some(user_id.clone()))
-                    .bind::<Nullable<Text>, _>(original.application_id.clone())
-                    .bind::<Text, _>(original.currency.clone())
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<Nullable<Text>, _>(Some(settlement_id.clone()))
-                    .bind::<Nullable<Text>, _>(Some(user_wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(transaction_id.clone()))
-                    .bind::<Text, _>("{}")
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {}), ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&refund_id)
-                    .bind::<Text, _>(&settlement_id)
-                    .bind::<BigInt, _>(-amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&refund_id)
-                    .bind::<Text, _>(&user_wallet_id)
-                    .bind::<BigInt, _>(amount_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(refund_id)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn adjust_wallet(
-        &self,
-        wallet_id: &str,
-        user_id: Option<&str>,
-        application_id: Option<&str>,
-        currency: &str,
-        amount_delta_minor: i64,
-        idempotency_key: &str,
-        metadata: serde_json::Value,
-    ) -> AppResult<WalletTransactionRecord> {
-        let wallet_id = wallet_id.to_string();
-        let user_id = user_id.map(ToOwned::to_owned);
-        let application_id = application_id.map(ToOwned::to_owned);
-        let currency = currency.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let metadata = util::to_json(&metadata)?;
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<WalletTransactionRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE kind = {} AND idempotency_key = {}",
-                    select_wallet_transaction_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if let Some(existing) = sql_query(existing_sql)
-                    .bind::<Text, _>("adjustment")
-                    .bind::<Text, _>(&idempotency_key)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                {
-                    return Ok(existing);
-                }
-                if amount_delta_minor == 0 {
-                    return Err(AppError::BadRequest("billing adjustment cannot be zero".to_string()));
-                }
-                let update_sql = if amount_delta_minor > 0 {
-                    format!(
-                        "UPDATE wallet_accounts SET available_minor = available_minor + {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {}",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
-                    )
-                } else {
-                    format!(
-                        "UPDATE wallet_accounts SET available_minor = available_minor - {}, version = version + 1, updated_at = {} WHERE id = {} AND currency = {} AND available_minor >= {}",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
-                    )
-                };
-                let affected = if amount_delta_minor > 0 {
-                    sql_query(update_sql)
-                        .bind::<BigInt, _>(amount_delta_minor)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&wallet_id)
-                        .bind::<Text, _>(&currency)
-                        .execute(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    sql_query(update_sql)
-                        .bind::<BigInt, _>(-amount_delta_minor)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&wallet_id)
-                        .bind::<Text, _>(&currency)
-                        .bind::<BigInt, _>(-amount_delta_minor)
-                        .execute(conn)
-                        .map_err(AppError::from)?
-                };
-                if affected == 0 {
-                    return Err(AppError::BadRequest("billing adjustment would make balance negative".to_string()));
-                }
-                let transaction_id = uuid::Uuid::new_v4().to_string();
-                let insert_sql = format!(
-                    "INSERT INTO wallet_transactions (id, kind, status, user_id, application_id, currency, amount_minor, source_wallet_id, destination_wallet_id, hold_id, idempotency_key, external_provider, external_order_id, metadata, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6),
-                    ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11), ph(kind, 12),
-                    ph(kind, 13), ph(kind, 14), ph(kind, 15), ph(kind, 16)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>("adjustment")
-                    .bind::<Text, _>("committed")
-                    .bind::<Nullable<Text>, _>(user_id.clone())
-                    .bind::<Nullable<Text>, _>(application_id.clone())
-                    .bind::<Text, _>(&currency)
-                    .bind::<BigInt, _>(amount_delta_minor.abs())
-                    .bind::<Nullable<Text>, _>(Some(wallet_id.clone()))
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(&idempotency_key)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Text, _>(metadata)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let entry_sql = format!(
-                    "INSERT INTO wallet_entries (id, transaction_id, wallet_id, available_delta_minor, reserved_delta_minor, created_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                );
-                sql_query(entry_sql)
-                    .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
-                    .bind::<Text, _>(&transaction_id)
-                    .bind::<Text, _>(&wallet_id)
-                    .bind::<BigInt, _>(amount_delta_minor)
-                    .bind::<BigInt, _>(0_i64)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!("{} WHERE id = {}", select_wallet_transaction_sql(), ph(kind, 1));
-                sql_query(select_sql)
-                    .bind::<Text, _>(transaction_id)
-                    .get_result::<WalletTransactionRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
     pub async fn list_application_authorization_profiles(
         &self,
         application_id: &str,
@@ -14729,6 +16843,32 @@ impl Db {
                 .bind::<Text, _>(application_id)
                 .load::<ApplicationAuthorizationProfileRecord>(&mut conn)
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_application_authorization_profile_counts(
+        &self,
+        profile_ids: &[String],
+    ) -> AppResult<BTreeMap<String, (i64, i64)>> {
+        if profile_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let profile_ids = profile_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=profile_ids.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT profiles.id AS profile_id, (SELECT COUNT(*) FROM application_permission_definitions WHERE profile_id = profiles.id AND is_active = 1) AS permission_count, (SELECT COUNT(*) FROM application_profile_roles WHERE profile_id = profiles.id AND is_active = 1) AS role_count FROM application_authorization_profiles AS profiles WHERE profiles.id IN ({placeholders})"
+            );
+            let rows = bind_text_list(&mut conn, sql_query(sql), &profile_ids)
+                .load::<ApplicationAuthorizationProfileCountRow>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| (row.profile_id, (row.permission_count, row.role_count)))
+                .collect())
         })
     }
 
@@ -14943,1108 +17083,6 @@ impl Db {
         })
     }
 
-    pub async fn list_application_profile_roles(
-        &self,
-        profile_id: &str,
-    ) -> AppResult<Vec<ApplicationProfileRoleRecord>> {
-        let profile_id = profile_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC",
-                select_application_profile_role_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(profile_id)
-                .load::<ApplicationProfileRoleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn upsert_application_profile_role(
-        &self,
-        role: NewApplicationProfileRole,
-    ) -> AppResult<ApplicationProfileRoleRecord> {
-        let role_key = role.role_key.trim().to_string();
-        let name = role.name.trim().to_string();
-        if role_key.is_empty() || role_key.len() > 128 || role_key.chars().any(|ch| ch.is_control())
-        {
-            return Err(AppError::BadRequest(
-                "application role key is invalid".to_string(),
-            ));
-        }
-        if name.is_empty() || name.len() > 160 || name.chars().any(|ch| ch.is_control()) {
-            return Err(AppError::BadRequest(
-                "application role name is invalid".to_string(),
-            ));
-        }
-        if role.is_default && !role.is_active {
-            return Err(AppError::BadRequest(
-                "an inactive application role cannot be the default role".to_string(),
-            ));
-        }
-        let permissions =
-            util::to_json(&normalize_application_entitlement_keys(role.permissions)?)?;
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<ApplicationProfileRoleRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE profile_id = {} AND role_key = {}",
-                    select_application_profile_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let existing = sql_query(existing_sql)
-                    .bind::<Text, _>(&role.profile_id)
-                    .bind::<Text, _>(&role_key)
-                    .get_result::<ApplicationProfileRoleRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?;
-                let id = existing
-                    .as_ref()
-                    .map(|value| value.id.clone())
-                    .or(role.id)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                if role.is_default {
-                    let clear_sql = format!(
-                        "UPDATE application_profile_roles SET is_default = 0, updated_at = {} WHERE profile_id = {} AND id <> {}",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                    );
-                    sql_query(clear_sql)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&role.profile_id)
-                        .bind::<Text, _>(&id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                if existing.is_some() {
-                    let sql = format!(
-                        "UPDATE application_profile_roles SET name = {}, description = {}, permissions = {}, source = {}, is_default = {}, is_active = {}, updated_at = {} WHERE profile_id = {} AND id = {}",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&name)
-                        .bind::<Nullable<Text>, _>(&role.description)
-                        .bind::<Text, _>(&permissions)
-                        .bind::<Text, _>(&role.source)
-                        .bind::<Integer, _>(i32::from(role.is_default))
-                        .bind::<Integer, _>(i32::from(role.is_active))
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&role.profile_id)
-                        .bind::<Text, _>(&id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                } else {
-                    let sql = format!(
-                        "INSERT INTO application_profile_roles (id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&id)
-                        .bind::<Text, _>(&role.profile_id)
-                        .bind::<Text, _>(&role_key)
-                        .bind::<Text, _>(&name)
-                        .bind::<Nullable<Text>, _>(&role.description)
-                        .bind::<Text, _>(&permissions)
-                        .bind::<Text, _>(&role.source)
-                        .bind::<Integer, _>(i32::from(role.is_default))
-                        .bind::<Integer, _>(i32::from(role.is_active))
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let sql = format!(
-                    "{} WHERE profile_id = {} AND id = {}",
-                    select_application_profile_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&role.profile_id)
-                    .bind::<Text, _>(&id)
-                    .get_result::<ApplicationProfileRoleRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn delete_application_profile_role(
-        &self,
-        profile_id: &str,
-        role_id: &str,
-    ) -> AppResult<()> {
-        let profile_id = profile_id.to_string();
-        let role_id = role_id.to_string();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let role_sql = format!(
-                    "{} WHERE profile_id = {} AND id = {}",
-                    select_application_profile_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let role = sql_query(role_sql)
-                    .bind::<Text, _>(&profile_id)
-                    .bind::<Text, _>(&role_id)
-                    .get_result::<ApplicationProfileRoleRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or(AppError::NotFound)?;
-                if role.is_default == 1 {
-                    return Err(AppError::BadRequest(
-                        "set another application role as default before deleting this role"
-                            .to_string(),
-                    ));
-                }
-                for table in [
-                    "application_profile_user_roles",
-                    "application_profile_group_roles",
-                    "application_profile_organization_roles",
-                ] {
-                    let sql = format!(
-                        "DELETE FROM {table} WHERE profile_id = {} AND role_id = {}",
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile_id)
-                        .bind::<Text, _>(&role_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let sql = format!(
-                    "DELETE FROM application_profile_roles WHERE profile_id = {} AND id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&profile_id)
-                    .bind::<Text, _>(&role_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                Ok(())
-            })
-        })
-    }
-
-    async fn replace_application_profile_role_assignments(
-        &self,
-        table: &str,
-        subject_column: &str,
-        profile_id: &str,
-        subject_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        if !matches!(
-            table,
-            "application_profile_user_roles"
-                | "application_profile_group_roles"
-                | "application_profile_organization_roles"
-        ) || !matches!(subject_column, "user_id" | "group_id" | "organization_role")
-        {
-            return Err(AppError::Internal(
-                "invalid application profile role assignment table".to_string(),
-            ));
-        }
-        let table = table.to_string();
-        let subject_column = subject_column.to_string();
-        let profile_id = profile_id.to_string();
-        let subject_id = subject_id.to_string();
-        let role_ids = dedupe_nonempty(role_ids);
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                for role_id in &role_ids {
-                    let sql = format!(
-                        "SELECT COUNT(*) AS count FROM application_profile_roles WHERE profile_id = {} AND id = {} AND is_active = 1",
-                        ph(kind, 1), ph(kind, 2)
-                    );
-                    if sql_query(sql)
-                        .bind::<Text, _>(&profile_id)
-                        .bind::<Text, _>(role_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count
-                        == 0
-                    {
-                        return Err(AppError::BadRequest(format!(
-                            "unknown application profile role: {role_id}"
-                        )));
-                    }
-                }
-                let delete_sql = format!(
-                    "DELETE FROM {table} WHERE profile_id = {} AND {subject_column} = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&profile_id)
-                    .bind::<Text, _>(&subject_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let now = util::now_ts();
-                for role_id in role_ids {
-                    let insert_sql = format!(
-                        "INSERT INTO {table} (profile_id, {subject_column}, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&profile_id)
-                        .bind::<Text, _>(&subject_id)
-                        .bind::<Text, _>(role_id)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn list_application_profile_user_role_ids(
-        &self,
-        profile_id: &str,
-        user_id: &str,
-    ) -> AppResult<Vec<String>> {
-        self.list_application_profile_role_ids(
-            "application_profile_user_roles",
-            "user_id",
-            profile_id,
-            user_id,
-        )
-        .await
-    }
-
-    pub async fn replace_application_profile_user_role_ids(
-        &self,
-        profile_id: &str,
-        user_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        self.replace_application_profile_role_assignments(
-            "application_profile_user_roles",
-            "user_id",
-            profile_id,
-            user_id,
-            role_ids,
-        )
-        .await
-    }
-
-    pub async fn list_application_profile_group_role_ids(
-        &self,
-        profile_id: &str,
-        group_id: &str,
-    ) -> AppResult<Vec<String>> {
-        self.list_application_profile_role_ids(
-            "application_profile_group_roles",
-            "group_id",
-            profile_id,
-            group_id,
-        )
-        .await
-    }
-
-    pub async fn replace_application_profile_group_role_ids(
-        &self,
-        profile_id: &str,
-        group_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        self.replace_application_profile_role_assignments(
-            "application_profile_group_roles",
-            "group_id",
-            profile_id,
-            group_id,
-            role_ids,
-        )
-        .await
-    }
-
-    pub async fn list_application_profile_organization_role_ids(
-        &self,
-        profile_id: &str,
-        organization_role: &str,
-    ) -> AppResult<Vec<String>> {
-        self.list_application_profile_role_ids(
-            "application_profile_organization_roles",
-            "organization_role",
-            profile_id,
-            organization_role,
-        )
-        .await
-    }
-
-    pub async fn replace_application_profile_organization_role_ids(
-        &self,
-        profile_id: &str,
-        organization_role: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        self.replace_application_profile_role_assignments(
-            "application_profile_organization_roles",
-            "organization_role",
-            profile_id,
-            organization_role,
-            role_ids,
-        )
-        .await
-    }
-
-    async fn list_application_profile_role_ids(
-        &self,
-        table: &str,
-        subject_column: &str,
-        profile_id: &str,
-        subject_id: &str,
-    ) -> AppResult<Vec<String>> {
-        if !matches!(
-            table,
-            "application_profile_user_roles"
-                | "application_profile_group_roles"
-                | "application_profile_organization_roles"
-        ) || !matches!(subject_column, "user_id" | "group_id" | "organization_role")
-        {
-            return Err(AppError::Internal(
-                "invalid application profile role lookup".to_string(),
-            ));
-        }
-        let table = table.to_string();
-        let subject_column = subject_column.to_string();
-        let profile_id = profile_id.to_string();
-        let subject_id = subject_id.to_string();
-        #[derive(Debug, diesel::QueryableByName)]
-        struct RoleIdRow {
-            #[diesel(sql_type = Text)]
-            role_id: String,
-        }
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT role_id FROM {table} WHERE profile_id = {} AND {subject_column} = {} AND is_active = 1 ORDER BY role_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&profile_id)
-                .bind::<Text, _>(&subject_id)
-                .load::<RoleIdRow>(&mut conn)
-                .map(|rows| rows.into_iter().map(|row| row.role_id).collect())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_application_profile_user_permission_overrides(
-        &self,
-        profile_id: &str,
-        user_id: &str,
-    ) -> AppResult<Vec<ApplicationProfilePermissionOverrideRecord>> {
-        let profile_id = profile_id.to_string();
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE profile_id = {} AND user_id = {} ORDER BY permission ASC",
-                select_application_profile_permission_override_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&profile_id)
-                .bind::<Text, _>(&user_id)
-                .load::<ApplicationProfilePermissionOverrideRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn replace_application_profile_user_permission_overrides(
-        &self,
-        profile_id: &str,
-        user_id: &str,
-        overrides: Vec<(String, String)>,
-    ) -> AppResult<()> {
-        let profile_id = profile_id.to_string();
-        let user_id = user_id.to_string();
-        let mut normalized = BTreeMap::new();
-        for (permission, effect) in overrides {
-            let permission = normalize_application_entitlement_keys(vec![permission])?
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::BadRequest("permission is required".to_string()))?;
-            let effect = effect.trim().to_ascii_lowercase();
-            if effect != "allow" && effect != "deny" {
-                return Err(AppError::BadRequest(
-                    "permission effect must be allow or deny".to_string(),
-                ));
-            }
-            normalized.insert(permission, effect);
-        }
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let delete_sql = format!(
-                    "DELETE FROM application_profile_permission_overrides WHERE profile_id = {} AND user_id = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&profile_id)
-                    .bind::<Text, _>(&user_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let now = util::now_ts();
-                for (permission, effect) in normalized {
-                    let sql = format!(
-                        "INSERT INTO application_profile_permission_overrides (profile_id, user_id, permission, effect, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile_id)
-                        .bind::<Text, _>(&user_id)
-                        .bind::<Text, _>(permission)
-                        .bind::<Text, _>(effect)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn list_application_roles(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<ApplicationRoleRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {} ORDER BY is_active DESC, name ASC",
-                select_application_role_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ApplicationRoleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_role_by_id(
-        &self,
-        application_id: &str,
-        role_id: &str,
-    ) -> AppResult<Option<ApplicationRoleRecord>> {
-        let application_id = application_id.to_string();
-        let role_id = role_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {} AND id = {}",
-                select_application_role_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(role_id)
-                .get_result::<ApplicationRoleRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn upsert_application_role(
-        &self,
-        application_id: &str,
-        role: NewApplicationRole,
-    ) -> AppResult<ApplicationRoleRecord> {
-        let application_id = application_id.to_string();
-        let (name, description, permissions, is_default, is_active) =
-            normalize_application_role_fields(role)?;
-        if is_default && !is_active {
-            return Err(AppError::BadRequest(
-                "an inactive application role cannot be the default role".to_string(),
-            ));
-        }
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<ApplicationRoleRecord, AppError, _>(|conn| {
-                let existing_sql = format!(
-                    "{} WHERE application_id = {} AND name = {}",
-                    select_application_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let existing = sql_query(existing_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&name)
-                    .get_result::<ApplicationRoleRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?;
-                if is_default {
-                    let clear_sql = format!(
-                        "UPDATE application_roles SET is_default = 0, updated_at = {} WHERE application_id = {}",
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(clear_sql)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&application_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let role_id = if let Some(existing) = existing {
-                    let update_sql = format!(
-                        "UPDATE application_roles SET description = {}, permissions = {}, is_default = {}, is_active = {}, updated_at = {} WHERE application_id = {} AND id = {}",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7)
-                    );
-                    sql_query(update_sql)
-                        .bind::<Nullable<Text>, _>(&description)
-                        .bind::<Text, _>(&permissions)
-                        .bind::<Integer, _>(i32::from(is_default))
-                        .bind::<Integer, _>(i32::from(is_active))
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&existing.id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                    existing.id
-                } else {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let insert_sql = format!(
-                        "INSERT INTO application_roles (id, application_id, name, description, permissions, is_default, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&id)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&name)
-                        .bind::<Nullable<Text>, _>(&description)
-                        .bind::<Text, _>(&permissions)
-                        .bind::<Integer, _>(i32::from(is_default))
-                        .bind::<Integer, _>(i32::from(is_active))
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                    id
-                };
-                let select_sql = format!(
-                    "{} WHERE application_id = {} AND id = {}",
-                    select_application_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(select_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(role_id)
-                    .get_result::<ApplicationRoleRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    /// Updates one concrete application role while preserving its stable ID.
-    /// This is intentionally separate from `upsert_application_role`: a
-    /// rename must never be interpreted as a create-by-name operation because
-    /// user, group and enterprise-role bindings reference the role ID.
-    pub async fn update_application_role(
-        &self,
-        application_id: &str,
-        role_id: &str,
-        role: NewApplicationRole,
-    ) -> AppResult<ApplicationRoleRecord> {
-        let application_id = application_id.to_string();
-        let role_id = role_id.to_string();
-        let (name, description, permissions, is_default, is_active) =
-            normalize_application_role_fields(role)?;
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<ApplicationRoleRecord, AppError, _>(|conn| {
-                let current_sql = format!(
-                    "{} WHERE application_id = {} AND id = {}",
-                    select_application_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let current = sql_query(current_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&role_id)
-                    .get_result::<ApplicationRoleRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or(AppError::NotFound)?;
-                if current.is_default == 1 && !is_active {
-                    return Err(AppError::BadRequest(
-                        "the default application role must remain active".to_string(),
-                    ));
-                }
-                if is_default && !is_active {
-                    return Err(AppError::BadRequest(
-                        "an inactive application role cannot be the default role".to_string(),
-                    ));
-                }
-
-                let duplicate_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_roles WHERE application_id = {} AND name = {} AND id <> {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3)
-                );
-                if sql_query(duplicate_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&name)
-                    .bind::<Text, _>(&role_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    > 0
-                {
-                    return Err(AppError::BadRequest(
-                        "application role name already exists".to_string(),
-                    ));
-                }
-
-                if is_default {
-                    let clear_sql = format!(
-                        "UPDATE application_roles SET is_default = 0, updated_at = {} WHERE application_id = {} AND id <> {}",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3)
-                    );
-                    sql_query(clear_sql)
-                        .bind::<BigInt, _>(now)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&role_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-
-                let update_sql = format!(
-                    "UPDATE application_roles SET name = {}, description = {}, permissions = {}, is_default = {}, is_active = {}, updated_at = {} WHERE application_id = {} AND id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8)
-                );
-                sql_query(update_sql)
-                    .bind::<Text, _>(&name)
-                    .bind::<Nullable<Text>, _>(&description)
-                    .bind::<Text, _>(&permissions)
-                    .bind::<Integer, _>(i32::from(is_default))
-                    .bind::<Integer, _>(i32::from(is_active))
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&role_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-
-                let select_sql = format!(
-                    "{} WHERE application_id = {} AND id = {}",
-                    select_application_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(select_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&role_id)
-                    .get_result::<ApplicationRoleRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn delete_application_role(
-        &self,
-        application_id: &str,
-        role_id: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let role_id = role_id.to_string();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let role_sql = format!(
-                    "{} WHERE application_id = {} AND id = {}",
-                    select_application_role_sql(),
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let role = sql_query(role_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&role_id)
-                    .get_result::<ApplicationRoleRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or(AppError::NotFound)?;
-                if role.is_default == 1 {
-                    return Err(AppError::BadRequest(
-                        "set another application role as default before deleting this role"
-                            .to_string(),
-                    ));
-                }
-                for table in [
-                    "application_user_roles",
-                    "application_group_roles",
-                    "application_organization_role_mappings",
-                ] {
-                    let sql = format!(
-                        "DELETE FROM {table} WHERE application_id = {} AND application_role_id = {}",
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&role_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let sql = format!(
-                    "DELETE FROM application_roles WHERE application_id = {} AND id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let affected = sql_query(sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&role_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                if affected == 0 {
-                    return Err(AppError::NotFound);
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn list_application_user_role_ids(
-        &self,
-        application_id: &str,
-        user_id: &str,
-    ) -> AppResult<Vec<String>> {
-        let application_id = application_id.to_string();
-        let user_id = user_id.to_string();
-        #[derive(Debug, diesel::QueryableByName)]
-        struct RoleIdRow {
-            #[diesel(sql_type = Text)]
-            application_role_id: String,
-        }
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_role_id FROM application_user_roles WHERE application_id = {} AND user_id = {} AND is_active = 1 ORDER BY application_role_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&user_id)
-                .load::<RoleIdRow>(&mut conn)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| row.application_role_id)
-                        .collect()
-                })
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn replace_application_user_role_ids(
-        &self,
-        application_id: &str,
-        user_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        self.replace_application_role_assignments(
-            "application_user_roles",
-            "user_id",
-            application_id,
-            user_id,
-            role_ids,
-        )
-        .await
-    }
-
-    pub async fn list_application_group_role_ids(
-        &self,
-        application_id: &str,
-        group_id: &str,
-    ) -> AppResult<Vec<String>> {
-        let application_id = application_id.to_string();
-        let group_id = group_id.to_string();
-        #[derive(Debug, diesel::QueryableByName)]
-        struct RoleIdRow {
-            #[diesel(sql_type = Text)]
-            application_role_id: String,
-        }
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_role_id FROM application_group_roles WHERE application_id = {} AND group_id = {} AND is_active = 1 ORDER BY application_role_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&group_id)
-                .load::<RoleIdRow>(&mut conn)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| row.application_role_id)
-                        .collect()
-                })
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn replace_application_group_role_ids(
-        &self,
-        application_id: &str,
-        group_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        self.replace_application_role_assignments(
-            "application_group_roles",
-            "group_id",
-            application_id,
-            group_id,
-            role_ids,
-        )
-        .await
-    }
-
-    async fn replace_application_role_assignments(
-        &self,
-        table: &str,
-        subject_column: &str,
-        application_id: &str,
-        subject_id: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        let table = table.to_string();
-        let subject_column = subject_column.to_string();
-        if !matches!(
-            table.as_str(),
-            "application_user_roles" | "application_group_roles"
-        ) || !matches!(subject_column.as_str(), "user_id" | "group_id")
-        {
-            return Err(AppError::Internal(
-                "invalid application role assignment table".to_string(),
-            ));
-        }
-        let application_id = application_id.to_string();
-        let subject_id = subject_id.to_string();
-        let role_ids = dedupe_nonempty(role_ids);
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                for role_id in &role_ids {
-                    let sql = format!(
-                        "SELECT COUNT(*) AS count FROM application_roles WHERE application_id = {} AND id = {} AND is_active = 1",
-                        ph(kind, 1), ph(kind, 2)
-                    );
-                    if sql_query(sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(role_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count == 0
-                    {
-                        return Err(AppError::BadRequest(format!("unknown application role: {role_id}")));
-                    }
-                }
-                let delete_sql = format!(
-                    "DELETE FROM {table} WHERE application_id = {} AND {subject_column} = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&subject_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let now = util::now_ts();
-                for role_id in role_ids {
-                    let insert_sql = format!(
-                        "INSERT INTO {table} (application_id, {subject_column}, application_role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&subject_id)
-                        .bind::<Text, _>(role_id)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn list_application_organization_role_ids(
-        &self,
-        application_id: &str,
-        organization_role: &str,
-    ) -> AppResult<Vec<String>> {
-        let application_id = application_id.to_string();
-        let organization_role = organization_role.to_string();
-        #[derive(Debug, diesel::QueryableByName)]
-        struct RoleIdRow {
-            #[diesel(sql_type = Text)]
-            application_role_id: String,
-        }
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_role_id FROM application_organization_role_mappings WHERE application_id = {} AND organization_role = {} AND is_active = 1 ORDER BY application_role_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&organization_role)
-                .load::<RoleIdRow>(&mut conn)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| row.application_role_id)
-                        .collect()
-                })
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn replace_application_organization_role_ids(
-        &self,
-        application_id: &str,
-        organization_role: &str,
-        role_ids: Vec<String>,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let organization_role = organization_role.trim().to_string();
-        if organization_role.is_empty() || organization_role.len() > 64 {
-            return Err(AppError::BadRequest(
-                "organization role is invalid".to_string(),
-            ));
-        }
-        let role_ids = dedupe_nonempty(role_ids);
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                for role_id in &role_ids {
-                    let sql = format!(
-                        "SELECT COUNT(*) AS count FROM application_roles WHERE application_id = {} AND id = {} AND is_active = 1",
-                        ph(kind, 1), ph(kind, 2)
-                    );
-                    if sql_query(sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(role_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count == 0
-                    {
-                        return Err(AppError::BadRequest(format!("unknown application role: {role_id}")));
-                    }
-                }
-                let delete_sql = format!(
-                    "DELETE FROM application_organization_role_mappings WHERE application_id = {} AND organization_role = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&organization_role)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let now = util::now_ts();
-                for role_id in role_ids {
-                    let insert_sql = format!(
-                        "INSERT INTO application_organization_role_mappings (application_id, organization_role, application_role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&organization_role)
-                        .bind::<Text, _>(role_id)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn list_application_user_permission_overrides(
-        &self,
-        application_id: &str,
-        user_id: &str,
-    ) -> AppResult<Vec<ApplicationPermissionOverrideRecord>> {
-        let application_id = application_id.to_string();
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, user_id, permission, effect FROM application_user_permission_overrides WHERE application_id = {} AND user_id = {} ORDER BY permission ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&user_id)
-                .load::<ApplicationPermissionOverrideRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn replace_application_user_permission_overrides(
-        &self,
-        application_id: &str,
-        user_id: &str,
-        overrides: Vec<(String, String)>,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let user_id = user_id.to_string();
-        let mut normalized = BTreeMap::new();
-        for (permission, effect) in overrides {
-            let permission = normalize_application_entitlement_keys(vec![permission])?
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::BadRequest("permission is required".to_string()))?;
-            let effect = effect.trim().to_ascii_lowercase();
-            if effect != "allow" && effect != "deny" {
-                return Err(AppError::BadRequest(
-                    "permission effect must be allow or deny".to_string(),
-                ));
-            }
-            normalized.insert(permission, effect);
-        }
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let delete_sql = format!(
-                    "DELETE FROM application_user_permission_overrides WHERE application_id = {} AND user_id = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&user_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let now = util::now_ts();
-                for (permission, effect) in normalized {
-                    let insert_sql = format!(
-                        "INSERT INTO application_user_permission_overrides (application_id, user_id, permission, effect, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&user_id)
-                        .bind::<Text, _>(permission)
-                        .bind::<Text, _>(effect)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
     pub async fn find_application_jwt_client(
         &self,
         application_id: &str,
@@ -16211,71 +17249,68 @@ impl Db {
         secret_hash: &str,
         grace_seconds: i64,
     ) -> AppResult<ApplicationJwtClientSecretRecord> {
-        let Some(client) = self
-            .find_application_jwt_client(application_id, client_id)
-            .await?
-        else {
-            return Err(AppError::NotFound);
-        };
-        if client.client_type != "confidential" || client.is_active != 1 {
-            return Err(AppError::BadRequest(
-                "JWT secrets require an active confidential client".to_string(),
-            ));
-        }
         if secret_hash.trim().is_empty() || secret_hash.len() > 512 {
             return Err(AppError::BadRequest(
                 "application JWT secret hash is invalid".to_string(),
             ));
         }
         let grace_seconds = grace_seconds.clamp(0, 86_400);
-        let client_db_id = client.id;
+        let application_id = application_id.to_string();
+        let client_id = client_id.to_string();
         let secret_hash = secret_hash.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<ApplicationJwtClientSecretRecord, AppError, _>(|conn| {
-                let expires_at = now.saturating_add(grace_seconds);
-                let update_sql = format!(
-                    "UPDATE application_jwt_client_secrets SET expires_at = CASE WHEN expires_at IS NULL OR expires_at > {} THEN {} ELSE expires_at END WHERE jwt_client_id = {} AND revoked_at IS NULL",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3)
-                );
-                sql_query(update_sql)
-                    .bind::<BigInt, _>(expires_at)
-                    .bind::<BigInt, _>(expires_at)
-                    .bind::<Text, _>(&client_db_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let secret_id = uuid::Uuid::new_v4().to_string();
-                let insert_sql = format!(
-                    "INSERT INTO application_jwt_client_secrets (id, jwt_client_id, secret_hash, created_at, expires_at, revoked_at) VALUES ({}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&secret_id)
-                    .bind::<Text, _>(&client_db_id)
-                    .bind::<Text, _>(&secret_hash)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Nullable<BigInt>, _>(None::<i64>)
-                    .bind::<Nullable<BigInt>, _>(None::<i64>)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let select_sql = format!(
-                    "{} WHERE id = {}",
-                    select_application_jwt_secret_sql(),
-                    ph(kind, 1)
-                );
-                sql_query(select_sql)
-                    .bind::<Text, _>(&secret_id)
-                    .get_result::<ApplicationJwtClientSecretRecord>(conn)
-                    .map_err(AppError::from)
+                rotate_application_jwt_secret_on_conn!(
+                    conn,
+                    kind,
+                    &application_id,
+                    &client_id,
+                    &secret_hash,
+                    grace_seconds,
+                    now,
+                )
             })
         })
+    }
+
+    /// Rotates an application JWT secret and records the management audit in
+    /// the same transaction.  The raw secret is never passed to the database
+    /// or the audit event; only the generated secret response remains in the
+    /// handler's in-memory scope.
+    pub async fn rotate_application_jwt_secret_with_audit(
+        &self,
+        application_id: &str,
+        client_id: &str,
+        secret_hash: &str,
+        grace_seconds: i64,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<ApplicationJwtClientSecretRecord> {
+        let application_id = application_id.to_string();
+        let client_id = client_id.to_string();
+        let secret_hash = secret_hash.to_string();
+        let grace_seconds = grace_seconds.clamp(0, 86_400);
+        let now = util::now_ts();
+        let webhook_db = self.clone();
+        let (secret, audit_event) = with_conn!(self, |conn, kind| {
+            conn.transaction::<(ApplicationJwtClientSecretRecord, AuditEventRecord), AppError, _>(
+                |conn| {
+                    let secret = rotate_application_jwt_secret_on_conn!(
+                        conn,
+                        kind,
+                        &application_id,
+                        &client_id,
+                        &secret_hash,
+                        grace_seconds,
+                        now,
+                    )?;
+                    let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
+                    Ok((secret, audit_event))
+                },
+            )
+        })?;
+        crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+        Ok(secret)
     }
 
     pub async fn verify_application_jwt_secret(
@@ -16835,43 +17870,32 @@ impl Db {
         &self,
         token: NewApplicationScimToken,
     ) -> AppResult<ApplicationScimTokenRecord> {
-        let scopes = util::to_json(&token.scopes)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO application_scim_tokens (id, application_id, token_prefix, token_hash, scopes, expires_at, revoked_at, last_used_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&token.id)
-                .bind::<Text, _>(&token.application_id)
-                .bind::<Text, _>(&token.token_prefix)
-                .bind::<Text, _>(&token.token_hash)
-                .bind::<Text, _>(scopes)
-                .bind::<Nullable<BigInt>, _>(token.expires_at)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!(
-                "{} WHERE id = {}",
-                select_application_scim_token_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&token.id)
-                .get_result::<ApplicationScimTokenRecord>(&mut conn)
-                .map_err(AppError::from)
+            insert_application_scim_token_on_conn!(conn, kind, &token, now)
         })
+    }
+
+    /// Creates an application SCIM token and its audit record atomically.
+    /// Only the token hash and non-sensitive prefix are stored or audited.
+    pub async fn insert_application_scim_token_with_audit(
+        &self,
+        token: NewApplicationScimToken,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<ApplicationScimTokenRecord> {
+        let now = util::now_ts();
+        let webhook_db = self.clone();
+        let (token, audit_event) = with_conn!(self, |conn, kind| {
+            conn.transaction::<(ApplicationScimTokenRecord, AuditEventRecord), AppError, _>(
+                |conn| {
+                    let token = insert_application_scim_token_on_conn!(conn, kind, &token, now)?;
+                    let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
+                    Ok((token, audit_event))
+                },
+            )
+        })?;
+        crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+        Ok(token)
     }
 
     pub async fn list_application_scim_tokens(
@@ -16917,17 +17941,20 @@ impl Db {
     pub async fn touch_application_scim_token(&self, token_hash: &str) -> AppResult<()> {
         let token_hash = token_hash.to_string();
         let now = util::now_ts();
+        let touch_before = now.saturating_sub(SCIM_TOKEN_USAGE_TOUCH_INTERVAL_SECONDS);
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE application_scim_tokens SET last_used_at = {} WHERE token_hash = {} AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > {})",
+                "UPDATE application_scim_tokens SET last_used_at = {} WHERE token_hash = {} AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > {}) AND (last_used_at IS NULL OR last_used_at < {})",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
+                ph(kind, 4),
             );
             sql_query(sql)
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(&token_hash)
                 .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(touch_before)
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(AppError::from)
@@ -16955,1694 +17982,6 @@ impl Db {
                 .bind::<Text, _>(&token_id)
                 .execute(&mut conn)
                 .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_by_slug_in_organization(
-        &self,
-        organization_id: &str,
-        slug: &str,
-    ) -> AppResult<Option<ApplicationRecord>> {
-        let organization_id = organization_id.to_string();
-        let slug = slug.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE organization_id = {} AND slug = {}",
-                select_application_sql(),
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(organization_id)
-                .bind::<Text, _>(slug)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_by_id(&self, id: &str) -> AppResult<Option<ApplicationRecord>> {
-        let id = id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE id = {}", select_application_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_discovery(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Option<ApplicationDiscoveryRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {}",
-                select_application_discovery_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_website_managed_discoveries(
-        &self,
-    ) -> AppResult<Vec<(ApplicationRecord, ApplicationDiscoveryRecord)>> {
-        #[derive(Debug, diesel::QueryableByName)]
-        struct DiscoveryRow {
-            #[diesel(sql_type = Text)]
-            application_id: String,
-        }
-        let rows = with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id FROM application_discovery WHERE management_mode = {} ORDER BY application_id ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(crate::application_discovery::MANAGEMENT_MODE_WEBSITE)
-                .load::<DiscoveryRow>(&mut conn)
-                .map_err(AppError::from)
-        })?;
-        let mut result = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(application) = self.find_application_by_id(&row.application_id).await? else {
-                continue;
-            };
-            let Some(discovery) = self.find_application_discovery(&row.application_id).await?
-            else {
-                continue;
-            };
-            result.push((application, discovery));
-        }
-        Ok(result)
-    }
-
-    pub async fn upsert_application_discovery(
-        &self,
-        discovery: NewApplicationDiscovery,
-    ) -> AppResult<ApplicationDiscoveryRecord> {
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let existing = format!(
-                "SELECT COUNT(*) AS count FROM application_discovery WHERE application_id = {}",
-                ph(kind, 1)
-            );
-            let exists = sql_query(existing)
-                .bind::<Text, _>(&discovery.application_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                > 0;
-            if exists {
-                let sql = format!(
-                    "UPDATE application_discovery SET management_mode = {}, website_url = {}, fetch_secret_ciphertext = {}, signing_public_jwks = {}, last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, operator_disabled = {}, updated_at = {} WHERE application_id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&discovery.management_mode)
-                    .bind::<Text, _>(&discovery.website_url)
-                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
-                    .bind::<Text, _>(&discovery.signing_public_jwks)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
-                    .bind::<Text, _>(&discovery.sync_status)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
-                    .bind::<Nullable<Text>, _>(&discovery.last_error)
-                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
-                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&discovery.application_id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            } else {
-                let sql = format!(
-                    "INSERT INTO application_discovery (application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16),
-                    ph(kind, 17)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&discovery.application_id)
-                    .bind::<Text, _>(&discovery.management_mode)
-                    .bind::<Text, _>(&discovery.website_url)
-                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
-                    .bind::<Text, _>(&discovery.signing_public_jwks)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
-                    .bind::<Text, _>(&discovery.sync_status)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
-                    .bind::<Nullable<Text>, _>(&discovery.last_error)
-                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
-                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
-            let sql = format!(
-                "{} WHERE application_id = {}",
-                select_application_discovery_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&discovery.application_id)
-                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Records a failed discovery attempt without touching the last verified
-    /// snapshot.  Runtime authorization deliberately reads the verified
-    /// revision/snapshot fields, so a transient website outage only changes
-    /// operator-visible status and diagnostics.
-    pub async fn mark_application_discovery_sync_error(
-        &self,
-        application_id: &str,
-        sync_status: &str,
-        last_error: Option<String>,
-    ) -> AppResult<ApplicationDiscoveryRecord> {
-        let application_id = application_id.to_string();
-        let sync_status = sync_status.to_string();
-        let last_error = last_error.map(|value| value.chars().take(512).collect::<String>());
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE application_discovery SET sync_status = {}, last_fetched_at = {}, last_error = {}, updated_at = {} WHERE application_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5)
-            );
-            let affected = sql_query(sql)
-                .bind::<Text, _>(&sync_status)
-                .bind::<BigInt, _>(now)
-                .bind::<Nullable<Text>, _>(&last_error)
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&application_id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            if affected == 0 {
-                return Err(AppError::NotFound);
-            }
-            let sql = format!(
-                "{} WHERE application_id = {}",
-                select_application_discovery_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&application_id)
-                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Applies one already verified website snapshot atomically. Network
-    /// fetching and signature validation happen before this method; this
-    /// transaction only reconciles the normalized result and the snapshot
-    /// metadata. Client secrets are already hashed by the verifier.
-    pub async fn apply_application_contract(
-        &self,
-        application_id: &str,
-        manifest: crate::application_discovery::VerifiedApplicationManifest,
-    ) -> AppResult<ApplicationDiscoveryRecord> {
-        let application_id = application_id.to_string();
-        let snapshot_json = util::to_json(&manifest.redacted_payload)?;
-        let manifest = manifest.clone();
-        let application_organization_id = self
-            .find_application_by_id(&application_id)
-            .await?
-            .ok_or(AppError::NotFound)?
-            .organization_id;
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<ApplicationDiscoveryRecord, AppError, _>(|conn| {
-                let current_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_discovery_sql(),
-                    ph(kind, 1)
-                );
-                let current = sql_query(current_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<ApplicationDiscoveryRecord>(conn)
-                    .map_err(AppError::from)?;
-                if current.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE {
-                    return Err(AppError::BadRequest(
-                        "application is not website-managed".to_string(),
-                    ));
-                }
-                if let Some(previous_revision) = current.last_verified_revision {
-                    if manifest.revision < previous_revision {
-                        return Err(AppError::BadRequest(
-                            "application discovery revision moved backwards".to_string(),
-                        ));
-                    }
-                    if manifest.revision == previous_revision {
-                        if current.last_verified_digest.as_deref() == Some(manifest.digest.as_str()) {
-                            // A verified website manifest is a short-lived
-                            // JWS. Refresh its lease and clear a transient
-                            // sync error even when the revision/content digest
-                            // is unchanged; otherwise the persisted expiry
-                            // would age out while periodic verification keeps
-                            // succeeding.
-                            let now = util::now_ts();
-                            let refresh_sql = format!(
-                                "UPDATE application_discovery SET last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, updated_at = {} WHERE application_id = {}",
-                                ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
-                            );
-                            sql_query(refresh_sql)
-                                .bind::<BigInt, _>(manifest.expires_at)
-                                .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
-                                .bind::<BigInt, _>(now)
-                                .bind::<BigInt, _>(now)
-                                .bind::<Nullable<Text>, _>(None::<String>)
-                                .bind::<Nullable<Text>, _>(Some(snapshot_json.clone()))
-                                .bind::<BigInt, _>(now)
-                                .bind::<Text, _>(&application_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                            let result_sql = format!(
-                                "{} WHERE application_id = {}",
-                                select_application_discovery_sql(),
-                                ph(kind, 1)
-                            );
-                            return sql_query(result_sql)
-                                .bind::<Text, _>(&application_id)
-                                .get_result::<ApplicationDiscoveryRecord>(conn)
-                                .map_err(AppError::from);
-                        }
-                        return Err(AppError::BadRequest(
-                            "application discovery revision was reused with different content".to_string(),
-                        ));
-                    }
-                }
-
-                let client_ids = manifest
-                    .clients
-                    .iter()
-                    .map(|client| client.client_id.clone())
-                    .collect::<BTreeSet<_>>();
-                let mut client_db_ids = BTreeMap::new();
-                let mut profile_db_ids = BTreeMap::new();
-                for client in &manifest.clients {
-                    let protocol = manifest
-                        .client_protocols
-                        .get(&client.client_id)
-                        .ok_or_else(|| {
-                            AppError::BadRequest(
-                                "application contract is missing a client protocol".to_string(),
-                            )
-                        })?;
-                    let existing_sql = format!(
-                        "{} WHERE client_id = {}",
-                        select_client_sql(),
-                        ph(kind, 1)
-                    );
-                    let existing = sql_query(existing_sql)
-                        .bind::<Text, _>(&client.client_id)
-                        .get_result::<ClientRecord>(conn)
-                        .optional()
-                        .map_err(AppError::from)?;
-                    let client_db_id = if let Some(existing) = existing {
-                        let owner_sql = format!(
-                            "SELECT COUNT(*) AS count FROM application_client_bindings WHERE client_db_id = {} AND application_id <> {}",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let owned_elsewhere = sql_query(owner_sql)
-                            .bind::<Text, _>(&existing.id)
-                            .bind::<Text, _>(&application_id)
-                            .get_result::<CountRow>(conn)
-                            .map_err(AppError::from)?
-                            .count
-                            > 0;
-                        if owned_elsewhere {
-                            return Err(AppError::BadRequest(
-                                "website-managed client belongs to another application".to_string(),
-                            ));
-                        }
-                        if existing.organization_id.as_deref()
-                            != Some(application_organization_id.as_str())
-                        {
-                            return Err(AppError::BadRequest(
-                                "website-managed client belongs to another organization"
-                                    .to_string(),
-                            ));
-                        }
-                        conn.website_discovery_update_client(kind, &existing.id, client)?;
-                        existing.id
-                    } else {
-                        conn.website_discovery_insert_client(kind, client)?
-                    };
-                    client_db_ids.insert(client.client_id.clone(), client_db_id.clone());
-                    let link_count_sql = format!(
-                        "SELECT COUNT(*) AS count FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
-                        ph(kind, 1), ph(kind, 2)
-                    );
-                    let linked = sql_query(link_count_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(&client_db_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count
-                        > 0;
-                    if !linked {
-                        let link_sql = format!(
-                            "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
-                            ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
-                        );
-                        sql_query(link_sql)
-                            .bind::<Text, _>(&application_id)
-                            .bind::<Text, _>(&client_db_id)
-                            .bind::<Text, _>(protocol)
-                            .bind::<Text, _>("default")
-                            .bind::<Text, _>(&format!("auth-domain:{application_id}"))
-                            .bind::<Integer, _>(1)
-                            .bind::<BigInt, _>(util::now_ts())
-                            .bind::<BigInt, _>(util::now_ts())
-                            .execute(conn)
-                            .map_err(AppError::from)?;
-                    }
-                }
-                let existing_clients_sql = format!(
-                    "SELECT client_db_id FROM application_client_bindings WHERE application_id = {} AND is_active = 1",
-                    ph(kind, 1)
-                );
-                #[derive(diesel::QueryableByName)]
-                struct ClientIdRow {
-                    #[diesel(sql_type = Text)]
-                    client_db_id: String,
-                }
-                if manifest.revoke_removed_clients {
-                    for row in sql_query(existing_clients_sql)
-                        .bind::<Text, _>(&application_id)
-                        .load::<ClientIdRow>(conn)
-                        .map_err(AppError::from)?
-                    {
-                        let client_sql = format!(
-                            "SELECT client_id FROM clients WHERE id = {}",
-                            ph(kind, 1)
-                        );
-                        #[derive(diesel::QueryableByName)]
-                        struct ClientNameRow {
-                            #[diesel(sql_type = Text)]
-                            client_id: String,
-                        }
-                        let current_client = sql_query(client_sql)
-                            .bind::<Text, _>(&row.client_db_id)
-                            .get_result::<ClientNameRow>(conn)
-                            .map_err(AppError::from)?;
-                        if !client_ids.contains(&current_client.client_id) {
-                            let deactivate_sql = format!(
-                                "UPDATE clients SET is_active = {}, updated_at = {} WHERE id = {}",
-                                ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                            );
-                            sql_query(deactivate_sql)
-                                .bind::<Integer, _>(0)
-                                .bind::<BigInt, _>(util::now_ts())
-                                .bind::<Text, _>(&row.client_db_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                            let unlink_sql = format!(
-                    "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            sql_query(unlink_sql)
-                                .bind::<Text, _>(&application_id)
-                                .bind::<Text, _>(&row.client_db_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                            let unlink_binding_sql = format!(
-                                "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            sql_query(unlink_binding_sql)
-                                .bind::<Text, _>(&application_id)
-                                .bind::<Text, _>(&row.client_db_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                        }
-                    }
-                }
-
-                conn.website_discovery_upsert_module(
-                    kind,
-                    &application_id,
-                    "protocols",
-                    &manifest.protocols,
-                )?;
-                conn.website_discovery_upsert_module(
-                    kind,
-                    &application_id,
-                    "login_adapters",
-                    &manifest.login_adapters,
-                )?;
-                conn.website_discovery_upsert_module(
-                    kind,
-                    &application_id,
-                    "directory_sync",
-                    &manifest.directory_sync,
-                )?;
-                conn.website_discovery_upsert_module(
-                    kind,
-                    &application_id,
-                    "authorization",
-                    &manifest.authorization,
-                )?;
-
-                // The website document is a complete snapshot. Remove
-                // profile records that disappeared from the new revision,
-                // together with their assignments and role/permission rows;
-                // otherwise a later reuse of the same client_id could revive
-                // stale website entitlements.
-                let existing_profiles_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_authorization_profile_sql(),
-                    ph(kind, 1)
-                );
-                let existing_profiles = sql_query(existing_profiles_sql)
-                    .bind::<Text, _>(&application_id)
-                    .load::<ApplicationAuthorizationProfileRecord>(conn)
-                    .map_err(AppError::from)?;
-                for existing_profile in existing_profiles {
-                    if manifest.profiles.contains_key(&existing_profile.profile_key) {
-                        continue;
-                    }
-                    for table in [
-                        "application_profile_permission_overrides",
-                        "application_profile_user_roles",
-                        "application_profile_group_roles",
-                        "application_profile_organization_roles",
-                        "application_permission_definitions",
-                        "application_profile_roles",
-                    ] {
-                        let delete_sql = format!(
-                            "DELETE FROM {table} WHERE profile_id = {}",
-                            ph(kind, 1)
-                        );
-                        sql_query(delete_sql)
-                            .bind::<Text, _>(&existing_profile.id)
-                            .execute(conn)
-                            .map_err(AppError::from)?;
-                    }
-                    let delete_profile_sql = format!(
-                        "DELETE FROM application_authorization_profiles WHERE id = {}",
-                        ph(kind, 1)
-                    );
-                    sql_query(delete_profile_sql)
-                        .bind::<Text, _>(&existing_profile.id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-
-                for (profile_key, profile) in &manifest.profiles {
-                    let connection_id = client_db_ids.get(profile_key).cloned();
-                    let connection_kind = if profile_key == "default" {
-                        "application".to_string()
-                    } else {
-                        manifest
-                            .client_protocols
-                            .get(profile_key)
-                            .cloned()
-                            .ok_or_else(|| {
-                                AppError::BadRequest(
-                                    "application contract profile has no client protocol"
-                                        .to_string(),
-                                )
-                            })?
-                    };
-                    let profile_id = conn.website_discovery_upsert_profile(
-                        kind,
-                        &application_id,
-                        profile_key,
-                        connection_id.as_deref(),
-                        &connection_kind,
-                        &manifest.version,
-                        &manifest.digest,
-                    )?;
-                    profile_db_ids.insert(profile_key.clone(), profile_id.clone());
-                    conn.website_discovery_replace_permissions(kind, &profile_id, profile)?;
-                    conn.website_discovery_replace_roles(kind, &profile_id, profile)?;
-                }
-
-                // Every verified v3 client receives an explicit
-                // application/profile binding in the runtime authority.
-                let now = util::now_ts();
-                let auth_domain_id = format!("auth-domain:{application_id}");
-                let auth_domain_count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_auth_domains WHERE application_id = {}",
-                    ph(kind, 1)
-                );
-                if sql_query(auth_domain_count_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    == 0
-                {
-                    let auth_domain_sql = format!(
-                        "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(auth_domain_sql)
-                        .bind::<Text, _>(&auth_domain_id)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>("default")
-                        .bind::<Integer, _>(1)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                for (client_id, client_db_id) in &client_db_ids {
-                    let profile_id = profile_db_ids
-                        .get(client_id)
-                        .or_else(|| profile_db_ids.get("default"))
-                        .map(String::as_str)
-                        .unwrap_or("default");
-                    let delete_binding_sql = format!(
-                        "DELETE FROM application_client_bindings WHERE client_db_id = {}",
-                        ph(kind, 1)
-                    );
-                    sql_query(delete_binding_sql)
-                        .bind::<Text, _>(client_db_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                    let binding_sql = format!(
-                        "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
-                    );
-                    sql_query(binding_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(client_db_id)
-                        .bind::<Text, _>(manifest.client_protocols.get(client_id).ok_or_else(|| {
-                            AppError::BadRequest(
-                                "application contract is missing a client protocol".to_string(),
-                            )
-                        })?)
-                        .bind::<Text, _>(profile_id)
-                        .bind::<Text, _>(&auth_domain_id)
-                        .bind::<Integer, _>(1)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-
-                if let Some(default_profile_id) = profile_db_ids.get("default") {
-                    #[derive(Debug, diesel::QueryableByName)]
-                    struct IdRow {
-                        #[diesel(sql_type = Text)]
-                        id: String,
-                    }
-
-                    // These mappings are website policy, so the complete set
-                    // is replaced on every verified revision. User role
-                    // assignments remain in the separate user-role table and
-                    // are never present in the website manifest.
-                    let profile_ids = profile_db_ids.values().cloned().collect::<Vec<_>>();
-                    for profile_id in &profile_ids {
-                        for table in [
-                            "application_profile_group_roles",
-                            "application_profile_organization_roles",
-                        ] {
-                            let delete_sql = format!(
-                                "DELETE FROM {table} WHERE profile_id = {}",
-                                ph(kind, 1)
-                            );
-                            sql_query(delete_sql)
-                                .bind::<Text, _>(profile_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                        }
-                    }
-                    for mapping in &manifest.authorization_mappings.group_mappings {
-                        let group_sql = format!(
-                            "SELECT id FROM access_groups WHERE id = {} OR name = {}",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let group_id = sql_query(group_sql)
-                            .bind::<Text, _>(&mapping.group)
-                            .bind::<Text, _>(&mapping.group)
-                            .get_result::<IdRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                            .ok_or_else(|| {
-                                AppError::BadRequest(format!(
-                                    "website authorization references unknown group: {}",
-                                    mapping.group
-                                ))
-                            })?
-                            .id;
-                        for profile_id in &profile_ids {
-                            let role_sql = format!(
-                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            let role_id = sql_query(role_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(&mapping.role)
-                                .get_result::<IdRow>(conn)
-                                .optional()
-                                .map_err(AppError::from)?;
-                            let Some(role_id) = role_id else {
-                                if profile_id == default_profile_id {
-                                    return Err(AppError::BadRequest(format!(
-                                        "website authorization references unknown role: {}",
-                                        mapping.role
-                                    )));
-                                }
-                                continue;
-                            };
-                            let insert_sql = format!(
-                                "INSERT INTO application_profile_group_roles (profile_id, group_id, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                                ph(kind, 1),
-                                ph(kind, 2),
-                                ph(kind, 3),
-                                ph(kind, 4),
-                                ph(kind, 5)
-                            );
-                            let now = util::now_ts();
-                            sql_query(insert_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(group_id.clone())
-                                .bind::<Text, _>(role_id.id)
-                                .bind::<BigInt, _>(now)
-                                .bind::<BigInt, _>(now)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                        }
-                    }
-                    for mapping in &manifest.authorization_mappings.organization_role_mappings {
-                        for profile_id in &profile_ids {
-                            let role_sql = format!(
-                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            let role_id = sql_query(role_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(&mapping.role)
-                                .get_result::<IdRow>(conn)
-                                .optional()
-                                .map_err(AppError::from)?;
-                            let Some(role_id) = role_id else {
-                                if profile_id == default_profile_id {
-                                    return Err(AppError::BadRequest(format!(
-                                        "website authorization references unknown role: {}",
-                                        mapping.role
-                                    )));
-                                }
-                                continue;
-                            };
-                            let insert_sql = format!(
-                                "INSERT INTO application_profile_organization_roles (profile_id, organization_role, role_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, 1, {}, {})",
-                                ph(kind, 1),
-                                ph(kind, 2),
-                                ph(kind, 3),
-                                ph(kind, 4),
-                                ph(kind, 5)
-                            );
-                            let now = util::now_ts();
-                            sql_query(insert_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(&mapping.organization_role)
-                                .bind::<Text, _>(role_id.id)
-                                .bind::<BigInt, _>(now)
-                                .bind::<BigInt, _>(now)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                        }
-                    }
-                }
-
-                let now = util::now_ts();
-                let update_sql = format!(
-                    "UPDATE application_discovery SET last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, updated_at = {} WHERE application_id = {}",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8), ph(kind, 9), ph(kind, 10), ph(kind, 11)
-                );
-                sql_query(update_sql)
-                    .bind::<BigInt, _>(manifest.revision)
-                    .bind::<Text, _>(&manifest.version)
-                    .bind::<Text, _>(&manifest.digest)
-                    .bind::<BigInt, _>(manifest.expires_at)
-                    .bind::<Text, _>(crate::application_discovery::SYNC_SYNCED)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Nullable<Text>, _>(None::<String>)
-                    .bind::<Nullable<Text>, _>(Some(snapshot_json))
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&application_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let result_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_discovery_sql(),
-                    ph(kind, 1)
-                );
-                sql_query(result_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<ApplicationDiscoveryRecord>(conn)
-                    .map_err(AppError::from)
-            })
-        })
-    }
-
-    pub async fn find_active_application_by_slug(
-        &self,
-        slug: &str,
-    ) -> AppResult<Option<ApplicationRecord>> {
-        let slug = slug.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE slug = {} AND is_active = 1 AND organization_id IN (SELECT id FROM organizations WHERE is_active = 1) ORDER BY organization_id ASC",
-                select_application_sql(),
-                ph(kind, 1)
-            );
-            let applications = sql_query(sql)
-                .bind::<Text, _>(slug)
-                .load::<ApplicationRecord>(&mut conn)
-                .map_err(AppError::from)?;
-            match applications.as_slice() {
-                [] => Ok(None),
-                [application] => Ok(Some(application.clone())),
-                _ => Err(AppError::BadRequest(
-                    "application slug is ambiguous; use an organization-specific URL".to_string(),
-                )),
-            }
-        })
-    }
-
-    pub async fn find_application_for_client(
-        &self,
-        client_db_id: &str,
-    ) -> AppResult<Option<ApplicationRecord>> {
-        let client_db_id = client_db_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE id IN (SELECT application_id FROM application_client_bindings WHERE client_db_id = {} AND is_active = 1)",
-                select_application_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(client_db_id)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_auth_domain(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Option<ApplicationAuthDomainRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT id, application_id, assurance_policy, is_active, created_at, updated_at FROM application_auth_domains WHERE application_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .get_result::<ApplicationAuthDomainRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_auth_context(
-        &self,
-        auth_domain_id: &str,
-        user_id: &str,
-    ) -> AppResult<Option<ApplicationAuthContextRecord>> {
-        let auth_domain_id = auth_domain_id.to_string();
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE auth_domain_id = {} AND user_id = {} AND revoked_at IS NULL ORDER BY authenticated_at DESC LIMIT 1",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(auth_domain_id)
-                .bind::<Text, _>(user_id)
-                .get_result::<ApplicationAuthContextRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn insert_application_auth_context(
-        &self,
-        context: NewApplicationAuthContext,
-    ) -> AppResult<ApplicationAuthContextRecord> {
-        let now = util::now_ts();
-        let amr = serde_json::to_string(&context.amr)
-            .map_err(|err| AppError::Internal(err.to_string()))?;
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO application_auth_contexts (id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&context.id)
-                .bind::<Text, _>(&context.auth_domain_id)
-                .bind::<Text, _>(&context.user_id)
-                .bind::<Text, _>(&context.acr)
-                .bind::<Text, _>(amr)
-                .bind::<BigInt, _>(context.authenticated_at)
-                .bind::<BigInt, _>(context.expires_at)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let select_sql = format!(
-                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(select_sql)
-                .bind::<Text, _>(context.id)
-                .get_result::<ApplicationAuthContextRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_application_client_bindings(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<ApplicationClientBindingRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE application_id = {} ORDER BY created_at ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ApplicationClientBindingRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_client_binding(
-        &self,
-        client_db_id: &str,
-    ) -> AppResult<Option<ApplicationClientBindingRecord>> {
-        let client_db_id = client_db_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE client_db_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(client_db_id)
-                .get_result::<ApplicationClientBindingRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_application_client_binding_by_public_client_id(
-        &self,
-        client_id: &str,
-    ) -> AppResult<Option<ApplicationClientBindingRecord>> {
-        let client_id = client_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT bindings.application_id, bindings.client_db_id, bindings.protocol, bindings.authorization_profile_id, bindings.auth_domain_id, bindings.is_active, bindings.created_at, bindings.updated_at FROM application_client_bindings bindings INNER JOIN clients ON clients.id = bindings.client_db_id WHERE clients.client_id = {} AND bindings.is_active = 1",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(client_id)
-                .get_result::<ApplicationClientBindingRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Resolves the single application that owns an enrollment invitation.
-    /// The mapping is intentionally separate from invitation metadata so a
-    /// generic enterprise invitation cannot be mistaken for an app-scoped
-    /// admission capability.
-    pub async fn find_application_for_enrollment_code(
-        &self,
-        invitation_id: &str,
-    ) -> AppResult<Option<ApplicationRecord>> {
-        let invitation_id = invitation_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE id IN (SELECT application_id FROM application_enrollment_codes WHERE invitation_id = {})",
-                select_application_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(invitation_id)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_application_client_ids(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<String>> {
-        #[derive(diesel::QueryableByName)]
-        struct ClientIdRow {
-            #[diesel(sql_type = Text)]
-            client_db_id: String,
-        }
-
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT client_db_id FROM application_client_bindings WHERE application_id = {} AND is_active = 1 ORDER BY created_at ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ClientIdRow>(&mut conn)
-                .map(|rows| rows.into_iter().map(|row| row.client_db_id).collect())
-                .map_err(AppError::from)
-        })
-    }
-
-    /// The invitation itself is the enrollment capability; this mapping gives
-    /// it one tenant-owned application home for listing and revocation.
-    pub async fn link_application_enrollment_code(
-        &self,
-        application_id: &str,
-        invitation_id: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let invitation_id = invitation_id.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO application_enrollment_codes (application_id, invitation_id, created_at) VALUES ({}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(invitation_id)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_application_enrollment_codes(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<InvitationRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT invitation_records.* FROM ({}) AS invitation_records INNER JOIN application_enrollment_codes ON application_enrollment_codes.invitation_id = invitation_records.id WHERE application_enrollment_codes.application_id = {} ORDER BY invitation_records.created_at DESC",
-                select_invitation_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<InvitationRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn application_enrollment_code_belongs_to(
-        &self,
-        application_id: &str,
-        invitation_id: &str,
-    ) -> AppResult<bool> {
-        let application_id = application_id.to_string();
-        let invitation_id = invitation_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT COUNT(*) AS count FROM application_enrollment_codes WHERE application_id = {} AND invitation_id = {}",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(invitation_id)
-                .get_result::<CountRow>(&mut conn)
-                .map(|row| row.count > 0)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn insert_application(
-        &self,
-        application: NewApplication,
-    ) -> AppResult<ApplicationRecord> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = util::now_ts();
-        let unique_identity_factors = util::to_json(&application.unique_identity_factors)?;
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO applications (id, organization_id, slug, name, description, access_mode, registration_mode, account_selection_mode, unique_identity_factors, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11),
-                ph(kind, 12)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&id)
-                .bind::<Text, _>(application.organization_id)
-                .bind::<Text, _>(application.slug)
-                .bind::<Text, _>(application.name)
-                .bind::<Nullable<Text>, _>(application.description)
-                .bind::<Text, _>(application.access_mode)
-                .bind::<Text, _>(application.registration_mode)
-                .bind::<Text, _>(application.account_selection_mode)
-                .bind::<Text, _>(unique_identity_factors)
-                .bind::<Integer, _>(i32::from(application.is_active))
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!("{} WHERE id = {}", select_application_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn update_application(
-        &self,
-        id: &str,
-        application: NewApplication,
-    ) -> AppResult<ApplicationRecord> {
-        let id = id.to_string();
-        let now = util::now_ts();
-        let unique_identity_factors = util::to_json(&application.unique_identity_factors)?;
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "UPDATE applications SET organization_id = {}, slug = {}, name = {}, description = {}, access_mode = {}, registration_mode = {}, account_selection_mode = {}, unique_identity_factors = {}, is_active = {}, updated_at = {} WHERE id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11)
-            );
-            let affected = sql_query(sql)
-                .bind::<Text, _>(application.organization_id)
-                .bind::<Text, _>(application.slug)
-                .bind::<Text, _>(application.name)
-                .bind::<Nullable<Text>, _>(application.description)
-                .bind::<Text, _>(application.access_mode)
-                .bind::<Text, _>(application.registration_mode)
-                .bind::<Text, _>(application.account_selection_mode)
-                .bind::<Text, _>(unique_identity_factors)
-                .bind::<Integer, _>(i32::from(application.is_active))
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            if affected == 0 {
-                return Err(AppError::NotFound);
-            }
-            let sql = format!("{} WHERE id = {}", select_application_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<ApplicationRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn delete_application(&self, id: &str) -> AppResult<()> {
-        let id = id.to_string();
-        // A protocol connection must never be left without an application
-        // policy. Capture the current links before deleting the aggregate so
-        // each detached connection can immediately receive a new locked
-        // fallback application afterwards.
-        let detached_client_ids = self.list_application_client_ids(&id).await?;
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let sql = format!(
-                    "DELETE FROM application_jwt_client_secrets WHERE jwt_client_id IN (SELECT id FROM application_jwt_clients WHERE application_id = {})",
-                    ph(kind, 1)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                for table in [
-                    "application_profile_permission_overrides",
-                    "application_profile_user_roles",
-                    "application_profile_group_roles",
-                    "application_profile_organization_roles",
-                    "application_permission_definitions",
-                    "application_profile_roles",
-                ] {
-                    let sql = format!(
-                        "DELETE FROM {table} WHERE profile_id IN (SELECT id FROM application_authorization_profiles WHERE application_id = {})",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                for table in [
-                    "application_authorization_profiles",
-                    "application_jwt_clients",
-                    "application_jwt_codes",
-                    "application_modules",
-                    "application_billing_settings",
-                    "application_identity_bindings",
-                    "application_saml_interactions",
-                    "application_saml_replays",
-                    "application_saml_sessions",
-                    "application_cas_tickets",
-                    "application_scim_tokens",
-                    "application_scim_groups",
-                    "application_members",
-                    "application_enrollment_codes",
-                    "application_discovery",
-                ] {
-                let sql = format!("DELETE FROM {table} WHERE application_id = {}", ph(kind, 1));
-                    sql_query(sql)
-                        .bind::<Text, _>(&id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let binding_sql = format!(
-                    "DELETE FROM application_client_bindings WHERE application_id = {}",
-                    ph(kind, 1)
-                );
-                sql_query(binding_sql)
-                    .bind::<Text, _>(&id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let sql = format!("DELETE FROM applications WHERE id = {}", ph(kind, 1));
-                let affected = sql_query(sql)
-                    .bind::<Text, _>(&id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                if affected == 0 {
-                    return Err(AppError::NotFound);
-                }
-                Ok(())
-            })
-        })?;
-        for client_db_id in detached_client_ids {
-            // A concurrent move to another application is harmless: both
-            // helpers see that explicit application and leave it untouched.
-            // If the deleted application was the last owner, the compatibility
-            // aggregate is immediately hardened before this function returns.
-            if let Some(client) = self.find_client_by_id(&client_db_id).await? {
-                self.ensure_application_for_client(&client).await?;
-                self.harden_new_client_application(&client.id).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Links one protocol client to exactly one application and profile.
-    /// Client configuration remains protocol-specific, while the application
-    /// binding owns the authentication domain and authorization boundary.
-    pub async fn link_client_to_application(
-        &self,
-        application_id: &str,
-        client_db_id: &str,
-        protocol: &str,
-        authorization_profile_id: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let client_db_id = client_db_id.to_string();
-        let protocol = protocol.to_string();
-        let authorization_profile_id = authorization_profile_id.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let application_count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM applications WHERE id = {}",
-                    ph(kind, 1)
-                );
-                if sql_query(application_count_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    == 0
-                {
-                    return Err(AppError::NotFound);
-                }
-                let same_organization_sql = format!(
-                    "SELECT COUNT(*) AS count FROM applications INNER JOIN clients ON clients.id = {} WHERE applications.id = {} AND clients.organization_id = applications.organization_id",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                if sql_query(same_organization_sql)
-                    .bind::<Text, _>(&client_db_id)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    == 0
-                {
-                    return Err(AppError::BadRequest(
-                        "OIDC client must belong to the application's organization".to_string(),
-                    ));
-                }
-                let delete_binding_sql = format!(
-                    "DELETE FROM application_client_bindings WHERE client_db_id = {}",
-                    ph(kind, 1)
-                );
-                sql_query(delete_binding_sql)
-                    .bind::<Text, _>(&client_db_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                let auth_domain_id = format!("auth-domain:{application_id}");
-                let auth_domain_count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_auth_domains WHERE application_id = {}",
-                    ph(kind, 1)
-                );
-                if sql_query(auth_domain_count_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    == 0
-                {
-                    let auth_domain_sql = format!(
-                        "INSERT INTO application_auth_domains (id, application_id, assurance_policy, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(auth_domain_sql)
-                        .bind::<Text, _>(&auth_domain_id)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>("default")
-                        .bind::<Integer, _>(1)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                let binding_sql = format!(
-                        "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6), ph(kind, 7), ph(kind, 8)
-                );
-                sql_query(binding_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&client_db_id)
-                    .bind::<Text, _>(&protocol)
-                    .bind::<Text, _>(&authorization_profile_id)
-                    .bind::<Text, _>(&auth_domain_id)
-                    .bind::<Integer, _>(1)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                Ok(())
-            })
-        })
-    }
-
-    /// Detaches a client without leaving it ungoverned. The client immediately
-    /// receives a locked fallback application.
-    pub async fn unlink_client_from_application(&self, client_db_id: &str) -> AppResult<()> {
-        let client_db_id = client_db_id.to_string();
-        let lookup_client_db_id = client_db_id.clone();
-        let generic_client_db_id = client_db_id.clone();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "DELETE FROM application_client_bindings WHERE client_db_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&generic_client_db_id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
-        })?;
-        if let Some(client) = self.find_client_by_id(&lookup_client_db_id).await? {
-            self.ensure_application_for_client(&client).await?;
-            self.harden_new_client_application(&client.id).await?;
-        }
-        Ok(())
-    }
-
-    /// Legacy compatibility reader. Application members are not a login
-    /// roster; new runtime code must use organization membership and
-    /// application entitlements instead.
-    pub async fn list_application_members(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<ApplicationMemberRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {} ORDER BY is_active DESC, created_at ASC",
-                select_application_member_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ApplicationMemberRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Legacy compatibility reader; retained for migration/audit tooling only.
-    pub async fn list_application_members_with_users(
-        &self,
-        application_id: &str,
-    ) -> AppResult<Vec<ApplicationMemberWithUserRecord>> {
-        let application_id = application_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_members.application_id, application_members.user_id, application_members.role, application_members.is_active, application_members.created_at, application_members.updated_at, users.email, users.username, users.display_name, users.phone, users.email_verified_at, users.phone_verified_at FROM application_members INNER JOIN users ON users.id = application_members.user_id WHERE application_members.application_id = {} ORDER BY application_members.is_active DESC, users.email ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .load::<ApplicationMemberWithUserRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Legacy compatibility writer for importing or repairing historical
-    /// application_members rows. It is intentionally not used by any login,
-    /// registration, or application-management runtime path.
-    pub async fn replace_application_members(
-        &self,
-        application_id: &str,
-        members: Vec<NewApplicationMember>,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let members = members
-            .into_iter()
-            .map(|member| (member.user_id.clone(), member))
-            .collect::<BTreeMap<_, _>>()
-            .into_values()
-            .collect::<Vec<_>>();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let app_sql = format!("{} WHERE id = {}", select_application_sql(), ph(kind, 1));
-                let application = sql_query(app_sql)
-                    .bind::<Text, _>(&application_id)
-                    .get_result::<ApplicationRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or(AppError::NotFound)?;
-                for member in &members {
-                    let user_sql = format!(
-                        "SELECT COUNT(*) AS count FROM users WHERE id = {} AND is_active = 1 AND archived_at IS NULL",
-                        ph(kind, 1)
-                    );
-                    if sql_query(user_sql)
-                        .bind::<Text, _>(&member.user_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count
-                        == 0
-                    {
-                        return Err(AppError::BadRequest(format!(
-                            "active user does not exist: {}",
-                            member.user_id
-                        )));
-                    }
-                }
-                let active_member_ids = members
-                    .iter()
-                    .filter(|member| member.is_active)
-                    .map(|member| member.user_id.clone())
-                    .collect::<BTreeSet<_>>();
-                let blocked_member_ids = members
-                    .iter()
-                    .filter(|member| !member.is_active)
-                    .map(|member| member.user_id.clone())
-                    .collect::<BTreeSet<_>>();
-                let binding_sql = format!(
-                    "{} WHERE application_id = {}",
-                    select_application_identity_binding_sql(),
-                    ph(kind, 1)
-                );
-                let bound_user_ids = sql_query(binding_sql)
-                    .bind::<Text, _>(&application_id)
-                    .load::<ApplicationIdentityBindingRecord>(conn)
-                    .map_err(AppError::from)?
-                    .into_iter()
-                    .map(|binding| binding.user_id)
-                    .collect::<BTreeSet<_>>();
-                let users_losing_access = match application.access_mode.as_str() {
-                    crate::applications::ACCESS_ASSIGNED_ACCOUNTS => bound_user_ids
-                        .difference(&active_member_ids)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    crate::applications::ACCESS_ORGANIZATION_MEMBERS => bound_user_ids
-                        .intersection(&blocked_member_ids)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    crate::applications::ACCESS_ALL_SIGNET_USERS
-                    | crate::applications::ACCESS_LEGACY_ALL_USERS => Vec::new(),
-                    _ => {
-                        return Err(AppError::Internal(
-                            "application access mode is invalid".to_string(),
-                        ));
-                    }
-                };
-                // Replacing a roster must release leases only for accounts
-                // that no longer have application access. Existing eligible
-                // accounts keep their reservations throughout the update.
-                for user_id in users_losing_access {
-                    clear_application_identity_bindings_for_user_for_conn!(
-                        conn,
-                        kind,
-                        &application_id,
-                        &user_id
-                    )?;
-                }
-
-                let delete_sql = format!(
-                    "DELETE FROM application_members WHERE application_id = {}",
-                    ph(kind, 1)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&application_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                for member in members {
-                    let insert_sql = format!(
-                        "INSERT INTO application_members (application_id, user_id, role, is_active, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(member.user_id)
-                        .bind::<Text, _>(member.role)
-                        .bind::<Integer, _>(i32::from(member.is_active))
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn user_can_access_application(
-        &self,
-        application: &ApplicationRecord,
-        user_id: &str,
-    ) -> AppResult<bool> {
-        if application.is_active != 1 {
-            return Ok(false);
-        }
-        let user_id = user_id.to_string();
-        let organization_id = application.organization_id.clone();
-        let application_id = application.id.clone();
-        with_conn!(self, |conn, kind| {
-            let organization_sql = format!(
-                "SELECT COUNT(*) AS count FROM organizations WHERE id = {} AND is_active = 1",
-                ph(kind, 1)
-            );
-            if sql_query(organization_sql)
-                .bind::<Text, _>(&organization_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                == 0
-            {
-                return Ok(false);
-            }
-            let user_sql = format!(
-                "SELECT COUNT(*) AS count FROM users WHERE id = {} AND is_active = 1 AND archived_at IS NULL",
-                ph(kind, 1)
-            );
-            if sql_query(user_sql)
-                .bind::<Text, _>(&user_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                == 0
-            {
-                return Ok(false);
-            }
-            // An application is a website integration, not a membership
-            // roster.  Once the global account and tenant are active, every
-            // Signet account is eligible to authenticate.  Application
-            // roles and directory mappings are evaluated after this check
-            // and only affect the entitlements emitted to the website.
-            let _ = (kind, organization_id, application_id);
-            Ok(true)
-        })
-    }
-
-    /// Atomically replaces this user's application-scoped factor reservations.
-    /// The primary key on `(application_id, factor_type, factor_digest)` is
-    /// the final concurrent enforcement point, not the management UI.
-    pub async fn replace_application_identity_bindings(
-        &self,
-        application_id: &str,
-        user_id: &str,
-        factors: Vec<(String, String)>,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let user_id = user_id.to_string();
-        let factors = factors
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            conn.transaction::<(), AppError, _>(|conn| {
-                let delete_sql = format!(
-                    "DELETE FROM application_identity_bindings WHERE application_id = {} AND user_id = {}",
-                    ph(kind, 1), ph(kind, 2)
-                );
-                sql_query(delete_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&user_id)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                for (factor_type, factor_digest) in factors {
-                    let insert_sql = format!(
-                        "INSERT INTO application_identity_bindings (application_id, factor_type, factor_digest, user_id, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
-                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5), ph(kind, 6)
-                    );
-                    sql_query(insert_sql)
-                        .bind::<Text, _>(&application_id)
-                        .bind::<Text, _>(factor_type)
-                        .bind::<Text, _>(factor_digest)
-                        .bind::<Text, _>(&user_id)
-                        .bind::<BigInt, _>(now)
-                        .bind::<BigInt, _>(now)
-                        .execute(conn)
-                        .map_err(|err| AppError::BadRequest(format!(
-                            "the verified identity factor is already used by another application account: {err}"
-                        )))?;
-                }
-                Ok(())
-            })
-        })
-    }
-
-    pub async fn application_identity_factor_is_available(
-        &self,
-        application_id: &str,
-        factor_type: &str,
-        factor_digest: &str,
-        user_id: &str,
-    ) -> AppResult<bool> {
-        let application_id = application_id.to_string();
-        let factor_type = factor_type.to_string();
-        let factor_digest = factor_digest.to_string();
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE application_id = {} AND factor_type = {} AND factor_digest = {}",
-                select_application_identity_binding_sql(),
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(factor_type)
-                .bind::<Text, _>(factor_digest)
-                .get_result::<ApplicationIdentityBindingRecord>(&mut conn)
-                .optional()
-                .map(|binding| binding.is_none_or(|binding| binding.user_id == user_id))
                 .map_err(AppError::from)
         })
     }
@@ -18677,21 +18016,6 @@ impl Db {
             sql_query(sql)
                 .bind::<Text, _>(user_id)
                 .load::<LinkedIdentityRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_user_ids_with_linked_identities(&self) -> AppResult<Vec<String>> {
-        #[derive(diesel::QueryableByName)]
-        struct UserIdRow {
-            #[diesel(sql_type = Text)]
-            user_id: String,
-        }
-
-        with_conn!(self, |conn, _kind| {
-            sql_query("SELECT DISTINCT user_id FROM linked_identities")
-                .load::<UserIdRow>(&mut conn)
-                .map(|rows| rows.into_iter().map(|row| row.user_id).collect())
                 .map_err(AppError::from)
         })
     }
@@ -19105,73 +18429,142 @@ impl Db {
         let id = id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let existing_sql = format!("{} WHERE id = {}", select_ldap_provider_sql(), ph(kind, 1));
-            let existing = sql_query(existing_sql)
-                .bind::<Text, _>(&id)
-                .get_result::<LdapProviderRecord>(&mut conn)
-                .map_err(AppError::from)?;
-            let bind_password = provider.bind_password.unwrap_or(existing.bind_password);
-            let sql = format!(
-                "UPDATE ldap_providers SET slug = {}, display_name = {}, organization_id = {}, url = {}, starttls = {}, bind_dn = {}, bind_password = {}, base_dn = {}, user_filter = {}, user_id_attribute = {}, email_attribute = {}, username_attribute = {}, display_name_attribute = {}, phone_attribute = {}, is_active = {}, allow_login = {}, allow_registration = {}, updated_at = {} WHERE id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11),
-                ph(kind, 12),
-                ph(kind, 13),
-                ph(kind, 14),
-                ph(kind, 15),
-                ph(kind, 16),
-                ph(kind, 17),
-                ph(kind, 18),
-                ph(kind, 19)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(provider.slug)
-                .bind::<Text, _>(provider.display_name)
-                .bind::<Nullable<Text>, _>(provider.organization_id)
-                .bind::<Text, _>(provider.url)
-                .bind::<Integer, _>(i32::from(provider.starttls))
-                .bind::<Text, _>(provider.bind_dn)
-                .bind::<Text, _>(bind_password)
-                .bind::<Text, _>(provider.base_dn)
-                .bind::<Text, _>(provider.user_filter)
-                .bind::<Text, _>(provider.user_id_attribute)
-                .bind::<Text, _>(provider.email_attribute)
-                .bind::<Text, _>(provider.username_attribute)
-                .bind::<Text, _>(provider.display_name_attribute)
-                .bind::<Text, _>(provider.phone_attribute)
-                .bind::<Integer, _>(i32::from(provider.is_active))
-                .bind::<Integer, _>(i32::from(provider.allow_login))
-                .bind::<Integer, _>(i32::from(provider.allow_registration))
-                .bind::<BigInt, _>(now)
-                .bind::<Text, _>(&id)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = format!("{} WHERE id = {}", select_ldap_provider_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<LdapProviderRecord>(&mut conn)
-                .map_err(AppError::from)
+            conn.transaction::<LdapProviderRecord, AppError, _>(|conn| {
+                let existing_sql =
+                    format!("{} WHERE id = {}", select_ldap_provider_sql(), ph(kind, 1));
+                let existing = sql_query(existing_sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<LdapProviderRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                let trust_boundary_changed = existing.slug != provider.slug
+                    || existing.organization_id != provider.organization_id;
+                if trust_boundary_changed {
+                    let provider_key = ldap_provider_key(&existing.slug);
+                    let identity_sql = format!(
+                        "DELETE FROM linked_identities WHERE provider_slug = {}",
+                        ph(kind, 1)
+                    );
+                    sql_query(identity_sql)
+                        .bind::<Text, _>(&provider_key)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                    // A worker holding the old provider configuration must
+                    // fail closed rather than publish a snapshot under the
+                    // new slug or organization.
+                    for table in [
+                        "directory_sync_leases",
+                        "directory_sync_checkpoints",
+                        "directory_sync_memberships",
+                        "directory_sync_groups",
+                        "directory_sync_runs",
+                    ] {
+                        let sql = format!(
+                            "DELETE FROM {table} WHERE provider_id = {}",
+                            ph(kind, 1)
+                        );
+                        sql_query(sql)
+                            .bind::<Text, _>(&id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                    }
+                }
+                let bind_password = provider.bind_password.unwrap_or(existing.bind_password);
+                let sql = format!(
+                    "UPDATE ldap_providers SET slug = {}, display_name = {}, organization_id = {}, url = {}, starttls = {}, bind_dn = {}, bind_password = {}, base_dn = {}, user_filter = {}, user_id_attribute = {}, email_attribute = {}, username_attribute = {}, display_name_attribute = {}, phone_attribute = {}, is_active = {}, allow_login = {}, allow_registration = {}, updated_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9),
+                    ph(kind, 10),
+                    ph(kind, 11),
+                    ph(kind, 12),
+                    ph(kind, 13),
+                    ph(kind, 14),
+                    ph(kind, 15),
+                    ph(kind, 16),
+                    ph(kind, 17),
+                    ph(kind, 18),
+                    ph(kind, 19)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(provider.slug)
+                    .bind::<Text, _>(provider.display_name)
+                    .bind::<Nullable<Text>, _>(provider.organization_id)
+                    .bind::<Text, _>(provider.url)
+                    .bind::<Integer, _>(i32::from(provider.starttls))
+                    .bind::<Text, _>(provider.bind_dn)
+                    .bind::<Text, _>(bind_password)
+                    .bind::<Text, _>(provider.base_dn)
+                    .bind::<Text, _>(provider.user_filter)
+                    .bind::<Text, _>(provider.user_id_attribute)
+                    .bind::<Text, _>(provider.email_attribute)
+                    .bind::<Text, _>(provider.username_attribute)
+                    .bind::<Text, _>(provider.display_name_attribute)
+                    .bind::<Text, _>(provider.phone_attribute)
+                    .bind::<Integer, _>(i32::from(provider.is_active))
+                    .bind::<Integer, _>(i32::from(provider.allow_login))
+                    .bind::<Integer, _>(i32::from(provider.allow_registration))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let sql = format!("{} WHERE id = {}", select_ldap_provider_sql(), ph(kind, 1));
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<LdapProviderRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
 
     pub async fn delete_ldap_provider(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!("DELETE FROM ldap_providers WHERE id = {}", ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            conn.transaction::<(), AppError, _>(|conn| {
+                let provider_sql =
+                    format!("{} WHERE id = {}", select_ldap_provider_sql(), ph(kind, 1));
+                let provider = sql_query(provider_sql)
+                    .bind::<Text, _>(&id)
+                    .get_result::<LdapProviderRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                    .ok_or(AppError::NotFound)?;
+                let provider_key = ldap_provider_key(&provider.slug);
+                let identity_sql = format!(
+                    "DELETE FROM linked_identities WHERE provider_slug = {}",
+                    ph(kind, 1)
+                );
+                sql_query(identity_sql)
+                    .bind::<Text, _>(&provider_key)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                for table in [
+                    "directory_sync_leases",
+                    "directory_sync_checkpoints",
+                    "directory_sync_memberships",
+                    "directory_sync_groups",
+                    "directory_sync_runs",
+                ] {
+                    let sql = format!("DELETE FROM {table} WHERE provider_id = {}", ph(kind, 1));
+                    sql_query(sql)
+                        .bind::<Text, _>(&id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+                let sql = format!("DELETE FROM ldap_providers WHERE id = {}", ph(kind, 1));
+                sql_query(sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(())
+            })
         })
     }
 
@@ -19184,24 +18577,83 @@ impl Db {
         let provider_id = provider_id.to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
+        let expires_at = now + DIRECTORY_SYNC_LEASE_TTL_SECONDS;
         with_conn!(self, |conn, kind| {
             conn.transaction::<DirectorySyncRunRecord, AppError, _>(|conn| {
-                let active_sql = format!(
-                    "SELECT COUNT(*) AS count FROM directory_sync_runs WHERE application_id = {} AND provider_id = {} AND status = 'running'",
+                // The lease row is the concurrency boundary.  A check-then-
+                // insert on directory_sync_runs is racy under PostgreSQL and
+                // MySQL's default isolation: two workers can both observe no
+                // running row.  First reclaim only an expired lease with a
+                // compare-and-set update, then attempt the unique-key insert
+                // for a previously unseen pair.
+                let abandon_sql = format!(
+                    "UPDATE directory_sync_runs SET status = 'failed', error = {}, finished_at = {} WHERE status = 'running' AND id IN (SELECT owner_run_id FROM directory_sync_leases WHERE application_id = {} AND provider_id = {} AND expires_at < {})",
                     ph(kind, 1),
-                    ph(kind, 2)
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
                 );
-                if sql_query(active_sql)
+                sql_query(abandon_sql)
+                    .bind::<Nullable<Text>, _>(Some(
+                        "directory synchronization lease expired".to_string(),
+                    ))
+                    .bind::<BigInt, _>(now)
                     .bind::<Text, _>(&application_id)
                     .bind::<Text, _>(&provider_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count
-                    > 0
-                {
-                    return Err(AppError::BadRequest(
-                        "directory synchronization is already running".to_string(),
-                    ));
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let reclaim_sql = format!(
+                    "UPDATE directory_sync_leases SET owner_run_id = {}, acquired_at = {}, heartbeat_at = {}, expires_at = {} WHERE application_id = {} AND provider_id = {} AND expires_at < {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7)
+                );
+                let reclaimed = sql_query(reclaim_sql)
+                    .bind::<Text, _>(&run_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(expires_at)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if reclaimed == 0 {
+                    let insert_lease_sql = format!(
+                        "INSERT INTO directory_sync_leases (application_id, provider_id, owner_run_id, acquired_at, heartbeat_at, expires_at) VALUES ({}, {}, {}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6)
+                    );
+                    let insert_result = sql_query(insert_lease_sql)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(&provider_id)
+                        .bind::<Text, _>(&run_id)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(expires_at)
+                        .execute(conn);
+                    match insert_result {
+                        Ok(_) => {}
+                        Err(diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::UniqueViolation,
+                            _,
+                        )) => {
+                            return Err(AppError::BadRequest(
+                                "directory synchronization is already running".to_string(),
+                            ));
+                        }
+                        Err(error) => return Err(AppError::from(error)),
+                    }
                 }
                 let insert_sql = format!(
                     "INSERT INTO directory_sync_runs (id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at) VALUES ({}, {}, {}, 'running', 0, 0, 0, 0, {}, {}, {}, {})",
@@ -19250,41 +18702,92 @@ impl Db {
         let status = status.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let update_sql = format!(
-                "UPDATE directory_sync_runs SET status = {}, total_seen = {}, created_count = {}, updated_count = {}, disabled_count = {}, error = {}, cursor = {}, finished_at = {} WHERE id = {}",
+            conn.transaction::<DirectorySyncRunRecord, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE directory_sync_runs SET status = {}, total_seen = {}, created_count = {}, updated_count = {}, disabled_count = {}, error = {}, cursor = {}, finished_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<Text, _>(&status)
+                    .bind::<BigInt, _>(total_seen)
+                    .bind::<BigInt, _>(created_count)
+                    .bind::<BigInt, _>(updated_count)
+                    .bind::<BigInt, _>(disabled_count)
+                    .bind::<Nullable<Text>, _>(error)
+                    .bind::<Nullable<Text>, _>(cursor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&run_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(AppError::NotFound);
+                }
+                let release_sql = format!(
+                    "DELETE FROM directory_sync_leases WHERE owner_run_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(release_sql)
+                    .bind::<Text, _>(&run_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "SELECT id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at FROM directory_sync_runs WHERE id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(&run_id)
+                    .get_result::<DirectorySyncRunRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    /// Renews a directory-sync lease only for its current owner.  A stale
+    /// worker must fail closed after another worker reclaimed the lease.
+    pub async fn renew_directory_sync_lease(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        run_id: &str,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let run_id = run_id.to_string();
+        let now = util::now_ts();
+        let expires_at = now + DIRECTORY_SYNC_LEASE_TTL_SECONDS;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE directory_sync_leases SET heartbeat_at = {}, expires_at = {} WHERE application_id = {} AND provider_id = {} AND owner_run_id = {} AND expires_at >= {}",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
                 ph(kind, 4),
                 ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9)
+                ph(kind, 6)
             );
-            let affected = sql_query(update_sql)
-                .bind::<Text, _>(&status)
-                .bind::<BigInt, _>(total_seen)
-                .bind::<BigInt, _>(created_count)
-                .bind::<BigInt, _>(updated_count)
-                .bind::<BigInt, _>(disabled_count)
-                .bind::<Nullable<Text>, _>(error)
-                .bind::<Nullable<Text>, _>(cursor)
+            let affected = sql_query(sql)
                 .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(expires_at)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
                 .bind::<Text, _>(&run_id)
+                .bind::<BigInt, _>(now)
                 .execute(&mut conn)
                 .map_err(AppError::from)?;
-            if affected == 0 {
-                return Err(AppError::NotFound);
+            if affected != 1 {
+                return Err(AppError::BadRequest(
+                    "directory synchronization lease was lost".to_string(),
+                ));
             }
-            let select_sql = format!(
-                "SELECT id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at FROM directory_sync_runs WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(select_sql)
-                .bind::<Text, _>(run_id)
-                .get_result::<DirectorySyncRunRecord>(&mut conn)
-                .map_err(AppError::from)
+            Ok(())
         })
     }
 
@@ -20257,6 +19760,7 @@ fn connect_mysql(_settings: &DatabaseSettings) -> AppResult<Db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit;
 
     #[test]
     fn default_quick_link_is_merged_without_overwriting_existing_links() {
@@ -20451,6 +19955,7 @@ mod tests {
     fn application_authorization_profile_migrations_cover_all_database_engines() {
         let required_tables = [
             "application_authorization_profiles",
+            "application_authorization_migration_state",
             "application_permission_definitions",
             "application_profile_roles",
             "application_profile_user_roles",
@@ -20471,6 +19976,25 @@ mod tests {
                     "{kind:?} is missing {table}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn application_discovery_idempotency_migrations_cover_all_database_engines() {
+        for (kind, migrations) in [
+            (DatabaseKind::Sqlite, SQLITE_MIGRATIONS),
+            (DatabaseKind::Postgres, POSTGRES_MIGRATIONS),
+            (DatabaseKind::Mysql, MYSQL_MIGRATIONS),
+        ] {
+            assert!(
+                migrations.iter().any(|statement| {
+                    statement
+                        .contains("CREATE TABLE IF NOT EXISTS application_discovery_idempotency")
+                        && statement.contains("claim_token")
+                        && statement.contains("request_hash")
+                }),
+                "{kind:?} is missing application discovery idempotency storage"
+            );
         }
     }
 
@@ -20612,6 +20136,7 @@ mod tests {
         ] {
             for table in [
                 "directory_sync_runs",
+                "directory_sync_leases",
                 "directory_sync_checkpoints",
                 "directory_sync_memberships",
                 "directory_sync_groups",
@@ -20650,7 +20175,76 @@ mod tests {
                     .any(|statement| { statement.contains("idx_directory_sync_runs_application") }),
                 "{kind:?} is missing the directory sync run index"
             );
+            assert!(
+                migrations
+                    .iter()
+                    .any(|statement| { statement.contains("idx_directory_sync_leases_expiry") }),
+                "{kind:?} is missing the directory sync lease expiry index"
+            );
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn directory_sync_leases_serialize_runs_and_reclaim_expired_workers() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        let left = db.clone();
+        let right = db.clone();
+        let (left, right) = tokio::join!(
+            left.start_directory_sync_run("lease-app", "lease-provider"),
+            right.start_directory_sync_run("lease-app", "lease-provider")
+        );
+        assert!(left.is_ok() ^ right.is_ok());
+        let run = left.or(right).unwrap();
+        assert!(
+            db.renew_directory_sync_lease("lease-app", "lease-provider", &run.id)
+                .await
+                .is_ok()
+        );
+
+        let expired_at = util::now_ts() - 1;
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "UPDATE directory_sync_leases SET expires_at = {} WHERE application_id = {} AND provider_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(expired_at)
+                .bind::<Text, _>("lease-app")
+                .bind::<Text, _>("lease-provider")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let reclaimed = db
+            .start_directory_sync_run("lease-app", "lease-provider")
+            .await
+            .unwrap();
+        assert_ne!(reclaimed.id, run.id);
+        assert_eq!(
+            db.list_directory_sync_runs("lease-app", 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == run.id)
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert!(
+            db.renew_directory_sync_lease("lease-app", "lease-provider", &run.id)
+                .await
+                .is_err()
+        );
+        db.finish_directory_sync_run(&reclaimed.id, "succeeded", 0, 0, 0, 0, None, None)
+            .await
+            .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -20710,6 +20304,478 @@ mod tests {
             assert!(!sql.contains("phone"));
             assert!(sql.contains("id <>"));
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scim_user_mutation_rolls_back_profile_password_and_active_state_together() {
+        let (db, path) = sqlite_test_db().await;
+        let first = db
+            .insert_user(test_user("scim-first@example.test", "scim-first"))
+            .await
+            .unwrap();
+        let second = db
+            .insert_user(test_user("scim-second@example.test", "scim-second"))
+            .await
+            .unwrap();
+
+        assert!(
+            db.apply_scim_user_mutation(ScimUserMutationPlan {
+                id: first.id.clone(),
+                expected_version: first.scim_concurrency_version(),
+                email: second.email.clone(),
+                username: "scim-first-renamed".to_string(),
+                display_name: Some("would roll back".to_string()),
+                phone: None,
+                is_admin: false,
+                is_active: false,
+                password_hash: Some("would-also-roll-back".to_string()),
+                scope: None,
+            })
+            .await
+            .is_err()
+        );
+        let unchanged = db.find_user_by_id(&first.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.email, "scim-first@example.test");
+        assert_eq!(unchanged.username, "scim-first");
+        assert_eq!(unchanged.display_name, None);
+        assert!(unchanged.is_active == 1);
+        assert_eq!(unchanged.password_hash, "test-hash");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn password_replacement_revokes_sessions_and_audits_atomically() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user(
+                "credential-rotation@example.test",
+                "credential-rotation",
+            ))
+            .await
+            .unwrap();
+        let (session, _) = db
+            .insert_session(&user.id, 600, SessionMetadata::default())
+            .await
+            .unwrap();
+
+        let updated = db
+            .replace_user_password_with_audit(
+                &user.id,
+                "rotated-password-hash".to_string(),
+                crate::audit::management_event(
+                    "credential-actor",
+                    "user.password.set",
+                    "user",
+                    Some(user.id.clone()),
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.password_hash, "rotated-password-hash");
+        assert!(db.find_session(&session.id).await.unwrap().is_none());
+        assert!(
+            db.list_audit_events(20)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.action == "user.password.set")
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mfa_enable_rolls_back_setup_and_recovery_codes_when_audit_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user("mfa-atomic@example.test", "mfa-atomic"))
+            .await
+            .unwrap();
+        let setup = db
+            .create_mfa_totp_setup(&user.id, "encrypted-totp-secret".to_string(), 300)
+            .await
+            .unwrap();
+        with_conn!(db.clone(), |conn, _kind| {
+            conn.batch_execute(
+                "CREATE TRIGGER fail_mfa_audit_outbox BEFORE INSERT ON audit_webhook_outbox BEGIN SELECT RAISE(ABORT, 'forced mfa audit failure'); END",
+            )
+            .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let result = db
+            .confirm_totp_setup_with_audit(
+                &user.id,
+                &setup.id,
+                vec!["recovery-hash".to_string()],
+                crate::audit::management_event(
+                    user.id.clone(),
+                    "mfa.totp.enable",
+                    "user",
+                    Some(user.id.clone()),
+                    serde_json::json!({ "method": "totp" }),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Database(message)) if message.contains("forced mfa audit failure"))
+        );
+
+        with_conn!(db.clone(), |conn, _kind| {
+            conn.batch_execute("DROP TRIGGER fail_mfa_audit_outbox")
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        assert!(db.find_mfa_totp_setup(&setup.id).await.unwrap().is_some());
+        assert!(db.find_totp_method(&user.id).await.unwrap().is_none());
+        assert!(db.list_recovery_codes(&user.id).await.unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn organization_creation_rolls_back_owner_and_context_when_audit_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user(
+                "organization-atomic@example.test",
+                "organization-atomic",
+            ))
+            .await
+            .unwrap();
+        with_conn!(db.clone(), |conn, _kind| {
+            conn.batch_execute(
+                "CREATE TRIGGER fail_organization_audit_outbox BEFORE INSERT ON audit_webhook_outbox BEGIN SELECT RAISE(ABORT, 'forced organization audit failure'); END",
+            )
+            .map_err(AppError::from)
+        })
+        .unwrap();
+        let result = db
+            .create_organization_with_owner_and_audit(
+                NewOrganization {
+                    slug: "organization-atomic".to_string(),
+                    name: "Organization Atomic".to_string(),
+                    kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
+                    description: None,
+                    allowed_email_domains: Vec::new(),
+                    is_active: true,
+                },
+                &user.id,
+                crate::audit::management_event(
+                    user.id.clone(),
+                    "organization.self_service_create",
+                    "organization",
+                    None,
+                    serde_json::json!({ "slug": "organization-atomic" }),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Database(message)) if message.contains("forced organization audit failure"))
+        );
+        with_conn!(db.clone(), |conn, _kind| {
+            conn.batch_execute("DROP TRIGGER fail_organization_audit_outbox")
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        assert!(
+            db.list_organizations()
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|organization| organization.slug != "organization-atomic")
+        );
+        assert!(
+            db.active_user_organization(&user.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn audit_webhook_outbox_claim_retry_and_expired_lease_recovery_are_fenced() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        db.insert_audit_event(crate::audit::management_event(
+            "outbox-actor",
+            "outbox.test",
+            "test",
+            Some("outbox-target".to_string()),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        let first = db.claim_audit_webhook_outbox(10).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let first_id = first[0].id.clone();
+        let first_attempts = first[0].attempts;
+        let owner = first[0].lease_owner.clone().unwrap();
+        assert!(
+            !db.complete_audit_webhook_outbox(&first_id, "wrong-owner")
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.retry_audit_webhook_outbox(
+                &first_id,
+                &owner,
+                first_attempts,
+                "temporary failure".into()
+            )
+            .await
+            .unwrap()
+        );
+
+        // Backoff keeps the row out of the next claim until it is due.
+        let first_id_for_future = first_id.clone();
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "UPDATE audit_webhook_outbox SET next_attempt_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(util::now_ts() + 60)
+                .bind::<Text, _>(first_id_for_future)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        assert!(db.claim_audit_webhook_outbox(10).await.unwrap().is_empty());
+        let first_id_for_due = first_id.clone();
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "UPDATE audit_webhook_outbox SET next_attempt_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(util::now_ts() - 1)
+                .bind::<Text, _>(first_id_for_due)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let second = db.claim_audit_webhook_outbox(10).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].attempts, 1);
+        let second_id = second[0].id.clone();
+        let second_owner = second[0].lease_owner.clone().unwrap();
+
+        // A worker that stopped without acknowledging the row is reclaimed
+        // by the next claimant after its lease expires.
+        let second_id_for_expiry = second_id.clone();
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "UPDATE audit_webhook_outbox SET lease_expires_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(util::now_ts() - 1)
+                .bind::<Text, _>(second_id_for_expiry)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        let reclaimed = db.claim_audit_webhook_outbox(10).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].id, second_id);
+        assert_ne!(
+            reclaimed[0].lease_owner.as_deref(),
+            Some(second_owner.as_str())
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scim_user_mutation_rejects_a_stale_row_snapshot() {
+        let (db, path) = sqlite_test_db().await;
+        let user = db
+            .insert_user(test_user("scim-cas@example.test", "scim-cas"))
+            .await
+            .unwrap();
+        let expected_version = user.scim_concurrency_version();
+        db.set_user_password(&user.id, "new-password-hash".to_string())
+            .await
+            .unwrap();
+
+        let result = db
+            .apply_scim_user_mutation(ScimUserMutationPlan {
+                id: user.id.clone(),
+                expected_version,
+                email: "scim-cas-renamed@example.test".to_string(),
+                username: "scim-cas-renamed".to_string(),
+                display_name: user.display_name.clone(),
+                phone: user.phone.clone(),
+                is_admin: user.is_admin == 1,
+                is_active: user.is_active == 1,
+                password_hash: None,
+                scope: None,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::OAuth {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+        let unchanged = db.find_user_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.email, "scim-cas@example.test");
+        assert_eq!(unchanged.username, "scim-cas");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scim_user_mutation_rechecks_application_scope_inside_write_transaction() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("scim-scope", "SCIM Scope"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "scim-scope-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let user = db
+            .insert_user(test_user("scim-scope@example.test", "scim-scope"))
+            .await
+            .unwrap();
+        db.upsert_organization_member(
+            &organization.id,
+            &user.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+        let expected_version = user.scim_concurrency_version();
+        let user_id = user.id.clone();
+        let organization_id = organization.id.clone();
+        let application_id = application.id.clone();
+        let sql_user_id = user_id.clone();
+        let sql_organization_id = organization_id.clone();
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "DELETE FROM organization_members WHERE organization_id = {} AND user_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&sql_organization_id)
+                .bind::<Text, _>(&sql_user_id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let result = db
+            .apply_scim_user_mutation(ScimUserMutationPlan {
+                id: user_id.clone(),
+                expected_version,
+                email: "scim-scope-renamed@example.test".to_string(),
+                username: "scim-scope-renamed".to_string(),
+                display_name: user.display_name.clone(),
+                phone: user.phone.clone(),
+                is_admin: user.is_admin == 1,
+                is_active: user.is_active == 1,
+                password_hash: None,
+                scope: Some(ScimUserMutationScope {
+                    application_id: Some(application_id),
+                    organization_id: Some(organization_id),
+                }),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::OAuth {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+        let unchanged = db.find_user_by_id(&user_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.email, "scim-scope@example.test");
+        assert_eq!(unchanged.username, "scim-scope");
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn scim_group_patch_rejects_a_stale_aggregate_version() {
+        let (db, path) = sqlite_test_db().await;
+        let group = db
+            .insert_group(NewGroup {
+                name: "SCIM CAS group".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let first = db
+            .apply_group_patch_plan(GroupPatchPlan {
+                application_id: None,
+                group_id: group.id.clone(),
+                name: "SCIM CAS group v2".to_string(),
+                description: None,
+                member_ids: Vec::new(),
+                create: false,
+                expected_version: Some(group.version),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.version, group.version + 1);
+        let result = db
+            .apply_group_patch_plan(GroupPatchPlan {
+                application_id: None,
+                group_id: group.id.clone(),
+                name: "stale overwrite".to_string(),
+                description: None,
+                member_ids: Vec::new(),
+                create: false,
+                expected_version: Some(group.version),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::OAuth {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+        assert_eq!(
+            db.find_group_by_id(&group.id).await.unwrap().unwrap().name,
+            "SCIM CAS group v2"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -20837,7 +20903,7 @@ mod tests {
             assert!(select_sql.contains("target ="));
             assert!(select_sql.contains("purpose ="));
             assert!(select_sql.contains("consumed_at IS NULL"));
-            assert!(select_sql.contains("ORDER BY created_at DESC LIMIT 1"));
+            assert!(select_sql.contains("ORDER BY created_at DESC, id DESC LIMIT 1"));
 
             let consume_sql = consume_verification_code_sql(kind);
             assert!(consume_sql.contains("SET consumed_at ="));
@@ -20978,6 +21044,263 @@ mod tests {
         .unwrap();
         db.migrate().await.unwrap();
         (db, path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn default_authorization_profile(
+        db: &Db,
+        application_id: &str,
+    ) -> ApplicationAuthorizationProfileRecord {
+        db.find_application_authorization_profile(application_id, "default")
+            .await
+            .unwrap()
+            .expect("application migrations create a default authorization profile")
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn replace_test_authorization_bindings(
+        db: &Db,
+        application_id: &str,
+        profile_id: &str,
+        update: AuthorizationBindingsUpdate,
+    ) {
+        db.replace_application_authorization_bindings_with_audit(
+            application_id,
+            profile_id,
+            update,
+            audit::management_event(
+                "authorization-profile-test",
+                "application.authorization_profile.bindings.test",
+                "application_authorization_profile",
+                Some(profile_id.to_string()),
+                serde_json::json!({ "application_id": application_id }),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mutation_receipts_claim_once_and_preserve_replay_metadata() {
+        let (db, path) = sqlite_test_db().await;
+        let first = db
+            .claim_mutation_receipt(
+                "dedupe-receipt-test",
+                "session:test",
+                "POST",
+                "/api/admin/applications",
+                "key-1",
+                "request-a",
+            )
+            .await
+            .unwrap();
+        let second = db
+            .claim_mutation_receipt(
+                "dedupe-receipt-test",
+                "session:test",
+                "POST",
+                "/api/admin/applications",
+                "key-1",
+                "request-a",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.status, "in_progress");
+        assert_eq!(second.owner_token, first.owner_token);
+
+        assert!(
+            db.finalize_mutation_receipt(
+                &first.id,
+                first.owner_token.as_deref().unwrap(),
+                "committed",
+                200,
+                Some(r#"{"id":"application-1"}"#.to_string()),
+                Some("application/json".to_string()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        let completed = db
+            .find_mutation_receipt(&first.id, "session:test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "committed");
+        assert_eq!(completed.response_status, Some(200));
+        assert_eq!(
+            completed.response_content_type.as_deref(),
+            Some("application/json")
+        );
+        assert!(completed.response_body.is_some());
+
+        let same_key_different_request = db
+            .claim_mutation_receipt(
+                "dedupe-receipt-test",
+                "session:test",
+                "POST",
+                "/api/admin/applications",
+                "key-1",
+                "request-b",
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_key_different_request.id, first.id);
+        assert_eq!(same_key_different_request.request_hash, "request-a");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn mutation_receipt_reclaim_fences_the_old_owner() {
+        let (db, path) = sqlite_test_db().await;
+        let first = db
+            .claim_mutation_receipt_with_owner(
+                "reclaim-receipt-test",
+                "session:test",
+                "POST",
+                "/api/admin/applications",
+                "key-1",
+                "request-a",
+                "owner-a",
+            )
+            .await
+            .unwrap();
+
+        let first_id = first.id.clone();
+        with_conn!(db.clone(), |conn, kind| {
+            let sql = format!(
+                "UPDATE mutation_receipts SET lease_expires_at = {} WHERE id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(util::now_ts() - 1)
+                .bind::<Text, _>(&first_id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let reclaimed = db
+            .claim_mutation_receipt_with_owner(
+                "reclaim-receipt-test",
+                "session:test",
+                "POST",
+                "/api/admin/applications",
+                "key-1",
+                "request-a",
+                "owner-b",
+            )
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.id, first.id);
+        assert_eq!(reclaimed.owner_token.as_deref(), Some("owner-b"));
+        assert!(reclaimed.lease_expires_at.unwrap() > util::now_ts());
+
+        assert!(
+            !db.finalize_mutation_receipt(
+                &first.id,
+                "owner-a",
+                "committed",
+                200,
+                Some("old".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.finalize_mutation_receipt(
+                &first.id,
+                "owner-b",
+                "committed",
+                200,
+                Some("new".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        let completed = db
+            .find_mutation_receipt(&first.id, "session:test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.response_body.as_deref(), Some("new"));
+        assert!(completed.owner_token.is_none());
+        assert!(completed.lease_expires_at.is_none());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn application_discovery_idempotency_claims_and_replays_completed_result() {
+        let (db, path) = sqlite_test_db().await;
+        let first = db
+            .claim_application_discovery_idempotency(
+                "org-1",
+                "request-1",
+                "hash-1",
+                "https://example.test",
+            )
+            .await
+            .unwrap();
+        let claim_token = match first {
+            ApplicationDiscoveryIdempotencyClaim::Claimed { claim_token } => claim_token,
+            other => panic!("expected a new claim, got {other:?}"),
+        };
+        assert_eq!(
+            db.claim_application_discovery_idempotency(
+                "org-1",
+                "request-1",
+                "hash-1",
+                "https://example.test",
+            )
+            .await
+            .unwrap(),
+            ApplicationDiscoveryIdempotencyClaim::InProgress
+        );
+        db.complete_application_discovery_idempotency(
+            "org-1",
+            "request-1",
+            &claim_token,
+            "application-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.claim_application_discovery_idempotency(
+                "org-1",
+                "request-1",
+                "hash-1",
+                "https://example.test",
+            )
+            .await
+            .unwrap(),
+            ApplicationDiscoveryIdempotencyClaim::Completed {
+                application_id: "application-1".to_string()
+            }
+        );
+        assert!(matches!(
+            db.claim_application_discovery_idempotency(
+                "org-1",
+                "request-1",
+                "different-hash",
+                "https://example.test",
+            )
+            .await,
+            Err(AppError::BadRequest(_))
+        ));
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]
@@ -21793,6 +22116,29 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    fn test_ldap_provider(slug: &str, organization_id: Option<&str>) -> NewLdapProvider {
+        NewLdapProvider {
+            slug: slug.to_string(),
+            display_name: format!("{slug} directory"),
+            organization_id: organization_id.map(ToOwned::to_owned),
+            url: "ldaps://directory.example.test".to_string(),
+            starttls: false,
+            bind_dn: "cn=reader,dc=example,dc=test".to_string(),
+            bind_password: Some("secret".to_string()),
+            base_dn: "dc=example,dc=test".to_string(),
+            user_filter: "(&(objectClass=person)(uid={login}))".to_string(),
+            user_id_attribute: "uid".to_string(),
+            email_attribute: "mail".to_string(),
+            username_attribute: "uid".to_string(),
+            display_name_attribute: "cn".to_string(),
+            phone_attribute: "telephoneNumber".to_string(),
+            is_active: true,
+            allow_login: true,
+            allow_registration: true,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
     fn test_client(client_id: &str, organization_id: &str) -> NewClient {
         NewClient {
             client_id: client_id.to_string(),
@@ -22059,7 +22405,7 @@ mod tests {
         db.upsert_application_module(
             &first.id,
             "authorization",
-            r#"{"inherit_enterprise_roles":true,"custom_roles":[{"name":"support"}]}"#,
+            r#"{"inherit_enterprise_roles":true,"permissions":["support.read"]}"#,
             false,
         )
         .await
@@ -22100,6 +22446,594 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn application_scim_group_patch_validates_members_in_the_bound_application() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("scim-group-bound", "SCIM Group Bound"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "scim-group-bound-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let group = db
+            .insert_application_scim_group(
+                &application.id,
+                NewGroup {
+                    name: "Bound group".to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        let first = db
+            .insert_user(test_user(
+                "scim-group-first@example.com",
+                "scim-group-first",
+            ))
+            .await
+            .unwrap();
+        let second = db
+            .insert_user(test_user(
+                "scim-group-second@example.com",
+                "scim-group-second",
+            ))
+            .await
+            .unwrap();
+        for user in [&first, &second] {
+            db.upsert_organization_member(
+                &organization.id,
+                &user.id,
+                crate::organizations::ROLE_MEMBER,
+            )
+            .await
+            .unwrap();
+        }
+
+        db.apply_group_patch_plan(GroupPatchPlan {
+            application_id: Some(application.id.clone()),
+            group_id: group.id.clone(),
+            name: "Bound group".to_string(),
+            description: None,
+            member_ids: vec![first.id.clone(), second.id.clone()],
+            create: false,
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+        let members = db
+            .list_application_scim_group_members(&application.id, &group.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            members
+                .into_iter()
+                .map(|member| member.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first.id, second.id])
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn application_scim_group_create_rolls_back_binding_and_group_on_invalid_member() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("scim-group-create", "SCIM Group Create"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "scim-group-create-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let unbound_user = db
+            .insert_user(test_user(
+                "scim-group-unbound@example.com",
+                "scim-group-unbound",
+            ))
+            .await
+            .unwrap();
+        let group_id = "scim-group-atomic-create".to_string();
+
+        let result = db
+            .apply_group_patch_plan(GroupPatchPlan {
+                application_id: Some(application.id.clone()),
+                group_id: group_id.clone(),
+                name: "Atomic create".to_string(),
+                description: None,
+                member_ids: vec![unbound_user.id],
+                create: true,
+                expected_version: None,
+            })
+            .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert!(
+            db.find_application_scim_group(&application.id, &group_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_application_scim_groups(&application.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn audited_application_mutations_commit_business_and_audit_together() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("audited-app", "Audited App"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application_with_audit(
+                test_application(
+                    &organization.id,
+                    "audited-website",
+                    crate::applications::ACCESS_ALL_SIGNET_USERS,
+                ),
+                crate::audit::management_event(
+                    "actor",
+                    "application.create",
+                    "application",
+                    None,
+                    serde_json::json!({ "source": "test" }),
+                ),
+            )
+            .await
+            .unwrap();
+        let module = db
+            .upsert_application_module_with_audit(
+                &application.id,
+                "protocols",
+                r#"{"oauth2_oidc":{"enabled":true}}"#,
+                true,
+                crate::audit::management_event(
+                    "actor",
+                    "application.module.update",
+                    "application",
+                    Some(application.id.clone()),
+                    serde_json::json!({ "module": "protocols" }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(module.is_enabled, 1);
+
+        let jwt_client = db
+            .upsert_application_jwt_client(
+                &application.id,
+                NewApplicationJwtClient {
+                    client_id: "audited-jwt".to_string(),
+                    client_type: "confidential".to_string(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        let jwt_secret = db
+            .rotate_application_jwt_secret_with_audit(
+                &application.id,
+                &jwt_client.client_id,
+                &util::hash_password("audited-secret").unwrap(),
+                300,
+                crate::audit::management_event(
+                    "actor",
+                    "application.jwt_client.secret.rotate",
+                    "application",
+                    Some(application.id.clone()),
+                    serde_json::json!({ "client_id": jwt_client.client_id }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(jwt_secret.jwt_client_id, jwt_client.id);
+
+        let token = db
+            .insert_application_scim_token_with_audit(
+                NewApplicationScimToken {
+                    id: "audited-scim-token".to_string(),
+                    application_id: application.id.clone(),
+                    token_prefix: "scim_v1_audited".to_string(),
+                    token_hash: util::token_hash("scim_v1_audited_secret"),
+                    scopes: vec!["scim.read".to_string()],
+                    expires_at: None,
+                },
+                crate::audit::management_event(
+                    "actor",
+                    "application.scim_token.create",
+                    "application",
+                    Some(application.id.clone()),
+                    serde_json::json!({ "token_id": "audited-scim-token" }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.token_hash, util::token_hash("scim_v1_audited_secret"));
+
+        let events = db.list_audit_events(20).await.unwrap();
+        for action in [
+            "application.create",
+            "application.module.update",
+            "application.jwt_client.secret.rotate",
+            "application.scim_token.create",
+        ] {
+            assert!(
+                events.iter().any(|event| event.action == action
+                    && event.target_id.as_deref() == Some(application.id.as_str())),
+                "missing committed audit event: {action}"
+            );
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn audited_application_creation_rolls_back_when_audit_insert_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("audit-rollback", "Audit Rollback"))
+            .await
+            .unwrap();
+        with_conn!(db.clone(), |conn, _kind| {
+            sql_query("DROP TABLE audit_events")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let result = db
+            .insert_application_with_audit(
+                test_application(
+                    &organization.id,
+                    "audit-rollback-website",
+                    crate::applications::ACCESS_ALL_SIGNET_USERS,
+                ),
+                crate::audit::management_event(
+                    "actor",
+                    "application.create",
+                    "application",
+                    None,
+                    serde_json::json!({}),
+                ),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            db.find_application_by_slug_in_organization(
+                &organization.id,
+                "audit-rollback-website",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn application_creation_with_initial_module_is_atomic() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization(
+                "atomic-application",
+                "Atomic Application",
+            ))
+            .await
+            .unwrap();
+
+        with_conn!(db.clone(), |conn, _kind| {
+            sql_query("DROP TABLE audit_events")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let result = db
+            .insert_application_with_module_with_audit(
+                test_application(
+                    &organization.id,
+                    "atomic-application-website",
+                    crate::applications::ACCESS_ALL_SIGNET_USERS,
+                ),
+                "protocols",
+                r#"{"website_url":"https://atomic.example"}"#,
+                false,
+                crate::audit::management_event(
+                    "actor",
+                    "application.create",
+                    "application",
+                    None,
+                    serde_json::json!({}),
+                ),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            db.find_application_by_slug_in_organization(
+                &organization.id,
+                "atomic-application-website",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn legacy_application_authorization_migrates_into_one_profile_idempotently() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("legacy-auth-org", "Legacy Auth Org"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "legacy-auth-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let user = db
+            .insert_user(test_user(
+                "legacy-auth-user@example.com",
+                "legacy-auth-user",
+            ))
+            .await
+            .unwrap();
+        db.upsert_organization_member(
+            &organization.id,
+            &user.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+        let group = db
+            .insert_group(NewGroup {
+                name: "Legacy Auth Group".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        db.replace_group_members(&group.id, vec![user.id.clone()])
+            .await
+            .unwrap();
+
+        let profile = db
+            .find_application_authorization_profile(&application.id, "default")
+            .await
+            .unwrap()
+            .unwrap();
+        let existing_role = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some("existing-profile-role".to_string()),
+                profile_id: profile.id.clone(),
+                role_key: "legacy".to_string(),
+                name: "Existing legacy role".to_string(),
+                description: None,
+                permissions: vec!["existing.permission".to_string()],
+                source: "manual".to_string(),
+                is_default: false,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let other_role = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some("other-profile-role".to_string()),
+                profile_id: profile.id.clone(),
+                role_key: "other".to_string(),
+                name: "Other role".to_string(),
+                description: None,
+                permissions: Vec::new(),
+                source: "manual".to_string(),
+                is_default: true,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        db.upsert_application_module(
+            &application.id,
+            "authorization",
+            &serde_json::json!({
+                "default_role": "legacy",
+                "custom_roles": [{
+                    "name": "config-extra",
+                    "permissions": ["config.read"]
+                }],
+                "group_mappings": [{
+                    "group": group.name,
+                    "role": "config-extra"
+                }],
+                "organization_role_mappings": {
+                    "admin": "config-extra"
+                }
+            })
+            .to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let application_id = application.id.clone();
+        let user_id = user.id.clone();
+        let group_id = group.id.clone();
+        with_conn!(db.clone(), |conn, _kind| {
+            sql_query(
+                "INSERT INTO application_roles (id, application_id, name, description, permissions, is_default, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Text, _>("legacy-role")
+            .bind::<Text, _>(&application_id)
+            .bind::<Text, _>("legacy")
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .bind::<Text, _>(r#"["legacy.read"]"#)
+            .bind::<Integer, _>(1)
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(1_i64)
+            .bind::<BigInt, _>(1_i64)
+            .execute(&mut conn)
+            .map_err(AppError::from)?;
+            sql_query(
+                "INSERT INTO application_user_roles (application_id, user_id, application_role_id, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(&application_id)
+            .bind::<Text, _>(&user_id)
+            .bind::<Text, _>("legacy-role")
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(1_i64)
+            .bind::<BigInt, _>(1_i64)
+            .execute(&mut conn)
+            .map_err(AppError::from)?;
+            sql_query(
+                "INSERT INTO application_group_roles (application_id, group_id, application_role_id, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(&application_id)
+            .bind::<Text, _>(&group_id)
+            .bind::<Text, _>("legacy-role")
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(1_i64)
+            .bind::<BigInt, _>(1_i64)
+            .execute(&mut conn)
+            .map_err(AppError::from)?;
+            sql_query(
+                "INSERT INTO application_organization_role_mappings (application_id, organization_role, application_role_id, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(&application_id)
+            .bind::<Text, _>("member")
+            .bind::<Text, _>("legacy-role")
+            .bind::<Integer, _>(1)
+            .bind::<BigInt, _>(1_i64)
+            .bind::<BigInt, _>(1_i64)
+            .execute(&mut conn)
+            .map_err(AppError::from)?;
+            sql_query(
+                "INSERT INTO application_user_permission_overrides (application_id, user_id, permission, effect, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(&application_id)
+            .bind::<Text, _>(&user_id)
+            .bind::<Text, _>("legacy.override")
+            .bind::<Text, _>("allow")
+            .bind::<BigInt, _>(1_i64)
+            .bind::<BigInt, _>(1_i64)
+            .execute(&mut conn)
+            .map_err(AppError::from)?;
+            Ok::<(), AppError>(())
+        })
+        .unwrap();
+
+        db.migrate_legacy_application_authorization().await.unwrap();
+        let first_snapshot = db
+            .read_application_authorization_bindings(&application.id, &profile.id)
+            .await
+            .unwrap();
+        let first_roles = db
+            .list_application_profile_roles(&profile.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_roles
+                .iter()
+                .filter(|role| role.is_default == 1)
+                .map(|role| role.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![existing_role.id.as_str()]
+        );
+        assert!(
+            first_roles
+                .iter()
+                .any(|role| role.role_key == "config-extra")
+        );
+        assert!(
+            !first_roles
+                .iter()
+                .any(|role| role.id == other_role.id && role.is_default == 1)
+        );
+        assert_eq!(
+            first_snapshot.user_bindings[&user.id].user_role_ids,
+            vec![existing_role.id.clone()]
+        );
+        let mut expected_group_role_ids = vec![
+            existing_role.id.clone(),
+            first_roles
+                .iter()
+                .find(|role| role.role_key == "config-extra")
+                .unwrap()
+                .id
+                .clone(),
+        ];
+        expected_group_role_ids.sort();
+        assert_eq!(
+            first_snapshot.group_bindings[&group.id],
+            expected_group_role_ids
+        );
+        assert_eq!(
+            first_snapshot.organization_role_bindings["member"],
+            vec![existing_role.id.clone()]
+        );
+        assert_eq!(
+            first_snapshot.organization_role_bindings["admin"],
+            vec![
+                first_roles
+                    .iter()
+                    .find(|role| role.role_key == "config-extra")
+                    .unwrap()
+                    .id
+                    .clone()
+            ]
+        );
+        assert_eq!(
+            first_snapshot.user_bindings[&user.id].user_permission_overrides[0].permission,
+            "legacy.override"
+        );
+
+        db.migrate_legacy_application_authorization().await.unwrap();
+        let second_snapshot = db
+            .read_application_authorization_bindings(&application.id, &profile.id)
+            .await
+            .unwrap();
+        let second_roles = db
+            .list_application_profile_roles(&profile.id)
+            .await
+            .unwrap();
+        assert_eq!(first_snapshot, second_snapshot);
+        assert_eq!(first_roles.len(), second_roles.len());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn updating_application_role_preserves_id_bindings_and_default_invariant() {
         let (db, path) = sqlite_test_db().await;
         let organization = db
@@ -22118,60 +23052,83 @@ mod tests {
             .insert_user(test_user("role-user@example.com", "role-user"))
             .await
             .unwrap();
+        db.upsert_organization_member(
+            &organization.id,
+            &user.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+        let profile = default_authorization_profile(&db, &application.id).await;
         let original = db
-            .upsert_application_role(
-                &application.id,
-                NewApplicationRole {
-                    name: "reader".to_string(),
-                    description: Some("Read access".to_string()),
-                    permissions: vec!["users.read".to_string()],
-                    is_default: true,
-                    is_active: true,
-                },
-            )
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "reader".to_string(),
+                name: "reader".to_string(),
+                source: "manual".to_string(),
+                description: Some("Read access".to_string()),
+                permissions: vec!["users.read".to_string()],
+                is_default: true,
+                is_active: true,
+            })
             .await
             .unwrap();
         let other = db
-            .upsert_application_role(
-                &application.id,
-                NewApplicationRole {
-                    name: "operator".to_string(),
-                    description: None,
-                    permissions: vec!["users.manage".to_string()],
-                    is_default: false,
-                    is_active: true,
-                },
-            )
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "operator".to_string(),
+                name: "operator".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["users.manage".to_string()],
+                is_default: false,
+                is_active: true,
+            })
             .await
             .unwrap();
-        db.replace_application_user_role_ids(&application.id, &user.id, vec![original.id.clone()])
-            .await
-            .unwrap();
+        replace_test_authorization_bindings(
+            &db,
+            &application.id,
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: Some(user.id.clone()),
+                group_id: None,
+                user_role_ids: vec![original.id.clone()],
+                user_permission_overrides: Vec::new(),
+                group_role_ids: Vec::new(),
+                organization_role_bindings: BTreeMap::new(),
+            },
+        )
+        .await;
 
         let updated = db
-            .update_application_role(
-                &application.id,
-                &original.id,
-                NewApplicationRole {
-                    name: "editor".to_string(),
-                    description: Some("Updated access".to_string()),
-                    permissions: vec!["users.manage".to_string()],
-                    is_default: true,
-                    is_active: true,
-                },
-            )
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some(original.id.clone()),
+                profile_id: profile.id.clone(),
+                role_key: "editor".to_string(),
+                name: "editor".to_string(),
+                source: "manual".to_string(),
+                description: Some("Updated access".to_string()),
+                permissions: vec!["users.manage".to_string()],
+                is_default: true,
+                is_active: true,
+            })
             .await
             .unwrap();
         assert_eq!(updated.id, original.id);
         assert_eq!(updated.name, "editor");
         assert_eq!(
-            db.list_application_user_role_ids(&application.id, &user.id)
+            db.read_application_authorization_bindings(&application.id, &profile.id)
                 .await
-                .unwrap(),
+                .unwrap()
+                .user_bindings[&user.id]
+                .user_role_ids,
             vec![original.id.clone()]
         );
         assert_eq!(
-            db.list_application_roles(&application.id)
+            db.list_application_profile_roles(&profile.id)
                 .await
                 .unwrap()
                 .into_iter()
@@ -22181,17 +23138,17 @@ mod tests {
             vec![original.id.clone()]
         );
         assert!(
-            db.update_application_role(
-                &application.id,
-                &other.id,
-                NewApplicationRole {
-                    name: "editor".to_string(),
-                    description: None,
-                    permissions: Vec::new(),
-                    is_default: false,
-                    is_active: true,
-                },
-            )
+            db.upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some(other.id.clone()),
+                profile_id: profile.id,
+                role_key: "editor".to_string(),
+                name: "editor".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: Vec::new(),
+                is_default: false,
+                is_active: true,
+            })
             .await
             .is_err()
         );
@@ -22237,99 +23194,98 @@ mod tests {
             .await
             .unwrap();
 
+        let profile = default_authorization_profile(&db, &application.id).await;
         let default_role = db
-            .upsert_application_role(
-                &application.id,
-                NewApplicationRole {
-                    name: "base".to_string(),
-                    description: None,
-                    permissions: vec!["app.read".to_string()],
-                    is_default: true,
-                    is_active: true,
-                },
-            )
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "base".to_string(),
+                name: "base".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["app.read".to_string()],
+                is_default: true,
+                is_active: true,
+            })
             .await
             .unwrap();
         let mapped_role = db
-            .upsert_application_role(
-                &application.id,
-                NewApplicationRole {
-                    name: "operator".to_string(),
-                    description: None,
-                    permissions: vec!["app.read".to_string(), "app.write".to_string()],
-                    is_default: false,
-                    is_active: true,
-                },
-            )
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "operator".to_string(),
+                name: "operator".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["app.read".to_string(), "app.write".to_string()],
+                is_default: false,
+                is_active: true,
+            })
             .await
             .unwrap();
 
         assert!(
-            db.upsert_application_role(
-                &application.id,
-                NewApplicationRole {
-                    name: "invalid-default".to_string(),
-                    description: None,
-                    permissions: Vec::new(),
-                    is_default: true,
-                    is_active: false,
-                },
-            )
+            db.upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "invalid-default".to_string(),
+                name: "invalid-default".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: Vec::new(),
+                is_default: true,
+                is_active: false,
+            })
             .await
             .is_err()
         );
         assert!(
-            db.update_application_role(
-                &application.id,
-                &default_role.id,
-                NewApplicationRole {
-                    name: "base".to_string(),
-                    description: None,
-                    permissions: vec!["app.read".to_string()],
-                    is_default: true,
-                    is_active: false,
-                },
-            )
+            db.upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some(default_role.id.clone()),
+                profile_id: profile.id.clone(),
+                role_key: "base".to_string(),
+                name: "base".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["app.read".to_string()],
+                is_default: true,
+                is_active: false,
+            })
             .await
             .is_err()
         );
         assert!(
-            db.delete_application_role(&application.id, &default_role.id)
+            db.delete_application_profile_role(&profile.id, &default_role.id)
                 .await
                 .is_err()
         );
 
-        db.replace_application_user_role_ids(
+        replace_test_authorization_bindings(
+            &db,
             &application.id,
-            &user.id,
-            vec![mapped_role.id.clone()],
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: Some(user.id.clone()),
+                group_id: Some(group.id.clone()),
+                user_role_ids: vec![mapped_role.id.clone()],
+                user_permission_overrides: vec![
+                    AuthorizationBindingPermissionOverride {
+                        permission: "app.read".to_string(),
+                        effect: "allow".to_string(),
+                    },
+                    AuthorizationBindingPermissionOverride {
+                        permission: "app.write".to_string(),
+                        effect: "deny".to_string(),
+                    },
+                ],
+                group_role_ids: vec![mapped_role.id.clone()],
+                organization_role_bindings: BTreeMap::from([(
+                    crate::organizations::ROLE_ADMIN.to_string(),
+                    vec![mapped_role.id.clone()],
+                )]),
+            },
         )
-        .await
-        .unwrap();
-        db.replace_application_group_role_ids(
-            &application.id,
-            &group.id,
-            vec![mapped_role.id.clone()],
-        )
-        .await
-        .unwrap();
-        db.replace_application_organization_role_ids(
-            &application.id,
-            crate::organizations::ROLE_ADMIN,
-            vec![mapped_role.id.clone()],
-        )
-        .await
-        .unwrap();
-        db.replace_application_user_permission_overrides(
-            &application.id,
-            &user.id,
-            vec![
-                ("app.read".to_string(), "allow".to_string()),
-                ("app.write".to_string(), "deny".to_string()),
-            ],
-        )
-        .await
-        .unwrap();
+        .await;
 
         let settings: crate::Settings =
             toml::from_str(include_str!("../../config/default.toml")).unwrap();
@@ -22363,17 +23319,17 @@ mod tests {
         // The resolver reads active role rows on every call. Changing or
         // disabling a role therefore revokes its website entitlement without
         // waiting for a previously issued token to expire.
-        db.update_application_role(
-            &application.id,
-            &mapped_role.id,
-            NewApplicationRole {
-                name: "operator".to_string(),
-                description: None,
-                permissions: vec!["app.read".to_string()],
-                is_default: false,
-                is_active: false,
-            },
-        )
+        db.upsert_application_profile_role(NewApplicationProfileRole {
+            id: Some(mapped_role.id.clone()),
+            profile_id: profile.id.clone(),
+            role_key: "operator".to_string(),
+            name: "operator".to_string(),
+            source: "manual".to_string(),
+            description: None,
+            permissions: vec!["app.read".to_string()],
+            is_default: false,
+            is_active: false,
+        })
         .await
         .unwrap();
         let entitlements = crate::authorization::resolve_entitlements(
@@ -22385,54 +23341,457 @@ mod tests {
         .unwrap();
         assert!(!entitlements.roles.iter().any(|role| role == "operator"));
         assert!(entitlements.roles.iter().any(|role| role == "base"));
-        assert!(
-            db.replace_application_user_role_ids(
+        let inactive_binding_result = db
+            .replace_application_authorization_bindings_with_audit(
                 &application.id,
-                &user.id,
-                vec![mapped_role.id.clone()],
+                &profile.id,
+                AuthorizationBindingsUpdate {
+                    user_id: Some(user.id.clone()),
+                    group_id: None,
+                    user_role_ids: vec![mapped_role.id.clone()],
+                    user_permission_overrides: Vec::new(),
+                    group_role_ids: Vec::new(),
+                    organization_role_bindings: BTreeMap::new(),
+                },
+                audit::management_event(
+                    "authorization-profile-test",
+                    "application.authorization_profile.bindings.test",
+                    "application_authorization_profile",
+                    Some(profile.id.clone()),
+                    serde_json::json!({}),
+                ),
             )
-            .await
-            .is_err()
-        );
+            .await;
+        assert!(inactive_binding_result.is_err());
 
         // Deleting a non-default role removes all three kinds of binding in
         // the same transaction, leaving no dangling authorization edge.
-        db.update_application_role(
-            &application.id,
-            &mapped_role.id,
-            NewApplicationRole {
-                name: "operator".to_string(),
-                description: None,
-                permissions: vec!["app.read".to_string(), "app.write".to_string()],
-                is_default: false,
-                is_active: true,
-            },
-        )
+        db.upsert_application_profile_role(NewApplicationProfileRole {
+            id: Some(mapped_role.id.clone()),
+            profile_id: profile.id.clone(),
+            role_key: "operator".to_string(),
+            name: "operator".to_string(),
+            source: "manual".to_string(),
+            description: None,
+            permissions: vec!["app.read".to_string(), "app.write".to_string()],
+            is_default: false,
+            is_active: true,
+        })
         .await
         .unwrap();
-        db.delete_application_role(&application.id, &mapped_role.id)
+        db.delete_application_profile_role(&profile.id, &mapped_role.id)
             .await
             .unwrap();
         assert!(
-            db.list_application_user_role_ids(&application.id, &user.id)
+            db.read_application_authorization_bindings(&application.id, &profile.id)
                 .await
                 .unwrap()
-                .is_empty()
+                .user_bindings
+                .get(&user.id)
+                .is_none_or(|binding| binding.user_role_ids.is_empty())
         );
         assert!(
-            db.list_application_group_role_ids(&application.id, &group.id)
+            db.read_application_authorization_bindings(&application.id, &profile.id)
                 .await
                 .unwrap()
-                .is_empty()
+                .group_bindings
+                .get(&group.id)
+                .is_none_or(Vec::is_empty)
         );
         assert!(
-            db.list_application_organization_role_ids(
-                &application.id,
-                crate::organizations::ROLE_ADMIN,
+            db.read_application_authorization_bindings(&application.id, &profile.id)
+                .await
+                .unwrap()
+                .organization_role_bindings
+                .get(crate::organizations::ROLE_ADMIN)
+                .is_none_or(Vec::is_empty)
+        );
+
+        drop(state);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn application_entitlements_keep_login_open_but_scope_policy_to_tenant_members() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("entitlement-scope", "Entitlement Scope"))
+            .await
+            .unwrap();
+        let other_organization = db
+            .insert_organization(test_organization("entitlement-other", "Entitlement Other"))
+            .await
+            .unwrap();
+        let member = db
+            .insert_user(test_user(
+                "entitlement-member@example.com",
+                "entitlement-member",
+            ))
+            .await
+            .unwrap();
+        let outsider = db
+            .insert_user(test_user(
+                "entitlement-outsider@example.com",
+                "entitlement-outsider",
+            ))
+            .await
+            .unwrap();
+        db.upsert_organization_member(
+            &organization.id,
+            &member.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+        db.upsert_organization_member(
+            &other_organization.id,
+            &outsider.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+
+        let group = db
+            .insert_group(NewGroup {
+                name: "Mixed entitlement group".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        db.replace_group_members(&group.id, vec![member.id.clone(), outsider.id.clone()])
+            .await
+            .unwrap();
+        let outsider_only_group = db
+            .insert_group(NewGroup {
+                name: "Outsider-only entitlement group".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        db.replace_group_members(&outsider_only_group.id, vec![outsider.id.clone()])
+            .await
+            .unwrap();
+        let scoped_groups = db
+            .list_application_authorization_groups(&organization.id)
+            .await
+            .unwrap();
+        assert!(scoped_groups.iter().any(|value| value.id == group.id));
+        assert!(
+            !scoped_groups
+                .iter()
+                .any(|value| value.id == outsider_only_group.id)
+        );
+        let enterprise_role = db
+            .insert_role(NewRole {
+                name: "mixed-enterprise-role".to_string(),
+                description: None,
+                is_system: false,
+                permissions: vec!["enterprise.mixed".to_string()],
+            })
+            .await
+            .unwrap();
+        db.replace_group_roles(&group.id, vec![enterprise_role.id])
+            .await
+            .unwrap();
+
+        let normalized_application = db
+            .insert_application(test_application(
+                &organization.id,
+                "scoped-application",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let profile = default_authorization_profile(&db, &normalized_application.id).await;
+        let application_role = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "mixed-application-role".to_string(),
+                name: "mixed-application-role".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["application.mixed".to_string()],
+                is_default: false,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        replace_test_authorization_bindings(
+            &db,
+            &normalized_application.id,
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: None,
+                group_id: Some(group.id.clone()),
+                user_role_ids: Vec::new(),
+                user_permission_overrides: Vec::new(),
+                group_role_ids: vec![application_role.id],
+                organization_role_bindings: BTreeMap::new(),
+            },
+        )
+        .await;
+
+        let settings: crate::Settings =
+            toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        let state = crate::AppState {
+            jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
+            settings,
+            db: db.clone(),
+        };
+        let member_record = db.find_user_by_id(&member.id).await.unwrap().unwrap();
+        let outsider_record = db.find_user_by_id(&outsider.id).await.unwrap().unwrap();
+
+        assert!(
+            crate::authorization::check_login_access(
+                &state,
+                &normalized_application,
+                &outsider.id,
             )
             .await
             .unwrap()
-            .is_empty()
+            .allowed
+        );
+        let member_entitlements = crate::authorization::resolve_entitlements(
+            &state,
+            &normalized_application,
+            &member_record,
+        )
+        .await
+        .unwrap();
+        assert!(
+            member_entitlements
+                .roles
+                .iter()
+                .any(|role| role == "mixed-application-role")
+        );
+        assert!(
+            member_entitlements
+                .roles
+                .iter()
+                .any(|role| role == "mixed-enterprise-role")
+        );
+        assert!(
+            member_entitlements
+                .permissions
+                .iter()
+                .any(|permission| permission == "application.mixed")
+        );
+        assert!(
+            member_entitlements
+                .groups
+                .iter()
+                .any(|name| name == "Mixed entitlement group")
+        );
+
+        let outsider_entitlements = crate::authorization::resolve_entitlements(
+            &state,
+            &normalized_application,
+            &outsider_record,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !outsider_entitlements
+                .roles
+                .iter()
+                .any(|role| role == "mixed-application-role")
+        );
+        assert!(
+            !outsider_entitlements
+                .roles
+                .iter()
+                .any(|role| role == "mixed-enterprise-role")
+        );
+        assert!(
+            !outsider_entitlements
+                .permissions
+                .iter()
+                .any(|permission| permission == "application.mixed")
+        );
+        assert!(outsider_entitlements.groups.is_empty());
+        assert!(outsider_entitlements.organization_role.is_none());
+
+        let legacy_application = db
+            .insert_application(test_application(
+                &organization.id,
+                "legacy-scoped-application",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let legacy_profile = db
+            .find_application_authorization_profile(&legacy_application.id, "default")
+            .await
+            .unwrap()
+            .unwrap();
+        db.upsert_application_profile_role(NewApplicationProfileRole {
+            id: Some("legacy-member-role".to_string()),
+            profile_id: legacy_profile.id.clone(),
+            role_key: "legacy-member".to_string(),
+            name: "Legacy member".to_string(),
+            description: None,
+            permissions: vec!["legacy.default".to_string()],
+            source: "manual".to_string(),
+            is_default: true,
+            is_active: true,
+        })
+        .await
+        .unwrap();
+        let legacy_operator = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: Some("legacy-operator-role".to_string()),
+                profile_id: legacy_profile.id.clone(),
+                role_key: "legacy-operator".to_string(),
+                name: "Legacy operator".to_string(),
+                description: None,
+                permissions: vec!["legacy.mixed".to_string()],
+                source: "manual".to_string(),
+                is_default: false,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        db.replace_application_authorization_bindings_with_audit(
+            &legacy_application.id,
+            &legacy_profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: None,
+                group_id: Some(group.id.clone()),
+                user_role_ids: Vec::new(),
+                user_permission_overrides: Vec::new(),
+                group_role_ids: vec![legacy_operator.id],
+                organization_role_bindings: BTreeMap::new(),
+            },
+            audit::management_event(
+                "authorization-profile-test",
+                "application.authorization_profile.bindings.update",
+                "application_authorization_profile",
+                Some(legacy_profile.id.clone()),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+        let member_legacy =
+            crate::authorization::resolve_entitlements(&state, &legacy_application, &member_record)
+                .await
+                .unwrap();
+        let outsider_legacy = crate::authorization::resolve_entitlements(
+            &state,
+            &legacy_application,
+            &outsider_record,
+        )
+        .await
+        .unwrap();
+        assert!(
+            member_legacy
+                .roles
+                .iter()
+                .any(|role| role == "legacy-operator")
+        );
+        assert!(
+            member_legacy
+                .permissions
+                .iter()
+                .any(|permission| permission == "legacy.mixed")
+        );
+        assert!(
+            !outsider_legacy
+                .roles
+                .iter()
+                .any(|role| role == "legacy-operator")
+        );
+        assert!(
+            !outsider_legacy
+                .permissions
+                .iter()
+                .any(|permission| permission == "legacy.mixed")
+        );
+        assert!(
+            outsider_legacy
+                .roles
+                .iter()
+                .any(|role| role == "legacy-member")
+        );
+
+        let profile_application = db
+            .insert_application(test_application(
+                &organization.id,
+                "profile-scoped-application",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let profile = db
+            .find_application_authorization_profile(&profile_application.id, "default")
+            .await
+            .unwrap()
+            .unwrap();
+        let profile_role = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "profile-operator".to_string(),
+                name: "Profile operator".to_string(),
+                description: None,
+                permissions: vec!["profile.mixed".to_string()],
+                source: "manual".to_string(),
+                is_default: false,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        db.replace_application_authorization_bindings_with_audit(
+            &profile_application.id,
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: None,
+                group_id: Some(group.id.clone()),
+                user_role_ids: Vec::new(),
+                user_permission_overrides: Vec::new(),
+                group_role_ids: vec![profile_role.id],
+                organization_role_bindings: BTreeMap::new(),
+            },
+            crate::audit::management_event(
+                "authorization-profile-test",
+                "application.authorization_profile.bindings.update",
+                "application_authorization_profile",
+                Some(profile.id.clone()),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+        let member_profile = crate::authorization::resolve_entitlements_for_profile(
+            &state,
+            &profile_application,
+            &profile,
+            &member_record,
+        )
+        .await
+        .unwrap();
+        let outsider_profile = crate::authorization::resolve_entitlements_for_profile(
+            &state,
+            &profile_application,
+            &profile,
+            &outsider_record,
+        )
+        .await
+        .unwrap();
+        assert!(
+            member_profile
+                .permissions
+                .iter()
+                .any(|permission| permission == "profile.mixed")
+        );
+        assert!(
+            !outsider_profile
+                .permissions
+                .iter()
+                .any(|permission| permission == "profile.mixed")
         );
 
         drop(state);
@@ -22785,6 +24144,40 @@ mod tests {
                 .len(),
             1
         );
+        let (user_total, users) = db
+            .list_users_page(
+                UserListScope::Live,
+                Some(&organization.id),
+                Some(UserListFilter::UserName("SAME-ORG".to_string())),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(user_total, 1);
+        assert_eq!(users[0].id, same_org_user.id);
+        let (group_total, groups) = db
+            .list_groups_page(
+                Some(&first.id),
+                Some(GroupListFilter::DisplayName("DIRECTORY GROUP".to_string())),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(group_total, 1);
+        assert_eq!(groups[0].id, group.id);
+        let member_refs = db
+            .list_scim_group_member_refs_page(
+                Some(&first.id),
+                Some(GroupListFilter::Id(group.id.clone())),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(member_refs.len(), 1);
+        assert_eq!(member_refs[0].user_id, same_org_user.id);
         assert!(
             db.list_application_scim_groups(&second.id)
                 .await
@@ -23682,13 +25075,10 @@ mod tests {
         application.registration_mode = crate::applications::REGISTRATION_INVITATION.to_string();
         let application = db.insert_application(application).await.unwrap();
         let client = db
-            .insert_client(test_client(
-                "restricted-enrollment-client",
-                &organization.id,
-            ))
-            .await
-            .unwrap();
-        db.link_client_to_application(&application.id, &client.id, "oidc", "default")
+            .insert_client_for_application(
+                &application.id,
+                test_client("restricted-enrollment-client", &organization.id),
+            )
             .await
             .unwrap();
 
@@ -23797,10 +25187,10 @@ mod tests {
         application.registration_mode = crate::applications::REGISTRATION_INVITATION.to_string();
         let application = db.insert_application(application).await.unwrap();
         let client = db
-            .insert_client(test_client("employee-app-client", &organization.id))
-            .await
-            .unwrap();
-        db.link_client_to_application(&application.id, &client.id, "oidc", "default")
+            .insert_client_for_application(
+                &application.id,
+                test_client("employee-app-client", &organization.id),
+            )
             .await
             .unwrap();
 
@@ -24215,6 +25605,21 @@ mod tests {
             ))
             .await
             .unwrap();
+        db.upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+            id: "binding-second-profile".to_string(),
+            application_id: second.id.clone(),
+            profile_key: "binding-second".to_string(),
+            connection_kind: "oidc".to_string(),
+            connection_id: None,
+            source_mode: "manual".to_string(),
+            remote_version: None,
+            remote_digest: None,
+            sync_status: "manual".to_string(),
+            last_synced_at: None,
+            last_error: None,
+        })
+        .await
+        .unwrap();
         let foreign_organization = db
             .insert_organization(test_organization("binding-foreign", "Binding Foreign"))
             .await
@@ -24228,11 +25633,20 @@ mod tests {
             .await
             .unwrap();
         let client = db
-            .insert_client(test_client("binding-exclusive-client", &organization.id))
+            .insert_client_for_application(
+                &first.id,
+                test_client("binding-exclusive-client", &organization.id),
+            )
             .await
             .unwrap();
+        let client_profile_id = db
+            .find_application_client_binding(&client.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_profile_id;
 
-        db.link_client_to_application(&first.id, &client.id, "oidc", "default")
+        db.link_client_to_application(&first.id, &client.id, "oidc", &client_profile_id)
             .await
             .unwrap();
         assert_eq!(
@@ -24253,30 +25667,54 @@ mod tests {
             first.id
         );
 
-        db.link_client_to_application(&second.id, &client.id, "oidc", "default")
+        assert!(matches!(
+            db.link_client_to_application(
+                &first.id,
+                &client.id,
+                "oidc",
+                "binding-second-profile"
+            )
+            .await,
+            Err(AppError::BadRequest(message))
+                if message == "authorization profile must belong to the application"
+        ));
+
+        db.upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+            id: "updated".to_string(),
+            application_id: first.id.clone(),
+            profile_key: "updated".to_string(),
+            connection_kind: "oidc".to_string(),
+            connection_id: Some(client.id.clone()),
+            source_mode: "manual".to_string(),
+            remote_version: None,
+            remote_digest: None,
+            sync_status: "manual".to_string(),
+            last_synced_at: None,
+            last_error: None,
+        })
+        .await
+        .unwrap();
+
+        db.link_client_to_application(&first.id, &client.id, "oidc", "updated")
             .await
             .unwrap();
-        assert!(
-            db.list_application_client_ids(&first.id)
+        assert_eq!(
+            db.find_application_client_binding(&client.id)
                 .await
                 .unwrap()
-                .is_empty()
+                .unwrap()
+                .authorization_profile_id,
+            "updated"
         );
+        assert!(matches!(
+            db.link_client_to_application(&second.id, &client.id, "oidc", "default")
+                .await,
+            Err(AppError::BadRequest(message)) if message == "OIDC client already belongs to another application"
+        ));
         assert_eq!(
-            db.list_application_client_ids(&second.id).await.unwrap(),
+            db.list_application_client_ids(&first.id).await.unwrap(),
             vec![client.id.clone()]
         );
-
-        db.unlink_client_from_application(&client.id)
-            .await
-            .unwrap();
-        let detached = db
-            .find_application_for_client(&client.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(detached.id, first.id);
-        assert_ne!(detached.id, second.id);
         assert!(
             db.list_application_client_ids(&second.id)
                 .await
@@ -24284,19 +25722,344 @@ mod tests {
                 .is_empty()
         );
 
-        db.link_client_to_application(&second.id, &client.id, "oidc", "default")
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dynamic_client_graph_rolls_back_when_registration_insert_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let system = db.system_organization().await.unwrap();
+        let client_id = "dynamic-registration-rollback";
+        let applications_before = db
+            .list_applications(Some(SIGNET_ORGANIZATION_ID))
+            .await
+            .unwrap()
+            .len();
+
+        // The trigger fails at the last graph write, after the client,
+        // application, physical profile, and binding have been inserted.
+        // This exercises the real database transaction rather than a
+        // validation failure that happens before any row is written.
+        with_conn!(db, |conn, _kind| {
+            conn.batch_execute(
+                "CREATE TRIGGER fail_dynamic_registration BEFORE INSERT ON client_registrations BEGIN SELECT RAISE(ABORT, 'forced dynamic registration failure'); END",
+            )
+            .map_err(AppError::from)
+        })
+        .unwrap();
+
+        let result = db
+            .register_dynamic_client_graph(
+                test_client(client_id, &system.id),
+                util::token_hash("dynamic-registration-token"),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::Database(message))
+                if message.contains("forced dynamic registration failure")
+        ));
+        assert!(
+            db.find_client_by_client_id(client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.list_applications(Some(SIGNET_ORGANIZATION_ID))
+                .await
+                .unwrap()
+                .len(),
+            applications_before
+        );
+
+        with_conn!(db, |conn, _kind| {
+            conn.batch_execute("DROP TRIGGER fail_dynamic_registration")
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dynamic_client_graph_allocates_a_bounded_collision_suffix() {
+        let (db, path) = sqlite_test_db().await;
+        let system = db.system_organization().await.unwrap();
+        let client_id = "dynamic-slug-collision";
+        let base_slug = application_slug_base(client_id);
+        for slug in [&base_slug, &format!("{base_slug}-2")] {
+            db.insert_application(test_application(
+                &system.id,
+                slug,
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
             .await
             .unwrap();
-        db.delete_application(&second.id).await.unwrap();
-        let deleted_fallback = db
+        }
+
+        let client = db
+            .register_dynamic_client_graph(
+                test_client(client_id, &system.id),
+                util::token_hash("dynamic-slug-token"),
+            )
+            .await
+            .unwrap();
+        let application = db
             .find_application_for_client(&client.id)
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(deleted_fallback.id, second.id);
         assert_eq!(
-            deleted_fallback.registration_mode,
-            crate::applications::REGISTRATION_DISABLED
+            application.slug,
+            application_slug_collision_candidate(&base_slug, client_id)
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn application_slug_base_disambiguates_noncanonical_client_ids() {
+        let canonical = application_slug_base("client-id");
+        let disambiguated = application_slug_base("Client.ID");
+        assert_ne!(canonical, disambiguated);
+        assert!(disambiguated.len() <= 64);
+        assert!(crate::applications::normalize_application_slug(&disambiguated).is_ok());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn application_oidc_client_graph_is_atomic_and_profile_bound() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("graph-app", "Graph App"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "graph-application",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        // Force a failure after the client insert would have happened. A
+        // profile-key collision must roll back the complete aggregate rather
+        // than leave an unbound client for a later reconciliation pass.
+        db.upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
+            id: "graph-existing-profile".to_string(),
+            application_id: application.id.clone(),
+            profile_key: "graph-rollback-client".to_string(),
+            connection_kind: "oidc".to_string(),
+            connection_id: None,
+            source_mode: "manual".to_string(),
+            remote_version: None,
+            remote_digest: None,
+            sync_status: "manual".to_string(),
+            last_synced_at: None,
+            last_error: None,
+        })
+        .await
+        .unwrap();
+        let rollback_result = db
+            .create_application_oidc_client_graph(
+                &application.id,
+                test_client("graph-rollback-client", &organization.id),
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            rollback_result,
+            Err(AppError::BadRequest(message))
+                if message == "authorization profile key is already used by another connection"
+        ));
+        assert!(
+            db.find_client_by_client_id("graph-rollback-client")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_application_client_binding_by_public_client_id("graph-rollback-client")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Exercise a failure after the profile, auth domain, and binding have
+        // already been written. A real database trigger is used here because
+        // malformed mapper input is rejected before the aggregate transaction
+        // in the HTTP layer and would not test rollback at the mapper step.
+        with_conn!(db, |conn, _kind| {
+            conn.batch_execute(
+                "CREATE TRIGGER fail_graph_mapper BEFORE INSERT ON client_claim_mappers BEGIN SELECT RAISE(ABORT, 'forced graph mapper failure'); END",
+            )
+            .map_err(AppError::from)
+        })
+        .unwrap();
+        let mapper_rollback_result = db
+            .create_application_oidc_client_graph(
+                &application.id,
+                test_client("graph-mapper-rollback", &organization.id),
+                vec![NewClientClaimMapper {
+                    claim_name: "department".to_string(),
+                    source: "static".to_string(),
+                    source_value: "engineering".to_string(),
+                    value_type: "string".to_string(),
+                    include_in_id_token: true,
+                    include_in_access_token: false,
+                    include_in_userinfo: false,
+                    is_active: true,
+                    sort_order: 0,
+                }],
+            )
+            .await;
+        assert!(matches!(
+            mapper_rollback_result,
+            Err(AppError::Database(message)) if message.contains("forced graph mapper failure")
+        ));
+        assert!(
+            db.find_client_by_client_id("graph-mapper-rollback")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_application_authorization_profile(&application.id, "graph-mapper-rollback")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_application_client_binding_by_public_client_id("graph-mapper-rollback")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_application_auth_domain(&application.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        with_conn!(db, |conn, _kind| {
+            conn.batch_execute("DROP TRIGGER fail_graph_mapper")
+                .map_err(AppError::from)
+        })
+        .unwrap();
+        let client_input = test_client("graph-client", &organization.id);
+        let client = db
+            .create_application_oidc_client_graph(
+                &application.id,
+                client_input.clone(),
+                vec![NewClientClaimMapper {
+                    claim_name: "department".to_string(),
+                    source: "static".to_string(),
+                    source_value: "engineering".to_string(),
+                    value_type: "string".to_string(),
+                    include_in_id_token: true,
+                    include_in_access_token: true,
+                    include_in_userinfo: false,
+                    is_active: true,
+                    sort_order: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        let binding = db
+            .find_application_client_binding(&client.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.application_id, application.id);
+        assert_ne!(binding.authorization_profile_id, "default");
+        let profile = db
+            .find_application_authorization_profile_by_id(&binding.authorization_profile_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.profile_key, "graph-client");
+        assert_eq!(profile.connection_id.as_deref(), Some(client.id.as_str()));
+        assert_eq!(
+            db.list_client_claim_mappers(&client.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let graph = db.read_application_graph(&application.id).await.unwrap();
+        assert_eq!(graph.bindings.len(), 1);
+        assert_eq!(graph.clients.len(), 1);
+        assert_eq!(graph.claim_mappers.len(), 1);
+        assert_eq!(graph.organizations.len(), 1);
+        assert_eq!(graph.profiles.len(), 3);
+        assert!(
+            graph
+                .profiles
+                .iter()
+                .any(|profile| profile.profile_key == "graph-rollback-client")
+        );
+        assert!(
+            graph
+                .profiles
+                .iter()
+                .any(|profile| profile.profile_key == "graph-client")
+        );
+
+        let mut updated_input = client_input;
+        updated_input.client_id = "graph-client-renamed".to_string();
+        updated_input.client_name = "Graph Client Renamed".to_string();
+        let updated = db
+            .update_application_oidc_client_graph(
+                &application.id,
+                &client.id,
+                updated_input,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.client_id, "graph-client-renamed");
+        let updated_binding = db
+            .find_application_client_binding(&client.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_binding.authorization_profile_id,
+            binding.authorization_profile_id
+        );
+        let renamed_profile = db
+            .find_application_authorization_profile_by_id(&binding.authorization_profile_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed_profile.profile_key, "graph-client-renamed");
+        assert!(
+            db.list_client_claim_mappers(&client.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        db.delete_application_oidc_client_graph(&application.id, &client.id)
+            .await
+            .unwrap();
+        assert!(db.find_client_by_id(&client.id).await.unwrap().is_none());
+        assert!(
+            db.find_application_authorization_profile_by_id(&binding.authorization_profile_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.find_application_client_binding(&client.id)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         drop(db);
@@ -25498,6 +27261,120 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn device_authorization_transitions_are_atomic_and_report_current_state() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        let now = util::now_ts();
+        db.insert_device_authorization(NewDeviceAuthorization {
+            device_code_hash: "atomic-device-code".to_string(),
+            user_code_hash: "atomic-user-code".to_string(),
+            user_code_display: "ABCD-EFGH".to_string(),
+            client_id: "client".to_string(),
+            scope: "openid".to_string(),
+            resource: None,
+            authorization_details: None,
+            expires_at: now + 600,
+            interval_seconds: 5,
+        })
+        .await
+        .unwrap();
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first_poll, second_poll) = tokio::join!(
+            first_db.poll_device_authorization("atomic-device-code", now),
+            second_db.poll_device_authorization("atomic-device-code", now),
+        );
+        let first_poll = first_poll.unwrap();
+        let second_poll = second_poll.unwrap();
+        assert_eq!(
+            usize::from(first_poll.changed) + usize::from(second_poll.changed),
+            1
+        );
+        assert!(
+            (first_poll.status == DeviceAuthorizationStatus::Pending
+                && second_poll.status == DeviceAuthorizationStatus::SlowDown)
+                || (second_poll.status == DeviceAuthorizationStatus::Pending
+                    && first_poll.status == DeviceAuthorizationStatus::SlowDown)
+        );
+
+        let approved = db
+            .authorize_device_authorization("atomic-user-code", "user-1")
+            .await
+            .unwrap();
+        assert!(approved.changed);
+        assert_eq!(approved.status, DeviceAuthorizationStatus::Authorized);
+
+        let denied_after_approval = db
+            .deny_device_authorization("atomic-user-code")
+            .await
+            .unwrap();
+        assert!(!denied_after_approval.changed);
+        assert_eq!(
+            denied_after_approval.status,
+            DeviceAuthorizationStatus::Authorized
+        );
+
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first_consume, second_consume) = tokio::join!(
+            first_db.consume_device_authorization("atomic-device-code"),
+            second_db.consume_device_authorization("atomic-device-code"),
+        );
+        let first_consume = first_consume.unwrap();
+        let second_consume = second_consume.unwrap();
+        assert_eq!(
+            usize::from(first_consume.changed) + usize::from(second_consume.changed),
+            1
+        );
+        assert_eq!(first_consume.status, DeviceAuthorizationStatus::Consumed);
+        assert_eq!(second_consume.status, DeviceAuthorizationStatus::Consumed);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn device_authorization_approve_and_deny_have_one_winner() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        let now = util::now_ts();
+        db.insert_device_authorization(NewDeviceAuthorization {
+            device_code_hash: "approve-deny-device-code".to_string(),
+            user_code_hash: "approve-deny-user-code".to_string(),
+            user_code_display: "IJKL-MNOP".to_string(),
+            client_id: "client".to_string(),
+            scope: "openid".to_string(),
+            resource: None,
+            authorization_details: None,
+            expires_at: now + 600,
+            interval_seconds: 5,
+        })
+        .await
+        .unwrap();
+
+        let approve_db = db.clone();
+        let deny_db = db.clone();
+        let (approve, deny) = tokio::join!(
+            approve_db.authorize_device_authorization("approve-deny-user-code", "user-1"),
+            deny_db.deny_device_authorization("approve-deny-user-code"),
+        );
+        let approve = approve.unwrap();
+        let deny = deny.unwrap();
+        assert_eq!(usize::from(approve.changed) + usize::from(deny.changed), 1);
+        if approve.changed {
+            assert_eq!(approve.status, DeviceAuthorizationStatus::Authorized);
+            assert_eq!(deny.status, DeviceAuthorizationStatus::Authorized);
+        } else {
+            assert_eq!(deny.status, DeviceAuthorizationStatus::Denied);
+            assert_eq!(approve.status, DeviceAuthorizationStatus::Denied);
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn disabling_user_through_profile_update_clears_auth_state() {
         let (db, path) = sqlite_test_db().await;
         let user = db
@@ -25544,6 +27421,71 @@ mod tests {
         assert_eq!(archived.is_active, 0);
         assert!(archived.archived_at.is_some());
         assert_user_auth_state_count(&db, &user.id, 0).await;
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn user_lifecycle_batch_is_atomic_deduplicated_and_cleans_auth_state() {
+        let (db, path) = sqlite_test_db().await;
+        let first = db
+            .insert_user(test_user("batch-first@example.com", "batch-first"))
+            .await
+            .unwrap();
+        let second = db
+            .insert_user(test_user("batch-second@example.com", "batch-second"))
+            .await
+            .unwrap();
+        insert_user_auth_state(&db, &first.id, "batch-first").await;
+        insert_user_auth_state(&db, &second.id, "batch-second").await;
+
+        let missing_id = "batch-missing".to_string();
+        let rejected = db
+            .apply_user_lifecycle_batch(
+                "actor",
+                vec![first.id.clone(), missing_id],
+                UserLifecycleBatchAction::Disable,
+            )
+            .await;
+        assert!(matches!(rejected, Err(AppError::NotFound)));
+        assert_eq!(
+            db.find_user_by_id(&first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active,
+            1
+        );
+        assert_user_auth_state_count(&db, &first.id, 1).await;
+
+        let changed = db
+            .apply_user_lifecycle_batch(
+                "actor",
+                vec![first.id.clone(), second.id.clone(), first.id.clone()],
+                UserLifecycleBatchAction::Disable,
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 2);
+        for user in [&first, &second] {
+            assert_eq!(
+                db.find_user_by_id(&user.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_active,
+                0
+            );
+            assert_user_auth_state_count(&db, &user.id, 0).await;
+        }
+        let events = db.list_audit_events(20).await.unwrap();
+        assert!(events.iter().any(|event| {
+            event.action == "user.bulk.disable"
+                && event.target_kind == "user_bulk"
+                && event.details.contains("\"count\":2")
+        }));
 
         drop(db);
         let _ = std::fs::remove_file(path);
@@ -25634,10 +27576,46 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn captcha_concurrent_correct_answers_have_one_winner() {
+        let (db, path) = sqlite_test_db_with_pool_size(4).await;
+        let record = db
+            .create_captcha_challenge("concurrent@example.com", "2 + 3 = ?", "5", 300)
+            .await
+            .unwrap();
+        let id = record.id.clone();
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let (first, second) = tokio::join!(
+            first_db.consume_captcha_challenge(&id, "concurrent@example.com", "5"),
+            second_db.consume_captcha_challenge(&id, "concurrent@example.com", "5"),
+        );
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(first.is_err() || second.is_err());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn iap_application_crud_normalizes_policy_fields() {
         let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("iap-crud", "IAP CRUD"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "iap-crud-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
         let created = db
             .insert_iap_application(NewIapApplication {
+                application_id: application.id.clone(),
                 slug: "docs".to_string(),
                 name: "Docs".to_string(),
                 description: Some("Internal docs".to_string()),
@@ -25670,6 +27648,7 @@ mod tests {
             .update_iap_application(
                 &created.id,
                 NewIapApplication {
+                    application_id: application.id.clone(),
                     slug: "docs".to_string(),
                     name: "Docs".to_string(),
                     description: None,
@@ -25689,6 +27668,7 @@ mod tests {
 
         let bad_permission = db
             .insert_iap_application(NewIapApplication {
+                application_id: application.id,
                 slug: "bad".to_string(),
                 name: "Bad".to_string(),
                 description: None,
@@ -26180,6 +28160,202 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_file(path);
     }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn audited_group_mutation_rolls_back_when_audit_insert_fails() {
+        let (db, path) = sqlite_test_db().await;
+        let group = db
+            .insert_group(NewGroup {
+                name: "audited-group".to_string(),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let user = db
+            .insert_user(test_user("audited-group@example.com", "audited-group"))
+            .await
+            .unwrap();
+
+        with_conn!(db.clone(), |conn, _kind| {
+            sql_query("DROP TABLE audit_events")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+        .unwrap();
+
+        assert!(
+            db.replace_group_members_with_audit(
+                &group.id,
+                vec![user.id.clone()],
+                crate::audit::management_event(
+                    "actor",
+                    "group.members.update",
+                    "group",
+                    Some(group.id.clone()),
+                    serde_json::json!({ "user_ids": [user.id] }),
+                ),
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.list_group_members(&group.id).await.unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn deleting_group_cleans_application_and_profile_edges() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("group-delete", "Group Delete"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "group-delete-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let member = db
+            .insert_user(test_user("group-delete@example.com", "group-delete"))
+            .await
+            .unwrap();
+        db.upsert_organization_member(
+            &organization.id,
+            &member.id,
+            crate::organizations::ROLE_MEMBER,
+        )
+        .await
+        .unwrap();
+        let group = db
+            .insert_application_scim_group(
+                &application.id,
+                NewGroup {
+                    name: "application-group".to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+        db.replace_group_members(&group.id, vec![member.id.clone()])
+            .await
+            .unwrap();
+        let profile = default_authorization_profile(&db, &application.id).await;
+        let role = db
+            .upsert_application_profile_role(NewApplicationProfileRole {
+                id: None,
+                profile_id: profile.id.clone(),
+                role_key: "group-role".to_string(),
+                name: "group-role".to_string(),
+                source: "manual".to_string(),
+                description: None,
+                permissions: vec!["group.read".to_string()],
+                is_default: false,
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        replace_test_authorization_bindings(
+            &db,
+            &application.id,
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: None,
+                group_id: Some(group.id.clone()),
+                user_role_ids: Vec::new(),
+                user_permission_overrides: Vec::new(),
+                group_role_ids: vec![role.id],
+                organization_role_bindings: BTreeMap::new(),
+            },
+        )
+        .await;
+
+        db.delete_group(&group.id).await.unwrap();
+        assert!(db.find_group_by_id(&group.id).await.unwrap().is_none());
+        assert!(
+            db.list_application_scim_groups(&application.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.read_application_authorization_bindings(&application.id, &profile.id)
+                .await
+                .unwrap()
+                .group_bindings
+                .get(&group.id)
+                .is_none_or(Vec::is_empty)
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn deleting_ldap_provider_revokes_reusable_slug_identity_and_sync_state() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("ldap-owner", "LDAP Owner"))
+            .await
+            .unwrap();
+        let provider = db
+            .insert_ldap_provider(test_ldap_provider(
+                "reusable-directory",
+                Some(&organization.id),
+            ))
+            .await
+            .unwrap();
+        let user = db
+            .insert_user(test_user("ldap-linked@example.com", "ldap-linked"))
+            .await
+            .unwrap();
+        db.insert_linked_identity(
+            &user.id,
+            &provider.provider_key(),
+            "external-subject",
+            Some("ldap-linked@example.com".to_string()),
+        )
+        .await
+        .unwrap();
+        db.start_directory_sync_run("removed-application", &provider.id)
+            .await
+            .unwrap();
+
+        db.delete_ldap_provider(&provider.id).await.unwrap();
+        assert!(
+            db.find_linked_identity(&provider.provider_key(), "external-subject")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_directory_sync_runs("removed-application", 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let replacement = db
+            .insert_ldap_provider(test_ldap_provider("reusable-directory", None))
+            .await
+            .unwrap();
+        assert!(
+            db.find_linked_identity(&replacement.provider_key(), "external-subject")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 macro_rules! insert_client_in_connection {
@@ -26519,7 +28695,7 @@ macro_rules! replace_website_profile_roles_in_connection {
         let profile = $profile;
     let now = util::now_ts();
     let deactivate_sql = format!(
-        "UPDATE application_profile_roles SET is_active = {}, source = {}, updated_at = {} WHERE profile_id = {}",
+        "UPDATE application_profile_roles SET is_active = {}, is_default = 0, source = {}, updated_at = {} WHERE profile_id = {}",
         ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4)
     );
     sql_query(deactivate_sql)
@@ -26531,6 +28707,18 @@ macro_rules! replace_website_profile_roles_in_connection {
         .map_err(AppError::from)?;
     for role in &profile.roles {
         let permissions = util::to_json(&role.permissions)?;
+        if role.is_default {
+            let clear_default_sql = format!(
+                "UPDATE application_profile_roles SET is_default = 0, updated_at = {} WHERE profile_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(clear_default_sql)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(profile_id)
+                .execute(conn)
+                .map_err(AppError::from)?;
+        }
         let existing_sql = format!(
             "{} WHERE profile_id = {} AND role_key = {}",
             select_application_profile_role_sql(),
@@ -27243,6 +29431,28 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)",
+    "CREATE TABLE IF NOT EXISTS mutation_receipts (
+        id TEXT PRIMARY KEY,
+        dedupe_hash TEXT NOT NULL UNIQUE,
+        scope_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_status INTEGER,
+        response_body TEXT,
+        response_content_type TEXT,
+        error_code TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        owner_token TEXT,
+        lease_expires_at INTEGER
+    )",
+    "ALTER TABLE mutation_receipts ADD COLUMN owner_token TEXT",
+    "ALTER TABLE mutation_receipts ADD COLUMN lease_expires_at INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_mutation_receipts_scope_status ON mutation_receipts(scope_key, status, updated_at)",
     "CREATE TABLE IF NOT EXISTS audit_webhooks (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -27258,6 +29468,20 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_audit_webhooks_active ON audit_webhooks(is_active, created_at)",
+    "CREATE TABLE IF NOT EXISTS audit_webhook_outbox (
+        id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_audit_webhook_outbox_due ON audit_webhook_outbox(state, next_attempt_at)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_webhook_outbox_lease ON audit_webhook_outbox(state, lease_expires_at)",
     "CREATE TABLE IF NOT EXISTS roles (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -27281,13 +29505,16 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         name TEXT NOT NULL UNIQUE,
         description TEXT,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        version INTEGER NOT NULL DEFAULT 0
     )",
+    "ALTER TABLE access_groups ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
     "CREATE TABLE IF NOT EXISTS group_members (
         group_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         PRIMARY KEY (group_id, user_id)
     )",
+    "CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id, group_id)",
     "CREATE TABLE IF NOT EXISTS group_roles (
         group_id TEXT NOT NULL,
         role_id TEXT NOT NULL,
@@ -27496,14 +29723,25 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         expires_at INTEGER NOT NULL,
         paid_at INTEGER,
         last_error TEXT,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        lease_generation INTEGER NOT NULL DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(provider_slug, merchant_order_no)
     )",
     "ALTER TABLE payment_orders ADD COLUMN idempotency_key TEXT",
+    "ALTER TABLE payment_orders ADD COLUMN lease_owner TEXT",
+    "ALTER TABLE payment_orders ADD COLUMN lease_expires_at INTEGER",
+    "ALTER TABLE payment_orders ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN next_retry_at INTEGER",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
     "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders(status, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_reconcile ON payment_orders(status, next_retry_at, lease_expires_at, updated_at)",
     "CREATE TABLE IF NOT EXISTS payment_refunds (
         id TEXT PRIMARY KEY,
         payment_order_id TEXT NOT NULL,
@@ -27552,6 +29790,16 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         finished_at INTEGER
     )",
     "CREATE INDEX IF NOT EXISTS idx_directory_sync_runs_application ON directory_sync_runs(application_id, started_at)",
+    "CREATE TABLE IF NOT EXISTS directory_sync_leases (
+        application_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        owner_run_id TEXT NOT NULL UNIQUE,
+        acquired_at INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (application_id, provider_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_directory_sync_leases_expiry ON directory_sync_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS directory_sync_checkpoints (
         application_id TEXT NOT NULL,
         provider_id TEXT NOT NULL,
@@ -27653,6 +29901,10 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         UNIQUE(application_id, profile_key)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_auth_profiles_application ON application_authorization_profiles(application_id, profile_key)",
+    "CREATE TABLE IF NOT EXISTS application_authorization_migration_state (
+        application_id TEXT PRIMARY KEY,
+        migrated_at INTEGER NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS application_permission_definitions (
         profile_id TEXT NOT NULL,
         permission_key TEXT NOT NULL,
@@ -27737,9 +29989,28 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         snapshot_json TEXT,
         operator_disabled INTEGER NOT NULL DEFAULT 0,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at BIGINT,
+        lease_generation BIGINT NOT NULL DEFAULT 0
     )",
+    "ALTER TABLE application_discovery ADD COLUMN lease_owner TEXT",
+    "ALTER TABLE application_discovery ADD COLUMN lease_expires_at BIGINT",
+    "ALTER TABLE application_discovery ADD COLUMN lease_generation BIGINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_application_discovery_mode_status ON application_discovery(management_mode, sync_status)",
+    "CREATE TABLE IF NOT EXISTS application_discovery_idempotency (
+        organization_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        application_id TEXT,
+        claim_token TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (organization_id, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_updated ON application_discovery_idempotency(status, updated_at)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -27754,6 +30025,8 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )",
+    "ALTER TABLE iap_applications ADD COLUMN application_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_iap_applications_application ON iap_applications(application_id, is_active)",
     "CREATE INDEX IF NOT EXISTS idx_iap_applications_match ON iap_applications(is_active, external_host, path_prefix)",
     "CREATE TABLE IF NOT EXISTS linked_identities (
         id TEXT PRIMARY KEY,
@@ -27765,6 +30038,7 @@ const SQLITE_MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL,
         UNIQUE(provider_slug, external_subject)
     )",
+    "CREATE INDEX IF NOT EXISTS idx_linked_identities_user ON linked_identities(user_id)",
     "CREATE TABLE IF NOT EXISTS ldap_providers (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -27910,6 +30184,23 @@ const SQLITE_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_application_cas_tickets_application ON application_cas_tickets(application_id, ticket_type, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_cas_tickets_user ON application_cas_tickets(application_id, user_id, revoked_at)",
     "ALTER TABLE application_jwt_codes ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_client ON authorization_codes(client_id)",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_application ON authorization_codes(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_user ON authorization_codes(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_client ON refresh_tokens(client_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_application ON refresh_tokens(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_invitation ON oidc_login_grants(invitation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_invitation_redemptions_invitation ON invitation_redemptions(invitation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_device_authorizations_user ON device_authorizations(authorized_user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_source ON wallet_transactions(source_wallet_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_destination ON wallet_transactions(destination_wallet_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_holds_application ON wallet_holds(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_group_roles_subject ON application_group_roles(group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_group_roles_subject ON application_profile_group_roles(group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
 ];
 
 const POSTGRES_MIGRATIONS: &[&str] = &[
@@ -28416,6 +30707,28 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)",
+    "CREATE TABLE IF NOT EXISTS mutation_receipts (
+        id TEXT PRIMARY KEY,
+        dedupe_hash TEXT NOT NULL UNIQUE,
+        scope_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_status INTEGER,
+        response_body TEXT,
+        response_content_type TEXT,
+        error_code TEXT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        completed_at BIGINT,
+        owner_token TEXT,
+        lease_expires_at BIGINT
+    )",
+    "ALTER TABLE mutation_receipts ADD COLUMN owner_token TEXT NULL",
+    "ALTER TABLE mutation_receipts ADD COLUMN lease_expires_at BIGINT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_mutation_receipts_scope_status ON mutation_receipts(scope_key, status, updated_at)",
     "CREATE TABLE IF NOT EXISTS audit_webhooks (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -28431,6 +30744,20 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_audit_webhooks_active ON audit_webhooks(is_active, created_at)",
+    "CREATE TABLE IF NOT EXISTS audit_webhook_outbox (
+        id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at BIGINT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at BIGINT,
+        last_error TEXT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_audit_webhook_outbox_due ON audit_webhook_outbox(state, next_attempt_at)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_webhook_outbox_lease ON audit_webhook_outbox(state, lease_expires_at)",
     "CREATE TABLE IF NOT EXISTS roles (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -28454,13 +30781,16 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         name TEXT NOT NULL UNIQUE,
         description TEXT,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        version BIGINT NOT NULL DEFAULT 0
     )",
+    "ALTER TABLE access_groups ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
     "CREATE TABLE IF NOT EXISTS group_members (
         group_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         PRIMARY KEY (group_id, user_id)
     )",
+    "CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id, group_id)",
     "CREATE TABLE IF NOT EXISTS group_roles (
         group_id TEXT NOT NULL,
         role_id TEXT NOT NULL,
@@ -28669,14 +30999,25 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         expires_at BIGINT NOT NULL,
         paid_at BIGINT,
         last_error TEXT,
+        lease_owner TEXT,
+        lease_expires_at BIGINT,
+        lease_generation BIGINT NOT NULL DEFAULT 0,
+        attempt_count BIGINT NOT NULL DEFAULT 0,
+        next_retry_at BIGINT,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         UNIQUE(provider_slug, merchant_order_no)
     )",
     "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS lease_owner TEXT",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS attempt_count BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN IF NOT EXISTS next_retry_at BIGINT",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
     "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders(status, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_orders_reconcile ON payment_orders(status, next_retry_at, lease_expires_at, updated_at)",
     "CREATE TABLE IF NOT EXISTS payment_refunds (
         id TEXT PRIMARY KEY,
         payment_order_id TEXT NOT NULL,
@@ -28725,6 +31066,16 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         finished_at BIGINT
     )",
     "CREATE INDEX IF NOT EXISTS idx_directory_sync_runs_application ON directory_sync_runs(application_id, started_at)",
+    "CREATE TABLE IF NOT EXISTS directory_sync_leases (
+        application_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        owner_run_id TEXT NOT NULL UNIQUE,
+        acquired_at BIGINT NOT NULL,
+        heartbeat_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        PRIMARY KEY (application_id, provider_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_directory_sync_leases_expiry ON directory_sync_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS directory_sync_checkpoints (
         application_id TEXT NOT NULL,
         provider_id TEXT NOT NULL,
@@ -28826,6 +31177,10 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         UNIQUE(application_id, profile_key)
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_auth_profiles_application ON application_authorization_profiles(application_id, profile_key)",
+    "CREATE TABLE IF NOT EXISTS application_authorization_migration_state (
+        application_id TEXT PRIMARY KEY,
+        migrated_at BIGINT NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS application_permission_definitions (
         profile_id TEXT NOT NULL,
         permission_key TEXT NOT NULL,
@@ -28910,9 +31265,28 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         snapshot_json TEXT,
         operator_disabled INTEGER NOT NULL DEFAULT 0,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at BIGINT,
+        lease_generation BIGINT NOT NULL DEFAULT 0
     )",
+    "ALTER TABLE application_discovery ADD COLUMN lease_owner TEXT NULL",
+    "ALTER TABLE application_discovery ADD COLUMN lease_expires_at BIGINT NULL",
+    "ALTER TABLE application_discovery ADD COLUMN lease_generation BIGINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_application_discovery_mode_status ON application_discovery(management_mode, sync_status)",
+    "CREATE TABLE IF NOT EXISTS application_discovery_idempotency (
+        organization_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        application_id TEXT,
+        claim_token TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (organization_id, idempotency_key)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_updated ON application_discovery_idempotency(status, updated_at)",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -28927,6 +31301,8 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL
     )",
+    "ALTER TABLE iap_applications ADD COLUMN application_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_iap_applications_application ON iap_applications(application_id, is_active)",
     "CREATE INDEX IF NOT EXISTS idx_iap_applications_match ON iap_applications(is_active, external_host, path_prefix)",
     "CREATE TABLE IF NOT EXISTS linked_identities (
         id TEXT PRIMARY KEY,
@@ -28938,6 +31314,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         UNIQUE(provider_slug, external_subject)
     )",
+    "CREATE INDEX IF NOT EXISTS idx_linked_identities_user ON linked_identities(user_id)",
     "CREATE TABLE IF NOT EXISTS ldap_providers (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -29083,6 +31460,23 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_application_cas_tickets_application ON application_cas_tickets(application_id, ticket_type, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_cas_tickets_user ON application_cas_tickets(application_id, user_id, revoked_at)",
     "ALTER TABLE application_jwt_codes ADD COLUMN IF NOT EXISTS client_id TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_client ON authorization_codes(client_id)",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_application ON authorization_codes(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_authorization_codes_user ON authorization_codes(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_client ON refresh_tokens(client_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_application ON refresh_tokens(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_oidc_login_grants_invitation ON oidc_login_grants(invitation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_invitation_redemptions_invitation ON invitation_redemptions(invitation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_device_authorizations_user ON device_authorizations(authorized_user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_source ON wallet_transactions(source_wallet_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_transactions_destination ON wallet_transactions(destination_wallet_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_holds_application ON wallet_holds(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_group_roles_subject ON application_group_roles(group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_profile_group_roles_subject ON application_profile_group_roles(group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
 ];
 
 const MYSQL_MIGRATIONS: &[&str] = &[
@@ -29590,6 +31984,28 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL,
         INDEX idx_audit_events_created (created_at)
     )",
+    "CREATE TABLE IF NOT EXISTS mutation_receipts (
+        id VARCHAR(64) PRIMARY KEY,
+        dedupe_hash VARCHAR(128) NOT NULL UNIQUE,
+        scope_key VARCHAR(128) NOT NULL,
+        method VARCHAR(16) NOT NULL,
+        path VARCHAR(1024) NOT NULL,
+        idempotency_key VARCHAR(255) NOT NULL,
+        request_hash VARCHAR(128) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        response_status INT NULL,
+        response_body TEXT NULL,
+        response_content_type VARCHAR(255) NULL,
+        error_code VARCHAR(128) NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        completed_at BIGINT NULL,
+        owner_token VARCHAR(128) NULL,
+        lease_expires_at BIGINT NULL,
+        INDEX idx_mutation_receipts_scope_status (scope_key, status, updated_at)
+    )",
+    "ALTER TABLE mutation_receipts ADD COLUMN owner_token VARCHAR(128) NULL",
+    "ALTER TABLE mutation_receipts ADD COLUMN lease_expires_at BIGINT NULL",
     "CREATE TABLE IF NOT EXISTS audit_webhooks (
         id VARCHAR(64) PRIMARY KEY,
         name VARCHAR(160) NOT NULL,
@@ -29604,6 +32020,20 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         INDEX idx_audit_webhooks_active (is_active, created_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS audit_webhook_outbox (
+        id VARCHAR(64) PRIMARY KEY,
+        event_id VARCHAR(64) NOT NULL UNIQUE,
+        state VARCHAR(32) NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at BIGINT NOT NULL,
+        lease_owner VARCHAR(64) NULL,
+        lease_expires_at BIGINT NULL,
+        last_error TEXT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        INDEX idx_audit_webhook_outbox_due (state, next_attempt_at),
+        INDEX idx_audit_webhook_outbox_lease (state, lease_expires_at)
     )",
     "CREATE TABLE IF NOT EXISTS roles (
         id VARCHAR(64) PRIMARY KEY,
@@ -29628,12 +32058,15 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         name VARCHAR(128) NOT NULL UNIQUE,
         description TEXT NULL,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        version BIGINT NOT NULL DEFAULT 0
     )",
+    "ALTER TABLE access_groups ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
     "CREATE TABLE IF NOT EXISTS group_members (
         group_id VARCHAR(64) NOT NULL,
         user_id VARCHAR(64) NOT NULL,
-        PRIMARY KEY (group_id, user_id)
+        PRIMARY KEY (group_id, user_id),
+        INDEX idx_group_members_user (user_id, group_id)
     )",
     "CREATE TABLE IF NOT EXISTS group_roles (
         group_id VARCHAR(64) NOT NULL,
@@ -29844,13 +32277,24 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         expires_at BIGINT NOT NULL,
         paid_at BIGINT NULL,
         last_error TEXT NULL,
+        lease_owner VARCHAR(128) NULL,
+        lease_expires_at BIGINT NULL,
+        lease_generation BIGINT NOT NULL DEFAULT 0,
+        attempt_count BIGINT NOT NULL DEFAULT 0,
+        next_retry_at BIGINT NULL,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         UNIQUE KEY uq_payment_order_merchant (provider_slug, merchant_order_no),
         INDEX idx_payment_orders_user (user_id, created_at),
-        INDEX idx_payment_orders_status (status, expires_at)
+        INDEX idx_payment_orders_status (status, expires_at),
+        INDEX idx_payment_orders_reconcile (status, next_retry_at, lease_expires_at, updated_at)
     )",
     "ALTER TABLE payment_orders ADD COLUMN idempotency_key VARCHAR(255) NULL",
+    "ALTER TABLE payment_orders ADD COLUMN lease_owner VARCHAR(128) NULL",
+    "ALTER TABLE payment_orders ADD COLUMN lease_expires_at BIGINT NULL",
+    "ALTER TABLE payment_orders ADD COLUMN lease_generation BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN attempt_count BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE payment_orders ADD COLUMN next_retry_at BIGINT NULL",
     "CREATE UNIQUE INDEX uq_payment_orders_idempotency ON payment_orders(user_id, provider_slug, idempotency_key)",
     "CREATE TABLE IF NOT EXISTS payment_refunds (
         id VARCHAR(64) PRIMARY KEY,
@@ -29899,6 +32343,16 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         started_at BIGINT NOT NULL,
         finished_at BIGINT NULL,
         INDEX idx_directory_sync_runs_application (application_id, started_at)
+    )",
+    "CREATE TABLE IF NOT EXISTS directory_sync_leases (
+        application_id VARCHAR(64) NOT NULL,
+        provider_id VARCHAR(64) NOT NULL,
+        owner_run_id VARCHAR(64) NOT NULL UNIQUE,
+        acquired_at BIGINT NOT NULL,
+        heartbeat_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        PRIMARY KEY (application_id, provider_id),
+        INDEX idx_directory_sync_leases_expiry (expires_at)
     )",
     "CREATE TABLE IF NOT EXISTS directory_sync_checkpoints (
         application_id VARCHAR(64) NOT NULL,
@@ -30001,6 +32455,10 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         UNIQUE KEY uq_application_auth_profile (application_id, profile_key),
         INDEX idx_application_auth_profiles_application (application_id, profile_key)
     )",
+    "CREATE TABLE IF NOT EXISTS application_authorization_migration_state (
+        application_id VARCHAR(64) PRIMARY KEY,
+        migrated_at BIGINT NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS application_permission_definitions (
         profile_id VARCHAR(64) NOT NULL,
         permission_key VARCHAR(256) NOT NULL,
@@ -30086,7 +32544,26 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         operator_disabled INT NOT NULL DEFAULT 0,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
+        lease_owner VARCHAR(128) NULL,
+        lease_expires_at BIGINT NULL,
+        lease_generation BIGINT NOT NULL DEFAULT 0,
         INDEX idx_application_discovery_mode_status (management_mode, sync_status)
+    )",
+    "ALTER TABLE application_discovery ADD COLUMN lease_owner VARCHAR(128) NULL",
+    "ALTER TABLE application_discovery ADD COLUMN lease_expires_at BIGINT NULL",
+    "ALTER TABLE application_discovery ADD COLUMN lease_generation BIGINT NOT NULL DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS application_discovery_idempotency (
+        organization_id VARCHAR(64) NOT NULL,
+        idempotency_key VARCHAR(128) NOT NULL,
+        request_hash VARCHAR(128) NOT NULL,
+        origin VARCHAR(2048) NOT NULL,
+        application_id VARCHAR(64) NULL,
+        claim_token VARCHAR(128) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (organization_id, idempotency_key),
+        INDEX idx_application_discovery_idempotency_updated (status, updated_at)
     )",
     "CREATE TABLE IF NOT EXISTS iap_applications (
         id VARCHAR(64) PRIMARY KEY,
@@ -30103,6 +32580,8 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         INDEX idx_iap_applications_match (is_active, external_host, path_prefix(255))
     )",
+    "ALTER TABLE iap_applications ADD COLUMN application_id VARCHAR(64) NULL",
+    "CREATE INDEX idx_iap_applications_application ON iap_applications(application_id, is_active)",
     "CREATE TABLE IF NOT EXISTS linked_identities (
         id VARCHAR(64) PRIMARY KEY,
         user_id VARCHAR(64) NOT NULL,
@@ -30113,6 +32592,7 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         UNIQUE KEY uq_linked_identity (provider_slug, external_subject)
     )",
+    "CREATE INDEX idx_linked_identities_user ON linked_identities(user_id)",
     "CREATE TABLE IF NOT EXISTS ldap_providers (
         id VARCHAR(64) PRIMARY KEY,
         slug VARCHAR(255) NOT NULL UNIQUE,
@@ -30258,4 +32738,21 @@ const MYSQL_MIGRATIONS: &[&str] = &[
         INDEX idx_application_cas_tickets_user (application_id, user_id, revoked_at)
     )",
     "ALTER TABLE application_jwt_codes ADD COLUMN client_id VARCHAR(255) NOT NULL DEFAULT ''",
+    "CREATE INDEX idx_authorization_codes_client ON authorization_codes(client_id)",
+    "CREATE INDEX idx_authorization_codes_application ON authorization_codes(application_id)",
+    "CREATE INDEX idx_authorization_codes_user ON authorization_codes(user_id)",
+    "CREATE INDEX idx_refresh_tokens_client ON refresh_tokens(client_id)",
+    "CREATE INDEX idx_refresh_tokens_application ON refresh_tokens(application_id)",
+    "CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id)",
+    "CREATE INDEX idx_oidc_login_grants_invitation ON oidc_login_grants(invitation_id)",
+    "CREATE INDEX idx_invitation_redemptions_invitation ON invitation_redemptions(invitation_id)",
+    "CREATE INDEX idx_device_authorizations_user ON device_authorizations(authorized_user_id)",
+    "CREATE INDEX idx_wallet_transactions_source ON wallet_transactions(source_wallet_id)",
+    "CREATE INDEX idx_wallet_transactions_destination ON wallet_transactions(destination_wallet_id)",
+    "CREATE INDEX idx_wallet_holds_application ON wallet_holds(application_id)",
+    "CREATE INDEX idx_application_group_roles_subject ON application_group_roles(group_id)",
+    "CREATE INDEX idx_application_profile_group_roles_subject ON application_profile_group_roles(group_id)",
+    "CREATE INDEX idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
+    "CREATE INDEX idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
+    "CREATE INDEX idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
 ];

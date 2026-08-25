@@ -1,45 +1,53 @@
-import {
-  ArrowRight,
-  CheckCircle2,
-  ChevronRight,
-  Circle,
-  Code2,
-  Copy as CopyIcon,
-  Database,
-  Eye,
-  Globe2,
-  KeyRound,
-  Coins,
-  LockKeyhole,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Settings2,
-  ShieldCheck,
-  SlidersHorizontal,
-  Trash2
-} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../../lib/api";
+import * as applicationApi from "../../lib/api/applications";
+import {
+  createApplicationRequestGuard,
+  type ApplicationRequestGuard,
+  type ApplicationRequestToken
+} from "./application-request-guard";
+import {
+  APPLICATION_AUTHORIZATION_DIRTY_SOURCE,
+  ApplicationAuthorizationModule
+} from "./ApplicationAuthorizationModule";
+import { BillingModule } from "./BillingModule";
+import { IapModule } from "./IapModule";
+import { ApplicationLoginAdaptersEditor } from "./ApplicationLoginAdaptersEditor";
+import {
+  APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE,
+  ApplicationDirectorySyncModule,
+  applicationDirectorySyncConfig
+} from "./ApplicationDirectorySyncModule";
+import {
+  APPLICATION_PROTOCOLS_DIRTY_SOURCE,
+  ApplicationProtocolsModule,
+  applicationProtocolsConfig
+} from "./ApplicationProtocolsModule";
+import {
+  ApplicationBasics,
+  type ApplicationBasicsCommands,
+  type ApplicationBasicsReadModel
+} from "./ApplicationBasics";
+import { APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE } from "./ApplicationOidcClients";
+import {
+  booleanValue,
+  record,
+  stringList,
+  stringValue
+} from "./application-module-values";
 import type {
-  ApplicationBillingSettings,
-  ApplicationClientBinding,
+  DirtyNavigationController,
+  DirtyNavigationSourceHandle
+} from "../navigation/useDirtyNavigation";
+import { stableDomainEqual } from "../admin/stable-domain-comparator";
+import type {
   ApplicationSection,
   ApplicationModule,
   ApplicationModuleKey,
-  ApplicationAuthorizationProfile,
-  ApplicationJwtClient,
-  ApplicationDirectorySyncRun,
-  ApplicationAuthorizationPreview,
-  ApplicationAuthorizationSubjects,
-  ApplicationPermissionDefinition,
-  ApplicationPermissionOverride,
-  ApplicationProfileRole,
-  ApplicationScimToken,
   Client,
   ExternalProvider,
   LdapProvider,
   Locale,
+  OrganizationOption,
   TenantApplication
 } from "../../types";
 
@@ -55,6 +63,8 @@ type Copy = {
   disabled: string;
   edit: string;
   delete: string;
+  description: string;
+  slug: string;
   overview: string;
   protocols: string;
   identity: string;
@@ -68,6 +78,7 @@ type Copy = {
   sharedWallet: string;
   isolatedWallet: string;
   walletModeLocked: string;
+  billingCurrency: string;
   billingCurrencies: string;
   billingCurrenciesHint: string;
   accessBundle: string;
@@ -94,6 +105,42 @@ type Copy = {
   jwtHint: string;
   connections: string;
   noConnections: string;
+  oidcClients: string;
+  oidcClientHint: string;
+  createOidcClient: string;
+  editOidcClient: string;
+  clientName: string;
+  clientSecret: string;
+  clientSecretHint: string;
+  redirectUris: string;
+  postLogoutUris: string;
+  scopes: string;
+  grantTypes: string;
+  responseTypes: string;
+  tokenAuthMethod: string;
+  requirePkce: string;
+  requireMfa: string;
+  newClientSecretHint: string;
+  iapRules: string;
+  iapRulesHint: string;
+  noIapRules: string;
+  createIapRule: string;
+  externalHost: string;
+  pathPrefix: string;
+  requiredOrganization: string;
+  requiredRoles: string;
+  requiredPermissions: string;
+  walletOverview: string;
+  walletAvailable: string;
+  walletReserved: string;
+  walletTransfer: string;
+  walletTransferHint: string;
+  transferAmount: string;
+  transferDirection: string;
+  transferToApplication: string;
+  transferFromApplication: string;
+  executeTransfer: string;
+  noApplicationWallet: string;
   client: string;
   bindingProtocol: string;
   clientId: string;
@@ -250,21 +297,22 @@ type Copy = {
   setupNext: string;
   setupNextHint: string;
   configure: string;
-  notAvailable: string;
 };
 
 const ZH: Copy = {
   applications: "应用",
   websites: "应用",
-  applicationIntro: "每个应用可以绑定多个客户端。把协议、登录适配器、目录同步和权限策略配置在这里，Signet 统一认证上下文即可复用。",
+  applicationIntro: "每个应用在自己的工作区创建并管理 OIDC 客户端。协议、登录适配器、目录同步、IAP 和余额策略都归属于应用。",
   createWebsite: "创建应用",
   selectWebsite: "选择一个应用",
   noWebsites: "还没有应用",
-  noWebsitesHint: "先创建一个应用，再绑定客户端并按需开启能力。",
+  noWebsitesHint: "先创建一个应用，再在应用内创建 OIDC 客户端并按需开启能力。",
   active: "已启用",
   disabled: "已停用",
   edit: "编辑基本信息",
   delete: "删除应用",
+  description: "说明",
+  slug: "Slug",
   overview: "总览",
   protocols: "协议",
   identity: "登录适配器",
@@ -278,10 +326,11 @@ const ZH: Copy = {
   sharedWallet: "共享总账户",
   isolatedWallet: "独立应用账户",
   walletModeLocked: "首次发生账务交易后账户模式会锁定。",
+  billingCurrency: "币种",
   billingCurrencies: "支持币种",
   billingCurrenciesHint: "留空表示使用 Signet 全局启用的币种；多个币种用逗号分隔。",
   accessBundle: "应用能力包",
-  accessBundleHint: "应用把多个客户端需要的接入能力绑定在一起；模块可以独立配置和启停。",
+  accessBundleHint: "应用把多个 OIDC 客户端需要的接入能力集中管理；模块可以独立配置和启停。",
   websiteUrl: "应用地址",
   notConfigured: "未配置",
   configured: "已配置",
@@ -292,7 +341,7 @@ const ZH: Copy = {
   saveFailed: "配置保存失败",
   loadFailed: "配置加载失败",
   retry: "重试",
-  protocolHint: "选择应用支持的标准协议，并为每个客户端绑定协议和权限 Profile。",
+  protocolHint: "选择应用支持的标准协议，并在应用内创建属于它的 OIDC 客户端。",
   protocolRuntimeHint: "协议配置属于应用，不再散落在全局客户端列表中。",
   oauth: "OAuth 2.0 / OIDC",
   oauthHint: "使用 Signet 作为身份提供方，为网站提供标准授权码、Token 和 UserInfo。",
@@ -302,8 +351,44 @@ const ZH: Copy = {
   casHint: "为支持 CAS 的内部系统提供票据校验入口。",
   jwt: "JWT",
   jwtHint: "为 API 或无状态服务配置 Signet 签发的 JWT 受众和有效期。",
-  connections: "客户端绑定",
-  noConnections: "没有可绑定的客户端",
+  connections: "应用内客户端",
+  noConnections: "还没有 OIDC 客户端",
+  oidcClients: "OIDC 客户端",
+  oidcClientHint: "先创建应用，再在应用内创建属于它的 OIDC 客户端。一个客户端只能属于一个应用。",
+  createOidcClient: "创建 OIDC 客户端",
+  editOidcClient: "编辑 OIDC 客户端",
+  clientName: "客户端名称",
+  clientSecret: "客户端 Secret",
+  clientSecretHint: "更新时留空表示保留现有 Secret；新建机密客户端必须填写。",
+  redirectUris: "回调地址",
+  postLogoutUris: "退出回调地址",
+  scopes: "Scopes",
+  grantTypes: "Grant types",
+  responseTypes: "Response types",
+  tokenAuthMethod: "Token 端点认证方式",
+  requirePkce: "要求 PKCE",
+  requireMfa: "要求客户端 MFA",
+  newClientSecretHint: "Secret 只在这里由你输入或保存，请立即安全记录。",
+  iapRules: "IAP 规则",
+  iapRulesHint: "在应用内配置多条 Host/path 规则；每条规则都属于当前应用。",
+  noIapRules: "还没有 IAP 规则",
+  createIapRule: "添加 IAP 规则",
+  externalHost: "外部 Host",
+  pathPrefix: "路径前缀",
+  requiredOrganization: "要求组织（可选）",
+  requiredRoles: "要求组织角色",
+  requiredPermissions: "要求权限",
+  walletOverview: "应用钱包",
+  walletAvailable: "可用余额",
+  walletReserved: "冻结余额",
+  walletTransfer: "应用账户划转",
+  walletTransferHint: "仅独立应用账户模式需要划转；共享模式直接使用总账户余额。",
+  transferAmount: "划转金额",
+  transferDirection: "划转方向",
+  transferToApplication: "总账户 → 应用账户",
+  transferFromApplication: "应用账户 → 总账户",
+  executeTransfer: "执行划转",
+  noApplicationWallet: "当前币种还没有应用钱包",
   client: "客户端",
   bindingProtocol: "绑定协议",
   authorizationProfile: "权限 Profile",
@@ -392,7 +477,7 @@ const ZH: Copy = {
   discardChanges: "放弃更改",
   authorizationHint: "权限采用两层合并：继承企业默认角色，再叠加应用 Profile 的专属角色和 Claim。",
   authorizationProfileHint: "每个客户端 Profile 独立维护权限定义、角色和用户映射。应用可以通过签名 v3 契约提供定义，也可以在 Signet 手工维护。",
-  noAuthorizationProfile: "请先为应用绑定一个客户端",
+  noAuthorizationProfile: "请先在应用内创建一个 OIDC 客户端",
   profileManual: "手工配置",
   profileSigned: "签名 Manifest",
   profileSynced: "已同步",
@@ -458,23 +543,24 @@ const ZH: Copy = {
   syncSources: "个同步源",
   protocolCount: "个协议",
   setupNext: "接入下一步",
-  setupNextHint: "先绑定客户端并选择协议和权限 Profile，再按应用实际情况开启 SAML、CAS、JWT、第三方登录或目录同步。",
-  configure: "去配置",
-  notAvailable: "尚未接入运行时"
+  setupNextHint: "先在协议页创建 OIDC 客户端，再按应用实际情况开启 SAML、CAS、JWT、第三方登录、目录同步或 IAP。",
+  configure: "去配置"
 };
 
 const EN: Copy = {
   applications: "Applications",
   websites: "Applications",
-  applicationIntro: "Each application can bind multiple clients. Configure protocols, login adapters, directory sync, and authorization here so one Signet authentication context can be reused safely.",
+  applicationIntro: "Create and manage OIDC clients inside each application. Protocols, login adapters, directory sync, IAP, and billing policies belong to the application.",
   createWebsite: "Create application",
   selectWebsite: "Select an application",
   noWebsites: "No applications yet",
-  noWebsitesHint: "Create an application first, then bind clients and enable only the capabilities it needs.",
+  noWebsitesHint: "Create an application first, then create its OIDC clients and enable only the capabilities it needs.",
   active: "Enabled",
   disabled: "Disabled",
   edit: "Edit basics",
   delete: "Delete application",
+  description: "Description",
+  slug: "Slug",
   overview: "Overview",
   protocols: "Protocols",
   identity: "Login adapters",
@@ -488,10 +574,11 @@ const EN: Copy = {
   sharedWallet: "Shared global wallet",
   isolatedWallet: "Isolated application wallet",
   walletModeLocked: "Wallet mode is locked after the first billing transaction.",
+  billingCurrency: "Currency",
   billingCurrencies: "Supported currencies",
   billingCurrenciesHint: "Leave empty to accept all currencies enabled globally; separate multiple currencies with commas.",
   accessBundle: "Application capability bundle",
-  accessBundleHint: "An application binds the capabilities its clients need; each module can be configured and enabled independently.",
+  accessBundleHint: "An application owns the capabilities used by its OIDC clients; each module can be configured and enabled independently.",
   websiteUrl: "Application URL",
   notConfigured: "Not configured",
   configured: "Configured",
@@ -502,7 +589,7 @@ const EN: Copy = {
   saveFailed: "Failed to save configuration",
   loadFailed: "Failed to load configuration",
   retry: "Retry",
-  protocolHint: "Choose the standards this application supports, then bind each client to its protocol and authorization profile.",
+  protocolHint: "Choose the standards this application supports, then create its OIDC clients here.",
   protocolRuntimeHint: "Protocol settings belong to the application instead of being scattered across a global client list.",
   oauth: "OAuth 2.0 / OIDC",
   oauthHint: "Use Signet as the identity provider with standard authorization code, token, and UserInfo flows.",
@@ -512,8 +599,44 @@ const EN: Copy = {
   casHint: "Provide ticket validation endpoints for internal CAS systems.",
   jwt: "JWT",
   jwtHint: "Configure Signet-issued JWT audiences and lifetimes for APIs or stateless services.",
-  connections: "Client bindings",
-  noConnections: "No clients are available to bind",
+  connections: "Application clients",
+  noConnections: "No OIDC clients yet",
+  oidcClients: "OIDC clients",
+  oidcClientHint: "Create the application first, then create its OIDC clients here. A client belongs to one application only.",
+  createOidcClient: "Create OIDC client",
+  editOidcClient: "Edit OIDC client",
+  clientName: "Client name",
+  clientSecret: "Client secret",
+  clientSecretHint: "Leave this blank when updating to keep the existing secret; new confidential clients require one.",
+  redirectUris: "Redirect URIs",
+  postLogoutUris: "Post-logout URIs",
+  scopes: "Scopes",
+  grantTypes: "Grant types",
+  responseTypes: "Response types",
+  tokenAuthMethod: "Token endpoint authentication",
+  requirePkce: "Require PKCE",
+  requireMfa: "Require client MFA",
+  newClientSecretHint: "Record the secret securely after saving; it is not displayed by Signet.",
+  iapRules: "IAP rules",
+  iapRulesHint: "Configure multiple Host/path rules inside this application; every rule belongs to this application.",
+  noIapRules: "No IAP rules yet",
+  createIapRule: "Add IAP rule",
+  externalHost: "External host",
+  pathPrefix: "Path prefix",
+  requiredOrganization: "Required organization (optional)",
+  requiredRoles: "Required organization roles",
+  requiredPermissions: "Required permissions",
+  walletOverview: "Application wallet",
+  walletAvailable: "Available",
+  walletReserved: "Reserved",
+  walletTransfer: "Application wallet transfer",
+  walletTransferHint: "Transfers are needed only for isolated application wallets; shared mode uses the global wallet directly.",
+  transferAmount: "Transfer amount",
+  transferDirection: "Transfer direction",
+  transferToApplication: "Global → application",
+  transferFromApplication: "Application → global",
+  executeTransfer: "Transfer balance",
+  noApplicationWallet: "No application wallet exists for this currency yet",
   client: "Client",
   bindingProtocol: "Binding protocol",
   authorizationProfile: "Authorization profile",
@@ -602,7 +725,7 @@ const EN: Copy = {
   discardChanges: "Discard changes",
   authorizationHint: "Authorization is merged in two layers: inherit enterprise defaults, then add application Profile roles and claims.",
   authorizationProfileHint: "Each client Profile has an independent permission vocabulary, role catalog, and subject mappings. An application can publish a signed v3 contract or be configured manually in Signet.",
-  noAuthorizationProfile: "Bind a client to this application first",
+  noAuthorizationProfile: "Create an OIDC client inside this application first",
   profileManual: "Manual configuration",
   profileSigned: "Signed manifest",
   profileSynced: "Synced",
@@ -668,159 +791,21 @@ const EN: Copy = {
   syncSources: "sync sources",
   protocolCount: "protocols",
   setupNext: "Next steps",
-  setupNextHint: "Attach an OAuth/OIDC client first, then enable SAML, CAS, JWT, external login, or directory sync as needed.",
-  configure: "Configure",
-  notAvailable: "Runtime not connected yet"
+  setupNextHint: "Create an OIDC client first, then enable SAML, CAS, JWT, external login, directory sync, or IAP as needed.",
+  configure: "Configure"
 };
 
-const MODULE_KEYS: ApplicationModuleKey[] = ["protocols", "login_adapters", "directory_sync", "authorization"];
+const APPLICATION_WORKSPACE_DIRTY_SOURCE = "applications.workspace";
 
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
-function booleanValue(value: unknown, fallback = false): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
-
-function stringValue(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
-type ApplicationRoleDraft = {
-  id: string | null;
-  role_key: string;
-  name: string;
-  description: string;
-  permissions: string[];
-  is_default: boolean;
-  is_active: boolean;
-  source: string;
-};
-
-function applicationRoleDraft(role: ApplicationProfileRole): ApplicationRoleDraft {
-  return {
-    id: role.id,
-    role_key: role.role_key,
-    name: role.name,
-    description: role.description ?? "",
-    permissions: [...role.permissions],
-    is_default: role.is_default,
-    is_active: role.is_active,
-    source: role.source
-  };
-}
-
-function normalizedPermissionList(values: string[]): string[] {
-  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
-}
-
-type PermissionTreeNode = {
-  label: string;
-  children: Map<string, PermissionTreeNode>;
-  definition?: ApplicationPermissionDefinition;
-};
-
-function permissionTree(definitions: ApplicationPermissionDefinition[]): PermissionTreeNode[] {
-  const root: PermissionTreeNode = { label: "", children: new Map() };
-  for (const definition of definitions.filter((item) => item.is_active)) {
-    const segments = definition.key.split(":");
-    let current = root;
-    segments.forEach((segment, index) => {
-      let next = current.children.get(segment);
-      if (!next) {
-        next = { label: segment, children: new Map() };
-        current.children.set(segment, next);
-      }
-      if (index === segments.length - 1) next.definition = definition;
-      current = next;
-    });
-  }
-  return Array.from(root.children.values()).sort((left, right) => left.label.localeCompare(right.label));
-}
-
-function PermissionTree({
-  definitions,
-  renderLeaf
-}: {
-  definitions: ApplicationPermissionDefinition[];
-  renderLeaf: (definition: ApplicationPermissionDefinition) => React.ReactNode;
-}) {
-  function renderNode(node: PermissionTreeNode, depth: number): React.ReactNode {
-    const children = Array.from(node.children.values()).sort((left, right) => left.label.localeCompare(right.label));
-    return (
-      <div className="permission-tree-node" key={`${node.definition?.key ?? node.label}-${depth}`}>
-        {node.definition && renderLeaf(node.definition)}
-        {!node.definition && <div className="permission-tree-branch"><ChevronRight size={13} /><strong>{node.label}</strong></div>}
-        {children.length > 0 && <div className="permission-tree-children">{children.map((child) => renderNode(child, depth + 1))}</div>}
-      </div>
-    );
-  }
-
-  const nodes = permissionTree(definitions);
-  return <div className="permission-tree">{nodes.length > 0 ? nodes.map((node) => renderNode(node, 0)) : <p className="muted">{"—"}</p>}</div>;
-}
-
-function formatScimTokenTime(value: number | null, locale: Locale): string {
-  if (value === null) return "";
-  return new Date(value * 1000).toLocaleString(locale === "zh-CN" ? "zh-CN" : "en-US");
-}
-
-function defaultModuleConfig(key: ApplicationModuleKey, application: TenantApplication): Record<string, unknown> {
-  switch (key) {
-    case "protocols":
-      return {
-        oauth2_oidc: { enabled: application.client_bindings.some((binding) => binding.protocol === "oidc"), client_ids: application.client_bindings.filter((binding) => binding.protocol === "oidc").map((binding) => binding.id) },
-        saml2: {
-          enabled: false,
-          entity_id: "",
-          acs_url: "",
-          slo_url: "",
-          name_id_claim: "email",
-          name_id_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-          require_signed_requests: false,
-          want_assertions_signed: false,
-          require_signed_logout: true,
-          want_logout_responses_signed: true,
-          sp_metadata_xml: "",
-          sp_signing_certificate: ""
-        },
-        cas: { enabled: false, service_urls: [], proxy_callback_urls: [], allow_proxy: false, ticket_ttl_seconds: 300, pgt_ttl_seconds: 300 },
-        jwt: { enabled: false, client_id: application.slug, client_type: "public", redirect_uris: [], audience: "", token_ttl_seconds: 3600 }
-      };
-    case "login_adapters":
-      return { enabled: true, provider_ids: [], allow_signet_password: true };
-    case "directory_sync":
-      return {
-        enabled: false,
-        ldap_provider_ids: [],
-        user_sync_filter: "",
-        group_base_dn: "",
-        group_filter: "(objectClass=group)",
-        group_id_attribute: "dn",
-        group_name_attribute: "cn",
-        group_member_attribute: "member",
-        reactivate_users: true,
-        max_entries: 100000,
-        deprovision_action: "remove_membership",
-        scim_enabled: false,
-        scim_audience: "",
-        sync_groups: true
-      };
-    case "authorization":
-      return { inherit_enterprise_roles: true, default_role: "member", custom_roles: [], claims: [] };
-  }
-}
-
-function moduleConfig(application: TenantApplication, key: ApplicationModuleKey): Record<string, unknown> {
+function moduleConfig(
+  application: TenantApplication,
+  key: "login_adapters" | "authorization"
+): Record<string, unknown> {
   const module = (application.modules ?? []).find((item) => item.module_key === key);
-  return { ...defaultModuleConfig(key, application), ...record(module?.config) };
+  const defaults = key === "login_adapters"
+    ? { enabled: true, provider_ids: [], allow_signet_password: true }
+    : { inherit_enterprise_roles: true, permissions: [], denied_permissions: [], claims: [] };
+  return { ...defaults, ...record(module?.config) };
 }
 
 function moduleEnabled(application: TenantApplication, key: ApplicationModuleKey): boolean {
@@ -832,18 +817,11 @@ function moduleEnabled(application: TenantApplication, key: ApplicationModuleKey
   );
 }
 
-function ModuleIcon({ keyName }: { keyName: ApplicationModuleKey }) {
-  if (keyName === "protocols") return <Code2 size={18} />;
-  if (keyName === "login_adapters") return <KeyRound size={18} />;
-  if (keyName === "directory_sync") return <Database size={18} />;
-  return <ShieldCheck size={18} />;
-}
-
 export function ApplicationWorkspace({
   applications,
-  clients,
   providers,
   ldapProviders,
+  organizationOptions,
   locale,
   canManage,
   initialApplicationId,
@@ -852,14 +830,15 @@ export function ApplicationWorkspace({
   onEditApplication,
   onDeleteApplication,
   onApplicationModuleChanged,
+  onApplicationOidcClientsChanged,
   onNavigationChange,
-  onDirtyChange,
+  dirtyNavigation,
   onRequestConfirmation
 }: {
   applications: TenantApplication[];
-  clients: Client[];
   providers: ExternalProvider[];
   ldapProviders: LdapProvider[];
+  organizationOptions: OrganizationOption[];
   locale: Locale;
   canManage: boolean;
   initialApplicationId?: string | null;
@@ -867,9 +846,10 @@ export function ApplicationWorkspace({
   onCreateApplication: () => void;
   onEditApplication: (application: TenantApplication) => void;
   onDeleteApplication: (id: string) => void;
-  onApplicationModuleChanged: (applicationId: string, module: ApplicationModule, clientBindings?: ApplicationClientBinding[]) => void;
+  onApplicationModuleChanged: (applicationId: string, module: ApplicationModule) => void;
+  onApplicationOidcClientsChanged?: (applicationId: string, clients: Client[]) => void;
   onNavigationChange?: (applicationId: string, section: ApplicationSection) => void;
-  onDirtyChange?: (dirty: boolean) => void;
+  dirtyNavigation: Pick<DirtyNavigationController, "getSnapshot" | "registerSource">;
   onRequestConfirmation?: (
     action: () => Promise<void> | void,
     title: string,
@@ -879,51 +859,56 @@ export function ApplicationWorkspace({
   const c = locale === "zh-CN" ? ZH : EN;
   const [selectedId, setSelectedId] = useState<string | null>(initialApplicationId ?? applications[0]?.id ?? null);
   const [section, setSection] = useState<ApplicationSection>(initialSection ?? "overview");
-  const [drafts, setDrafts] = useState<Partial<Record<ApplicationModuleKey, Record<string, unknown>>>>({});
-  const [savingKey, setSavingKey] = useState<ApplicationModuleKey | null>(null);
+  const [drafts, setDrafts] = useState<Partial<Record<"login_adapters", Record<string, unknown>>>>({});
+  const [savingKey, setSavingKey] = useState<"login_adapters" | null>(null);
   const [feedback, setFeedback] = useState("");
-  const [jwtClient, setJwtClient] = useState<ApplicationJwtClient | null>(null);
-  const [rotatedSecret, setRotatedSecret] = useState("");
-  const [secretSaving, setSecretSaving] = useState(false);
-  const [scimTokens, setScimTokens] = useState<ApplicationScimToken[]>([]);
-  const [scimTokenScopes, setScimTokenScopes] = useState<string[]>(["scim.read", "scim.write"]);
-  const [scimTokenExpiry, setScimTokenExpiry] = useState("");
-  const [scimTokenSaving, setScimTokenSaving] = useState(false);
-  const [createdScimToken, setCreatedScimToken] = useState("");
-  const [syncRuns, setSyncRuns] = useState<ApplicationDirectorySyncRun[]>([]);
-  const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
-  const [authorizationProfiles, setAuthorizationProfiles] = useState<ApplicationAuthorizationProfile[]>([]);
-  const [selectedAuthorizationProfileId, setSelectedAuthorizationProfileId] = useState("");
-  const [profileFeedback, setProfileFeedback] = useState("");
-  const [applicationRoles, setApplicationRoles] = useState<ApplicationProfileRole[]>([]);
-  const [applicationPermissionCatalog, setApplicationPermissionCatalog] = useState<ApplicationPermissionDefinition[]>([]);
-  const [roleDraft, setRoleDraft] = useState<ApplicationRoleDraft | null>(null);
-  const [roleSaving, setRoleSaving] = useState(false);
-  const [roleFeedback, setRoleFeedback] = useState("");
-  const [authorizationSubjects, setAuthorizationSubjects] = useState<ApplicationAuthorizationSubjects | null>(null);
-  const [selectedAuthorizationUserId, setSelectedAuthorizationUserId] = useState("");
-  const [selectedAuthorizationGroupId, setSelectedAuthorizationGroupId] = useState("");
-  const [userRoleIds, setUserRoleIds] = useState<string[]>([]);
-  const [groupRoleIds, setGroupRoleIds] = useState<string[]>([]);
-  const [organizationRoleIds, setOrganizationRoleIds] = useState<Record<string, string[]>>({});
-  const [userPermissionOverrides, setUserPermissionOverrides] = useState<ApplicationPermissionOverride[]>([]);
-  const [authorizationPreview, setAuthorizationPreview] = useState<ApplicationAuthorizationPreview | null>(null);
-  const [authorizationLoading, setAuthorizationLoading] = useState(false);
-  const [authorizationSaving, setAuthorizationSaving] = useState(false);
-  const [authorizationFeedback, setAuthorizationFeedback] = useState("");
-  const [billingSettings, setBillingSettings] = useState<ApplicationBillingSettings | null>(null);
-  const [billingLoading, setBillingLoading] = useState(false);
-  const [billingError, setBillingError] = useState("");
-  const [billingReloadToken, setBillingReloadToken] = useState(0);
-  const [billingSaving, setBillingSaving] = useState(false);
-  const [bindingDraft, setBindingDraft] = useState<Record<string, { protocol: string; authorization_profile_id: string }>>({});
+  const [protocolReadModel, setProtocolReadModel] = useState<{ applicationId: string; config: Record<string, unknown> } | null>(null);
+  const [directoryReadModel, setDirectoryReadModel] = useState<{ applicationId: string; config: Record<string, unknown> } | null>(null);
+  const [billingEnabled, setBillingEnabled] = useState(false);
+  const [billingDirty, setBillingDirty] = useState(false);
+  const [iapRuleCount, setIapRuleCount] = useState(0);
+  const [iapRuleDirty, setIapRuleDirty] = useState(false);
   const selectedIdRef = useRef(selectedId);
-  const selected = applications.find((item) => item.id === selectedId) ?? null;
-  const selectedAuthorizationProfile = authorizationProfiles.find((profile) => profile.id === selectedAuthorizationProfileId) ?? null;
-
-  useEffect(() => {
+  const applicationGenerationRef = useRef(0);
+  if (selectedIdRef.current !== selectedId) {
     selectedIdRef.current = selectedId;
-  }, [selectedId]);
+    applicationGenerationRef.current += 1;
+  }
+  const selected = applications.find((item) => item.id === selectedId) ?? null;
+
+  const requestGuard = useMemo<ApplicationRequestGuard>(() => ({
+    ...createApplicationRequestGuard(() => ({
+      applicationId: selectedIdRef.current,
+      generation: applicationGenerationRef.current
+    }))
+  }), []);
+  const dirtySourceRef = useRef<DirtyNavigationSourceHandle | null>(null);
+
+  function beginApplicationRequest(
+    applicationId = selectedIdRef.current,
+    scope = "mutation"
+  ): ApplicationRequestToken | null {
+    return requestGuard.begin(applicationId ?? undefined, { scope, kind: "mutation" });
+  }
+
+  function isCurrentApplicationRequest(token: ApplicationRequestToken): boolean {
+    return requestGuard.isCurrent(token);
+  }
+
+  function requestOptions(token: ApplicationRequestToken) {
+    return {
+      signal: token.signal,
+      ...(token.idempotencyKey ? { idempotencyKey: token.idempotencyKey } : {})
+    };
+  }
+
+  function invalidateApplicationRequests(nextId: string | null) {
+    selectedIdRef.current = nextId;
+    applicationGenerationRef.current += 1;
+    requestGuard.invalidate();
+  }
+
+  useEffect(() => () => requestGuard.dispose(), [requestGuard]);
 
   useEffect(() => {
     if (applications.length === 0) {
@@ -938,1264 +923,360 @@ export function ApplicationWorkspace({
   }, [applications, initialApplicationId, selectedId]);
 
   useEffect(() => {
-    if (initialSection) setSection(initialSection);
-  }, [initialSection]);
+    const nextSection = initialSection ?? "overview";
+    if (nextSection === section) return;
+    // Browser back/forward and accepted hash navigation can change the
+    // section without going through openSection.  The parent guard has
+    // already confirmed the discard by this point, so clear drafts before
+    // applying the externally-driven section.
+    resetWorkspaceDrafts();
+    setSection(nextSection);
+  }, [initialSection, section]);
 
   useEffect(() => {
     setFeedback("");
-    // Drafts are scoped to the selected website. Keeping them across a
-    // selection change can silently show (and later save) one website's
-    // protocol or authorization settings on another website.
+    // Parent-owned drafts are scoped to the selected application. The
+    // protocol and directory modules reset their own drafts on the same
+    // application boundary and are keyed by the selected id below.
     setDrafts({});
-    setJwtClient(null);
-    setRotatedSecret("");
-    setScimTokens([]);
-    setScimTokenScopes(["scim.read", "scim.write"]);
-    setScimTokenExpiry("");
-    setCreatedScimToken("");
-    setSyncRuns([]);
-    setRunningProviderId(null);
-    setAuthorizationProfiles([]);
-    setSelectedAuthorizationProfileId("");
-    setProfileFeedback("");
-    setApplicationRoles([]);
-    setApplicationPermissionCatalog([]);
-    setRoleDraft(null);
-    setRoleFeedback("");
-    setAuthorizationSubjects(null);
-    setSelectedAuthorizationUserId("");
-    setSelectedAuthorizationGroupId("");
-    setUserRoleIds([]);
-    setGroupRoleIds([]);
-    setOrganizationRoleIds({});
-    setUserPermissionOverrides([]);
-    setAuthorizationPreview(null);
-    setAuthorizationFeedback("");
-    setBillingSettings(null);
-    setBillingLoading(false);
-    setBillingError("");
-    setBillingSaving(false);
-    setBindingDraft(Object.fromEntries(
-      (selected?.client_bindings ?? []).map((binding) => [binding.id, {
-        protocol: binding.protocol,
-        authorization_profile_id: binding.authorization_profile_id
-      }])
-    ));
+    setProtocolReadModel(null);
+    setDirectoryReadModel(null);
+    setBillingEnabled(false);
+    setBillingDirty(false);
+    setIapRuleCount(0);
+    setIapRuleDirty(false);
+    setSavingKey(null);
   }, [selectedId]);
 
   function hasUnsavedDrafts(): boolean {
     if (!selected) return false;
+    const sources = dirtyNavigation.getSnapshot().sources;
+    if (
+      sources[APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE]
+      || sources[APPLICATION_AUTHORIZATION_DIRTY_SOURCE]
+      || sources[APPLICATION_PROTOCOLS_DIRTY_SOURCE]
+      || sources[APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE]
+      || iapRuleDirty
+    ) return true;
+    if (billingDirty) return true;
     return Object.entries(drafts).some(([key, draft]) => (
       draft !== undefined
-      && JSON.stringify(draft) !== JSON.stringify(moduleConfig(selected, key as ApplicationModuleKey))
+      && !stableDomainEqual(draft, moduleConfig(selected, key as "login_adapters"))
     ));
   }
 
-  useEffect(() => {
-    onDirtyChange?.(hasUnsavedDrafts());
-  }, [drafts, selected, onDirtyChange]);
+  function hasWorkspaceDrafts(): boolean {
+    if (billingDirty || iapRuleDirty || !selected) return billingDirty || iapRuleDirty;
+    return Object.entries(drafts).some(([key, draft]) => (
+      draft !== undefined
+      && !stableDomainEqual(draft, moduleConfig(selected, key as "login_adapters"))
+    ));
+  }
+
+  function syncWorkspaceDirtySource() {
+    const sources = dirtyNavigation.getSnapshot().sources;
+    dirtySourceRef.current?.setDirty(
+      hasWorkspaceDrafts()
+      || sources[APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE]
+      || sources[APPLICATION_AUTHORIZATION_DIRTY_SOURCE]
+      || sources[APPLICATION_PROTOCOLS_DIRTY_SOURCE]
+      || sources[APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE]
+    );
+  }
 
   useEffect(() => {
-    let cancelled = false;
-    if (!selected) return () => { cancelled = true; };
-    void api<ApplicationJwtClient | null>(`/api/admin/applications/${selected.id}/jwt-client`)
-      .then((client) => {
-        if (!cancelled) setJwtClient(client);
-      })
-      .catch(() => {
-        if (!cancelled) setJwtClient(null);
-      });
-    return () => { cancelled = true; };
-  }, [selected]);
+    const source = dirtyNavigation.registerSource(APPLICATION_WORKSPACE_DIRTY_SOURCE);
+    dirtySourceRef.current = source;
+    return () => {
+      source.unregister();
+      if (dirtySourceRef.current === source) dirtySourceRef.current = null;
+    };
+  }, [dirtyNavigation.registerSource]);
 
   useEffect(() => {
-    let cancelled = false;
-    if (!selected) {
-      setBillingSettings(null);
-      setBillingLoading(false);
-      return () => { cancelled = true; };
-    }
-    setBillingLoading(true);
-    setBillingError("");
-    void api<ApplicationBillingSettings>(`/api/admin/applications/${selected.id}/billing-settings`)
-      .then((settings) => {
-        if (!cancelled) setBillingSettings(settings);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setBillingSettings(null);
-          setBillingError(c.loadFailed);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setBillingLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [selected, billingReloadToken]);
+    syncWorkspaceDirtySource();
+  }, [
+    billingDirty,
+    drafts,
+    iapRuleDirty,
+    selected
+  ]);
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationUserId) {
-      setUserRoleIds([]);
-      setUserPermissionOverrides([]);
-      return () => { cancelled = true; };
-    }
-    setAuthorizationLoading(true);
-    void Promise.all([
-      api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/roles`),
-      api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/permission-overrides`)
-    ])
-      .then(([roles, overrides]) => {
-        if (cancelled) return;
-        setUserRoleIds(roles);
-        setUserPermissionOverrides(overrides);
-        setAuthorizationPreview(null);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setUserRoleIds([]);
-        setUserPermissionOverrides([]);
-        setAuthorizationFeedback(c.saveFailed);
-      })
-      .finally(() => {
-        if (!cancelled) setAuthorizationLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationProfileId, selectedAuthorizationUserId]);
+  function resetWorkspaceDrafts() {
+    setDrafts({});
+    setProtocolReadModel(null);
+    setDirectoryReadModel(null);
+    setBillingDirty(false);
+    setIapRuleDirty(false);
+  }
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationGroupId) {
-      setGroupRoleIds([]);
-      return () => { cancelled = true; };
-    }
-    void api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/groups/${selectedAuthorizationGroupId}/roles`)
-      .then((roles) => {
-        if (!cancelled) setGroupRoleIds(roles);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setGroupRoleIds([]);
-          setAuthorizationFeedback(c.saveFailed);
-        }
-      });
-    return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationProfileId, selectedAuthorizationGroupId]);
+  function updateProtocolReadModel(applicationId: string, config: Record<string, unknown> | null) {
+    setProtocolReadModel((current) => {
+      if (config === null) return current?.applicationId === applicationId ? null : current;
+      return { applicationId, config };
+    });
+  }
 
-  useEffect(() => {
-    let cancelled = false;
-    const organizationRoles = authorizationSubjects?.organization_roles ?? [];
-    if (!selected || !selectedAuthorizationProfileId || organizationRoles.length === 0) {
-      setOrganizationRoleIds({});
-      return () => { cancelled = true; };
-    }
-    void Promise.all(organizationRoles.map(async (organizationRole) => {
-      const roleIds = await api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/organization-roles/${encodeURIComponent(organizationRole)}/roles`);
-      return [organizationRole, roleIds] as const;
-    }))
-      .then((entries) => {
-        if (!cancelled) setOrganizationRoleIds(Object.fromEntries(entries));
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setOrganizationRoleIds({});
-          setAuthorizationFeedback(c.saveFailed);
-        }
-      });
-    return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationProfileId, authorizationSubjects]);
+  function updateDirectoryReadModel(applicationId: string, config: Record<string, unknown> | null) {
+    setDirectoryReadModel((current) => {
+      if (config === null) return current?.applicationId === applicationId ? null : current;
+      return { applicationId, config };
+    });
+  }
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected) return () => { cancelled = true; };
-    void Promise.all([
-      api<ApplicationAuthorizationProfile[]>(`/api/admin/applications/${selected.id}/authorization/profiles`),
-      api<ApplicationAuthorizationSubjects>(`/api/admin/applications/${selected.id}/authorization/subjects`)
-    ])
-      .then(([profiles, subjects]) => {
-        if (cancelled) return;
-        setAuthorizationProfiles(profiles);
-        setSelectedAuthorizationProfileId((current) => current && profiles.some((profile) => profile.id === current)
-          ? current
-          : profiles[0]?.id ?? "");
-        setAuthorizationSubjects(subjects);
-        setSelectedAuthorizationUserId(subjects.users[0]?.user_id ?? "");
-        setSelectedAuthorizationGroupId(subjects.groups[0]?.id ?? "");
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setAuthorizationProfiles([]);
-        setSelectedAuthorizationProfileId("");
-        setApplicationRoles([]);
-        setApplicationPermissionCatalog([]);
-        setAuthorizationSubjects(null);
-      });
-    return () => { cancelled = true; };
-  }, [selected]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected || !selectedAuthorizationProfileId) {
-      setApplicationRoles([]);
-      setApplicationPermissionCatalog([]);
-      return () => { cancelled = true; };
-    }
-    void Promise.all([
-      api<ApplicationProfileRole[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`),
-      api<ApplicationPermissionDefinition[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/catalog`)
-    ])
-      .then(([roles, catalog]) => {
-        if (cancelled) return;
-        setApplicationRoles(roles);
-        setApplicationPermissionCatalog(catalog);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setApplicationRoles([]);
-        setApplicationPermissionCatalog([]);
-        setAuthorizationFeedback(c.saveFailed);
-      });
-    return () => { cancelled = true; };
-  }, [selected, selectedAuthorizationProfileId, authorizationProfiles]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected) return () => { cancelled = true; };
-    void api<ApplicationDirectorySyncRun[]>(`/api/admin/applications/${selected.id}/directory-sync/runs`)
-      .then((runs) => {
-        if (!cancelled) setSyncRuns(runs);
-      })
-      .catch(() => {
-        if (!cancelled) setSyncRuns([]);
-      });
-    return () => { cancelled = true; };
-  }, [selected]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!selected) return () => { cancelled = true; };
-    void api<ApplicationScimToken[]>(`/api/admin/applications/${selected.id}/scim-tokens`)
-      .then((tokens) => {
-        if (!cancelled) setScimTokens(tokens);
-      })
-      .catch(() => {
-        if (!cancelled) setScimTokens([]);
-      });
-    return () => { cancelled = true; };
-  }, [selected]);
-
-  const selectedClients = useMemo(() => {
-    if (!selected) return [];
-    const ids = new Set(selected.client_bindings.map((binding) => binding.id));
-    return clients.filter((client) => ids.has(client.id));
-  }, [clients, selected]);
-
-  function draftFor(key: ApplicationModuleKey): Record<string, unknown> {
+  function draftFor(key: "login_adapters"): Record<string, unknown> {
     if (!selected) return {};
     return drafts[key] ?? moduleConfig(selected, key);
   }
 
-  function updateDraft(key: ApplicationModuleKey, next: Record<string, unknown>) {
+  function updateDraft(key: "login_adapters", next: Record<string, unknown>) {
     setDrafts((current) => ({ ...current, [key]: next }));
   }
 
-  async function saveModule(key: ApplicationModuleKey) {
+  async function saveLoginAdapters() {
     if (!selected) return;
-    const selectedIdAtStart = selected.id;
-    setSavingKey(key);
+    const request = beginApplicationRequest(selected.id, "module:login_adapters");
+    if (!request) return;
+    setSavingKey("login_adapters");
     setFeedback("");
+    let moduleWritten = false;
+    let committed = false;
     try {
-      const config = draftFor(key);
-      let attachedClients: ApplicationClientBinding[] | undefined;
-      if (key === "protocols") {
-        attachedClients = await api<ApplicationClientBinding[]>(`/api/admin/applications/${selected.id}/client-bindings`, {
-          method: "PUT",
-          body: JSON.stringify({ bindings: Object.entries(bindingDraft).map(([client_id, binding]) => ({ client_id, ...binding })) })
-        });
-      }
-      const isEnabled = key === "protocols"
-        ? ["oauth2_oidc", "saml2", "cas", "jwt", "iap", "forward_auth"].some((protocol) => booleanValue(record(config[protocol]).enabled))
-        : key === "login_adapters"
-          ? booleanValue(config.enabled, true)
-          : key === "directory_sync"
-            ? booleanValue(config.enabled)
-            : true;
-      const module = await api<ApplicationModule>(`/api/admin/applications/${selected.id}/modules/${key}`, {
-        method: "PUT",
-        body: JSON.stringify({ config, is_enabled: isEnabled })
+      const config = draftFor("login_adapters");
+      const module = await applicationApi.updateApplicationModule(selected.id, "login_adapters", {
+        config,
+        is_enabled: booleanValue(config.enabled, true)
+      }, requestOptions(request));
+      moduleWritten = true;
+      if (!isCurrentApplicationRequest(request)) return;
+      onApplicationModuleChanged(selected.id, module);
+      setDrafts((current) => {
+        const next = { ...current };
+        delete next.login_adapters;
+        return next;
       });
-      if (selectedIdRef.current !== selectedIdAtStart) return;
-      if (key === "protocols") {
-        const jwt = record(record(config).jwt);
-        const jwtEnabled = booleanValue(jwt.enabled);
-        if (jwtEnabled && selectedIdRef.current === selectedIdAtStart) {
-          const configuredClient = await api<ApplicationJwtClient>(`/api/admin/applications/${selected.id}/jwt-client`, {
-            method: "PUT",
-            body: JSON.stringify({
-              client_id: stringValue(jwt.client_id, selected.slug),
-              client_type: stringValue(jwt.client_type, "public"),
-              is_active: true
-            })
+      setFeedback(c.saved);
+      committed = true;
+    } catch {
+      if (isCurrentApplicationRequest(request)) {
+        try {
+          const modules = await applicationApi.listApplicationModules(selected.id, {
+            force: true,
+            ...requestOptions(request)
           });
-          setJwtClient(configuredClient);
+          if (!isCurrentApplicationRequest(request)) return;
+          const reloaded = modules.find((item) => item.module_key === "login_adapters");
+          if (reloaded) {
+            onApplicationModuleChanged(selected.id, reloaded);
+          }
+          if (reloaded && moduleWritten) {
+            setDrafts((current) => {
+              const next = { ...current };
+              delete next.login_adapters;
+              return next;
+            });
+          }
+        } catch {
+          // Keep the draft when the reconciliation read also fails.  The
+          // dirty state then gives the user a safe retry path instead of
+          // claiming that an unknown write outcome was discarded.
         }
+        if (isCurrentApplicationRequest(request)) setFeedback(c.saveFailed);
       }
-      if (selectedIdRef.current !== selectedIdAtStart) return;
-      onApplicationModuleChanged(selected.id, module, attachedClients);
-      setDrafts((current) => ({ ...current, [key]: config }));
-      setFeedback(c.saved);
-    } catch {
-      setFeedback(c.saveFailed);
     } finally {
-      setSavingKey(null);
-    }
-  }
-
-  async function saveBillingSettings() {
-    if (!selected || !billingSettings || !canManage) return;
-    setBillingSaving(true);
-    setFeedback("");
-    try {
-      const settings = await api<ApplicationBillingSettings>(`/api/admin/applications/${selected.id}/billing-settings`, {
-        method: "PUT",
-        body: JSON.stringify({
-          accept_signet_balance: billingSettings.accept_signet_balance,
-          wallet_mode: billingSettings.wallet_mode,
-          supported_currencies: billingSettings.supported_currencies
-        })
-      });
-      setBillingSettings(settings);
-      setFeedback(c.saved);
-    } catch {
-      setFeedback(c.saveFailed);
-    } finally {
-      setBillingSaving(false);
-    }
-  }
-
-  function startApplicationRole(role?: ApplicationProfileRole) {
-    setRoleFeedback("");
-    if (role) {
-      setRoleDraft(applicationRoleDraft(role));
-      return;
-    }
-    setRoleDraft({
-      id: null,
-      role_key: "",
-      name: "",
-      description: "",
-      permissions: [],
-      is_default: !applicationRoles.some((item) => item.is_default && item.is_active),
-      is_active: true,
-      source: "manual"
-    });
-  }
-
-  function updateRoleDraft(next: Partial<ApplicationRoleDraft>) {
-    setRoleDraft((current) => current ? { ...current, ...next } : current);
-  }
-
-  function toggleRolePermission(permission: string) {
-    if (!roleDraft) return;
-    const permissions = roleDraft.permissions.includes(permission)
-      ? roleDraft.permissions.filter((item) => item !== permission)
-      : [...roleDraft.permissions, permission];
-    updateRoleDraft({ permissions: normalizedPermissionList(permissions) });
-  }
-
-  async function saveApplicationRole() {
-    if (!selected || !selectedAuthorizationProfileId || !roleDraft) return;
-    const name = roleDraft.name.trim();
-    const roleKey = roleDraft.role_key.trim();
-    if (!name || !roleKey) {
-      setRoleFeedback(c.saveFailed);
-      return;
-    }
-    setRoleSaving(true);
-    setRoleFeedback("");
-    try {
-      const payload = JSON.stringify({
-        role_key: roleKey,
-        name,
-        description: roleDraft.description.trim() || null,
-        permissions: normalizedPermissionList(roleDraft.permissions),
-        is_default: roleDraft.is_default,
-        is_active: roleDraft.is_active
-      });
-      const path = roleDraft.id
-        ? `/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles/${roleDraft.id}`
-        : `/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`;
-      await api<ApplicationProfileRole>(path, {
-        method: roleDraft.id ? "PUT" : "POST",
-        body: payload
-      });
-      const roles = await api<ApplicationProfileRole[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles`);
-      setApplicationRoles(roles);
-      setRoleDraft(null);
-      setRoleFeedback(c.saved);
-    } catch {
-      setRoleFeedback(c.saveFailed);
-    } finally {
-      setRoleSaving(false);
-    }
-  }
-
-  async function deleteApplicationRole(role: ApplicationProfileRole) {
-    if (!selected || !selectedAuthorizationProfileId || role.is_default) {
-      setRoleFeedback(c.defaultRoleDeleteHint);
-      return;
-    }
-    if (!window.confirm(`${c.deleteRole}: ${role.name}?`)) return;
-    setRoleSaving(true);
-    setRoleFeedback("");
-    try {
-      await api(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/roles/${role.id}`, { method: "DELETE" });
-      setApplicationRoles((current) => current.filter((item) => item.id !== role.id));
-      if (roleDraft?.id === role.id) setRoleDraft(null);
-      setRoleFeedback(c.saved);
-    } catch {
-      setRoleFeedback(c.saveFailed);
-    } finally {
-      setRoleSaving(false);
-    }
-  }
-
-  function toggleRoleId(roleIds: string[], roleId: string): string[] {
-    return roleIds.includes(roleId)
-      ? roleIds.filter((item) => item !== roleId)
-      : [...roleIds, roleId];
-  }
-
-  function updatePermissionOverride(permission: string, effect: "" | "allow" | "deny") {
-    setUserPermissionOverrides((current) => {
-      const withoutPermission = current.filter((item) => item.permission !== permission);
-      if (!effect) return withoutPermission;
-      return [...withoutPermission, { permission, effect }];
-    });
-    setAuthorizationPreview(null);
-  }
-
-  function updateCustomPermissionOverrides(value: string) {
-    const knownPermissions = new Set(applicationPermissionCatalog.map((permission) => permission.key));
-    const standard = userPermissionOverrides.filter((item) => knownPermissions.has(item.permission));
-    const custom = value
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const separator = line.indexOf(":");
-        const effect = separator > 0 ? line.slice(0, separator).trim() : "allow";
-        const permission = (separator > 0 ? line.slice(separator + 1) : line).trim();
-        return effect === "deny" && permission ? { permission, effect: "deny" as const } : permission ? { permission, effect: "allow" as const } : null;
-      })
-      .filter((item): item is ApplicationPermissionOverride => item !== null);
-    setUserPermissionOverrides([...standard, ...custom]);
-    setAuthorizationPreview(null);
-  }
-
-  async function saveAuthorizationBindings() {
-    if (!selected || !selectedAuthorizationProfileId) return;
-    setAuthorizationSaving(true);
-    setAuthorizationFeedback("");
-    try {
-      const requests: Promise<unknown>[] = [];
-      if (selectedAuthorizationUserId) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/roles`, {
-          method: "PUT",
-          body: JSON.stringify({ role_ids: userRoleIds })
-        }));
-        requests.push(api<ApplicationPermissionOverride[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/users/${selectedAuthorizationUserId}/permission-overrides`, {
-          method: "PUT",
-          body: JSON.stringify({ overrides: userPermissionOverrides })
-        }));
-      }
-      if (selectedAuthorizationGroupId) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/groups/${selectedAuthorizationGroupId}/roles`, {
-          method: "PUT",
-          body: JSON.stringify({ role_ids: groupRoleIds })
-        }));
-      }
-      for (const organizationRole of authorizationSubjects?.organization_roles ?? []) {
-        requests.push(api<string[]>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/organization-roles/${encodeURIComponent(organizationRole)}/roles`, {
-          method: "PUT",
-          body: JSON.stringify({ role_ids: organizationRoleIds[organizationRole] ?? [] })
-        }));
-      }
-      await Promise.all(requests);
-      setAuthorizationFeedback(c.saved);
-      setAuthorizationPreview(null);
-    } catch {
-      setAuthorizationFeedback(c.saveFailed);
-    } finally {
-      setAuthorizationSaving(false);
-    }
-  }
-
-  async function runAuthorizationPreview() {
-    if (!selected || !selectedAuthorizationProfileId || !selectedAuthorizationUserId) return;
-    setAuthorizationLoading(true);
-    setAuthorizationFeedback("");
-    try {
-      const preview = await api<ApplicationAuthorizationPreview>(`/api/admin/applications/${selected.id}/authorization/profiles/${selectedAuthorizationProfileId}/${selectedAuthorizationUserId}`);
-      setAuthorizationPreview(preview);
-    } catch {
-      setAuthorizationFeedback(c.saveFailed);
-      setAuthorizationPreview(null);
-    } finally {
-      setAuthorizationLoading(false);
-    }
-  }
-
-  async function rotateJwtSecret() {
-    if (!selected || !jwtClient || jwtClient.client_type !== "confidential") return;
-    setSecretSaving(true);
-    setFeedback("");
-    try {
-      const response = await api<{ secret: string }>(`/api/admin/applications/${selected.id}/jwt-client/secret`, {
-        method: "POST",
-        body: JSON.stringify({ grace_seconds: 300 })
-      });
-      setRotatedSecret(response.secret);
-      const refreshed = await api<ApplicationJwtClient | null>(`/api/admin/applications/${selected.id}/jwt-client`);
-      setJwtClient(refreshed);
-    } catch {
-      setFeedback(c.saveFailed);
-    } finally {
-      setSecretSaving(false);
-    }
-  }
-
-  async function revokeJwtSecrets() {
-    if (!selected || !jwtClient || jwtClient.active_secret_count === 0) return;
-    setSecretSaving(true);
-    try {
-      await api(`/api/admin/applications/${selected.id}/jwt-client/secrets`, { method: "DELETE" });
-      setRotatedSecret("");
-      const refreshed = await api<ApplicationJwtClient | null>(`/api/admin/applications/${selected.id}/jwt-client`);
-      setJwtClient(refreshed);
-    } catch {
-      setFeedback(c.saveFailed);
-    } finally {
-      setSecretSaving(false);
+      if (isCurrentApplicationRequest(request)) setSavingKey(null);
+      requestGuard.finish(request, committed);
     }
   }
 
   function selectApplication(nextId: string) {
     if (nextId === selectedId) return;
     if (hasUnsavedDrafts() && !window.confirm(`${c.unsavedChanges}\n${c.discardChanges}?`)) return;
+    resetWorkspaceDrafts();
+    invalidateApplicationRequests(nextId);
     setSelectedId(nextId);
     setSection("overview");
     onNavigationChange?.(nextId, "overview");
   }
 
-  function toggleScimTokenScope(scope: string) {
-    setScimTokenScopes((current) => current.includes(scope)
-      ? current.filter((item) => item !== scope)
-      : [...current, scope]);
-  }
-
-  async function createScimToken() {
-    if (!selected || scimTokenScopes.length === 0) return;
-    let expiresAt: number | null = null;
-    if (scimTokenExpiry) {
-      const parsed = Date.parse(scimTokenExpiry);
-      if (!Number.isFinite(parsed) || parsed <= Date.now()) {
-        setFeedback(c.saveFailed);
-        return;
-      }
-      expiresAt = Math.floor(parsed / 1000);
-    }
-    setScimTokenSaving(true);
-    setFeedback("");
-    try {
-      const response = await api<ApplicationScimToken>(`/api/admin/applications/${selected.id}/scim-tokens`, {
-        method: "POST",
-        body: JSON.stringify({ scopes: scimTokenScopes, expires_at: expiresAt })
-      });
-      const { token, ...metadata } = response;
-      setScimTokens((current) => [metadata, ...current]);
-      setCreatedScimToken(token ?? "");
-      setScimTokenExpiry("");
-      setFeedback(c.saved);
-    } catch {
-      setFeedback(c.saveFailed);
-    } finally {
-      setScimTokenSaving(false);
-    }
-  }
-
-  async function revokeScimToken(tokenId: string) {
-    if (!selected) return;
-    setScimTokenSaving(true);
-    setFeedback("");
-    try {
-      await api(`/api/admin/applications/${selected.id}/scim-tokens/${tokenId}`, { method: "DELETE" });
-      setScimTokens((current) => current.map((token) => token.id === tokenId
-        ? { ...token, revoked_at: Math.floor(Date.now() / 1000) }
-        : token));
-      if (createdScimToken) setCreatedScimToken("");
-    } catch {
-      setFeedback(c.saveFailed);
-    } finally {
-      setScimTokenSaving(false);
-    }
-  }
-
-  async function runDirectorySync(providerId: string) {
-    if (!selected || !canManage) return;
-    setRunningProviderId(providerId);
-    setFeedback("");
-    try {
-      const run = await api<ApplicationDirectorySyncRun>(`/api/admin/applications/${selected.id}/directory-sync/${providerId}/run`, {
-        method: "POST"
-      });
-      setSyncRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
-      setFeedback(c.syncCompleted);
-    } catch {
-      setFeedback(c.saveFailed);
-      try {
-        const runs = await api<ApplicationDirectorySyncRun[]>(`/api/admin/applications/${selected.id}/directory-sync/runs`);
-        setSyncRuns(runs);
-      } catch {
-        // Preserve the original action error in the UI when refreshing the
-        // history is also unavailable.
-      }
-    } finally {
-      setRunningProviderId(null);
-    }
-  }
-
-  async function copyCreatedScimToken() {
-    if (!createdScimToken) return;
-    try {
-      await navigator.clipboard.writeText(createdScimToken);
-      setFeedback(c.copied);
-    } catch {
-      setFeedback(c.saveFailed);
-    }
-  }
-
-  function openSection(next: "overview" | ApplicationModuleKey | "billing") {
+  function commitSectionChange(next: "overview" | ApplicationModuleKey | "billing" | "iap") {
     setFeedback("");
     setSection(next);
     if (selected) onNavigationChange?.(selected.id, next);
-    if (next !== "overview" && next !== "billing") {
-      setDrafts((current) => current[next] ? current : { ...current, [next]: selected ? moduleConfig(selected, next) : {} });
+  }
+
+  function openSection(next: "overview" | ApplicationModuleKey | "billing" | "iap") {
+    if (next === section) return;
+    if (hasUnsavedDrafts()) {
+      if (onRequestConfirmation) {
+        onRequestConfirmation(
+          () => {
+            resetWorkspaceDrafts();
+            commitSectionChange(next);
+          },
+          c.unsavedChanges,
+          c.discardChanges
+        );
+        return;
+      }
+      if (!window.confirm(`${c.unsavedChanges}\n${c.discardChanges}?`)) return;
+      resetWorkspaceDrafts();
     }
+    commitSectionChange(next);
   }
 
-  function updateProtocol(
-    protocol: "oauth2_oidc" | "saml2" | "cas" | "jwt",
-    field: string,
-    value: string | boolean | number | string[]
-  ) {
-    const current = draftFor("protocols");
-    const nextProtocol = { ...record(current[protocol]), [field]: value };
-    updateDraft("protocols", { ...current, [protocol]: nextProtocol });
-  }
-
-  function renderBillingEditor() {
-    if (billingLoading) return <div className="loading-state" role="status">{c.saving}</div>;
-    if (billingError) return <div className="error" role="alert">{billingError}<button type="button" onClick={() => setBillingReloadToken((current) => current + 1)}>{c.retry}</button></div>;
-    if (!selected || !billingSettings) return <p className="muted">{c.noModuleConfig}</p>;
-    return (
-      <div className="application-module-content">
-        <ModuleHeader icon={<Coins size={19} />} title={c.billing} description={c.billingHint} />
-        <div className="authorization-subsection">
-          <Toggle label={c.acceptSignetBalance} hint={c.acceptSignetBalanceHint} checked={billingSettings.accept_signet_balance} onChange={(value) => setBillingSettings((current) => current ? { ...current, accept_signet_balance: value } : current)} disabled={!canManage} />
-          <label className="application-input"><span>{c.walletMode}</span><select value={billingSettings.wallet_mode} disabled={!canManage || billingSettings.mode_locked_at !== null} onChange={(event) => setBillingSettings((current) => current ? { ...current, wallet_mode: event.target.value as ApplicationBillingSettings["wallet_mode"] } : current)}><option value="shared">{c.sharedWallet}</option><option value="isolated">{c.isolatedWallet}</option></select><small>{billingSettings.mode_locked_at !== null ? c.walletModeLocked : c.billingHint}</small></label>
-          <Input label={c.billingCurrencies} hint={c.billingCurrenciesHint} value={billingSettings.supported_currencies.join(", ")} disabled={!canManage} onChange={(value) => setBillingSettings((current) => current ? { ...current, supported_currencies: Array.from(new Set(value.split(",").map((item) => item.trim().toUpperCase()).filter(Boolean))) } : current)} />
-        </div>
-        {canManage && <ModuleSave saving={billingSaving} feedback={feedback} copy={c} onSave={() => void saveBillingSettings()} />}
-      </div>
-    );
-  }
-
-  function toggleId(key: "client_ids" | "provider_ids" | "ldap_provider_ids", id: string) {
-    const current = draftFor(key === "client_ids" ? "protocols" : key === "provider_ids" ? "login_adapters" : "directory_sync");
+  function toggleProviderId(id: string) {
+    const current = draftFor("login_adapters");
+    const key = "provider_ids";
     const values = stringList(current[key]);
     const next = values.includes(id) ? values.filter((item) => item !== id) : [...values, id];
-    updateDraft(key === "client_ids" ? "protocols" : key === "provider_ids" ? "login_adapters" : "directory_sync", { ...current, [key]: next });
-  }
-
-  function toggleClientBinding(clientId: string) {
-    const existing = bindingDraft[clientId];
-    const next = { ...bindingDraft };
-    if (existing) {
-      delete next[clientId];
-    } else {
-      next[clientId] = { protocol: "oidc", authorization_profile_id: "default" };
-    }
-    setBindingDraft(next);
-    const config = draftFor("protocols");
-    const oauth = record(config.oauth2_oidc);
-    updateDraft("protocols", {
-      ...config,
-      oauth2_oidc: {
-        ...oauth,
-        client_ids: Object.entries(next)
-          .filter(([, binding]) => binding.protocol === "oidc")
-          .map(([id]) => id)
-      }
-    });
-  }
-
-  function updateClientBinding(clientId: string, field: "protocol" | "authorization_profile_id", value: string) {
-    const existing = bindingDraft[clientId];
-    if (!existing) return;
-    const next = {
-      ...bindingDraft,
-      [clientId]: { ...existing, [field]: value }
-    };
-    setBindingDraft(next);
-    if (field === "protocol") {
-      const config = draftFor("protocols");
-      const oauth = record(config.oauth2_oidc);
-      updateDraft("protocols", {
-        ...config,
-        oauth2_oidc: {
-          ...oauth,
-          client_ids: Object.entries(next)
-            .filter(([, binding]) => binding.protocol === "oidc")
-            .map(([id]) => id)
-        }
-      });
-    }
-  }
-
-  function renderProtocolEditor() {
-    if (!selected) return null;
-    const config = draftFor("protocols");
-    const oauth = record(config.oauth2_oidc);
-    const saml = record(config.saml2);
-    const cas = record(config.cas);
-    const jwt = record(config.jwt);
-    return (
-      <div className="application-module-content">
-        <ModuleHeader icon={<Code2 size={19} />} title={c.protocols} description={c.protocolHint} />
-        <div className="protocol-grid">
-          <ProtocolCard icon={<Globe2 size={19} />} title={c.oauth} description={c.oauthHint} enabled={booleanValue(oauth.enabled, selected.client_bindings.some((binding) => binding.protocol === "oidc"))} onToggle={(value) => updateProtocol("oauth2_oidc", "enabled", value)} tone="brand">
-            <div className="application-connection-list">
-              <div className="subsection-heading"><strong>{c.connections}</strong><span>{selectedClients.length}</span></div>
-              {clients.filter((client) => client.organization_id === selected.organization_id).map((client) => {
-                const binding = bindingDraft[client.id];
-                return (
-                  <div className="application-choice" key={client.id}>
-                    <input type="checkbox" checked={Boolean(binding)} onChange={() => toggleClientBinding(client.id)} />
-                    <span><strong>{client.client_name}</strong><small>{client.client_id}</small></span>
-                    {binding && <>
-                      <select aria-label={`${c.bindingProtocol}: ${client.client_id}`} value={binding.protocol} onChange={(event) => updateClientBinding(client.id, "protocol", event.target.value)}>
-                        {[["oidc", "OIDC"], ["saml", "SAML"], ["cas", "CAS"], ["jwt", "JWT"], ["iap", "IAP"], ["forward_auth", "Forward Auth"]].map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-                      </select>
-                      <select aria-label={`${c.authorizationProfile}: ${client.client_id}`} value={binding.authorization_profile_id} onChange={(event) => updateClientBinding(client.id, "authorization_profile_id", event.target.value)}>
-                        <option value="default">default</option>
-                        {(selected.authorization_profiles ?? []).filter((profile) => profile.profile_key !== "default").map((profile) => <option value={profile.id} key={profile.id}>{profile.profile_key}</option>)}
-                      </select>
-                    </>}
-                    <span className="application-choice-status">{client.is_active ? c.active : c.disabled}</span>
-                  </div>
-                );
-              })}
-              {clients.filter((client) => client.organization_id === selected.organization_id).length === 0 && <p className="muted">{c.noConnections}</p>}
-            </div>
-          </ProtocolCard>
-          <ProtocolCard icon={<LockKeyhole size={19} />} title={c.saml} description={c.samlHint} enabled={booleanValue(saml.enabled)} onToggle={(value) => updateProtocol("saml2", "enabled", value)}>
-            <div className="form-grid-2 compact-form-grid">
-              <Input label={c.entityId} value={stringValue(saml.entity_id)} onChange={(value) => updateProtocol("saml2", "entity_id", value)} />
-              <Input label={c.acsUrl} value={stringValue(saml.acs_url)} onChange={(value) => updateProtocol("saml2", "acs_url", value)} />
-              <Input label={c.sloUrl} hint={locale === "zh-CN" ? "网站的 SingleLogoutService；填写后 Signet metadata 会广告应用级 SLO endpoint。" : "The website SingleLogoutService. When set, Signet metadata advertises the application SLO endpoint."} value={stringValue(saml.slo_url)} onChange={(value) => updateProtocol("saml2", "slo_url", value)} />
-              <Input label={c.nameIdClaim} value={stringValue(saml.name_id_claim, "email")} onChange={(value) => updateProtocol("saml2", "name_id_claim", value)} />
-              <Input label={c.nameIdFormat} value={stringValue(saml.name_id_format)} onChange={(value) => updateProtocol("saml2", "name_id_format", value)} />
-            </div>
-            <div className="form-grid-2 compact-form-grid">
-              <Input label={c.spSigningCertificate} value={stringValue(saml.sp_signing_certificate)} onChange={(value) => updateProtocol("saml2", "sp_signing_certificate", value)} textarea />
-              <Input label={c.spMetadataXml} value={stringValue(saml.sp_metadata_xml)} onChange={(value) => updateProtocol("saml2", "sp_metadata_xml", value)} textarea />
-            </div>
-            <div className="application-toggle-grid">
-              <Toggle label={c.signedRequests} checked={booleanValue(saml.require_signed_requests)} onChange={(value) => updateProtocol("saml2", "require_signed_requests", value)} />
-              <Toggle label={c.signedAssertions} checked={booleanValue(saml.want_assertions_signed)} onChange={(value) => updateProtocol("saml2", "want_assertions_signed", value)} />
-              <Toggle label={c.signedLogout} checked={booleanValue(saml.require_signed_logout, true)} onChange={(value) => updateProtocol("saml2", "require_signed_logout", value)} />
-              <Toggle label={c.signedLogoutResponses} checked={booleanValue(saml.want_logout_responses_signed, true)} onChange={(value) => updateProtocol("saml2", "want_logout_responses_signed", value)} />
-            </div>
-            <small className="module-note"><Circle size={11} />{c.protocolRuntimeHint}</small>
-          </ProtocolCard>
-          <ProtocolCard icon={<TicketIcon />} title={c.cas} description={c.casHint} enabled={booleanValue(cas.enabled)} onToggle={(value) => updateProtocol("cas", "enabled", value)}>
-            <Input
-              label={c.casServiceUrls}
-              hint={locale === "zh-CN" ? "每行一个精确 service URL；生产环境必须使用 HTTPS。旧配置中的 Service Validate URL 会作为兼容值读取。" : "One exact service URL per line; production deployments must use HTTPS. The legacy Service Validate URL is read as a compatibility value."}
-              value={stringList(cas.service_urls).join("\n") || stringValue(cas.service_validate_url)}
-              textarea
-              onChange={(value) => updateProtocol("cas", "service_urls", value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))}
-            />
-            <Input
-              label={c.casProxyCallbacks}
-              hint={locale === "zh-CN" ? "启用 PGT/代理票据时，每行一个已登记的回调 URL。" : "When PGT/proxy tickets are enabled, enter one registered callback URL per line."}
-              value={stringList(cas.proxy_callback_urls).join("\n")}
-              textarea
-              onChange={(value) => updateProtocol("cas", "proxy_callback_urls", value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))}
-            />
-            <Toggle label={c.casAllowProxy} checked={booleanValue(cas.allow_proxy)} onChange={(value) => updateProtocol("cas", "allow_proxy", value)} />
-            <div className="form-grid-2 compact-form-grid">
-              <Input label={c.casTicketTtl} type="number" value={String(typeof cas.ticket_ttl_seconds === "number" ? cas.ticket_ttl_seconds : 300)} onChange={(value) => updateProtocol("cas", "ticket_ttl_seconds", Number(value) || 300)} />
-              <Input label={c.casPgtTtl} type="number" value={String(typeof cas.pgt_ttl_seconds === "number" ? cas.pgt_ttl_seconds : 300)} onChange={(value) => updateProtocol("cas", "pgt_ttl_seconds", Number(value) || 300)} />
-            </div>
-          </ProtocolCard>
-          <ProtocolCard icon={<Code2 size={19} />} title={c.jwt} description={c.jwtHint} enabled={booleanValue(jwt.enabled)} onToggle={(value) => updateProtocol("jwt", "enabled", value)}>
-            <div className="form-grid-2 compact-form-grid">
-              <Input label={c.clientId} value={stringValue(jwt.client_id, selected.slug)} onChange={(value) => updateProtocol("jwt", "client_id", value)} />
-              <Input label={c.audience} value={stringValue(jwt.audience)} onChange={(value) => updateProtocol("jwt", "audience", value)} />
-              <Input label={c.tokenTtl} type="number" value={String(typeof jwt.token_ttl_seconds === "number" ? jwt.token_ttl_seconds : 3600)} onChange={(value) => updateProtocol("jwt", "token_ttl_seconds", Number(value) || 3600)} />
-              <label className="application-input"><span>{c.jwtClientType}</span><select value={stringValue(jwt.client_type, "public")} onChange={(event) => updateProtocol("jwt", "client_type", event.target.value)}><option value="public">{c.publicClient}</option><option value="confidential">{c.confidentialClient}</option></select></label>
-            </div>
-            <Input label={c.redirect} hint={locale === "zh-CN" ? "每行一个精确回调地址；生产环境必须使用 HTTPS。" : "One exact redirect URI per line; production deployments must use HTTPS."} value={stringList(jwt.redirect_uris).join("\n")} textarea onChange={(value) => updateProtocol("jwt", "redirect_uris", value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))} />
-            {jwtClient?.client_type === "confidential" && <div className="module-secret-panel"><div><strong>{c.confidentialClient}</strong><small>{jwtClient.active_secret_count} active secret(s)</small></div><div className="module-secret-actions"><button type="button" className="text-button" onClick={() => void rotateJwtSecret()} disabled={secretSaving}>{secretSaving ? c.saving : c.rotateSecret}</button><button type="button" className="text-danger-button" onClick={() => onRequestConfirmation ? onRequestConfirmation(() => revokeJwtSecrets(), c.revokeSecrets, c.revokeSecretsHint) : void revokeJwtSecrets()} disabled={secretSaving || jwtClient.active_secret_count === 0}>{c.revokeSecrets}</button></div>{rotatedSecret && <div className="module-secret-value"><code>{rotatedSecret}</code><small>{c.secretOnlyOnce}</small></div>}</div>}
-          </ProtocolCard>
-        </div>
-        <ModuleSave saving={savingKey === "protocols"} feedback={feedback} copy={c} onSave={() => void saveModule("protocols")} />
-      </div>
-    );
+    updateDraft("login_adapters", { ...current, [key]: next });
   }
 
   function renderIdentityEditor() {
     if (!selected) return null;
     const config = draftFor("login_adapters");
-    return (
-      <div className="application-module-content">
-        <ModuleHeader icon={<KeyRound size={19} />} title={c.loginAdapters} description={c.loginAdaptersHint} />
-        <div className="module-setting-card">
-          <Toggle label={c.enabled} checked={booleanValue(config.enabled, moduleEnabled(selected, "login_adapters"))} onChange={(value) => updateDraft("login_adapters", { ...config, enabled: value })} />
-          <div className="application-choice-list">
-            {providers.filter((provider) => !provider.organization_id || provider.organization_id === selected.organization_id).map((provider) => (
-              <label className="application-choice" key={provider.id}>
-                <input type="checkbox" checked={stringList(config.provider_ids).includes(provider.id)} onChange={() => toggleId("provider_ids", provider.id)} />
-                <span><strong>{provider.display_name}</strong><small>{provider.issuer}</small></span>
-                <span className="application-choice-status">{provider.allow_login && provider.is_active ? c.active : c.disabled}</span>
-              </label>
-            ))}
-            {providers.length === 0 && <p className="muted">{c.noLoginAdapters}</p>}
-          </div>
-          <Toggle label={locale === "zh-CN" ? "允许 Signet 密码 / Passkey 登录" : "Allow Signet password / Passkey sign-in"} checked={booleanValue(config.allow_signet_password, true)} onChange={(value) => updateDraft("login_adapters", { ...config, allow_signet_password: value })} />
-        </div>
-        <ModuleSave saving={savingKey === "login_adapters"} feedback={feedback} copy={c} onSave={() => void saveModule("login_adapters")} />
-      </div>
-    );
+    return <ApplicationLoginAdaptersEditor
+      providers={providers}
+      organizationId={selected.organization_id}
+      enabled={booleanValue(config.enabled, moduleEnabled(selected, "login_adapters"))}
+      providerIds={stringList(config.provider_ids)}
+      allowSignetPassword={booleanValue(config.allow_signet_password, true)}
+      saving={savingKey === "login_adapters"}
+      feedback={feedback}
+      copy={{
+        loginAdapters: c.loginAdapters,
+        loginAdaptersHint: c.loginAdaptersHint,
+        enabled: c.enabled,
+        active: c.active,
+        disabled: c.disabled,
+        allowSignetPassword: locale === "zh-CN" ? "允许 Signet 密码 / Passkey 登录" : "Allow Signet password / Passkey sign-in",
+        noLoginAdapters: c.noLoginAdapters,
+        save: c.save,
+        saving: c.saving,
+        saveFailed: c.saveFailed
+      }}
+      onEnabledChange={(value) => updateDraft("login_adapters", { ...config, enabled: value })}
+      onProviderToggle={toggleProviderId}
+      onAllowSignetPasswordChange={(value) => updateDraft("login_adapters", { ...config, allow_signet_password: value })}
+      onSave={() => void saveLoginAdapters()}
+    />;
   }
 
-  function renderDirectoryEditor() {
-    if (!selected) return null;
-    const config = draftFor("directory_sync");
-    return (
-      <div className="application-module-content">
-        <ModuleHeader icon={<Database size={19} />} title={c.directorySync} description={c.directorySyncHint} />
-        <div className="module-setting-card">
-          <div className="subsection-heading"><strong>{c.ldapAd}</strong><span>{stringList(config.ldap_provider_ids).length} {c.syncSources}</span></div>
-          <div className="application-choice-list">
-            {ldapProviders.map((provider) => (
-              <div className="directory-sync-provider-row" key={provider.id}>
-                <label className="application-choice">
-                  <input type="checkbox" checked={stringList(config.ldap_provider_ids).includes(provider.id)} onChange={() => toggleId("ldap_provider_ids", provider.id)} />
-                  <span><strong>{provider.display_name}</strong><small>{provider.url} · {provider.base_dn}</small></span>
-                  <span className="application-choice-status">{provider.is_active ? c.active : c.disabled}</span>
-                </label>
-                <button type="button" className="text-button directory-sync-run-button" onClick={() => void runDirectorySync(provider.id)} disabled={!canManage || runningProviderId !== null || !stringList(config.ldap_provider_ids).includes(provider.id) || !booleanValue(config.enabled)}>
-                  <RefreshCw size={14} className={runningProviderId === provider.id ? "spin" : undefined} />
-                  {runningProviderId === provider.id ? c.syncRunning : c.runNow}
-                </button>
-              </div>
-            ))}
-            {ldapProviders.length === 0 && <p className="muted">{c.notConfigured}</p>}
-          </div>
-          <div className="module-divider" />
-          <div className="subsection-heading"><strong>{c.ldapAd} {c.directorySync}</strong><span>{c.deprovisionAction}: remove_membership</span></div>
-          <div className="form-grid-2 compact-form-grid">
-            <Input label={c.userSyncFilter} hint={locale === "zh-CN" ? "留空则使用 LDAP provider 的用户过滤器，并将登录占位符替换为通配符。" : "Leave blank to derive a wildcard filter from the LDAP provider user filter."} value={stringValue(config.user_sync_filter)} onChange={(value) => updateDraft("directory_sync", { ...config, user_sync_filter: value })} />
-            <Input label={c.groupBaseDn} value={stringValue(config.group_base_dn)} onChange={(value) => updateDraft("directory_sync", { ...config, group_base_dn: value })} />
-            <Input label={c.groupIdAttribute} value={stringValue(config.group_id_attribute, "dn")} onChange={(value) => updateDraft("directory_sync", { ...config, group_id_attribute: value })} />
-            <Input label={c.groupNameAttribute} value={stringValue(config.group_name_attribute, "cn")} onChange={(value) => updateDraft("directory_sync", { ...config, group_name_attribute: value })} />
-            <Input label={c.groupMemberAttribute} value={stringValue(config.group_member_attribute, "member")} onChange={(value) => updateDraft("directory_sync", { ...config, group_member_attribute: value })} />
-            <Input label={c.maxEntries} type="number" value={String(typeof config.max_entries === "number" ? config.max_entries : 100000)} onChange={(value) => updateDraft("directory_sync", { ...config, max_entries: Number(value) || 100000 })} />
-          </div>
-          <Input label={c.groupFilter} value={stringValue(config.group_filter, "(objectClass=group)")} onChange={(value) => updateDraft("directory_sync", { ...config, group_filter: value })} />
-          <Toggle label={c.reactivateUsers} checked={booleanValue(config.reactivate_users, true)} onChange={(value) => updateDraft("directory_sync", { ...config, reactivate_users: value })} />
-          <label className="application-input"><span>{c.deprovisionAction}</span><select value={stringValue(config.deprovision_action, "remove_membership")} onChange={(event) => updateDraft("directory_sync", { ...config, deprovision_action: event.target.value })}><option value="remove_membership">remove_membership</option></select></label>
-          <div className="module-divider" />
-          <div className="subsection-heading"><strong>{c.scim}</strong><span>{booleanValue(config.scim_enabled) ? c.configured : c.notConfigured}</span></div>
-          <p className="muted">{c.scimHint}</p>
-          <Toggle label={c.enabled} checked={booleanValue(config.enabled)} onChange={(value) => updateDraft("directory_sync", { ...config, enabled: value })} />
-          <Toggle label={c.enabled} checked={booleanValue(config.scim_enabled)} onChange={(value) => updateDraft("directory_sync", { ...config, scim_enabled: value })} />
-          <div className="form-grid-2 compact-form-grid">
-            <Input label={c.scimAudience} value={stringValue(config.scim_audience)} onChange={(value) => updateDraft("directory_sync", { ...config, scim_audience: value })} />
-          </div>
-          <Toggle label={c.groupSync} checked={booleanValue(config.sync_groups, true)} onChange={(value) => updateDraft("directory_sync", { ...config, sync_groups: value })} />
-        </div>
-        <div className="module-setting-card directory-sync-history">
-          <div className="subsection-heading"><div><strong>{c.syncHistory}</strong><p className="muted">{c.syncCheckpoint}: {(() => {
-            const checkpoint = syncRuns.find((run) => run.status === "succeeded" && run.cursor);
-            return checkpoint?.cursor ? formatScimTokenTime(Number(checkpoint.cursor), locale) : c.syncNoCheckpoint;
-          })()}</p></div><span>{syncRuns.length}</span></div>
-          <div className="directory-sync-run-list">
-            {syncRuns.map((run) => {
-              const provider = ldapProviders.find((item) => item.id === run.provider_id);
-              const status = run.status === "succeeded" ? c.syncSuccess : run.status === "failed" ? c.syncFailure : c.syncRunning;
-              return <div className={`directory-sync-run${run.status === "succeeded" ? " succeeded" : run.status === "failed" ? " failed" : " running"}`} key={run.id}>
-                <div className="directory-sync-run-heading"><strong>{provider?.display_name ?? run.provider_id}</strong><span>{status}</span></div>
-                <div className="directory-sync-run-meta"><span>{formatScimTokenTime(run.started_at, locale)}</span><span>{c.syncSeen}: {run.total_seen}</span><span>{c.syncCreated}: {run.created_count}</span><span>{c.syncUpdated}: {run.updated_count}</span><span>{c.syncDisabled}: {run.disabled_count}</span></div>
-                {run.error && <small className="directory-sync-run-error">{run.error}</small>}
-              </div>;
-            })}
-            {syncRuns.length === 0 && <p className="muted">{c.noSyncRuns}</p>}
-          </div>
-        </div>
-        <div className="module-setting-card scim-token-card">
-          <div className="subsection-heading"><div><strong>{c.scimTokens}</strong><p className="muted">{c.scimTokensHint}</p></div><span>{scimTokens.filter((token) => !token.revoked_at).length}</span></div>
-          <div className="scim-token-create">
-            <strong>{c.createScimToken}</strong>
-            <div className="scim-token-scope-list">
-              <label className="application-choice"><input type="checkbox" checked={scimTokenScopes.includes("scim.read")} onChange={() => toggleScimTokenScope("scim.read")} /><span><strong>{c.scimRead}</strong><small>scim.read</small></span></label>
-              <label className="application-choice"><input type="checkbox" checked={scimTokenScopes.includes("scim.write")} onChange={() => toggleScimTokenScope("scim.write")} /><span><strong>{c.scimWrite}</strong><small>scim.write</small></span></label>
-            </div>
-            <Input label={c.scimTokenExpiry} hint={c.scimTokenExpiryHint} type="datetime-local" value={scimTokenExpiry} onChange={setScimTokenExpiry} />
-            <button type="button" className="secondary-button" onClick={() => void createScimToken()} disabled={scimTokenSaving || scimTokenScopes.length === 0 || !booleanValue(config.scim_enabled)}><Plus size={14} />{scimTokenSaving ? c.saving : c.createScimToken}</button>
-          </div>
-          {createdScimToken && <div className="module-secret-value scim-token-reveal"><div><code>{createdScimToken}</code><small>{c.tokenOnlyOnce}</small></div><button type="button" className="text-button" onClick={() => void copyCreatedScimToken()}><CopyIcon size={14} />{c.copyToken}</button></div>}
-          <div className="scim-token-list">
-            {scimTokens.map((token) => (
-              <div className={`scim-token-row${token.revoked_at ? " revoked" : ""}`} key={token.id}>
-                <div className="scim-token-main"><strong>{token.token_prefix}…</strong><small>{token.scopes.join(" · ")}</small></div>
-                <div className="scim-token-meta"><span>{token.revoked_at ? c.revoked : `${c.tokenExpires}: ${token.expires_at ? formatScimTokenTime(token.expires_at, locale) : c.tokenNeverExpires}`}</span><span>{c.tokenLastUsed}: {token.last_used_at ? formatScimTokenTime(token.last_used_at, locale) : c.tokenNeverUsed}</span><small>{c.tokenCreated}: {formatScimTokenTime(token.created_at, locale)}</small></div>
-                {!token.revoked_at && <button type="button" className="text-danger-button" onClick={() => onRequestConfirmation ? onRequestConfirmation(() => revokeScimToken(token.id), c.revokeToken, c.revokeTokenHint) : void revokeScimToken(token.id)} disabled={scimTokenSaving}>{c.revokeToken}</button>}
-              </div>
-            ))}
-            {scimTokens.length === 0 && <p className="muted">{c.noScimTokens}</p>}
-          </div>
-        </div>
-        <ModuleSave saving={savingKey === "directory_sync"} feedback={feedback} copy={c} onSave={() => void saveModule("directory_sync")} />
-      </div>
-    );
-  }
-
-  function renderAuthorizationEditor() {
-    if (!selected) return null;
-    const config = draftFor("authorization");
-    const claims = stringList(config.claims);
-    const knownPermissions = new Set(applicationPermissionCatalog.map((permission) => permission.key));
-    const customRolePermissions = roleDraft
-      ? roleDraft.permissions.filter((permission) => !knownPermissions.has(permission))
-      : [];
-    const authorizationUsers = authorizationSubjects?.users ?? [];
-    const authorizationGroups = authorizationSubjects?.groups ?? [];
-    const customOverrideLines = userPermissionOverrides
-      .filter((override) => !knownPermissions.has(override.permission))
-      .map((override) => `${override.effect}:${override.permission}`)
-      .join("\n");
-    return (
-      <div className="application-module-content">
-        <ModuleHeader icon={<ShieldCheck size={19} />} title={c.permissions} description={c.authorizationHint} />
-        {authorizationProfiles.length === 0 ? (
-          <div className="module-setting-card authorization-empty-profile">
-            <strong>{c.noAuthorizationProfile}</strong>
-            <p className="muted">{c.setupNextHint}</p>
-          </div>
-        ) : <div className="module-setting-card">
-          <div className="authorization-profile-panel">
-            <div className="subsection-heading">
-              <div><strong>{c.authorizationProfile}</strong><p className="muted">{c.authorizationProfileHint}</p></div>
-              <span>{authorizationProfiles.length}</span>
-            </div>
-            <label className="application-input">
-              <span>{c.authorizationProfile}</span>
-              <select value={selectedAuthorizationProfileId} onChange={(event) => setSelectedAuthorizationProfileId(event.target.value)}>
-                {authorizationProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.profile_key}</option>)}
-              </select>
-            </label>
-            {selectedAuthorizationProfile && <>
-              <div className="authorization-profile-mode-row">
-                <span className="application-role-badge default">{c.profileManual}</span>
-                <span className="muted">{selectedAuthorizationProfile.sync_status}</span>
-              </div>
-              {selectedAuthorizationProfile.last_error && <p className="module-save-error" role="alert">{selectedAuthorizationProfile.last_error}</p>}
-              {selectedAuthorizationProfile.source_mode === "manual" && <p className="module-note"><Circle size={11} />{c.profileNoDefinition}</p>}
-            </>}
-          </div>
-          <div className="module-divider" />
-          <p className="module-note"><Circle size={11} />{c.loginBoundaryNote}</p>
-          <div className="module-divider" />
-          <div className="subsection-heading">
-            <div><strong>{c.customRoles}</strong><p className="muted">{c.customRolesHint}</p></div>
-            {canManage && <button type="button" className="secondary-button" onClick={() => startApplicationRole()} disabled={roleSaving}><Plus size={14} />{c.addRole}</button>}
-          </div>
-          <div className="application-role-list">
-            {applicationRoles.map((role) => (
-              <article className={`application-role-record${role.is_active ? "" : " inactive"}`} key={role.id}>
-                <div className="application-role-record-main">
-                  <strong>{role.name}</strong>
-                  <small><code>{role.role_key}</code> · {role.description || c.noModuleConfig}</small>
-                  <div className="application-role-permission-summary">
-                    {role.permissions.length > 0
-                      ? role.permissions.map((permission) => <span key={permission}>{permission}</span>)
-                      : <span>{c.notConfigured}</span>}
-                  </div>
-                </div>
-                <div className="application-role-record-meta">
-                  {role.is_default && <span className="application-role-badge default">{c.defaultRole}</span>}
-                  <span className="application-role-badge">{role.is_active ? c.active : c.disabled}</span>
-                </div>
-                {canManage && <div className="application-role-record-actions">
-                  <button type="button" className="secondary-button" onClick={() => startApplicationRole(role)} disabled={roleSaving}><Pencil size={13} />{c.editRole}</button>
-                  <button type="button" className="text-danger-button" onClick={() => void deleteApplicationRole(role)} disabled={roleSaving || role.is_default} title={role.is_default ? c.defaultRoleDeleteHint : c.deleteRole}><Trash2 size={13} />{c.deleteRole}</button>
-                </div>}
-              </article>
-            ))}
-            {applicationRoles.length === 0 && <p className="muted">{c.noApplicationRoles}</p>}
-          </div>
-          {roleDraft && (
-            <div className="application-role-editor">
-              <div className="subsection-heading"><strong>{roleDraft.id ? c.editRole : c.addRole}</strong><span>{roleDraft.id ?? c.notConfigured}</span></div>
-              <div className="form-grid-2 compact-form-grid">
-                <Input label={c.roleKey} value={roleDraft.role_key} disabled={roleDraft.source === "manifest" || !!roleDraft.id} onChange={(value) => updateRoleDraft({ role_key: value })} />
-                <Input label={c.roleName} value={roleDraft.name} onChange={(value) => updateRoleDraft({ name: value })} />
-                <Input label={c.roleDescription} value={roleDraft.description} onChange={(value) => updateRoleDraft({ description: value })} />
-              </div>
-              <Toggle label={c.activeRole} checked={roleDraft.is_active} onChange={(value) => updateRoleDraft({ is_active: value, is_default: value ? roleDraft.is_default : false })} />
-              <Toggle label={c.defaultRole} hint={c.inheritEnterpriseHint} checked={roleDraft.is_default} disabled={!roleDraft.is_active} onChange={(value) => updateRoleDraft({ is_default: value })} />
-              <div className="module-divider" />
-              <div><strong>{c.rolePermissions}</strong><p className="muted">{c.rolePermissionsHint}</p></div>
-              {applicationPermissionCatalog.length > 0 && <>
-                <span className="application-permission-label">{c.permissionTree}</span>
-                <PermissionTree
-                  definitions={applicationPermissionCatalog}
-                  renderLeaf={(permission) => <label className="application-choice permission-tree-choice" key={permission.key}>
-                    <input type="checkbox" checked={roleDraft.permissions.includes(permission.key)} onChange={() => toggleRolePermission(permission.key)} />
-                    <span><strong>{permission.label}</strong><small><code>{permission.key}</code>{permission.description ? ` · ${permission.description}` : ""}</small></span>
-                  </label>}
-                />
-              </>}
-              <Input
-                label={c.customPermissions}
-                hint={c.customPermissionsHint}
-                value={customRolePermissions.join("\n")}
-                textarea
-                onChange={(value) => updateRoleDraft({ permissions: normalizedPermissionList([
-                  ...roleDraft.permissions.filter((permission) => knownPermissions.has(permission)),
-                  ...value.split(/\r?\n/)
-                ]) })}
-              />
-              <div className="application-role-editor-actions">
-                <button type="button" className="secondary-button" onClick={() => setRoleDraft(null)} disabled={roleSaving}>{c.removeRole}</button>
-                <button type="button" className="primary-action" onClick={() => void saveApplicationRole()} disabled={roleSaving || !roleDraft.name.trim() || !roleDraft.role_key.trim()}>{roleSaving ? c.saving : c.save}<ArrowRight size={15} /></button>
-              </div>
-            </div>
-          )}
-          {roleFeedback && <p className={roleFeedback === c.saveFailed || roleFeedback === c.defaultRoleDeleteHint ? "module-save-error" : "module-save-feedback"} role="status">{roleFeedback}</p>}
-          <div className="module-divider" />
-          <div className="authorization-subsection">
-            <div className="subsection-heading"><div><strong>{c.userRoleBindings}</strong><p className="muted">{c.userRoleBindingsHint}</p></div><span>{authorizationUsers.length}</span></div>
-            {authorizationUsers.length > 0 ? <>
-              <label className="application-input"><span>{c.selectUser}</span><select value={selectedAuthorizationUserId} disabled={authorizationLoading} onChange={(event) => setSelectedAuthorizationUserId(event.target.value)}>
-                {authorizationUsers.map((user) => <option value={user.user_id} key={user.user_id}>{user.email} · {user.display_name || user.username}</option>)}
-              </select></label>
-              <div className="application-permission-grid">
-                {applicationRoles.filter((role) => role.is_active || userRoleIds.includes(role.id)).map((role) => (
-                  <label className="application-choice" key={role.id}>
-                    <input type="checkbox" checked={userRoleIds.includes(role.id)} onChange={() => setUserRoleIds((current) => toggleRoleId(current, role.id))} disabled={authorizationSaving} />
-                    <span><strong>{role.name}</strong><small>{role.description || c.noModuleConfig}</small></span>
-                  </label>
-                ))}
-                {applicationRoles.length === 0 && <p className="muted">{c.noApplicationRoles}</p>}
-              </div>
-            </> : <p className="muted">{c.noAuthorizationUsers}</p>}
-          </div>
-          <div className="authorization-subsection">
-            <div className="subsection-heading"><div><strong>{c.groupRoleBindings}</strong><p className="muted">{c.groupRoleBindingsHint}</p></div><span>{authorizationGroups.length}</span></div>
-            {authorizationGroups.length > 0 ? <>
-              <label className="application-input"><span>{c.selectGroup}</span><select value={selectedAuthorizationGroupId} disabled={authorizationLoading} onChange={(event) => setSelectedAuthorizationGroupId(event.target.value)}>
-                {authorizationGroups.map((group) => <option value={group.id} key={group.id}>{group.name}</option>)}
-              </select></label>
-              <div className="application-permission-grid">
-                {applicationRoles.filter((role) => role.is_active || groupRoleIds.includes(role.id)).map((role) => (
-                  <label className="application-choice" key={role.id}>
-                    <input type="checkbox" checked={groupRoleIds.includes(role.id)} onChange={() => setGroupRoleIds((current) => toggleRoleId(current, role.id))} disabled={authorizationSaving} />
-                    <span><strong>{role.name}</strong><small>{role.description || c.noModuleConfig}</small></span>
-                  </label>
-                ))}
-                {applicationRoles.length === 0 && <p className="muted">{c.noApplicationRoles}</p>}
-              </div>
-            </> : <p className="muted">{c.noAuthorizationGroups}</p>}
-          </div>
-          <div className="authorization-subsection">
-            <div className="subsection-heading"><div><strong>{c.enterpriseRoleMappings}</strong><p className="muted">{c.enterpriseRoleMappingsHint}</p></div><span>{authorizationSubjects?.organization_roles.length ?? 0}</span></div>
-            <div className="authorization-mapping-list">
-              {(authorizationSubjects?.organization_roles ?? []).map((organizationRole) => (
-                <div className="authorization-mapping-row" key={organizationRole}>
-                  <strong>{organizationRole}</strong>
-                  <div className="application-role-chip-list">
-                    {applicationRoles.filter((role) => role.is_active || (organizationRoleIds[organizationRole] ?? []).includes(role.id)).map((role) => (
-                      <label className="application-choice" key={role.id}>
-                        <input type="checkbox" checked={(organizationRoleIds[organizationRole] ?? []).includes(role.id)} onChange={() => setOrganizationRoleIds((current) => ({ ...current, [organizationRole]: toggleRoleId(current[organizationRole] ?? [], role.id) }))} disabled={authorizationSaving} />
-                        <span><strong>{role.name}</strong><small>{role.description || c.noModuleConfig}</small></span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="authorization-subsection">
-            <div className="subsection-heading"><div><strong>{c.permissionOverrides}</strong><p className="muted">{c.permissionOverridesHint}</p></div><span>{selectedAuthorizationUserId ? userPermissionOverrides.length : 0}</span></div>
-            {selectedAuthorizationUserId ? <>
-              <PermissionTree
-                definitions={applicationPermissionCatalog}
-                renderLeaf={(permission) => {
-                  const effect = userPermissionOverrides.find((override) => override.permission === permission.key)?.effect ?? "";
-                  return <label className="application-input permission-tree-override" key={permission.key}><span>{permission.label}<small><code>{permission.key}</code></small></span><select value={effect} disabled={authorizationSaving} onChange={(event) => updatePermissionOverride(permission.key, event.target.value as "" | "allow" | "deny")}><option value="">{c.inheritPermission}</option><option value="allow">{c.allowPermission}</option><option value="deny">{c.denyPermission}</option></select></label>;
-                }}
-              />
-              <Input label={c.customOverrides} hint={c.customOverridesHint} value={customOverrideLines} textarea onChange={updateCustomPermissionOverrides} />
-            </> : <p className="muted">{c.noAuthorizationUsers}</p>}
-          </div>
-          <div className="application-role-editor-actions">
-            <span className="module-save-feedback" role="status">{authorizationFeedback}</span>
-            {canManage && <button type="button" className="primary-action" onClick={() => void saveAuthorizationBindings()} disabled={authorizationSaving || authorizationLoading}>{authorizationSaving ? c.saving : c.saveBindings}<ArrowRight size={15} /></button>}
-          </div>
-          <div className="module-divider" />
-          <div className="authorization-subsection">
-            <div className="subsection-heading"><div><strong>{c.authorizationPreview}</strong><p className="muted">{c.authorizationPreviewHint}</p></div><button type="button" className="secondary-button" onClick={() => void runAuthorizationPreview()} disabled={!selectedAuthorizationUserId || authorizationLoading}><Eye size={14} />{authorizationLoading ? c.saving : c.runPreview}</button></div>
-            {authorizationPreview ? <div className="authorization-preview" role="status">
-              <strong className={authorizationPreview.decision.allowed ? "preview-allowed" : "preview-denied"}>{authorizationPreview.decision.allowed ? c.previewAllowed : c.previewDenied}</strong>
-              <div className="authorization-preview-grid"><div><span>{c.previewRoles}</span><strong>{authorizationPreview.entitlements?.roles.join(" · ") || "-"}</strong></div><div><span>{c.previewPermissions}</span><strong>{authorizationPreview.entitlements?.permissions.join(" · ") || "-"}</strong></div><div><span>{c.previewGroups}</span><strong>{authorizationPreview.entitlements?.groups.join(" · ") || "-"}</strong></div><div><span>{c.previewPolicyVersion}</span><code>{authorizationPreview.decision.policy_version}</code></div></div>
-            </div> : <p className="muted">{c.previewEmpty}</p>}
-          </div>
-          <div className="module-divider" />
-          <p className="module-note">{c.loginBoundaryNote}</p>
-          <Input label={c.claims} hint={c.claimsHint} value={claims.join("\n")} textarea onChange={(value) => updateDraft("authorization", { ...config, claims: value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) })} />
-        </div>}
-        <ModuleSave saving={savingKey === "authorization"} feedback={feedback} copy={c} onSave={() => void saveModule("authorization")} />
-      </div>
-    );
-  }
-
-  if (applications.length === 0) {
-    return (
-      <section className="application-workspace empty-application-workspace">
-        <div className="application-empty-illustration"><Globe2 size={30} /></div>
-        <h3>{c.noWebsites}</h3>
-        <p>{c.noWebsitesHint}</p>
-        {canManage && <button type="button" onClick={onCreateApplication}><Plus size={15} />{c.createWebsite}</button>}
-      </section>
-    );
-  }
-
-  const protocolConfig = selected ? record(draftFor("protocols")) : {};
-  const websiteUrl = stringValue(protocolConfig.website_url);
+  const protocolConfig = selected
+    ? protocolReadModel?.applicationId === selected.id
+      ? protocolReadModel.config
+      : applicationProtocolsConfig(selected)
+    : {};
   const enabledProtocolCount = selected
     ? ["oauth2_oidc", "saml2", "cas", "jwt"].filter((key) => booleanValue(record(protocolConfig[key]).enabled)).length
     : 0;
   const enabledIdentityCount = selected ? stringList(record(draftFor("login_adapters")).provider_ids).length : 0;
-  const enabledSyncCount = selected ? stringList(record(draftFor("directory_sync")).ldap_provider_ids).length + (booleanValue(record(draftFor("directory_sync")).scim_enabled) ? 1 : 0) : 0;
+  const directoryConfig = selected
+    ? directoryReadModel?.applicationId === selected.id
+      ? directoryReadModel.config
+      : applicationDirectorySyncConfig(selected)
+    : {};
+  const enabledSyncCount = selected
+    ? stringList(directoryConfig.ldap_provider_ids).length
+      + (booleanValue(directoryConfig.scim_enabled) ? 1 : 0)
+    : 0;
+  const readModel: ApplicationBasicsReadModel = {
+    applications,
+    selected,
+    section,
+    // Read-only projection. The App basics editor is the sole writer of this
+    // protocol config field; module editors never update website_url.
+    websiteUrl: stringValue(protocolConfig.website_url),
+    enabledProtocolCount,
+    enabledIdentityCount,
+    enabledSyncCount,
+    identitySourceCount: providers.filter((provider) => provider.is_active).length + ldapProviders.filter((provider) => provider.is_active).length,
+    authorizationSummary: booleanValue(record(selected ? moduleConfig(selected, "authorization") : {}).inherit_enterprise_roles, true) ? c.inheritEnterprise : c.notConfigured,
+    moduleEnabled: {
+      protocols: selected ? moduleEnabled(selected, "protocols") : false,
+      login_adapters: selected ? moduleEnabled(selected, "login_adapters") : false,
+      directory_sync: selected ? moduleEnabled(selected, "directory_sync") : false,
+      authorization: selected ? moduleEnabled(selected, "authorization") : false
+    },
+    billingEnabled,
+    iapRuleCount
+  };
+  const commands: ApplicationBasicsCommands = {
+    createApplication: onCreateApplication,
+    editApplication: onEditApplication,
+    deleteApplication: onDeleteApplication,
+    selectApplication,
+    openSection
+  };
   return (
-    <section className="application-workspace">
-      <div className="application-workspace-heading">
-        <div>
-          <span className="eyebrow"><Globe2 size={14} />{c.websites}</span>
-          <h3>{c.applications}</h3>
-          <p>{c.applicationIntro}</p>
-        </div>
-        {canManage && <button type="button" className="primary-action" onClick={onCreateApplication}><Plus size={15} />{c.createWebsite}</button>}
-      </div>
-      <div className="application-stat-strip">
-        <div><span>{c.websites}</span><strong>{applications.length}</strong></div>
-                <div><span>{c.protocols}</span><strong>{applications.reduce((total, item) => total + (item.client_bindings.length > 0 ? 1 : 0) + (item.modules ?? []).filter((module) => module.module_key === "protocols" && module.is_enabled).length, 0)}</strong></div>
-        <div><span>{c.identitySources}</span><strong>{providers.filter((provider) => provider.is_active).length + ldapProviders.filter((provider) => provider.is_active).length}</strong></div>
-      </div>
-      <div className="application-workspace-layout">
-        <aside className="application-picker" aria-label={c.selectWebsite}>
-          <div className="application-picker-heading"><span>{c.selectWebsite}</span><strong>{applications.length}</strong></div>
-          <label className="application-mobile-picker">
-            <span className="sr-only">{c.selectWebsite}</span>
-            <select value={selected?.id ?? ""} onChange={(event) => selectApplication(event.target.value)}>
-              {applications.map((application) => <option value={application.id} key={application.id}>{application.name} · {application.slug}</option>)}
-            </select>
-          </label>
-          <div className="application-picker-list">
-            {applications.map((application) => (
-              <button type="button" key={application.id} className={application.id === selected?.id ? "selected" : ""} onClick={() => selectApplication(application.id)}>
-                <span className="application-avatar">{Array.from(application.name)[0]?.toUpperCase() ?? "W"}</span>
-                <span className="application-picker-copy"><strong>{application.name}</strong><small>{application.slug}</small><em><span className="status-dot" aria-hidden="true" />{application.is_active ? c.active : c.disabled}</em></span>
-                <ChevronRight size={16} />
-              </button>
-            ))}
-          </div>
-        </aside>
-        {selected && (
-          <div className="application-detail">
-            <div className="application-detail-hero">
-              <div className="application-hero-identity"><span className="application-hero-avatar"><Globe2 size={25} /></span><div><div className="application-breadcrumb"><span>{c.websites}</span><ChevronRight size={13} /><span>{selected.slug}</span></div><h4>{selected.name}</h4><p>{selected.description || c.accessBundleHint}</p>{websiteUrl && <a className="application-website-link" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={12} />{websiteUrl}</a>}</div></div>
-              <div className="application-hero-actions">{canManage && <button type="button" className="icon-button" onClick={() => onEditApplication(selected)} title={c.edit} aria-label={c.edit}><Pencil size={16} /></button>}</div>
-            </div>
-            <nav className="application-detail-tabs" aria-label={c.accessBundle}>
-              {(["overview", ...MODULE_KEYS, "billing"] as const).map((item) => {
-                const label = item === "overview" ? c.overview : item === "protocols" ? c.protocols : item === "login_adapters" ? c.identity : item === "directory_sync" ? c.directory : item === "authorization" ? c.permissions : c.billing;
-                const enabled = item === "billing"
-                  ? billingSettings?.accept_signet_balance === true
-                  : item === "overview"
-                    ? false
-                    : moduleEnabled(selected, item);
-                return <button type="button" className={section === item ? "active" : ""} key={item} onClick={() => openSection(item)} aria-current={section === item ? "page" : undefined}>{item === "billing" ? <Coins size={16} aria-hidden="true" /> : <ModuleTabIcon item={item} />}<span>{label}</span>{item !== "overview" && <span className={`tab-status ${enabled ? "on" : ""}`} aria-label={enabled ? c.active : c.disabled}>{enabled ? c.active : c.disabled}</span>}</button>;
-              })}
-            </nav>
-            {section === "overview" && (
-              <div className="application-overview-panel">
-                <div className="application-module-grid">
-                  <ModuleSummary keyName="protocols" title={c.protocols} icon={<Code2 size={18} />} enabled={moduleEnabled(selected, "protocols")} summary={`${enabledProtocolCount} ${c.protocolCount}`} onClick={() => openSection("protocols")} />
-                  <ModuleSummary keyName="login_adapters" title={c.identity} icon={<KeyRound size={18} />} enabled={moduleEnabled(selected, "login_adapters")} summary={`${enabledIdentityCount} ${c.sourcesSelected}`} onClick={() => openSection("login_adapters")} />
-                  <ModuleSummary keyName="directory_sync" title={c.directory} icon={<Database size={18} />} enabled={moduleEnabled(selected, "directory_sync")} summary={`${enabledSyncCount} ${c.syncSources}`} onClick={() => openSection("directory_sync")} />
-                  <ModuleSummary keyName="authorization" title={c.permissions} icon={<ShieldCheck size={18} />} enabled={moduleEnabled(selected, "authorization")} summary={booleanValue(record(draftFor("authorization")).inherit_enterprise_roles, true) ? c.inheritEnterprise : c.notConfigured} onClick={() => openSection("authorization")} />
-                </div>
-                <div className="application-next-step"><div className="next-step-icon"><SlidersHorizontal size={18} /></div><div><strong>{c.setupNext}</strong><p>{c.setupNextHint}</p></div><button type="button" onClick={() => openSection("protocols")}><span>{c.configure}</span><ArrowRight size={15} /></button></div>
-              </div>
-            )}
-            {section === "protocols" && renderProtocolEditor()}
+    <ApplicationBasics
+      readModel={readModel}
+      commands={commands}
+      copy={c}
+      canManage={canManage}
+    >
+            {section === "protocols" && selected && <ApplicationProtocolsModule
+              key={selected.id}
+              application={selected}
+              canManage={canManage}
+              locale={locale}
+              copy={c}
+              requestGuard={requestGuard}
+              dirtyNavigation={dirtyNavigation}
+              onDirtyChange={syncWorkspaceDirtySource}
+              onReadModelChange={updateProtocolReadModel}
+              onApplicationModuleChanged={onApplicationModuleChanged}
+              onApplicationOidcClientsChanged={onApplicationOidcClientsChanged}
+              onRequestConfirmation={onRequestConfirmation}
+            />}
             {section === "login_adapters" && renderIdentityEditor()}
-            {section === "directory_sync" && renderDirectoryEditor()}
-            {section === "authorization" && renderAuthorizationEditor()}
-            {section === "billing" && renderBillingEditor()}
-            {canManage && <div className="application-danger-zone"><button type="button" className="text-danger-button" onClick={() => onDeleteApplication(selected.id)}><Trash2 size={14} />{c.delete}</button></div>}
-          </div>
-        )}
-      </div>
-    </section>
+            {section === "directory_sync" && selected && <ApplicationDirectorySyncModule
+              key={selected.id}
+              application={selected}
+              ldapProviders={ldapProviders}
+              locale={locale}
+              canManage={canManage}
+              copy={c}
+              requestGuard={requestGuard}
+              dirtyNavigation={dirtyNavigation}
+              onDirtyChange={syncWorkspaceDirtySource}
+              onReadModelChange={updateDirectoryReadModel}
+              onApplicationModuleChanged={onApplicationModuleChanged}
+              onRequestConfirmation={onRequestConfirmation}
+            />}
+            {section === "authorization" && selected && <ApplicationAuthorizationModule
+              key={selected.id}
+              application={selected}
+              authorizationConfig={moduleConfig(selected, "authorization")}
+              canManage={canManage}
+              copy={c}
+              requestGuard={requestGuard}
+              dirtyNavigation={dirtyNavigation}
+              onApplicationModuleChanged={onApplicationModuleChanged}
+              hasUnsavedChanges={hasUnsavedDrafts}
+              onDiscardChanges={resetWorkspaceDrafts}
+              onRequestConfirmation={onRequestConfirmation}
+            />}
+            {section === "iap" && selected && <IapModule
+              applicationId={selected.id}
+              organizationId={selected.organization_id}
+              organizationOptions={organizationOptions}
+              canManage={canManage}
+              copy={c}
+              requestGuard={requestGuard}
+              onDirtyChange={setIapRuleDirty}
+              onRulesCountChange={setIapRuleCount}
+              onRequestConfirmation={onRequestConfirmation}
+            />}
+            {section === "billing" && selected && <BillingModule
+              applicationId={selected.id}
+              canManage={canManage}
+              copy={c}
+              requestGuard={requestGuard}
+              onDirtyChange={setBillingDirty}
+              onEnabledChange={setBillingEnabled}
+            />}
+    </ApplicationBasics>
   );
-}
-
-function ModuleHeader({ icon, title, description }: { icon: React.ReactNode; title: string; description: string }) {
-  return <div className="application-module-header"><span className="module-heading-icon">{icon}</span><div><h5>{title}</h5><p>{description}</p></div></div>;
-}
-
-function ModuleTabIcon({ item }: { item: "overview" | ApplicationModuleKey }) {
-  if (item === "overview") return <Settings2 size={16} />;
-  return <ModuleIcon keyName={item} />;
-}
-
-function ModuleSummary({ keyName, title, icon, enabled, summary, onClick }: { keyName: ApplicationModuleKey; title: string; icon: React.ReactNode; enabled: boolean; summary: string; onClick: () => void }) {
-  return <button type="button" className="application-module-summary" onClick={onClick}><span className={`module-summary-icon module-${keyName}`}>{icon}</span><span className="module-summary-copy"><strong>{title}</strong><small>{summary}</small></span><span className={`module-summary-state ${enabled ? "on" : ""}`}>{enabled ? <CheckCircle2 size={15} /> : <Circle size={15} />}</span><ChevronRight size={15} /></button>;
-}
-
-function ProtocolCard({ icon, title, description, enabled, onToggle, tone, children }: { icon: React.ReactNode; title: string; description: string; enabled: boolean; onToggle: (value: boolean) => void; tone?: string; children: React.ReactNode }) {
-  return <article className={`protocol-card${tone ? ` protocol-${tone}` : ""}${enabled ? " enabled" : ""}`}><div className="protocol-card-heading"><span className="protocol-icon">{icon}</span><div><h6>{title}</h6><p>{description}</p></div><Toggle compact checked={enabled} onChange={onToggle} /></div><div className="protocol-card-body">{children}</div></article>;
-}
-
-function ModuleSave({ saving, feedback, copy, onSave }: { saving: boolean; feedback: string; copy: Copy; onSave: () => void }) {
-  return <div className="application-module-actions"><span className={feedback === copy.saveFailed ? "module-save-error" : "module-save-feedback"}>{feedback}</span><button type="button" className="primary-action" onClick={onSave} disabled={saving}>{saving ? copy.saving : copy.save}<ArrowRight size={15} /></button></div>;
-}
-
-function Toggle({ label, hint, checked, onChange, compact = false, disabled = false }: { label?: string; hint?: string; checked: boolean; onChange: (value: boolean) => void; compact?: boolean; disabled?: boolean }) {
-  return <label className={`application-toggle${compact ? " compact" : ""}`}><span className="toggle-copy">{label && <strong>{label}</strong>}{hint && <small>{hint}</small>}</span><input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span></label>;
-}
-
-function Input({ label, hint, value, onChange, type = "text", textarea = false, disabled = false }: { label: string; hint?: string; value: string; onChange: (value: string) => void; type?: string; textarea?: boolean; disabled?: boolean }) {
-  return <label className="application-input"><span>{label}</span>{textarea ? <textarea value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} /> : <input type={type} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />}{hint && <small>{hint}</small>}</label>;
-}
-
-function TicketIcon() {
-  return <span className="ticket-icon" aria-hidden="true">✦</span>;
 }

@@ -43,6 +43,26 @@ export type User = {
   permissions?: string[];
 };
 
+/**
+ * Canonical page envelope for list endpoints consumed by the management UI.
+ * `page` is one-based and `total` is the count after all server-side filters.
+ */
+export type PaginatedEnvelope<T> = {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+};
+
+export type UserDirectoryPage = PaginatedEnvelope<User>;
+
+/** Bounded keyset page used by the deep user-directory route. */
+export type UserDirectoryCursorPage = {
+  items: User[];
+  page_size: number;
+  next_cursor: string | null;
+};
+
 export type LoginEvent = {
   id: string;
   user_id: string;
@@ -82,6 +102,9 @@ export type AuditWebhook = {
   created_at: number;
   updated_at: number;
 };
+
+/** Minimal account identity used by administrative selectors. */
+export type UserOption = Pick<User, "id" | "email" | "username" | "display_name">;
 
 export type Role = {
   id: string;
@@ -246,7 +269,7 @@ export type ApplicationBillingSettings = {
 };
 
 export type ApplicationModuleKey = "protocols" | "login_adapters" | "directory_sync" | "authorization";
-export type ApplicationSection = "overview" | ApplicationModuleKey | "billing";
+export type ApplicationSection = "overview" | ApplicationModuleKey | "billing" | "iap";
 
 export type ApplicationModule = {
   module_key: ApplicationModuleKey;
@@ -289,18 +312,6 @@ export type ApplicationProfileRole = {
   description: string | null;
   permissions: string[];
   source: string;
-  is_default: boolean;
-  is_active: boolean;
-  created_at: number;
-  updated_at: number;
-};
-
-export type ApplicationRole = {
-  id: string;
-  application_id: string;
-  name: string;
-  description: string | null;
-  permissions: string[];
   is_default: boolean;
   is_active: boolean;
   created_at: number;
@@ -591,6 +602,7 @@ export type Client = {
   redirect_uris: string[];
   post_logout_redirect_uris: string[];
   scopes: string[];
+  audience: string;
   grant_types: string[];
   response_types: string[];
   token_endpoint_auth_method: string;
@@ -646,6 +658,7 @@ export type ClientClaimMapper = {
 
 export type IapApplication = {
   id: string;
+  application_id: string | null;
   slug: string;
   name: string;
   description: string | null;
@@ -657,18 +670,6 @@ export type IapApplication = {
   is_active: boolean;
   created_at: number;
   updated_at: number;
-};
-
-export type ClientClaimMapperForm = {
-  claim_name: string;
-  source: string;
-  source_value: string;
-  value_type: string;
-  include_in_id_token: boolean;
-  include_in_access_token: boolean;
-  include_in_userinfo: boolean;
-  is_active: boolean;
-  sort_order: number;
 };
 
 export type Invitation = {
@@ -861,8 +862,42 @@ export type RuntimeSettings = {
   updated_at: number;
 };
 
-export type Tab = "account" | "overview" | "users" | "applications" | "clients" | "iap" | "organizations" | "invitations" | "billing" | "registration" | "providers" | "portal" | "security" | "settings";
+export type Tab = "account" | "overview" | "users" | "applications" | "organizations" | "invitations" | "billing" | "registration" | "providers" | "portal" | "security" | "settings";
 export type UserFilter = "live" | "active" | "disabled" | "archived" | "authorization_code" | "all";
+export type UserDirectoryLinkedIdentity = "linked" | "unlinked";
+export type UserDirectoryRoleFilter = "admin" | "user";
+export type UserDirectoryLoginRegion = "domestic" | "overseas";
+
+/** Fields that the paginated user-directory endpoint may evaluate server-side. */
+export type UserDirectoryServerFilters = {
+  status?: UserFilter;
+  search?: string;
+  organization_id?: string;
+  linked_identity?: UserDirectoryLinkedIdentity;
+  email?: string;
+  phone?: string;
+  role?: UserDirectoryRoleFilter;
+  registration_from?: string;
+  registration_to?: string;
+  last_login_from?: string;
+  last_login_to?: string;
+  login_region?: UserDirectoryLoginRegion;
+};
+
+/**
+ * Stable, transport-shaped query state for the user directory.
+ * Optional filters are omitted from the URL when empty; page and page_size
+ * remain explicit so changing either value always creates a distinct request.
+ */
+export type UserDirectoryQuery = {
+  /** One-based page number. */
+  page: number;
+  /** Requested number of rows per page. */
+  page_size: number;
+  /** Opaque keyset position; omitted for the first page. */
+  cursor?: string;
+} & UserDirectoryServerFilters;
+
 export type Theme = "light" | "dark";
 
 export type PendingConfirmation = {

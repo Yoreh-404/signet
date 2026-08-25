@@ -1,6 +1,6 @@
 use crate::{
-    AppState, Settings, admin, application_discovery, billing, browser_accounts, cas_sso, csrf,
-    frontend, health, iap, jwt_sso, oidc, passkeys, registration, saml_sso, scim,
+    AppState, Settings, admin, billing, browser_accounts, cas_sso, csrf, frontend, health, iap,
+    jwt_sso, mutations, oidc, passkeys, registration, saml_sso, scim,
 };
 use anyhow::Context;
 use axum::{
@@ -37,6 +37,13 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
         .merge(saml_sso::routes())
         .merge(cas_sso::routes())
         .fallback(frontend::serve)
+        // CSRF must remain the outer layer so a duplicate idempotency key
+        // cannot turn into a CSRF bypass.  The mutation protocol only sees a
+        // request after browser-write protection has succeeded.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            mutations::protocol,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf::protect_browser_writes,
@@ -68,7 +75,6 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
 }
 
 pub async fn serve(state: AppState, settings: &Settings) -> anyhow::Result<()> {
-    application_discovery::spawn_periodic_sync(state.clone());
     let app = router(state, settings)?;
     let addr = settings.socket_addr()?;
     let listener = TcpListener::bind(addr)

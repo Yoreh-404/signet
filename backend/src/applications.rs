@@ -8,8 +8,8 @@ use crate::{
     AppState,
     auth_domain::ClientBinding,
     db::{
-        ApplicationClientBindingRecord, ApplicationModuleRecord, ApplicationRecord, ClientRecord,
-        UserRecord,
+        ApplicationClientBindingRecord, ApplicationModuleRecord, ApplicationRecord,
+        AuthorizationPolicySnapshot, ClientRecord, UserRecord,
     },
     error::{AppError, AppResult},
     organizations::normalize_slug,
@@ -91,12 +91,21 @@ pub fn normalize_module_config(module_key: &str, value: Value) -> AppResult<Valu
         }
         "authorization" => {
             validate_bool_field(object, "inherit_enterprise_roles")?;
-            validate_string_field(object, "default_role")?;
             validate_string_list_field(object, "claims")?;
             validate_string_list_field(object, "permissions")?;
             validate_string_list_field(object, "denied_permissions")?;
-            validate_role_mappings(object)?;
-            validate_custom_roles(object)?;
+            for field in [
+                "default_role",
+                "custom_roles",
+                "group_mappings",
+                "organization_role_mappings",
+            ] {
+                if object.contains_key(field) {
+                    return Err(AppError::BadRequest(format!(
+                        "application authorization roles must be managed through profiles; remove {field} from the module config"
+                    )));
+                }
+            }
         }
         _ => {
             return Err(AppError::BadRequest(format!(
@@ -273,13 +282,13 @@ fn validate_directory_sync_config(object: &Map<String, Value>) -> AppResult<()> 
         }
     }
 
-    if let Some(action) = object.get("deprovision_action").and_then(Value::as_str) {
-        if action.trim() != "remove_membership" {
-            return Err(AppError::BadRequest(
-                "application directory sync currently supports only remove_membership deprovisioning"
-                    .to_string(),
-            ));
-        }
+    if let Some(action) = object.get("deprovision_action").and_then(Value::as_str)
+        && action.trim() != "remove_membership"
+    {
+        return Err(AppError::BadRequest(
+            "application directory sync currently supports only remove_membership deprovisioning"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -446,12 +455,12 @@ fn validate_saml_protocol_config(object: &Map<String, Value>) -> AppResult<()> {
     ] {
         validate_bool_field(saml, field)?;
     }
-    if let Some(index) = saml.get("acs_index") {
-        if index.as_u64().is_none_or(|value| value > u16::MAX as u64) {
-            return Err(AppError::BadRequest(
-                "application SAML acs_index must be an unsigned 16-bit integer".to_string(),
-            ));
-        }
+    if let Some(index) = saml.get("acs_index")
+        && index.as_u64().is_none_or(|value| value > u16::MAX as u64)
+    {
+        return Err(AppError::BadRequest(
+            "application SAML acs_index must be an unsigned 16-bit integer".to_string(),
+        ));
     }
     if let Some(binding) = saml.get("response_binding").and_then(Value::as_str)
         && !matches!(binding.trim().to_ascii_lowercase().as_str(), "post")
@@ -489,76 +498,15 @@ fn validate_saml_protocol_config(object: &Map<String, Value>) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_custom_roles(object: &Map<String, Value>) -> AppResult<()> {
-    let Some(value) = object.get("custom_roles") else {
-        return Ok(());
-    };
-    let Some(roles) = value.as_array() else {
-        return Err(AppError::BadRequest(
-            "application module field custom_roles must be a list".to_string(),
-        ));
-    };
-    for role in roles {
-        let role = role.as_object().ok_or_else(|| {
-            AppError::BadRequest(
-                "application module custom_roles entries must be objects".to_string(),
-            )
-        })?;
-        validate_string_field(role, "name")?;
-        validate_string_field(role, "description")?;
-        validate_string_list_field(role, "permissions")?;
-    }
-    Ok(())
-}
-
-fn validate_role_mappings(object: &Map<String, Value>) -> AppResult<()> {
-    if let Some(value) = object.get("organization_role_mappings") {
-        let mappings = value.as_object().ok_or_else(|| {
-            AppError::BadRequest(
-                "application authorization organization_role_mappings must be an object"
-                    .to_string(),
-            )
-        })?;
-        if mappings
-            .iter()
-            .any(|(key, value)| key.trim().is_empty() || value.as_str().is_none())
-        {
-            return Err(AppError::BadRequest(
-                "application authorization organization_role_mappings must map strings to strings"
-                    .to_string(),
-            ));
-        }
-    }
-    if let Some(value) = object.get("group_mappings") {
-        let mappings = value.as_array().ok_or_else(|| {
-            AppError::BadRequest(
-                "application authorization group_mappings must be a list".to_string(),
-            )
-        })?;
-        for mapping in mappings {
-            let mapping = mapping.as_object().ok_or_else(|| {
-                AppError::BadRequest(
-                    "application authorization group_mappings entries must be objects".to_string(),
-                )
-            })?;
-            validate_string_field(mapping, "group")?;
-            validate_string_field(mapping, "role")?;
-        }
-    }
-    Ok(())
-}
-
 async fn application_module(
     state: &AppState,
     application_id: &str,
     module_key: &str,
 ) -> AppResult<Option<ApplicationModuleRecord>> {
-    Ok(state
+    state
         .db
-        .list_application_modules(application_id)
-        .await?
-        .into_iter()
-        .find(|module| module.module_key == module_key))
+        .find_application_module(application_id, module_key)
+        .await
 }
 
 /// Returns the validated configuration of an enabled application module.
@@ -586,6 +534,106 @@ pub async fn enabled_module_config(
     })?))
 }
 
+/// Immutable request boundary for an application-owned protocol connection.
+/// The control-plane binding and application row are resolved together before
+/// any data-plane authorization decision is made; callers must not reuse this
+/// value across requests.
+#[derive(Debug, Clone)]
+pub struct ApplicationBoundarySnapshot {
+    pub application: ApplicationRecord,
+    pub binding: ApplicationClientBindingRecord,
+}
+
+/// Transactionally materialized application/client runtime boundary.
+/// `policy` is intentionally retained so a user-bearing authorization path can
+/// hand the exact database snapshot forward without reopening the pool.  When
+/// loaded without a user it is a runtime-only projection; callers must not use
+/// it as a user authorization decision.
+#[derive(Debug, Clone)]
+pub struct ApplicationRuntimeSnapshot {
+    pub policy: AuthorizationPolicySnapshot,
+    pub application: ApplicationRecord,
+    pub binding: ApplicationClientBindingRecord,
+}
+
+impl ApplicationRuntimeSnapshot {
+    pub async fn load(
+        state: &AppState,
+        client: &ClientRecord,
+        required_protocol: Option<&str>,
+    ) -> AppResult<Self> {
+        let policy = state
+            .db
+            .load_client_runtime_snapshot(&client.id, required_protocol)
+            .await?;
+        let runtime_active = if required_protocol.is_some() {
+            policy.is_interactive_client_runtime_active()
+        } else {
+            policy.is_application_client_runtime_active()
+        };
+        if !runtime_active
+            || policy.client_id.as_deref() != Some(client.id.as_str())
+            || policy.client_organization_id.as_deref() != client.organization_id.as_deref()
+        {
+            return Err(AppError::Forbidden);
+        }
+        let application = policy.application.clone().ok_or(AppError::Forbidden)?;
+        let binding = policy.binding.clone().ok_or(AppError::Forbidden)?;
+        Ok(Self {
+            policy,
+            application,
+            binding,
+        })
+    }
+
+    pub fn require_interactive(&self) -> AppResult<()> {
+        if self.policy.is_interactive_client_runtime_active() {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+
+    pub fn require_service(&self) -> AppResult<()> {
+        if self.policy.is_application_client_runtime_active() {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+}
+
+pub async fn resolve_application_boundary(
+    state: &AppState,
+    client: &ClientRecord,
+) -> AppResult<ApplicationBoundarySnapshot> {
+    let runtime = ApplicationRuntimeSnapshot::load(state, client, None).await?;
+    Ok(ApplicationBoundarySnapshot {
+        application: runtime.application,
+        binding: runtime.binding,
+    })
+}
+
+/// Control-plane deletion preflight.  The actual destructive operation still
+/// belongs to `Db::delete_application`; the database layer must accept this
+/// expected organization/application revision in one transaction before a
+/// handler can claim deletion is fully TOCTOU-safe.
+pub async fn application_deletion_boundary(
+    state: &AppState,
+    application_id: &str,
+    expected_organization_id: &str,
+) -> AppResult<ApplicationRecord> {
+    let application = state
+        .db
+        .find_application_by_id(application_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if application.organization_id != expected_organization_id {
+        return Err(AppError::Forbidden);
+    }
+    Ok(application)
+}
+
 /// Applies the live lifecycle gate shared by every application-owned runtime
 /// adapter. Configuration reads are intentionally not enough: a disabled
 /// enterprise must immediately disable all of its websites, even when a
@@ -606,21 +654,16 @@ pub async fn ensure_application_runtime_active(
         return Err(AppError::Forbidden);
     }
     if let Some(discovery) = state.db.find_application_discovery(&application.id).await?
-        && discovery.management_mode == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+        && !crate::application_discovery::website_discovery_runtime_active(
+            &discovery.management_mode,
+            discovery.operator_disabled != 0,
+            discovery.last_verified_revision,
+            discovery.last_verified_expires_at,
+            discovery.snapshot_json.is_some(),
+            crate::util::now_ts(),
+        )
     {
-        // A website-managed application is fail-closed until Signet has one
-        // complete, verified snapshot.  Once a snapshot exists, a later
-        // fetch/signature error does not interrupt runtime authorization; the
-        // snapshot is local and remains authoritative until its signed expiry.
-        if discovery.operator_disabled != 0
-            || discovery.last_verified_revision.is_none()
-            || discovery.snapshot_json.is_none()
-            || discovery
-                .last_verified_expires_at
-                .is_some_and(|expires_at| expires_at <= crate::util::now_ts())
-        {
-            return Err(AppError::Forbidden);
-        }
+        return Err(AppError::Forbidden);
     }
     Ok(())
 }
@@ -659,27 +702,42 @@ pub async fn validate_module_bindings(
 ) -> AppResult<()> {
     match module_key {
         "protocols" => {
-            for (protocol, protocol_value) in config {
-                let client_ids = protocol_value
-                    .as_object()
-                    .and_then(|protocol| protocol.get("client_ids"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str);
-                for client_id in client_ids {
+            let client_ids = config
+                .values()
+                .filter_map(Value::as_object)
+                .filter_map(|protocol| protocol.get("client_ids"))
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>();
+            if !client_ids.is_empty() {
+                let bound_clients = state.db.list_application_clients(&application.id).await?;
+                let mut bound_ids = BTreeSet::new();
+                for client in &bound_clients {
+                    if client_ids.contains(&client.id) {
+                        if client.organization_id.as_deref()
+                            != Some(application.organization_id.as_str())
+                        {
+                            return Err(AppError::Forbidden);
+                        }
+                        bound_ids.insert(client.id.clone());
+                    }
+                }
+                for client_id in client_ids.difference(&bound_ids) {
                     let client = state
                         .db
                         .find_client_by_id(client_id)
                         .await?
                         .ok_or_else(|| {
-                            AppError::BadRequest(format!("{protocol} client does not exist"))
+                            AppError::BadRequest("protocol client does not exist".to_string())
                         })?;
                     if client.organization_id.as_deref()
                         != Some(application.organization_id.as_str())
                     {
                         return Err(AppError::Forbidden);
                     }
+                    return Err(AppError::Forbidden);
                 }
             }
         }
@@ -993,27 +1051,9 @@ pub async fn resolve_application_for_client(
     state: &AppState,
     client: &ClientRecord,
 ) -> AppResult<(ApplicationRecord, ClientBinding)> {
-    let application = state
-        .db
-        .find_application_for_client(&client.id)
-        .await?
-        .ok_or_else(|| AppError::Forbidden)?;
-    let binding = state
-        .db
-        .find_application_client_binding(&client.id)
-        .await?
-        .map(client_binding_from_record)
-        .unwrap_or_else(|| ClientBinding {
-            application_id: application.id.clone(),
-            client_db_id: client.id.clone(),
-            protocol: "oidc".to_string(),
-            authorization_profile_id: "default".to_string(),
-            auth_domain_id: format!("auth-domain:{}", application.id),
-            is_active: true,
-        });
-    if binding.application_id != application.id || !binding.is_active {
-        return Err(AppError::Forbidden);
-    }
+    let boundary = resolve_application_boundary(state, client).await?;
+    let application = boundary.application;
+    let binding = client_binding_from_record(boundary.binding);
     Ok((application, binding))
 }
 
@@ -1033,39 +1073,56 @@ pub async fn authorize_user_for_application(
     client: &ClientRecord,
     user: &UserRecord,
 ) -> AppResult<(ApplicationRecord, ClientBinding)> {
-    let (application, binding) = resolve_application_for_client(state, client).await?;
-    ensure_application_runtime_active(state, &application).await?;
-    if !application_protocol_enabled(state, &application.id, &binding.protocol).await? {
-        return Err(AppError::Forbidden);
-    }
-    if !state
+    let snapshot = state
         .db
-        .user_can_access_application(&application, &user.id)
-        .await?
+        .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")
+        .await?;
+    if !snapshot.is_authorizable
+        || snapshot.client_id.as_deref() != Some(client.id.as_str())
+        || snapshot.user_id != user.id
     {
         return Err(AppError::Forbidden);
     }
-    Ok((application, binding))
+    let application = snapshot.application.ok_or(AppError::Forbidden)?;
+    let binding = snapshot.binding.ok_or(AppError::Forbidden)?;
+    Ok((application, client_binding_from_record(binding)))
 }
 
 /// Enforces the live website boundary for grants that do not have a user
-/// subject (for example client credentials). Clients that are not attached to
-/// an Application remain platform-level OAuth clients and are deliberately
-/// left alone; an attached client must stop working as soon as its website,
-/// owning enterprise, or OAuth/OIDC module is disabled.
+/// subject (for example client credentials). Every active client is expected
+/// to have an explicit application aggregate; a missing binding is data
+/// corruption and fails closed rather than becoming an ungoverned legacy
+/// client.
 pub async fn authorize_application_client(
     state: &AppState,
     client: &ClientRecord,
     protocol: &str,
-) -> AppResult<Option<ApplicationRecord>> {
-    let Some(application) = state.db.find_application_for_client(&client.id).await? else {
-        return Ok(None);
-    };
-    ensure_application_runtime_active(state, &application).await?;
-    if !application_protocol_enabled(state, &application.id, protocol).await? {
+) -> AppResult<ApplicationRecord> {
+    let runtime = ApplicationRuntimeSnapshot::load(state, client, Some(protocol)).await?;
+    runtime.require_interactive()?;
+    Ok(runtime.application)
+}
+
+/// Authorizes an application-owned machine client for the OAuth
+/// `client_credentials` grant. Service-only applications such as Memory
+/// Atlas can disable interactive OIDC while still issuing narrowly scoped
+/// tokens to explicitly declared service accounts.
+pub async fn authorize_client_for_service_token(
+    state: &AppState,
+    client: &ClientRecord,
+) -> AppResult<ApplicationRecord> {
+    let runtime = ApplicationRuntimeSnapshot::load(state, client, None).await?;
+    runtime.require_service()?;
+    if client.service_account_enabled != 1
+        || !client
+            .grant_types()
+            .map_err(|_| AppError::Forbidden)?
+            .iter()
+            .any(|value| value == "client_credentials")
+    {
         return Err(AppError::Forbidden);
     }
-    Ok(Some(application))
+    Ok(runtime.application)
 }
 
 /// Side-effect-free eligibility probe for account chooser rendering. The
@@ -1076,19 +1133,11 @@ pub async fn user_can_authorize_client(
     client: &ClientRecord,
     user: &UserRecord,
 ) -> AppResult<bool> {
-    let Some(application) = state.db.find_application_for_client(&client.id).await? else {
-        return Ok(false);
-    };
-    if !application_protocol_enabled(state, &application.id, "oauth2_oidc").await? {
-        return Ok(false);
-    }
-    // Application membership and application-local factor reservations are
-    // not part of the login boundary.  The chooser is only a preview of the
-    // same active-account check enforced by authorize_user_for_application.
-    state
+    let snapshot = state
         .db
-        .user_can_access_application(&application, &user.id)
-        .await
+        .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")
+        .await?;
+    Ok(snapshot.is_authorizable)
 }
 
 /// Creates or refreshes the current user's application-local factor locks.
@@ -1123,7 +1172,7 @@ fn verified_identity_factor_digests(
                 user.email.trim().to_ascii_lowercase()
             }
             FACTOR_PHONE if user.phone_verified_at.is_some() => {
-                normalize_phone(user.phone.as_deref().ok_or_else(|| AppError::Forbidden)?)?
+                normalize_phone(user.phone.as_deref().ok_or(AppError::Forbidden)?)?
             }
             FACTOR_EMAIL | FACTOR_PHONE => return Err(AppError::Forbidden),
             _ => {
@@ -1148,9 +1197,7 @@ pub fn normalize_phone(value: &str) -> AppResult<String> {
     let value = value.trim();
     let mut normalized = String::with_capacity(value.len());
     for (index, ch) in value.chars().enumerate() {
-        if ch.is_ascii_digit() {
-            normalized.push(ch);
-        } else if ch == '+' && index == 0 {
+        if ch.is_ascii_digit() || (ch == '+' && index == 0) {
             normalized.push(ch);
         } else if !matches!(ch, ' ' | '-' | '(' | ')' | '.') {
             return Err(AppError::BadRequest("phone is invalid".to_string()));
@@ -1387,8 +1434,16 @@ mod tests {
         client_b_input.client_id = "binding-client-b".to_string();
         client_b_input.client_name = "Binding Client B".to_string();
         client_b_input.organization_id = Some(organization_b.id.clone());
-        let client_a = state.db.insert_client(client_a_input).await.unwrap();
-        let client_b = state.db.insert_client(client_b_input).await.unwrap();
+        let client_a = state
+            .db
+            .insert_client_for_application(&application_a.id, client_a_input)
+            .await
+            .unwrap();
+        let client_b = state
+            .db
+            .insert_client_for_application(&application_b.id, client_b_input)
+            .await
+            .unwrap();
 
         let shared_oidc = state
             .db
@@ -1564,9 +1619,21 @@ mod tests {
 
         // OIDC connections are exclusive to one application, and a failed
         // cross-enterprise move must leave the existing binding untouched.
+        let client_a_profile_id = state
+            .db
+            .find_application_client_binding(&client_a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_profile_id;
         state
             .db
-            .link_client_to_application(&application_a.id, &client_a.id, "oidc", "default")
+            .link_client_to_application(
+                &application_a.id,
+                &client_a.id,
+                "oidc",
+                &client_a_profile_id,
+            )
             .await
             .unwrap();
         assert!(
@@ -1609,6 +1676,263 @@ mod tests {
         )
         .await
         .unwrap();
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn runtime_authorization_snapshot_fails_closed_on_boundary_mismatch() {
+        let mut settings: crate::Settings =
+            toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gpt-sso-runtime-boundary-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        settings.database.kind = crate::config::DatabaseKind::Sqlite;
+        settings.database.url = path.to_string_lossy().into_owned();
+        settings.database.pool_size = 1;
+        settings.database.run_migrations = true;
+        settings.bootstrap.admin.create_on_startup = false;
+        settings.bootstrap.clients.clear();
+        let db = crate::db::Db::connect(&settings).unwrap();
+        db.migrate().await.unwrap();
+        let state = crate::AppState {
+            jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
+            settings,
+            db,
+        };
+
+        let organization_a = state
+            .db
+            .insert_organization(crate::db::NewOrganization {
+                slug: "runtime-boundary-org-a".to_string(),
+                name: "Runtime Boundary Org A".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
+                description: None,
+                allowed_email_domains: Vec::new(),
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let organization_b = state
+            .db
+            .insert_organization(crate::db::NewOrganization {
+                slug: "runtime-boundary-org-b".to_string(),
+                name: "Runtime Boundary Org B".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
+                description: None,
+                allowed_email_domains: Vec::new(),
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let application_input = crate::db::NewApplication {
+            organization_id: organization_a.id.clone(),
+            slug: "runtime-boundary-app".to_string(),
+            name: "Runtime Boundary App".to_string(),
+            description: None,
+            access_mode: ACCESS_ALL_SIGNET_USERS.to_string(),
+            registration_mode: REGISTRATION_DISABLED.to_string(),
+            account_selection_mode: ACCOUNT_SELECTION_OPTIONAL.to_string(),
+            unique_identity_factors: Vec::new(),
+            is_active: true,
+        };
+        let application = state
+            .db
+            .insert_application(application_input.clone())
+            .await
+            .unwrap();
+        let user = state
+            .db
+            .insert_user(crate::db::NewUser {
+                email: "runtime-boundary-user@example.test".to_string(),
+                username: "runtime-boundary-user".to_string(),
+                display_name: None,
+                phone: None,
+                password_hash: "test-hash".to_string(),
+                email_verified_at: None,
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: true,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        let client_input = crate::db::NewClient {
+            client_id: "runtime-boundary-client".to_string(),
+            client_secret_hash: None,
+            client_name: "Runtime Boundary Client".to_string(),
+            logo_uri: String::new(),
+            organization_id: Some(organization_a.id.clone()),
+            redirect_uris: vec!["https://runtime-boundary.example/callback".to_string()],
+            post_logout_redirect_uris: Vec::new(),
+            scopes: vec!["openid".to_string()],
+            audience: String::new(),
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: "none".to_string(),
+            require_pkce: true,
+            require_mfa: false,
+            require_pushed_authorization_requests: false,
+            require_s256_pkce: false,
+            require_confidential_client: false,
+            require_dpop: false,
+            require_account_selection: false,
+            trust_email_verified: false,
+            authorization_details_types: Vec::new(),
+            subject_type: crate::subject::SUBJECT_TYPE_PUBLIC.to_string(),
+            sector_identifier_uri: String::new(),
+            jwks_uri: String::new(),
+            jwks: String::new(),
+            backchannel_logout_uri: String::new(),
+            backchannel_logout_session_required: false,
+            frontchannel_logout_uri: String::new(),
+            frontchannel_logout_session_required: false,
+            service_account_enabled: false,
+            service_account_permissions: Vec::new(),
+            is_active: true,
+        };
+        let client = state
+            .db
+            .insert_client_for_application(&application.id, client_input.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            state
+                .db
+                .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")
+                .await
+                .unwrap()
+                .is_authorizable
+        );
+
+        // The client is still bound to application A, but its live tenant
+        // identity points at organization B. Both runtime and user policy
+        // snapshots must reject this split boundary.
+        let mut foreign_client = client_input.clone();
+        foreign_client.organization_id = Some(organization_b.id.clone());
+        state
+            .db
+            .update_client(&client.id, foreign_client)
+            .await
+            .unwrap();
+        assert!(
+            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+                .await
+                .is_err()
+        );
+        assert!(
+            !state
+                .db
+                .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")
+                .await
+                .unwrap()
+                .is_authorizable
+        );
+        state
+            .db
+            .update_client(&client.id, client_input.clone())
+            .await
+            .unwrap();
+
+        let mut inactive_application = application_input.clone();
+        inactive_application.is_active = false;
+        state
+            .db
+            .update_application(&application.id, inactive_application)
+            .await
+            .unwrap();
+        assert!(
+            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+                .await
+                .is_err()
+        );
+        state
+            .db
+            .update_application(&application.id, application_input.clone())
+            .await
+            .unwrap();
+
+        let organization_a_record = state
+            .db
+            .find_organization_by_id(&organization_a.id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .update_organization(
+                &organization_a.id,
+                crate::db::NewOrganization {
+                    slug: organization_a_record.slug,
+                    name: organization_a_record.name,
+                    kind: organization_a_record.kind,
+                    description: organization_a_record.description,
+                    allowed_email_domains: crate::util::from_json(
+                        &organization_a_record.allowed_email_domains,
+                    )
+                    .unwrap(),
+                    is_active: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+                .await
+                .is_err()
+        );
+
+        state
+            .db
+            .update_organization(
+                &organization_a.id,
+                crate::db::NewOrganization {
+                    slug: "runtime-boundary-org-a".to_string(),
+                    name: "Runtime Boundary Org A".to_string(),
+                    kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
+                    description: None,
+                    allowed_email_domains: Vec::new(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .db
+            .upsert_application_discovery(crate::db::NewApplicationDiscovery {
+                application_id: application.id.clone(),
+                management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.to_string(),
+                website_url: "https://runtime-boundary.example".to_string(),
+                fetch_secret_ciphertext: "ciphertext".to_string(),
+                signing_public_jwks: "{}".to_string(),
+                last_verified_revision: None,
+                last_verified_version: None,
+                last_verified_digest: None,
+                last_verified_expires_at: None,
+                sync_status: crate::application_discovery::SYNC_PENDING.to_string(),
+                last_fetched_at: None,
+                last_success_at: None,
+                last_error: None,
+                snapshot_json: None,
+                operator_disabled: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+                .await
+                .is_err()
+        );
 
         drop(state);
         let _ = std::fs::remove_file(path);

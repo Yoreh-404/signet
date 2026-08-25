@@ -1,4 +1,6 @@
-use sso_backend::{AppState, Settings, application_discovery, db::Db, jwt::JwtManager, server};
+use sso_backend::{
+    AppState, Settings, application_discovery, billing, db::Db, jwt::JwtManager, server, webhooks,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         jwt,
     };
+    let audit_webhook_worker = webhooks::spawn_audit_webhook_worker(state.db.clone());
 
     // A website-managed application stays unavailable until this initial
     // refresh succeeds, but one unavailable website must not prevent Signet
@@ -35,6 +38,14 @@ async fn main() -> anyhow::Result<()> {
     if let Err(error) = application_discovery::sync_all(&state).await {
         tracing::warn!(error = %error, "initial website application discovery sweep failed");
     }
+    let discovery_worker = application_discovery::spawn_periodic_sync(state.clone());
 
-    server::serve(state, &settings).await
+    let billing_worker = billing::spawn_reconcile_worker(state.clone());
+    let result = server::serve(state, &settings).await;
+    discovery_worker.stop().await;
+    if let Some(worker) = billing_worker {
+        worker.stop().await;
+    }
+    audit_webhook_worker.stop().await;
+    result
 }

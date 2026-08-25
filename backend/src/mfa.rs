@@ -130,6 +130,14 @@ pub fn verify_setup_code(secret: &str, code: &str) -> AppResult<bool> {
         .map(|step| step.is_some())
 }
 
+pub fn protect_totp_secret(state: &AppState, secret: &str) -> AppResult<String> {
+    crate::secret_store::SecretStore::from_settings(&state.settings)?.encrypt_totp(secret)
+}
+
+pub fn reveal_totp_secret(state: &AppState, ciphertext: &str) -> AppResult<String> {
+    crate::secret_store::SecretStore::from_settings(&state.settings)?.decrypt_totp(ciphertext)
+}
+
 pub async fn complete_challenge(
     state: &AppState,
     challenge: MfaChallengeRecord,
@@ -144,8 +152,9 @@ pub async fn complete_challenge(
         .find_totp_method(&challenge.user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    let secret = reveal_totp_secret(state, &method.secret)?;
     if let Some(step) = StandardTotpVerifier::default().verify_code(
-        &method.secret,
+        &secret,
         code,
         util::now_ts(),
         method.last_used_step,

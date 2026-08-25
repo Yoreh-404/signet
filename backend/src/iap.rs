@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    access::{Authorizer, Permission},
+    access::Permission,
     auth::{self, AccountCapabilities},
     db::{IapApplicationRecord, NewIapApplication, UserOrganizationRecord},
     error::{AppError, AppResult},
@@ -238,11 +238,27 @@ async fn ensure_user_allowed(
     application: &IapApplicationRecord,
     user: &crate::db::UserRecord,
 ) -> AppResult<()> {
-    for permission in application.required_permissions()? {
-        state
+    let required_permissions = application
+        .required_permissions()?
+        .into_iter()
+        .map(|permission| Permission::try_from(permission.as_str()))
+        .collect::<AppResult<Vec<_>>>()?;
+    if !crate::access::user_can_hold_permissions(user) {
+        return Err(AppError::Forbidden);
+    }
+    if user.is_admin != 1 {
+        let effective_permissions = state
             .db
-            .require_permission(user, Permission::try_from(permission.as_str())?)
-            .await?;
+            .list_effective_permissions(&user.id)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if required_permissions
+            .iter()
+            .any(|permission| !effective_permissions.contains(permission.as_str()))
+        {
+            return Err(AppError::Forbidden);
+        }
     }
     let organizations = state.db.user_organizations(&user.id).await?;
     if DefaultIapAccessPolicy.permits_organization(application, &organizations)? {
@@ -311,6 +327,7 @@ pub fn normalize_iap_application(input: NewIapApplication) -> AppResult<NewIapAp
         .filter(|value| !value.is_empty());
     let required_organization_roles = normalize_roles(input.required_organization_roles)?;
     Ok(NewIapApplication {
+        application_id: input.application_id,
         slug,
         name,
         description,
@@ -531,6 +548,7 @@ mod tests {
     fn app(host: &str, prefix: &str) -> IapApplicationRecord {
         IapApplicationRecord {
             id: "id".to_string(),
+            application_id: Some("application-id".to_string()),
             slug: "docs".to_string(),
             name: "Docs".to_string(),
             description: None,
@@ -579,6 +597,7 @@ mod tests {
     #[test]
     fn normalizes_iap_application_input() {
         let normalized = normalize_iap_application(NewIapApplication {
+            application_id: "application-id".to_string(),
             slug: "Docs-App".to_string(),
             name: " Docs ".to_string(),
             description: Some(" ".to_string()),

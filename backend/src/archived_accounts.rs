@@ -97,6 +97,20 @@ pub fn ensure_assignable_user_record(
     Ok(())
 }
 
+pub fn ensure_assignable_user_state(
+    user_id: &str,
+    archived_at: Option<i64>,
+    allowed_archived_user_ids: &BTreeSet<String>,
+    target: &str,
+) -> AppResult<()> {
+    if archived_at.is_some() && !allowed_archived_user_ids.contains(user_id) {
+        return Err(AppError::BadRequest(format!(
+            "archived users cannot be assigned to {target}: {user_id}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

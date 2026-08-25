@@ -3,12 +3,15 @@ use crate::{
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
     auth_flow, authorization_details, csrf,
-    db::{ClientRecord, DeviceAuthorizationRecord, NewDeviceAuthorization},
+    db::{
+        ClientRecord, DeviceAuthorizationRecord, DeviceAuthorizationStatus, NewDeviceAuthorization,
+    },
     error::{AppError, AppResult},
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
-    oidc::{self, ClientAuthFields},
+    oidc,
+    oidc_client_auth::{ClientAuthFields, ClientAuthForm},
     redirects, util,
 };
 use axum::{
@@ -59,30 +62,16 @@ impl DeviceCodeGenerator for RandomDeviceCodeGenerator {
 
 #[derive(Debug, Deserialize)]
 pub struct DeviceAuthorizationRequest {
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
+    #[serde(flatten)]
+    client_auth: ClientAuthForm,
     scope: Option<String>,
     resource: Option<String>,
     authorization_details: Option<String>,
 }
 
 impl ClientAuthFields for DeviceAuthorizationRequest {
-    fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
-    }
-
-    fn client_secret(&self) -> Option<&str> {
-        self.client_secret.as_deref()
-    }
-
-    fn client_assertion_type(&self) -> Option<&str> {
-        self.client_assertion_type.as_deref()
-    }
-
-    fn client_assertion(&self) -> Option<&str> {
-        self.client_assertion.as_deref()
+    fn client_auth(&self) -> &ClientAuthForm {
+        &self.client_auth
     }
 }
 
@@ -284,7 +273,7 @@ pub async fn device_form(
             return Ok(response);
         }
     }
-    let record = if action == DeviceFormAction::Deny {
+    let transition = if action == DeviceFormAction::Deny {
         state.db.deny_device_authorization(&user_code_hash).await?
     } else {
         state
@@ -292,6 +281,14 @@ pub async fn device_form(
             .authorize_device_authorization(&user_code_hash, &current.user.id)
             .await?
     };
+    if !transition.changed {
+        return Ok(device_code_entry_page(
+            Some(&payload.user_code),
+            Some(device_authorization_status_message(transition.status)),
+        )
+        .into_response());
+    }
+    let record = transition.record;
     state
         .db
         .record_login_event(
@@ -393,42 +390,81 @@ pub async fn consume_authorized_device_code(
             "device code was issued to a different client",
         ));
     }
-    let now = util::now_ts();
-    if record.expires_at < now {
-        return Err(oauth_error("expired_token", "device code has expired"));
-    }
-    if record.consumed_at.is_some() {
-        return Err(oauth_error(
-            "invalid_grant",
-            "device code has already been consumed",
-        ));
-    }
-    if record.denied_at.is_some() {
-        return Err(oauth_error(
-            "access_denied",
-            "device authorization was denied",
-        ));
-    }
-    if record.authorized_user_id.is_none() {
-        if let Some(last_poll_at) = record.last_poll_at
-            && now - last_poll_at < i64::from(record.interval_seconds)
-        {
-            return Err(oauth_error("slow_down", "polling interval is too short"));
-        }
-        state
-            .db
-            .mark_device_authorization_polled(&device_code_hash, now)
-            .await?;
-        return Err(oauth_error(
+    let poll = state
+        .db
+        .poll_device_authorization(&device_code_hash, util::now_ts())
+        .await
+        .map_err(|error| match error {
+            AppError::NotFound => oauth_error("invalid_grant", "device code is invalid"),
+            other => other,
+        })?;
+    match poll.status {
+        DeviceAuthorizationStatus::Pending => Err(oauth_error(
             "authorization_pending",
             "device authorization is still pending",
-        ));
+        )),
+        DeviceAuthorizationStatus::SlowDown => {
+            Err(oauth_error("slow_down", "polling interval is too short"))
+        }
+        DeviceAuthorizationStatus::Expired => {
+            Err(oauth_error("expired_token", "device code has expired"))
+        }
+        DeviceAuthorizationStatus::Denied => Err(oauth_error(
+            "access_denied",
+            "device authorization was denied",
+        )),
+        DeviceAuthorizationStatus::Consumed => Err(oauth_error(
+            "invalid_grant",
+            "device code has already been consumed",
+        )),
+        DeviceAuthorizationStatus::Authorized => {
+            let consumed = state
+                .db
+                .consume_device_authorization(&device_code_hash)
+                .await
+                .map_err(|error| match error {
+                    AppError::NotFound => oauth_error("invalid_grant", "device code is invalid"),
+                    other => other,
+                })?;
+            if consumed.changed && consumed.status == DeviceAuthorizationStatus::Consumed {
+                Ok(consumed.record)
+            } else {
+                Err(device_authorization_oauth_error(consumed.status))
+            }
+        }
     }
-    state
-        .db
-        .consume_device_authorization(&device_code_hash)
-        .await
-        .map_err(|_| oauth_error("invalid_grant", "device code has already been consumed"))
+}
+
+fn device_authorization_status_message(status: DeviceAuthorizationStatus) -> &'static str {
+    match status {
+        DeviceAuthorizationStatus::Pending => "授权状态已被其他请求更新",
+        DeviceAuthorizationStatus::Authorized => "授权码已确认",
+        DeviceAuthorizationStatus::Denied => "授权已被拒绝",
+        DeviceAuthorizationStatus::Consumed => "授权码已使用",
+        DeviceAuthorizationStatus::Expired => "授权码已过期",
+        DeviceAuthorizationStatus::SlowDown => "请求过于频繁，请稍后再试",
+    }
+}
+
+fn device_authorization_oauth_error(status: DeviceAuthorizationStatus) -> AppError {
+    match status {
+        DeviceAuthorizationStatus::Expired => {
+            oauth_error("expired_token", "device code has expired")
+        }
+        DeviceAuthorizationStatus::Denied => {
+            oauth_error("access_denied", "device authorization was denied")
+        }
+        DeviceAuthorizationStatus::Consumed => {
+            oauth_error("invalid_grant", "device code has already been consumed")
+        }
+        DeviceAuthorizationStatus::Pending | DeviceAuthorizationStatus::SlowDown => oauth_error(
+            "authorization_pending",
+            "device authorization is still pending",
+        ),
+        DeviceAuthorizationStatus::Authorized => {
+            oauth_error("invalid_grant", "device code could not be consumed")
+        }
+    }
 }
 
 fn ensure_device_grant(client: &ClientRecord) -> AppResult<()> {
@@ -465,7 +501,7 @@ fn normalize_device_scope(
 
 fn user_visible_record_error(record: &DeviceAuthorizationRecord) -> Option<&'static str> {
     let now = util::now_ts();
-    if record.expires_at < now {
+    if record.expires_at <= now {
         Some("授权码已过期")
     } else if record.consumed_at.is_some() {
         Some("授权码已使用")

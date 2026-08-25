@@ -4,28 +4,27 @@ use crate::{
     application_discovery, applications, archived_accounts,
     audit::{self, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_flow, authorization, backchannel_logout, billing, claim_mapper,
-    client_assertion, client_policy, csrf,
+    auth_flow, authorization, backchannel_logout, billing, claim_mapper, client_assertion,
+    client_policy, config, csrf,
     db::{
-        ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
-        ApplicationDiscoveryRecord,
+        ApplicationAuthorizationProfileRecord, ApplicationDiscoveryRecord,
         ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
-        ApplicationProfileRoleRecord, ApplicationRecord, ApplicationRoleRecord,
-        ApplicationScimTokenRecord, AuditEventRecord, AuthorizationCodeType,
-        ClientGrantWithClientRecord, GroupRecord, InvitationRecord, InvitationUpdate,
-        LinkedIdentityRecord, LoginCodeLevel, LoginEventRecord, NewApplication,
-        NewApplicationAuthorizationProfile, NewApplicationBillingSettings, NewApplicationDiscovery,
-        NewApplicationJwtClient, NewApplicationProfileRole, NewApplicationRole,
-        NewApplicationScimToken, NewBulkProvisionedUser, NewClient, NewClientClaimMapper,
-        NewExternalOidcProvider, NewGroup, NewIapApplication, NewInvitation, NewLdapProvider,
-        NewLoginSettings, NewOrganization, NewRegistrationSettings, NewRole, NewRuntimeSettings,
-        NewSecurityPolicy, NewUser, OrganizationMemberInput, OrganizationMemberWithUserRecord,
-        OrganizationRecord, PublicAuditWebhook, PublicClient, PublicClientClaimMapper,
-        PublicExternalOidcProvider, PublicIapApplication, PublicInvitation,
-        PublicInvitationRedemption, PublicLdapProvider, PublicLoginSettings,
-        PublicRegistrationSettings, PublicSecurityPolicy, PublicUser, QuickLink, RoleRecord,
-        SecurityPolicyRecord, SessionRecord, SigningKeyRecord, UserListScope,
-        UserOrganizationRecord, UserUpdate,
+        ApplicationProfileRoleRecord, ApplicationRecord, ApplicationScimTokenRecord,
+        AuditEventRecord, AuthorizationBindingPermissionOverride, AuthorizationBindingsSnapshot,
+        AuthorizationBindingsUpdate, AuthorizationCodeType, ClientGrantWithClientRecord,
+        GroupRecord, InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel,
+        LoginEventRecord, NewApplication, NewApplicationBillingSettings, NewApplicationDiscovery,
+        NewApplicationJwtClient, NewApplicationProfileRole, NewApplicationScimToken,
+        NewBulkProvisionedUser, NewClient, NewClientClaimMapper, NewExternalOidcProvider, NewGroup,
+        NewIapApplication, NewInvitation, NewLdapProvider, NewLoginSettings, NewOrganization,
+        NewRegistrationSettings, NewRole, NewRuntimeSettings, NewSecurityPolicy, NewUser,
+        OrganizationMemberInput, OrganizationMemberWithUserRecord, OrganizationRecord,
+        PublicAuditWebhook, PublicClient, PublicClientClaimMapper, PublicExternalOidcProvider,
+        PublicIapApplication, PublicInvitation, PublicInvitationRedemption, PublicLdapProvider,
+        PublicLoginSettings, PublicRegistrationSettings, PublicSecurityPolicy, PublicUser,
+        QuickLink, RoleRecord, SecurityPolicyRecord, SessionRecord, SigningKeyRecord,
+        UserListFilters, UserListLinkedIdentityFilter, UserListLoginRegion, UserListRoleFilter,
+        UserListScope, UserOptionRecord, UserOrganizationRecord, UserUpdate,
     },
     directory, directory_sync,
     error::{AppError, AppResult},
@@ -33,6 +32,7 @@ use crate::{
     identity_sources::{self, OidcDiscoveryResult, OidcProviderTemplate},
     mfa::{self, RecoveryCodeIssuer},
     mfa_policy::MfaDecision,
+    mutations,
     network_policy::{self, TrustedNetworkPolicy},
     organizations::{self, OrganizationEmailPolicy},
     security_policy::{self, PasswordPolicy, PasswordSubject},
@@ -46,6 +46,8 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use axum_extra::extract::cookie::CookieJar;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, NaiveDate};
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -105,7 +107,11 @@ pub fn routes() -> Router<AppState> {
             get(list_signing_keys).post(rotate_signing_key),
         )
         .route("/api/admin/users", get(list_users).post(create_user))
+        .route("/api/admin/users/page", get(list_users))
+        .route("/api/admin/users/cursor", get(list_users_cursor))
+        .route("/api/admin/user-options", get(list_user_options))
         .route("/api/admin/users/import-csv", post(import_users_csv))
+        .route("/api/admin/users/bulk-lifecycle", post(bulk_user_lifecycle))
         .route(
             "/api/admin/users/{id}",
             get(user_detail).put(update_user).delete(delete_user),
@@ -115,11 +121,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/users/{id}/mfa/reset", post(reset_user_mfa))
         .route("/api/admin/users/{id}/login-events", get(user_login_events))
         .route("/api/admin/users/{id}/permissions", get(user_permissions))
-        .route("/api/admin/clients", get(list_clients).post(create_client))
-        .route(
-            "/api/admin/clients/{id}",
-            put(update_client).delete(delete_client),
-        )
+        .route("/api/admin/clients", get(list_clients))
         .route(
             "/api/admin/applications",
             get(list_applications).post(create_application),
@@ -138,7 +140,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/applications/{id}/client-bindings",
-            get(list_application_client_bindings).put(replace_application_client_bindings),
+            get(list_application_client_bindings),
+        )
+        .route(
+            "/api/admin/application-discovery/discover",
+            post(discover_application),
+        )
+        .route(
+            "/api/admin/applications/{id}/oidc-clients",
+            get(list_application_oidc_clients).post(create_application_oidc_client),
+        )
+        .route(
+            "/api/admin/applications/{id}/oidc-clients/{client_id}",
+            put(update_application_oidc_client).delete(delete_application_oidc_client),
         )
         .route(
             "/api/admin/applications/{id}/modules",
@@ -151,6 +165,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/admin/applications/{id}/billing-settings",
             get(get_application_billing_settings).put(update_application_billing_settings),
+        )
+        .route(
+            "/api/admin/applications/{id}/iap-rules",
+            get(list_application_iap_rules).post(create_application_iap_rule),
+        )
+        .route(
+            "/api/admin/applications/{id}/iap-rules/{rule_id}",
+            put(update_application_iap_rule).delete(delete_application_iap_rule),
         )
         .route(
             "/api/admin/applications/{id}/directory-sync/runs",
@@ -181,10 +203,6 @@ pub fn routes() -> Router<AppState> {
             delete(revoke_application_scim_token),
         )
         .route(
-            "/api/admin/applications/{id}/roles",
-            get(list_application_roles).post(create_application_role),
-        )
-        .route(
             "/api/admin/applications/{id}/authorization/catalog",
             get(application_permission_catalog),
         )
@@ -201,6 +219,11 @@ pub fn routes() -> Router<AppState> {
             get(application_profile_permission_catalog),
         )
         .route(
+            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/bindings",
+            get(get_application_authorization_bindings)
+                .put(update_application_authorization_bindings),
+        )
+        .route(
             "/api/admin/applications/{id}/authorization/profiles/{profile_id}/roles",
             get(list_application_profile_roles).post(create_application_profile_role),
         )
@@ -209,52 +232,12 @@ pub fn routes() -> Router<AppState> {
             put(update_application_profile_role).delete(delete_application_profile_role),
         )
         .route(
-            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/users/{user_id}/roles",
-            get(list_application_profile_user_roles).put(update_application_profile_user_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/groups/{group_id}/roles",
-            get(list_application_profile_group_roles).put(update_application_profile_group_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/organization-roles/{organization_role}/roles",
-            get(list_application_profile_organization_role_roles)
-                .put(update_application_profile_organization_role_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/authorization/profiles/{profile_id}/users/{user_id}/permission-overrides",
-            get(list_application_profile_user_permission_overrides)
-                .put(update_application_profile_user_permission_overrides),
-        )
-        .route(
             "/api/admin/applications/{id}/authorization/profiles/{profile_id}/{user_id}",
             get(application_profile_authorization_preview),
         )
         .route(
             "/api/admin/applications/{id}/authorization/subjects",
             get(application_authorization_subjects),
-        )
-        .route(
-            "/api/admin/applications/{id}/roles/{role_id}",
-            put(update_application_role).delete(delete_application_role),
-        )
-        .route(
-            "/api/admin/applications/{id}/users/{user_id}/roles",
-            get(list_application_user_roles).put(update_application_user_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/groups/{group_id}/roles",
-            get(list_application_group_roles).put(update_application_group_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/organization-roles/{organization_role}/roles",
-            get(list_application_organization_role_roles)
-                .put(update_application_organization_role_roles),
-        )
-        .route(
-            "/api/admin/applications/{id}/users/{user_id}/permission-overrides",
-            get(list_application_user_permission_overrides)
-                .put(update_application_user_permission_overrides),
         )
         .route(
             "/api/admin/applications/{id}/authorization/{user_id}",
@@ -268,15 +251,9 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/applications/{id}/enrollment-codes/{code_id}",
             delete(delete_application_enrollment_code),
         )
-        .route(
-            "/api/admin/iap-applications",
-            get(list_iap_applications).post(create_iap_application),
-        )
-        .route(
-            "/api/admin/iap-applications/{id}",
-            put(update_iap_application).delete(delete_iap_application),
-        )
+        .route("/api/admin/iap-applications", get(list_iap_applications))
         .route("/api/admin/audit-events", get(list_audit_events))
+        .route("/api/admin/mutations/{id}", get(get_mutation_receipt))
         .route(
             "/api/admin/audit-webhooks",
             get(list_audit_webhooks).post(create_audit_webhook),
@@ -736,9 +713,14 @@ async fn start_totp_setup(
     let current = auth::require_current_user(&state, &jar).await?;
     auth::ensure_current_account_mutable(&current)?;
     let secret = mfa::generate_totp_secret();
+    let encrypted_secret = mfa::protect_totp_secret(&state, &secret)?;
     let setup = state
         .db
-        .create_mfa_totp_setup(&current.user.id, secret.clone(), mfa::MFA_SETUP_TTL_SECONDS)
+        .create_mfa_totp_setup(
+            &current.user.id,
+            encrypted_secret,
+            mfa::MFA_SETUP_TTL_SECONDS,
+        )
         .await?;
     let issuer = state.effective_issuer(&headers).await?;
     let otpauth_uri = mfa::otpauth_uri(&issuer, &current.user.email, &secret)?;
@@ -765,28 +747,25 @@ async fn confirm_totp_setup(
     if setup.user_id != current.user.id || setup.expires_at < util::now_ts() {
         return Err(AppError::Unauthorized);
     }
-    if !mfa::verify_setup_code(&setup.secret, &payload.code)? {
+    let secret = mfa::reveal_totp_secret(&state, &setup.secret)?;
+    if !mfa::verify_setup_code(&secret, &payload.code)? {
         return Err(AppError::Unauthorized);
     }
-    state
-        .db
-        .upsert_totp_method(&current.user.id, setup.secret)
-        .await?;
-    state.db.delete_mfa_totp_setup(&payload.setup_id).await?;
     let codes = mfa::StandardRecoveryCodeIssuer.issue_recovery_codes(mfa::RECOVERY_CODE_COUNT)?;
     state
         .db
-        .replace_recovery_codes(&current.user.id, mfa::code_hashes(&codes))
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id.clone(),
-            "mfa.totp.enable",
-            "user",
-            Some(current.user.id.clone()),
-            serde_json::json!({ "method": "totp" }),
-        ))
+        .confirm_totp_setup_with_audit(
+            &current.user.id,
+            &payload.setup_id,
+            mfa::code_hashes(&codes),
+            audit::management_event(
+                current.user.id.clone(),
+                "mfa.totp.enable",
+                "user",
+                Some(current.user.id.clone()),
+                serde_json::json!({ "method": "totp" }),
+            ),
+        )
         .await?;
     Ok(Json(ConfirmTotpResponse {
         status: mfa_status_for_user(&state, &current.user.id).await?,
@@ -800,23 +779,20 @@ async fn rotate_recovery_codes(
 ) -> AppResult<Json<ConfirmTotpResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
     auth::ensure_current_account_mutable(&current)?;
-    if state.db.find_totp_method(&current.user.id).await?.is_none() {
-        return Err(AppError::BadRequest("MFA is not enabled".to_string()));
-    }
     let codes = mfa::StandardRecoveryCodeIssuer.issue_recovery_codes(mfa::RECOVERY_CODE_COUNT)?;
     state
         .db
-        .replace_recovery_codes(&current.user.id, mfa::code_hashes(&codes))
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id.clone(),
-            "mfa.recovery_codes.rotate",
-            "user",
-            Some(current.user.id.clone()),
-            serde_json::json!({ "count": codes.len() }),
-        ))
+        .replace_recovery_codes_with_audit(
+            &current.user.id,
+            mfa::code_hashes(&codes),
+            audit::management_event(
+                current.user.id.clone(),
+                "mfa.recovery_codes.rotate",
+                "user",
+                Some(current.user.id.clone()),
+                serde_json::json!({ "count": codes.len() }),
+            ),
+        )
         .await?;
     Ok(Json(ConfirmTotpResponse {
         status: mfa_status_for_user(&state, &current.user.id).await?,
@@ -830,16 +806,18 @@ async fn disable_mfa(
 ) -> AppResult<Json<MfaStatusResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
     auth::ensure_current_account_mutable(&current)?;
-    state.db.delete_mfa_for_user(&current.user.id).await?;
     state
         .db
-        .record_audit_event(audit::management_event(
-            current.user.id.clone(),
-            "mfa.disable",
-            "user",
-            Some(current.user.id.clone()),
-            serde_json::json!({}),
-        ))
+        .delete_mfa_for_user_with_audit(
+            &current.user.id,
+            audit::management_event(
+                current.user.id.clone(),
+                "mfa.disable",
+                "user",
+                Some(current.user.id.clone()),
+                serde_json::json!({}),
+            ),
+        )
         .await?;
     Ok(Json(mfa_status_for_user(&state, &current.user.id).await?))
 }
@@ -909,40 +887,29 @@ async fn create_my_organization(
 ) -> AppResult<Json<OrganizationResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
     auth::ensure_current_account_mutable(&current)?;
+    let organization_input = NewOrganization {
+        slug: organizations::normalize_slug(&payload.slug)?,
+        name: organizations::normalize_name(&payload.name)?,
+        kind: organizations::ORGANIZATION_KIND_TENANT.to_string(),
+        description: normalize_optional_text(payload.description),
+        allowed_email_domains: security_policy::normalize_email_domain_rules(
+            payload.allowed_email_domains,
+        )?,
+        is_active: true,
+    };
     let organization = state
         .db
-        .insert_organization(NewOrganization {
-            slug: organizations::normalize_slug(&payload.slug)?,
-            name: organizations::normalize_name(&payload.name)?,
-            kind: organizations::ORGANIZATION_KIND_TENANT.to_string(),
-            description: normalize_optional_text(payload.description),
-            allowed_email_domains: security_policy::normalize_email_domain_rules(
-                payload.allowed_email_domains,
-            )?,
-            is_active: true,
-        })
-        .await?;
-    state
-        .db
-        .upsert_organization_member(
-            &organization.id,
+        .create_organization_with_owner_and_audit(
+            organization_input.clone(),
             &current.user.id,
-            organizations::ROLE_OWNER,
+            audit::management_event(
+                current.user.id.clone(),
+                "organization.self_service_create",
+                "organization",
+                None,
+                serde_json::json!({ "slug": organization_input.slug, "name": organization_input.name }),
+            ),
         )
-        .await?;
-    state
-        .db
-        .set_active_user_organization(&current.user.id, &organization.id)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "organization.self_service_create",
-            "organization",
-            Some(organization.id.clone()),
-            serde_json::json!({ "slug": organization.slug, "name": organization.name }),
-        ))
         .await?;
     Ok(Json(organization_response(&state, organization).await?))
 }
@@ -1176,17 +1143,17 @@ async fn overview(
     headers: HeaderMap,
 ) -> AppResult<Json<OverviewResponse>> {
     require_admin_reader(&state, &jar).await?;
-    let users = state.db.count_users(UserListScope::All).await?;
-    let active_users = state.db.count_users(UserListScope::Active).await?;
-    let clients = state.db.list_clients().await?;
+    let (users, active_users, clients, active_clients) = tokio::try_join!(
+        state.db.count_users(UserListScope::All),
+        state.db.count_users(UserListScope::Active),
+        state.db.count_clients(false),
+        state.db.count_clients(true),
+    )?;
     Ok(Json(OverviewResponse {
         active_users: active_users as usize,
         users: users as usize,
-        active_clients: clients
-            .iter()
-            .filter(|client| client.is_active == 1)
-            .count(),
-        clients: clients.len(),
+        active_clients: active_clients as usize,
+        clients: clients as usize,
         issuer: state.effective_issuer(&headers).await?,
         database_kind: format!("{:?}", state.settings.database.kind).to_ascii_lowercase(),
     }))
@@ -1640,15 +1607,8 @@ async fn update_login_settings(
 }
 
 fn normalize_base_url(value: &str, field: &str) -> AppResult<String> {
-    let value = value.trim().trim_end_matches('/').to_string();
-    let url = Url::parse(&value)
-        .map_err(|err| AppError::BadRequest(format!("{field} is invalid: {err}")))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AppError::BadRequest(format!(
-            "{field} must be an absolute http(s) URL"
-        )));
-    }
-    Ok(value)
+    config::validate_public_origin(value, field)
+        .map_err(|err| AppError::BadRequest(err.to_string()))
 }
 
 fn normalize_email_domains(values: Vec<String>) -> AppResult<Vec<String>> {
@@ -1732,61 +1692,385 @@ fn normalize_optional_email(value: Option<String>) -> AppResult<Option<String>> 
     Ok(Some(email))
 }
 
-#[derive(Debug, Deserialize)]
+const USER_DIRECTORY_DEFAULT_PAGE_SIZE: usize = 25;
+const USER_DIRECTORY_MAX_PAGE_SIZE: usize = 200;
+const USER_OPTION_DEFAULT_LIMIT: usize = 100;
+const USER_OPTION_MAX_LIMIT: usize = 200;
+
+#[derive(Debug, Deserialize, Default)]
 struct UserListQuery {
     status: Option<String>,
+    page: Option<String>,
+    page_size: Option<String>,
+    cursor: Option<String>,
+    // Offset/limit remain accepted for non-UI callers during migration. The
+    // response contract is the one-based page envelope below.
+    offset: Option<String>,
+    limit: Option<String>,
+    #[serde(alias = "q")]
+    search: Option<String>,
     organization_id: Option<String>,
     linked_identity: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    role: Option<String>,
+    #[serde(alias = "registration_from", alias = "date_from")]
+    created_from: Option<String>,
+    #[serde(alias = "registration_to", alias = "date_to")]
+    created_to: Option<String>,
+    last_login_from: Option<String>,
+    last_login_to: Option<String>,
+    #[serde(alias = "region")]
+    login_region: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedUserListQuery {
+    scope: UserListScope,
+    filters: UserListFilters,
+    page: usize,
+    page_size: usize,
+    offset: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UserListPageResponse {
+    items: Vec<PublicUser>,
+    page: usize,
+    page_size: usize,
+    total: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct UserDirectoryCursorResponse {
+    items: Vec<PublicUser>,
+    page_size: usize,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UserOptionQuery {
+    status: Option<String>,
+    organization_id: Option<String>,
+    #[serde(alias = "q")]
+    search: Option<String>,
+    limit: Option<String>,
+}
+
+fn encode_user_directory_cursor(cursor: &crate::db::UserDirectoryCursor) -> AppResult<String> {
+    let bytes = serde_json::to_vec(cursor)
+        .map_err(|error| AppError::Internal(format!("failed to encode user cursor: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_user_directory_cursor(
+    value: Option<String>,
+) -> AppResult<Option<crate::db::UserDirectoryCursor>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > 2048 {
+        return Err(AppError::BadRequest("cursor is invalid".to_string()));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| AppError::BadRequest("cursor is invalid".to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| AppError::BadRequest("cursor is invalid".to_string()))
+}
+
+fn normalize_user_list_text(
+    value: Option<String>,
+    field: &str,
+    max_chars: usize,
+) -> AppResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > max_chars || value.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!("{field} is invalid")));
+    }
+    Ok(Some(value))
+}
+
+fn parse_user_list_number(
+    value: Option<String>,
+    field: &str,
+    default: usize,
+    max: Option<usize>,
+    allow_zero: bool,
+) -> AppResult<usize> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let value = value.trim();
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| AppError::BadRequest(format!("{field} must be a positive integer")))?;
+    let parsed = usize::try_from(parsed)
+        .map_err(|_| AppError::BadRequest(format!("{field} is too large")))?;
+    if (!allow_zero && parsed == 0) || max.is_some_and(|max| parsed > max) {
+        let message = max.map_or_else(
+            || {
+                if allow_zero {
+                    format!("{field} must be a non-negative integer")
+                } else {
+                    format!("{field} must be a positive integer")
+                }
+            },
+            |max| format!("{field} must be between 1 and {max}"),
+        );
+        return Err(AppError::BadRequest(message));
+    }
+    Ok(parsed)
+}
+
+fn parse_user_list_date(
+    value: Option<String>,
+    field: &str,
+    upper_bound: bool,
+) -> AppResult<Option<i64>> {
+    let Some(value) = normalize_user_list_text(value, field, 64)? else {
+        return Ok(None);
+    };
+    let (timestamp, date_only) = if let Ok(timestamp) = value.parse::<i64>() {
+        (timestamp, false)
+    } else if let Ok(date) = NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+        (
+            date.and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid")
+                .and_utc()
+                .timestamp(),
+            true,
+        )
+    } else if let Ok(datetime) = DateTime::parse_from_rfc3339(&value) {
+        (datetime.timestamp(), false)
+    } else {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be an RFC3339 timestamp, Unix timestamp, or YYYY-MM-DD"
+        )));
+    };
+    if timestamp < 0 {
+        return Err(AppError::BadRequest(format!("{field} is invalid")));
+    }
+    let timestamp = if upper_bound && date_only {
+        timestamp
+            .checked_add(86_400)
+            .ok_or_else(|| AppError::BadRequest(format!("{field} is out of range")))?
+    } else {
+        timestamp
+    };
+    Ok(Some(timestamp))
+}
+
+fn parse_user_list_query(query: UserListQuery) -> AppResult<ParsedUserListQuery> {
+    let scope = user_list_scope(query.status.as_deref())?;
+    let page_size = if query.page_size.is_some() {
+        parse_user_list_number(
+            query.page_size,
+            "page_size",
+            USER_DIRECTORY_DEFAULT_PAGE_SIZE,
+            Some(USER_DIRECTORY_MAX_PAGE_SIZE),
+            false,
+        )?
+    } else if query.limit.is_some() {
+        parse_user_list_number(
+            query.limit,
+            "limit",
+            USER_DIRECTORY_DEFAULT_PAGE_SIZE,
+            Some(USER_DIRECTORY_MAX_PAGE_SIZE),
+            false,
+        )?
+    } else {
+        USER_DIRECTORY_DEFAULT_PAGE_SIZE
+    };
+    let page = if query.page.is_some() {
+        parse_user_list_number(query.page, "page", 1, None, false)?
+    } else if query.offset.is_some() {
+        let offset = parse_user_list_number(query.offset, "offset", 0, None, true)?;
+        offset
+            .checked_div(page_size)
+            .and_then(|page| page.checked_add(1))
+            .ok_or_else(|| AppError::BadRequest("offset is too large".to_string()))?
+    } else {
+        1
+    };
+    let offset = page
+        .checked_sub(1)
+        .and_then(|page| page.checked_mul(page_size))
+        .ok_or_else(|| AppError::BadRequest("page is too large".to_string()))?;
+
+    let linked_identity = match query
+        .linked_identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all")
+    {
+        "all" => UserListLinkedIdentityFilter::All,
+        "linked" => UserListLinkedIdentityFilter::Linked,
+        "unlinked" => UserListLinkedIdentityFilter::Unlinked,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported linked identity filter: {other}"
+            )));
+        }
+    };
+    let role = match query
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all")
+    {
+        "all" => UserListRoleFilter::Any,
+        "admin" => UserListRoleFilter::Admin,
+        "user" => UserListRoleFilter::User,
+        value => UserListRoleFilter::Named(
+            normalize_user_list_text(Some(value.to_string()), "role", 128)?
+                .expect("non-empty role was checked above"),
+        ),
+    };
+    let login_region = match query
+        .login_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all")
+    {
+        "all" => UserListLoginRegion::All,
+        "domestic" => UserListLoginRegion::Domestic,
+        "overseas" => UserListLoginRegion::Overseas,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported login region filter: {other}"
+            )));
+        }
+    };
+    let created_from = parse_user_list_date(query.created_from, "registration_from", false)?;
+    let created_to = parse_user_list_date(query.created_to, "registration_to", true)?;
+    let last_login_from = parse_user_list_date(query.last_login_from, "last_login_from", false)?;
+    let last_login_to = parse_user_list_date(query.last_login_to, "last_login_to", true)?;
+    if created_from
+        .zip(created_to)
+        .is_some_and(|(from, to)| from >= to)
+    {
+        return Err(AppError::BadRequest(
+            "registration_from must be before registration_to".to_string(),
+        ));
+    }
+    if last_login_from
+        .zip(last_login_to)
+        .is_some_and(|(from, to)| from >= to)
+    {
+        return Err(AppError::BadRequest(
+            "last_login_from must be before last_login_to".to_string(),
+        ));
+    }
+
+    Ok(ParsedUserListQuery {
+        scope,
+        filters: UserListFilters {
+            organization_id: normalize_user_list_text(
+                query.organization_id,
+                "organization_id",
+                128,
+            )?,
+            linked_identity,
+            search: normalize_user_list_text(query.search, "search", 256)?,
+            email: normalize_user_list_text(query.email, "email", 320)?,
+            phone: normalize_user_list_text(query.phone, "phone", 128)?,
+            role,
+            created_from,
+            created_to,
+            last_login_from,
+            last_login_to,
+            login_region,
+        },
+        page,
+        page_size,
+        offset,
+    })
 }
 
 async fn list_users(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(query): Query<UserListQuery>,
-) -> AppResult<Json<Vec<PublicUser>>> {
-    require_user_reader(&state, &jar).await?;
+) -> AppResult<Json<UserListPageResponse>> {
+    let parsed = parse_user_list_query(query)?;
+    require_user_list_reader(&state, &jar, parsed.filters.organization_id.as_deref()).await?;
+    let page = state
+        .db
+        .list_admin_users_page(
+            parsed.scope,
+            parsed.filters,
+            parsed.offset,
+            parsed.page_size,
+        )
+        .await?;
+    Ok(Json(UserListPageResponse {
+        items: page.users.into_iter().map(|user| user.public()).collect(),
+        page: parsed.page,
+        page_size: page.limit,
+        total: page.total,
+    }))
+}
+
+/// Cursor-based directory endpoint for deep paging. The legacy page endpoint
+/// remains available for compatibility, while new clients avoid COUNT/OFFSET
+/// scans and receive an opaque position token tied to the stable SQL order.
+async fn list_users_cursor(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<UserListQuery>,
+) -> AppResult<Json<UserDirectoryCursorResponse>> {
+    let cursor = decode_user_directory_cursor(query.cursor.clone())?;
+    let parsed = parse_user_list_query(query)?;
+    require_user_list_reader(&state, &jar, parsed.filters.organization_id.as_deref()).await?;
+    let page = state
+        .db
+        .list_admin_users_page_after(parsed.scope, parsed.filters, cursor, parsed.page_size)
+        .await?;
+    Ok(Json(UserDirectoryCursorResponse {
+        items: page.users.into_iter().map(|user| user.public()).collect(),
+        page_size: page.limit,
+        next_cursor: page
+            .next_cursor
+            .as_ref()
+            .map(encode_user_directory_cursor)
+            .transpose()?,
+    }))
+}
+
+async fn list_user_options(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<UserOptionQuery>,
+) -> AppResult<Json<Vec<UserOptionRecord>>> {
     let scope = user_list_scope(query.status.as_deref())?;
-    let mut users = state.db.list_users(scope).await?;
-    if let Some(organization_id) = query
-        .organization_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let member_ids = state
+    let organization_id = normalize_user_list_text(query.organization_id, "organization_id", 128)?;
+    let search = normalize_user_list_text(query.search, "search", 256)?;
+    let limit = parse_user_list_number(
+        query.limit,
+        "limit",
+        USER_OPTION_DEFAULT_LIMIT,
+        Some(USER_OPTION_MAX_LIMIT),
+        false,
+    )?;
+    require_user_list_reader(&state, &jar, organization_id.as_deref()).await?;
+    Ok(Json(
+        state
             .db
-            .list_organization_members(organization_id)
-            .await?
-            .into_iter()
-            .map(|member| member.user_id)
-            .collect::<BTreeSet<_>>();
-        users.retain(|user| member_ids.contains(&user.id));
-    }
-    let linked_identity_filter = query
-        .linked_identity
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("all");
-    match linked_identity_filter {
-        "all" => {}
-        "linked" | "unlinked" => {
-            let linked_user_ids = state
-                .db
-                .list_user_ids_with_linked_identities()
-                .await?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            let has_linked_identity = linked_identity_filter == "linked";
-            users.retain(|user| linked_user_ids.contains(&user.id) == has_linked_identity);
-        }
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unsupported linked identity filter: {other}"
-            )));
-        }
-    }
-    Ok(Json(users.into_iter().map(|user| user.public()).collect()))
+            .list_user_options(scope, organization_id.as_deref(), search.as_deref(), limit)
+            .await?,
+    ))
 }
 
 fn user_list_scope(status: Option<&str>) -> AppResult<UserListScope> {
@@ -1866,6 +2150,22 @@ async fn list_audit_events(
         .require_permission(&current.user, Permission::AuditRead)
         .await?;
     Ok(Json(state.db.list_audit_events(200).await?))
+}
+
+async fn get_mutation_receipt(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Json<mutations::PublicMutationReceipt>> {
+    auth::require_current_user(&state, &jar).await?;
+    let scope_key = mutations::scope_key(&headers, &state.settings.security.cookie_name);
+    let receipt = state
+        .db
+        .find_mutation_receipt(&id, &scope_key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(receipt.into()))
 }
 
 async fn list_audit_webhooks(
@@ -2107,6 +2407,12 @@ struct UserIdsInput {
     user_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UserLifecycleBatchInput {
+    action: String,
+    user_ids: Vec<String>,
+}
+
 const ADMIN_READ_PERMISSIONS: &[Permission] = &[
     Permission::AdminRead,
     Permission::SettingsManage,
@@ -2127,7 +2433,6 @@ const ADMIN_READ_PERMISSIONS: &[Permission] = &[
 const USER_READ_PERMISSIONS: &[Permission] = &[
     Permission::UsersRead,
     Permission::UsersManage,
-    Permission::OrganizationsManage,
     Permission::SecurityManage,
 ];
 const IAP_READ_PERMISSIONS: &[Permission] = &[Permission::IapRead, Permission::IapManage];
@@ -2167,16 +2472,36 @@ async fn require_user_reader(state: &AppState, jar: &CookieJar) -> AppResult<aut
     require_any_permission(state, jar, USER_READ_PERMISSIONS).await
 }
 
+/// Global user reads require an explicit user-directory permission. An
+/// organization owner/admin may use the directory only with an organization
+/// boundary; `organizations.manage` is never treated as global `users.read`.
+async fn require_user_list_reader(
+    state: &AppState,
+    jar: &CookieJar,
+    organization_id: Option<&str>,
+) -> AppResult<auth::CurrentUser> {
+    let current = auth::require_current_user(state, jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    if state
+        .db
+        .has_any_permission(&current.user, USER_READ_PERMISSIONS)
+        .await?
+    {
+        return Ok(current);
+    }
+    let Some(organization_id) = organization_id else {
+        return Err(AppError::Forbidden);
+    };
+    require_organization_manager_for(state, &current, organization_id).await?;
+    Ok(current)
+}
+
 async fn require_user_manager(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
     require_permission(state, jar, Permission::UsersManage).await
 }
 
 async fn require_iap_reader(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
     require_any_permission(state, jar, IAP_READ_PERMISSIONS).await
-}
-
-async fn require_iap_manager(state: &AppState, jar: &CookieJar) -> AppResult<auth::CurrentUser> {
-    require_permission(state, jar, Permission::IapManage).await
 }
 
 async fn require_authorization_code_manager(
@@ -2346,22 +2671,35 @@ async fn organization_members_input(
     state: &AppState,
     input: OrganizationMembersInput,
 ) -> AppResult<Vec<OrganizationMemberInput>> {
+    let mut email_selectors = Vec::new();
+    for member in &input.members {
+        if member
+            .user_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            if let Some(email) = member
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                email_selectors.push(email.to_string());
+            }
+        }
+    }
+    let user_ids_by_email = state.db.find_user_ids_by_emails(&email_selectors).await?;
     let mut members = Vec::with_capacity(input.members.len());
     for member in input.members {
         let user_id = member.user_id.unwrap_or_default().trim().to_string();
         let email = member.email.unwrap_or_default().trim().to_string();
         let user_id = match (user_id.is_empty(), email.is_empty()) {
             (false, true) => user_id,
-            (true, false) => {
-                state
-                    .db
-                    .find_user_by_email(&email)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::BadRequest("no account found for member email".to_string())
-                    })?
-                    .id
-            }
+            (true, false) => user_ids_by_email.get(&email).cloned().ok_or_else(|| {
+                AppError::BadRequest("no account found for member email".to_string())
+            })?,
             _ => {
                 return Err(AppError::BadRequest(
                     "organization member must provide exactly one of user_id or email".to_string(),
@@ -2390,9 +2728,21 @@ async fn list_roles(
 ) -> AppResult<Json<Vec<RoleAccessResponse>>> {
     require_security_manager(&state, &jar).await?;
     let roles = state.db.list_roles().await?;
+    let permissions_by_role = state.db.list_role_permissions_by_role().await?;
     let mut response = Vec::with_capacity(roles.len());
     for role in roles {
-        response.push(role_response(&state, role).await?);
+        response.push(RoleAccessResponse {
+            permissions: permissions_by_role
+                .get(&role.id)
+                .cloned()
+                .unwrap_or_default(),
+            id: role.id,
+            name: role.name,
+            description: role.description,
+            is_system: role.is_system,
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        });
     }
     Ok(Json(response))
 }
@@ -2488,9 +2838,19 @@ async fn list_groups(
 ) -> AppResult<Json<Vec<GroupAccessResponse>>> {
     require_security_manager(&state, &jar).await?;
     let groups = state.db.list_groups().await?;
+    let roles_by_group = state.db.list_group_roles_by_group().await?;
+    let members_by_group = state.db.list_group_members_public_by_group().await?;
     let mut response = Vec::with_capacity(groups.len());
     for group in groups {
-        response.push(group_response(&state, group).await?);
+        response.push(GroupAccessResponse {
+            roles: roles_by_group.get(&group.id).cloned().unwrap_or_default(),
+            members: members_by_group.get(&group.id).cloned().unwrap_or_default(),
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+        });
     }
     Ok(Json(response))
 }
@@ -2503,20 +2863,19 @@ async fn create_group(
     let current = require_security_manager(&state, &jar).await?;
     let group = state
         .db
-        .insert_group(NewGroup {
-            name: payload.name,
-            description: payload.description,
-        })
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "group.create",
-            "group",
-            Some(group.id.clone()),
-            serde_json::json!({ "name": group.name.clone() }),
-        ))
+        .insert_group_with_audit(
+            NewGroup {
+                name: payload.name,
+                description: payload.description,
+            },
+            audit::management_event(
+                current.user.id,
+                "group.create",
+                "group",
+                None,
+                serde_json::json!({}),
+            ),
+        )
         .await?;
     Ok(Json(group_response(&state, group).await?))
 }
@@ -2530,23 +2889,20 @@ async fn update_group(
     let current = require_security_manager(&state, &jar).await?;
     let group = state
         .db
-        .update_group(
+        .update_group_with_audit(
             &id,
             NewGroup {
                 name: payload.name,
                 description: payload.description,
             },
+            audit::management_event(
+                current.user.id,
+                "group.update",
+                "group",
+                Some(id.clone()),
+                serde_json::json!({}),
+            ),
         )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "group.update",
-            "group",
-            Some(group.id.clone()),
-            serde_json::json!({ "name": group.name.clone() }),
-        ))
         .await?;
     Ok(Json(group_response(&state, group).await?))
 }
@@ -2562,16 +2918,18 @@ async fn delete_group(
         .find_group_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state.db.delete_group(&id).await?;
     state
         .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "group.delete",
-            "group",
-            Some(id),
-            serde_json::json!({ "name": group.name }),
-        ))
+        .delete_group_with_audit(
+            &id,
+            audit::management_event(
+                current.user.id,
+                "group.delete",
+                "group",
+                Some(id.clone()),
+                serde_json::json!({ "name": group.name }),
+            ),
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2585,23 +2943,23 @@ async fn update_group_roles(
     let current = require_security_manager(&state, &jar).await?;
     state
         .db
-        .replace_group_roles(&id, payload.role_ids.clone())
+        .replace_group_roles_with_audit(
+            &id,
+            payload.role_ids.clone(),
+            audit::management_event(
+                current.user.id,
+                "group.roles.update",
+                "group",
+                Some(id.clone()),
+                serde_json::json!({ "role_ids": payload.role_ids }),
+            ),
+        )
         .await?;
     let group = state
         .db
         .find_group_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "group.roles.update",
-            "group",
-            Some(id),
-            serde_json::json!({ "role_ids": payload.role_ids }),
-        ))
-        .await?;
     Ok(Json(group_response(&state, group).await?))
 }
 
@@ -2620,23 +2978,23 @@ async fn update_group_members(
     ensure_group_members_editable(&state, &id, &payload.user_ids).await?;
     state
         .db
-        .replace_group_members(&id, payload.user_ids.clone())
+        .replace_group_members_with_audit(
+            &id,
+            payload.user_ids.clone(),
+            audit::management_event(
+                current.user.id,
+                "group.members.update",
+                "group",
+                Some(id.clone()),
+                serde_json::json!({ "user_ids": payload.user_ids }),
+            ),
+        )
         .await?;
     let group = state
         .db
         .find_group_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "group.members.update",
-            "group",
-            Some(id),
-            serde_json::json!({ "user_ids": payload.user_ids }),
-        ))
-        .await?;
     Ok(Json(group_response(&state, group).await?))
 }
 
@@ -2688,19 +3046,22 @@ async fn create_organization(
     Json(payload): Json<OrganizationInput>,
 ) -> AppResult<Json<OrganizationResponse>> {
     let current = require_organization_manager(&state, &jar).await?;
+    let organization_input = organization_input_to_new(payload)?;
     let organization = state
         .db
-        .insert_organization(organization_input_to_new(payload)?)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "organization.create",
-            "organization",
-            Some(organization.id.clone()),
-            serde_json::json!({ "slug": organization.slug.clone(), "name": organization.name.clone() }),
-        ))
+        .insert_organization_with_audit(
+            organization_input.clone(),
+            audit::management_event(
+                current.user.id,
+                "organization.create",
+                "organization",
+                None,
+                serde_json::json!({
+                    "slug": organization_input.slug,
+                    "name": organization_input.name
+                }),
+            ),
+        )
         .await?;
     Ok(Json(organization_response(&state, organization).await?))
 }
@@ -2712,19 +3073,23 @@ async fn update_organization(
     Json(payload): Json<OrganizationInput>,
 ) -> AppResult<Json<OrganizationResponse>> {
     let current = require_organization_manager(&state, &jar).await?;
+    let organization_input = organization_input_to_new(payload)?;
     let organization = state
         .db
-        .update_organization(&id, organization_input_to_new(payload)?)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "organization.update",
-            "organization",
-            Some(organization.id.clone()),
-            serde_json::json!({ "slug": organization.slug.clone(), "name": organization.name.clone() }),
-        ))
+        .update_organization_with_audit(
+            &id,
+            organization_input.clone(),
+            audit::management_event(
+                current.user.id,
+                "organization.update",
+                "organization",
+                Some(id.clone()),
+                serde_json::json!({
+                    "slug": organization_input.slug,
+                    "name": organization_input.name
+                }),
+            ),
+        )
         .await?;
     Ok(Json(organization_response(&state, organization).await?))
 }
@@ -2740,16 +3105,18 @@ async fn delete_organization(
         .find_organization_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state.db.delete_organization(&id).await?;
     state
         .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "organization.delete",
-            "organization",
-            Some(id),
-            serde_json::json!({ "slug": organization.slug, "name": organization.name }),
-        ))
+        .delete_organization_with_audit(
+            &id,
+            audit::management_event(
+                current.user.id,
+                "organization.delete",
+                "organization",
+                Some(id.clone()),
+                serde_json::json!({ "slug": organization.slug, "name": organization.name }),
+            ),
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -3019,7 +3386,6 @@ async fn update_organization_members(
 ) -> AppResult<Json<OrganizationResponse>> {
     let current = auth::require_current_user(&state, &jar).await?;
     auth::ensure_current_account_mutable(&current)?;
-    let members = organization_members_input(&state, payload).await?;
     let organization = state
         .db
         .find_organization_by_id(&id)
@@ -3037,26 +3403,38 @@ async fn update_organization_members(
     {
         return Err(AppError::Forbidden);
     }
+    // Resolve email selectors only after the organization boundary and
+    // manager permission have been established. This prevents an unauthorized
+    // caller from using "unknown member email" as an account-existence oracle.
+    let members = organization_members_input(&state, payload).await?;
     ensure_organization_members_editable(&state, &id, &members).await?;
     state
         .db
-        .replace_organization_members(&id, members.clone())
+        .replace_organization_members_with_audit(
+            &id,
+            members.clone(),
+            audit::management_event(
+                current.user.id,
+                "organization.members.update",
+                "organization",
+                Some(id.clone()),
+                serde_json::json!({
+                    "members": members
+                        .iter()
+                        .map(|member| serde_json::json!({
+                            "user_id": member.user_id,
+                            "role": member.role
+                        }))
+                        .collect::<Vec<_>>()
+                }),
+            ),
+        )
         .await?;
     let organization = state
         .db
         .find_organization_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "organization.members.update",
-            "organization",
-            Some(id),
-            serde_json::json!({ "members": members.into_iter().map(|member| serde_json::json!({ "user_id": member.user_id, "role": member.role })).collect::<Vec<_>>() }),
-        ))
-        .await?;
     Ok(Json(organization_response(&state, organization).await?))
 }
 
@@ -3650,28 +4028,36 @@ async fn validate_bulk_import_existing_identities(
     state: &AppState,
     batch: &mut ParsedBulkImport,
 ) -> AppResult<()> {
-    for candidate in batch.candidates.clone() {
-        if batch.rows[candidate.result_index].outcome == "invalid" {
-            continue;
-        }
-        if state
-            .db
-            .find_user_by_email(&candidate.email)
-            .await?
-            .is_some()
-        {
+    let candidates = batch
+        .candidates
+        .iter()
+        .filter(|candidate| batch.rows[candidate.result_index].outcome != "invalid")
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let emails = candidates
+        .iter()
+        .map(|candidate| candidate.email.clone())
+        .collect::<Vec<_>>();
+    let usernames = candidates
+        .iter()
+        .map(|candidate| candidate.username.clone())
+        .collect::<Vec<_>>();
+    let (existing_emails, existing_usernames) = state
+        .db
+        .find_existing_user_identities(&emails, &usernames)
+        .await?;
+    for candidate in candidates {
+        if existing_emails.contains(&candidate.email) {
             mark_bulk_import_row_invalid(
                 &mut batch.rows,
                 candidate.result_index,
                 "email already belongs to an existing account",
             );
         }
-        if state
-            .db
-            .find_user_by_username(&candidate.username)
-            .await?
-            .is_some()
-        {
+        if existing_usernames.contains(&candidate.username) {
             mark_bulk_import_row_invalid(
                 &mut batch.rows,
                 candidate.result_index,
@@ -3894,34 +4280,50 @@ async fn update_user(
     if let Some(password) = payload.password.as_deref() {
         validate_password_for_subject(&state, password, &payload.email, &payload.username).await?;
     }
-    let user = state
-        .db
-        .update_user(UserUpdate {
-            id: &id,
-            email: payload.email,
-            username: payload.username,
-            display_name: payload.display_name,
-            phone: payload.phone,
-            is_admin: payload.is_admin,
-            is_active: payload.is_active,
-        })
-        .await?;
-    if let Some(password) = payload.password {
+    let password_hash = payload
+        .password
+        .as_deref()
+        .map(util::hash_password)
+        .transpose()?;
+    let user_update = UserUpdate {
+        id: &id,
+        email: payload.email,
+        username: payload.username,
+        display_name: payload.display_name,
+        phone: payload.phone,
+        is_admin: payload.is_admin,
+        is_active: payload.is_active,
+    };
+    let updated_email = user_update.email.clone();
+    let user = if let Some(password_hash) = password_hash {
         state
             .db
-            .set_user_password(&id, util::hash_password(&password)?)
+            .update_user_with_password_and_audit(
+                user_update,
+                password_hash,
+                audit::management_event(
+                    current.user.id.clone(),
+                    "user.update",
+                    "user",
+                    Some(id.clone()),
+                    serde_json::json!({ "email": updated_email }),
+                ),
+            )
+            .await?
+    } else {
+        let user = state.db.update_user(user_update).await?;
+        state
+            .db
+            .record_audit_event(audit::management_event(
+                current.user.id,
+                "user.update",
+                "user",
+                Some(id),
+                serde_json::json!({ "email": user.email.clone() }),
+            ))
             .await?;
-    }
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "user.update",
-            "user",
-            Some(id),
-            serde_json::json!({ "email": user.email.clone() }),
-        ))
-        .await?;
+        user
+    };
     Ok(Json(user.public()))
 }
 
@@ -3994,6 +4396,24 @@ async fn enable_user(
     Ok(Json(user.public()))
 }
 
+async fn bulk_user_lifecycle(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<UserLifecycleBatchInput>,
+) -> AppResult<Json<serde_json::Value>> {
+    let current = require_user_manager(&state, &jar).await?;
+    let action = crate::db::UserLifecycleBatchAction::parse(&payload.action)?;
+    let count = state
+        .db
+        .apply_user_lifecycle_batch(&current.user.id, payload.user_ids, action)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "action": action.as_str(),
+        "count": count,
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 struct PasswordInput {
     password: String,
@@ -4015,17 +4435,17 @@ async fn set_user_password(
     validate_password_for_subject(&state, &payload.password, &user.email, &user.username).await?;
     state
         .db
-        .set_user_password(&id, util::hash_password(&payload.password)?)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "user.password.set",
-            "user",
-            Some(id),
-            serde_json::json!({}),
-        ))
+        .replace_user_password_with_audit(
+            &id,
+            util::hash_password(&payload.password)?,
+            audit::management_event(
+                current.user.id,
+                "user.password.set",
+                "user",
+                Some(id.clone()),
+                serde_json::json!({}),
+            ),
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -4042,16 +4462,18 @@ async fn reset_user_mfa(
         .find_user_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    state.db.delete_mfa_for_user(&id).await?;
     state
         .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "mfa.admin_reset",
-            "user",
-            Some(id.clone()),
-            serde_json::json!({}),
-        ))
+        .delete_mfa_for_user_with_audit(
+            &id,
+            audit::management_event(
+                current.user.id,
+                "mfa.admin_reset",
+                "user",
+                Some(id.clone()),
+                serde_json::json!({}),
+            ),
+        )
         .await?;
     Ok(Json(mfa_status_for_user(&state, &id).await?))
 }
@@ -4133,13 +4555,23 @@ async fn ensure_assignable_user_ids(
     allowed_archived_user_ids: &BTreeSet<String>,
     target: &str,
 ) -> AppResult<()> {
+    let requested = requested_user_ids.iter().cloned().collect::<Vec<_>>();
+    let states = state.db.find_user_assignment_states(&requested).await?;
+    let states = states
+        .into_iter()
+        .map(|state| (state.id, state.archived_at))
+        .collect::<BTreeMap<_, _>>();
     for user_id in requested_user_ids {
-        let user = state
-            .db
-            .find_user_by_id(user_id)
-            .await?
+        let archived_at = states
+            .get(user_id)
+            .copied()
             .ok_or_else(|| AppError::BadRequest(format!("unknown user: {user_id}")))?;
-        archived_accounts::ensure_assignable_user_record(&user, allowed_archived_user_ids, target)?;
+        archived_accounts::ensure_assignable_user_state(
+            user_id,
+            archived_at,
+            allowed_archived_user_ids,
+            target,
+        )?;
     }
     Ok(())
 }
@@ -4149,14 +4581,33 @@ async fn list_clients(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicClient>>> {
     let (_, organization) = current_organization_client_manager(&state, &jar, false).await?;
-    let mut clients = Vec::new();
-    for client in state
+    let clients = state
         .db
         .list_clients_for_organization(&organization.id)
-        .await?
-    {
-        clients.push(public_client_with_claim_mappers(&state, client).await?);
-    }
+        .await?;
+    let client_ids = clients
+        .iter()
+        .map(|client| client.id.clone())
+        .collect::<Vec<_>>();
+    let mut mappers_by_client = state
+        .db
+        .list_client_claim_mappers_by_client_ids(&client_ids)
+        .await?;
+    let clients = clients
+        .into_iter()
+        .map(|client| {
+            let mut public = client.public()?;
+            public.organization_slug = Some(organization.slug.clone());
+            public.organization_name = Some(organization.name.clone());
+            public.claim_mappers = mappers_by_client
+                .remove(&public.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mapper| mapper.public())
+                .collect();
+            Ok(public)
+        })
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(clients))
 }
 
@@ -4274,151 +4725,6 @@ struct ClientClaimMapperInput {
     sort_order: i32,
 }
 
-async fn create_client(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Json(payload): Json<ClientInput>,
-) -> AppResult<Json<PublicClient>> {
-    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
-    validate_client_input(&payload)?;
-    let organization_id =
-        client_organization_from_context(payload.organization_id.clone(), &organization)?;
-    let claim_mappers = client_input_to_claim_mappers(&payload)?;
-    let client = state
-        .db
-        .insert_client(client_input_to_new(
-            payload,
-            None,
-            organization_id.clone(),
-            None,
-        )?)
-        .await?;
-    let application = state.db.harden_new_client_application(&client.id).await?;
-    state
-        .db
-        .replace_client_claim_mappers(&client.id, claim_mappers)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "client.create",
-            "client",
-            Some(client.id.clone()),
-            serde_json::json!({
-                "client_id": client.client_id.clone(),
-                "organization_id": organization_id,
-                "application_id": application.id,
-                "require_mfa": client.require_mfa == 1,
-                "require_pushed_authorization_requests": client.require_pushed_authorization_requests == 1,
-                "require_s256_pkce": client.require_s256_pkce == 1,
-                "require_confidential_client": client.require_confidential_client == 1,
-                "require_dpop": client.require_dpop == 1,
-                "require_account_selection": client.require_account_selection == 1,
-                "trust_email_verified": client.trust_email_verified == 1,
-                "authorization_details_types": client.authorization_details_types()?,
-                "service_account_enabled": client.service_account_enabled == 1
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        public_client_with_claim_mappers(&state, client).await?,
-    ))
-}
-
-async fn update_client(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-    Json(payload): Json<ClientInput>,
-) -> AppResult<Json<PublicClient>> {
-    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
-    validate_client_input(&payload)?;
-    let existing = state
-        .db
-        .find_client_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if existing.organization_id.as_deref() != Some(organization.id.as_str()) {
-        return Err(AppError::NotFound);
-    }
-    let organization_id =
-        client_organization_from_context(payload.organization_id.clone(), &organization)?;
-    let claim_mappers = client_input_to_claim_mappers(&payload)?;
-    let client = state
-        .db
-        .update_client(
-            &id,
-            client_input_to_new(
-                payload,
-                existing.client_secret_hash.clone(),
-                organization_id.clone(),
-                Some(existing.audience.clone()),
-            )?,
-        )
-        .await?;
-    state
-        .db
-        .replace_client_claim_mappers(&client.id, claim_mappers)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "client.update",
-            "client",
-            Some(id),
-            serde_json::json!({
-                "client_id": client.client_id.clone(),
-                "organization_id": organization_id,
-                "require_mfa": client.require_mfa == 1,
-                "require_pushed_authorization_requests": client.require_pushed_authorization_requests == 1,
-                "require_s256_pkce": client.require_s256_pkce == 1,
-                "require_confidential_client": client.require_confidential_client == 1,
-                "require_dpop": client.require_dpop == 1,
-                "require_account_selection": client.require_account_selection == 1,
-                "trust_email_verified": client.trust_email_verified == 1,
-                "authorization_details_types": client.authorization_details_types()?,
-                "service_account_enabled": client.service_account_enabled == 1
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        public_client_with_claim_mappers(&state, client).await?,
-    ))
-}
-
-async fn delete_client(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
-    let (current, organization) = current_organization_client_manager(&state, &jar, true).await?;
-    let client = state
-        .db
-        .find_client_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if client.organization_id.as_deref() != Some(organization.id.as_str()) {
-        return Err(AppError::NotFound);
-    }
-    state.db.delete_client(&id).await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "client.delete",
-            "client",
-            Some(id),
-            serde_json::json!({
-                "client_id": client.client_id,
-                "organization_id": client.organization_id
-            }),
-        ))
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 #[derive(Debug, Deserialize)]
 struct ApplicationInput {
     slug: String,
@@ -4429,28 +4735,8 @@ struct ApplicationInput {
     #[serde(default)]
     unique_identity_factors: Vec<String>,
     is_active: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationClientBindingInput {
-    client_id: String,
-    #[serde(default = "default_oidc_protocol")]
-    protocol: String,
-    #[serde(default = "default_authorization_profile")]
-    authorization_profile_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationClientBindingsInput {
-    bindings: Vec<ApplicationClientBindingInput>,
-}
-
-fn default_oidc_protocol() -> String {
-    "oidc".to_string()
-}
-
-fn default_authorization_profile() -> String {
-    "default".to_string()
+    #[serde(default)]
+    website_url: Option<String>,
 }
 
 const APPLICATION_MODULE_KEYS: &[&str] = &[
@@ -4552,19 +4838,6 @@ struct ApplicationScimTokenInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ApplicationRoleResponse {
-    id: String,
-    application_id: String,
-    name: String,
-    description: Option<String>,
-    permissions: Vec<String>,
-    is_default: bool,
-    is_active: bool,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct ApplicationProfileRoleResponse {
     id: String,
     profile_id: String,
@@ -4594,32 +4867,19 @@ struct ApplicationProfileRoleInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApplicationRoleInput {
-    name: String,
+struct ApplicationAuthorizationBindingsInput {
     #[serde(default)]
-    description: Option<String>,
+    user_id: Option<String>,
     #[serde(default)]
-    permissions: Vec<String>,
+    group_id: Option<String>,
     #[serde(default)]
-    is_default: bool,
-    #[serde(default = "default_true")]
-    is_active: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationRoleIdsInput {
-    role_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ApplicationPermissionOverrideResponse {
-    permission: String,
-    effect: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationPermissionOverridesInput {
-    overrides: Vec<ApplicationPermissionOverrideInput>,
+    user_role_ids: Vec<String>,
+    #[serde(default)]
+    user_permission_overrides: Vec<ApplicationPermissionOverrideInput>,
+    #[serde(default)]
+    group_role_ids: Vec<String>,
+    #[serde(default)]
+    organization_role_bindings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4682,21 +4942,6 @@ fn application_permission_definition_response(
         source: definition.source,
         is_active: definition.is_active == 1,
     }
-}
-
-fn application_role_response(role: ApplicationRoleRecord) -> AppResult<ApplicationRoleResponse> {
-    let permissions = role.permission_keys()?;
-    Ok(ApplicationRoleResponse {
-        id: role.id,
-        application_id: role.application_id,
-        name: role.name,
-        description: role.description,
-        permissions,
-        is_default: role.is_default == 1,
-        is_active: role.is_active == 1,
-        created_at: role.created_at,
-        updated_at: role.updated_at,
-    })
 }
 
 fn application_module_response(
@@ -4778,19 +5023,81 @@ struct ApplicationClientBindingResponse {
     auth_domain_id: String,
 }
 
-async fn application_client_binding_response(
-    state: &AppState,
-    binding: ApplicationClientBindingRecord,
-) -> AppResult<Option<ApplicationClientBindingResponse>> {
-    let Some(client) = state.db.find_client_by_id(&binding.client_db_id).await? else {
-        return Ok(None);
-    };
-    Ok(Some(ApplicationClientBindingResponse {
-        client: public_client_with_claim_mappers(state, client).await?,
-        protocol: binding.protocol,
-        authorization_profile_id: binding.authorization_profile_id,
-        auth_domain_id: binding.auth_domain_id,
-    }))
+#[derive(Debug, Clone, Copy)]
+enum MissingApplicationClientPolicy {
+    Skip,
+    NotFound,
+}
+
+/// Assemble application client bindings from the aggregate read projection.
+///
+/// The graph is loaded by `Db::read_application_graph` with bounded queries
+/// for every relation. Keeping this assembler synchronous makes the read
+/// model boundary explicit: once the graph is available, a binding list must
+/// never open a connection for a client, mapper, or organization.
+fn application_client_binding_responses_from_graph(
+    graph: &crate::db::ApplicationGraphRecordSet,
+    protocol: Option<&str>,
+    missing_client_policy: MissingApplicationClientPolicy,
+) -> AppResult<Vec<ApplicationClientBindingResponse>> {
+    let clients_by_id = graph
+        .clients
+        .iter()
+        .map(|client| (client.id.as_str(), client))
+        .collect::<BTreeMap<_, _>>();
+    let mut mappers_by_client = BTreeMap::<String, Vec<PublicClientClaimMapper>>::new();
+    for mapper in &graph.claim_mappers {
+        mappers_by_client
+            .entry(mapper.client_db_id.clone())
+            .or_default()
+            .push(mapper.clone().public());
+    }
+    for mappers in mappers_by_client.values_mut() {
+        // Match list_client_claim_mappers' ORDER BY. The graph query groups
+        // by client first, so restore the per-client created_at tie-breaker
+        // before exposing the public projection.
+        mappers.sort_by_key(|mapper| (mapper.sort_order, mapper.created_at));
+    }
+    let organizations_by_id = graph
+        .organizations
+        .iter()
+        .map(|organization| (organization.id.as_str(), organization))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut response = Vec::with_capacity(graph.bindings.len());
+    for binding in &graph.bindings {
+        if protocol.is_some_and(|expected| binding.protocol != expected) {
+            continue;
+        }
+        let Some(client) = clients_by_id.get(binding.client_db_id.as_str()) else {
+            if matches!(
+                missing_client_policy,
+                MissingApplicationClientPolicy::NotFound
+            ) {
+                return Err(AppError::NotFound);
+            }
+            continue;
+        };
+
+        let mut public = (*client).clone().public()?;
+        if let Some(organization_id) = public.organization_id.as_deref()
+            && let Some(organization) = organizations_by_id.get(organization_id)
+        {
+            public.organization_slug = Some(organization.slug.clone());
+            public.organization_name = Some(organization.name.clone());
+        }
+        public.claim_mappers = mappers_by_client
+            .get(&binding.client_db_id)
+            .cloned()
+            .unwrap_or_default();
+        response.push(ApplicationClientBindingResponse {
+            client: public,
+            protocol: binding.protocol.clone(),
+            authorization_profile_id: binding.authorization_profile_id.clone(),
+            auth_domain_id: binding.auth_domain_id.clone(),
+        });
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4829,6 +5136,13 @@ struct ApplicationDiscoveryInput {
     signing_public_jwks: Option<String>,
     #[serde(default)]
     operator_disabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationDiscoveryDiscoverInput {
+    website_url: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 fn application_discovery_response(
@@ -4897,83 +5211,53 @@ fn application_input_to_new(
     })
 }
 
-async fn ensure_application_authorization_profiles(
-    state: &AppState,
-    application: &ApplicationRecord,
-) -> AppResult<Vec<ApplicationAuthorizationProfileRecord>> {
-    if state
-        .db
-        .find_application_discovery(&application.id)
-        .await?
-        .is_some_and(|record| record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE)
-    {
-        return state
-            .db
-            .list_application_authorization_profiles(&application.id)
-            .await;
-    }
-
-    let mut profiles = Vec::new();
-    for binding in state.db.list_application_client_bindings(&application.id).await? {
-        let client = state
-            .db
-            .find_client_by_id(&binding.client_db_id)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let existing = state
-            .db
-            .find_application_authorization_profile(&application.id, &client.client_id)
-            .await?;
-        let profile = state
-            .db
-            .upsert_application_authorization_profile(NewApplicationAuthorizationProfile {
-                id: existing
-                    .as_ref()
-                    .map(|profile| profile.id.clone())
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                application_id: application.id.clone(),
-                profile_key: client.client_id.clone(),
-                connection_kind: binding.protocol,
-                connection_id: Some(client.id.clone()),
-                source_mode: application_discovery::SOURCE_MODE_MANUAL.to_string(),
-                remote_version: None,
-                remote_digest: None,
-                sync_status: application_discovery::SYNC_STATUS_MANUAL.to_string(),
-                last_synced_at: None,
-                last_error: None,
-            })
-            .await?;
-        profiles.push(profile);
-    }
-    Ok(profiles)
-}
-
 async fn application_response(
     state: &AppState,
     application: ApplicationRecord,
 ) -> AppResult<ApplicationResponse> {
-    let mut client_bindings = Vec::new();
-    for binding in state.db.list_application_client_bindings(&application.id).await? {
-        if let Some(binding) = application_client_binding_response(state, binding).await? {
-            client_bindings.push(binding);
-        }
-    }
+    let graph = state.db.read_application_graph(&application.id).await?;
+    application_response_from_graph(application, graph)
+}
+
+fn application_response_from_graph(
+    application: ApplicationRecord,
+    graph: crate::db::ApplicationGraphRecordSet,
+) -> AppResult<ApplicationResponse> {
+    let client_bindings = application_client_binding_responses_from_graph(
+        &graph,
+        None,
+        MissingApplicationClientPolicy::Skip,
+    )?;
+    let crate::db::ApplicationGraphRecordSet {
+        modules,
+        profiles,
+        permission_definitions,
+        profile_roles,
+        ..
+    } = graph;
     let unique_identity_factors = application.unique_identity_factors()?;
-    let modules = state
-        .db
-        .list_application_modules(&application.id)
-        .await?
+    let modules = modules
         .into_iter()
         .map(application_module_response)
         .collect::<AppResult<Vec<_>>>()?;
-    let profiles = ensure_application_authorization_profiles(&state, &application).await?;
+    // A representation read must not repair or mutate the aggregate.  Profile
+    // creation belongs to the explicit client/application write transaction;
+    // otherwise a harmless GET can leave a partial profile graph behind when
+    // a later query or response conversion fails.
+    let mut permission_counts = BTreeMap::<String, usize>::new();
+    for definition in permission_definitions {
+        if definition.is_active == 1 {
+            *permission_counts.entry(definition.profile_id).or_default() += 1;
+        }
+    }
+    let mut role_counts = BTreeMap::<String, usize>::new();
+    for role in profile_roles {
+        if role.is_active == 1 {
+            *role_counts.entry(role.profile_id).or_default() += 1;
+        }
+    }
     let mut authorization_profiles = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let definitions = state
-            .db
-            .list_application_permission_definitions(&profile.id)
-            .await?;
-        let roles = state.db.list_application_profile_roles(&profile.id).await?;
         authorization_profiles.push(ApplicationAuthorizationProfileResponse {
             id: profile.id.clone(),
             profile_key: profile.profile_key.clone(),
@@ -4985,11 +5269,8 @@ async fn application_response(
             sync_status: profile.sync_status.clone(),
             last_synced_at: profile.last_synced_at,
             last_error: profile.last_error.clone(),
-            permission_count: definitions
-                .iter()
-                .filter(|item| item.is_active == 1)
-                .count(),
-            role_count: roles.iter().filter(|item| item.is_active == 1).count(),
+            permission_count: permission_counts.get(&profile.id).copied().unwrap_or(0),
+            role_count: role_counts.get(&profile.id).copied().unwrap_or(0),
             created_at: profile.created_at,
             updated_at: profile.updated_at,
         });
@@ -5099,10 +5380,27 @@ async fn list_applications(
 ) -> AppResult<Json<Vec<ApplicationResponse>>> {
     let (current, organization) = current_organization_context(&state, &jar).await?;
     require_organization_manager_for(&state, &current, &organization.id).await?;
-    let mut result = Vec::new();
-    for application in state.db.list_applications(Some(&organization.id)).await? {
-        result.push(application_response(&state, application).await?);
-    }
+    let applications = state.db.list_applications(Some(&organization.id)).await?;
+    let application_ids = applications
+        .iter()
+        .map(|application| application.id.clone())
+        .collect::<Vec<_>>();
+    let graphs = state
+        .db
+        .read_application_graph_batch(&application_ids)
+        .await?;
+    let result = applications
+        .into_iter()
+        .map(|application| {
+            let graph = graphs.get(&application.id).cloned().ok_or_else(|| {
+                AppError::Internal(format!(
+                    "application graph is missing for {}",
+                    application.id
+                ))
+            })?;
+            application_response_from_graph(application, graph)
+        })
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(result))
 }
 
@@ -5286,21 +5584,23 @@ async fn update_application_module(
     }
     let module = state
         .db
-        .upsert_application_module(&id, &module_key, &config_json, payload.is_enabled)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.module.update",
-            "application",
-            Some(id),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "module": module_key,
-                "is_enabled": payload.is_enabled,
-            }),
-        ))
+        .upsert_application_module_with_audit(
+            &id,
+            &module_key,
+            &config_json,
+            payload.is_enabled,
+            audit::management_event(
+                current.user.id.clone(),
+                "application.module.update",
+                "application",
+                Some(id.clone()),
+                serde_json::json!({
+                    "organization_id": application.organization_id,
+                    "module": module_key.clone(),
+                    "is_enabled": payload.is_enabled,
+                }),
+            ),
+        )
         .await?;
     Ok(Json(application_module_response(module)?))
 }
@@ -5428,22 +5728,23 @@ async fn rotate_application_jwt_secret(
         .ok_or_else(|| AppError::Internal("failed to hash JWT client secret".to_string()))?;
     let record = state
         .db
-        .rotate_application_jwt_secret(&id, &client_id, &secret_hash, payload.grace_seconds)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.jwt_client.secret.rotate",
-            "application",
-            Some(id),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "client_id": client_id,
-                "grace_seconds": payload.grace_seconds,
-                "secret_id": record.id,
-            }),
-        ))
+        .rotate_application_jwt_secret_with_audit(
+            &id,
+            &client_id,
+            &secret_hash,
+            payload.grace_seconds,
+            audit::management_event(
+                current.user.id.clone(),
+                "application.jwt_client.secret.rotate",
+                "application",
+                Some(id.clone()),
+                serde_json::json!({
+                    "organization_id": application.organization_id,
+                    "client_id": client_id.clone(),
+                    "grace_seconds": payload.grace_seconds,
+                }),
+            ),
+        )
         .await?;
     Ok(Json(ApplicationJwtSecretRotationResponse {
         client_id,
@@ -5582,26 +5883,31 @@ async fn create_application_scim_token(
         ));
     }
     let raw_token = format!("scim_v1_{}", util::random_token(32));
+    let token_id = uuid::Uuid::new_v4().to_string();
+    let token_prefix = raw_token.chars().take(16).collect::<String>();
+    let token_scopes = scopes.clone();
     let record = state
         .db
-        .insert_application_scim_token(NewApplicationScimToken {
-            id: uuid::Uuid::new_v4().to_string(),
-            application_id: application.id.clone(),
-            token_prefix: raw_token.chars().take(16).collect(),
-            token_hash: util::token_hash(&raw_token),
-            scopes,
-            expires_at: payload.expires_at,
-        })
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.scim_token.create",
-            "application",
-            Some(application.id),
-            serde_json::json!({ "token_id": record.id, "token_prefix": record.token_prefix }),
-        ))
+        .insert_application_scim_token_with_audit(
+            NewApplicationScimToken {
+                id: token_id.clone(),
+                application_id: application.id.clone(),
+                token_prefix,
+                token_hash: util::token_hash(&raw_token),
+                scopes: token_scopes,
+                expires_at: payload.expires_at,
+            },
+            audit::management_event(
+                current.user.id.clone(),
+                "application.scim_token.create",
+                "application",
+                Some(application.id.clone()),
+                serde_json::json!({
+                    "token_id": token_id,
+                    "token_prefix": raw_token.chars().take(16).collect::<String>(),
+                }),
+            ),
+        )
         .await?;
     Ok(Json(application_scim_token_response(
         record,
@@ -5807,7 +6113,10 @@ async fn update_application_discovery(
             || record.fetch_secret_ciphertext != fetch_secret_ciphertext
             || record.signing_public_jwks != signing_public_jwks
     });
-    let has_trust = !fetch_secret_ciphertext.is_empty() && !signing_public_jwks.is_empty();
+    // Challenge-mode website applications intentionally have no persisted
+    // fetch secret.  The pinned signing key is sufficient because each sync
+    // carries a fresh HTTPS challenge and a signed registration proof.
+    let has_trust = !signing_public_jwks.is_empty();
     let sync_status = if management_mode == application_discovery::MANAGEMENT_MODE_SIGNET {
         application_discovery::SYNC_DISABLED.to_string()
     } else if !has_trust {
@@ -5930,20 +6239,289 @@ async fn sync_application_discovery(
     Ok(Json(application_discovery_response(record)))
 }
 
-async fn list_application_roles(
+async fn discover_application(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(payload): Json<ApplicationDiscoveryDiscoverInput>,
+) -> AppResult<Json<ApplicationDiscoveryResponse>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let origin = application_discovery::website_origin(&payload.website_url)?;
+    let entry = state
+        .settings
+        .discovery
+        .auto_registration
+        .allowlist
+        .iter()
+        .find(|entry| {
+            entry
+                .origin
+                .trim()
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(&origin)
+        })
+        .ok_or(AppError::Forbidden)?;
+    let idempotency_key = payload
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if idempotency_key.is_some_and(|value| value.len() > 128 || value.chars().any(char::is_control))
+    {
+        return Err(AppError::BadRequest(
+            "idempotency_key is invalid".to_string(),
+        ));
+    }
+    require_organization_manager_for(&state, &current, &entry.organization_id).await?;
+    let record = if let Some(idempotency_key) = idempotency_key {
+        let request_hash = util::sha256_base64url(&format!(
+            "signet:application-discovery:auto-register:v1:{origin}"
+        ));
+        match state
+            .db
+            .claim_application_discovery_idempotency(
+                &entry.organization_id,
+                idempotency_key,
+                &request_hash,
+                &origin,
+            )
+            .await?
+        {
+            crate::db::ApplicationDiscoveryIdempotencyClaim::Completed { application_id } => {
+                let application = state
+                    .db
+                    .find_application_by_id(&application_id)
+                    .await?
+                    .ok_or(AppError::NotFound)?;
+                if application.organization_id != entry.organization_id {
+                    return Err(AppError::Forbidden);
+                }
+                state
+                    .db
+                    .find_application_discovery(&application_id)
+                    .await?
+                    .ok_or(AppError::NotFound)?
+            }
+            crate::db::ApplicationDiscoveryIdempotencyClaim::InProgress => {
+                return Err(AppError::BadRequest(
+                    "idempotency_key is already being processed".to_string(),
+                ));
+            }
+            crate::db::ApplicationDiscoveryIdempotencyClaim::Claimed { claim_token } => {
+                let result =
+                    application_discovery::auto_register_application(&state, &origin).await;
+                match result {
+                    Ok(record) => {
+                        state
+                            .db
+                            .complete_application_discovery_idempotency(
+                                &entry.organization_id,
+                                idempotency_key,
+                                &claim_token,
+                                &record.application_id,
+                            )
+                            .await?;
+                        record
+                    }
+                    Err(error) => {
+                        state
+                            .db
+                            .fail_application_discovery_idempotency(
+                                &entry.organization_id,
+                                idempotency_key,
+                                &claim_token,
+                            )
+                            .await?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    } else {
+        application_discovery::auto_register_application(&state, &origin).await?
+    };
+    let sync_status = record.sync_status.clone();
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.discovery.auto_register",
+            "application_discovery",
+            Some(record.application_id.clone()),
+            serde_json::json!({
+                "origin": origin,
+                "idempotency_key": idempotency_key,
+                "sync_status": sync_status,
+            }),
+        ))
+        .await?;
+    Ok(Json(application_discovery_response(record)))
+}
+
+async fn list_application_oidc_clients(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
-) -> AppResult<Json<Vec<ApplicationRoleResponse>>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    let roles = state
+) -> AppResult<Json<Vec<PublicClient>>> {
+    let current = auth::require_current_user(&state, &jar).await?;
+    let application = state
         .db
-        .list_application_roles(&id)
+        .find_application_by_id(&id)
         .await?
-        .into_iter()
-        .map(application_role_response)
-        .collect::<AppResult<Vec<_>>>()?;
-    Ok(Json(roles))
+        .ok_or(AppError::NotFound)?;
+    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let graph = state.db.read_application_graph(&id).await?;
+    let clients = application_client_binding_responses_from_graph(
+        &graph,
+        Some("oidc"),
+        MissingApplicationClientPolicy::NotFound,
+    )?
+    .into_iter()
+    .map(|binding| binding.client)
+    .collect();
+    Ok(Json(clients))
+}
+
+async fn create_application_oidc_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(id): Path<String>,
+    Json(payload): Json<ClientInput>,
+) -> AppResult<Json<PublicClient>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
+    validate_client_input(&payload)?;
+    if payload
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|organization_id| {
+            !organization_id.is_empty() && organization_id != application.organization_id
+        })
+    {
+        return Err(AppError::Forbidden);
+    }
+    let claim_mappers = client_input_to_claim_mappers(&payload)?;
+    let client = state
+        .db
+        .create_application_oidc_client_graph(
+            &application.id,
+            client_input_to_new(
+                payload,
+                None,
+                Some(application.organization_id.clone()),
+                None,
+            )?,
+            claim_mappers,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.oidc_client.create",
+            "application",
+            Some(application.id),
+            serde_json::json!({ "client_id": client.client_id }),
+        ))
+        .await?;
+    Ok(Json(
+        public_client_with_claim_mappers(&state, client).await?,
+    ))
+}
+
+async fn update_application_oidc_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, client_db_id)): Path<(String, String)>,
+    Json(payload): Json<ClientInput>,
+) -> AppResult<Json<PublicClient>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
+    validate_client_input(&payload)?;
+    if payload
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|organization_id| {
+            !organization_id.is_empty() && organization_id != application.organization_id
+        })
+    {
+        return Err(AppError::Forbidden);
+    }
+    let binding = state
+        .db
+        .find_application_client_binding(&client_db_id)
+        .await?
+        .filter(|binding| binding.application_id == application.id && binding.protocol == "oidc")
+        .ok_or(AppError::NotFound)?;
+    let existing = state
+        .db
+        .find_client_by_id(&binding.client_db_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let claim_mappers = client_input_to_claim_mappers(&payload)?;
+    let client = state
+        .db
+        .update_application_oidc_client_graph(
+            &application.id,
+            &existing.id,
+            client_input_to_new(
+                payload,
+                existing.client_secret_hash.clone(),
+                Some(application.organization_id.clone()),
+                Some(existing.audience.clone()),
+            )?,
+            claim_mappers,
+        )
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.oidc_client.update",
+            "application",
+            Some(application.id),
+            serde_json::json!({ "client_id": client.client_id }),
+        ))
+        .await?;
+    Ok(Json(
+        public_client_with_claim_mappers(&state, client).await?,
+    ))
+}
+
+async fn delete_application_oidc_client(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, client_db_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
+    let binding = state
+        .db
+        .find_application_client_binding(&client_db_id)
+        .await?
+        .filter(|binding| binding.application_id == application.id && binding.protocol == "oidc")
+        .ok_or(AppError::NotFound)?;
+    let client = state
+        .db
+        .find_client_by_id(&binding.client_db_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    state
+        .db
+        .delete_application_oidc_client_graph(&application.id, &client.id)
+        .await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.oidc_client.delete",
+            "application",
+            Some(application.id),
+            serde_json::json!({ "client_id": client.client_id }),
+        ))
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn application_permission_catalog(
@@ -5970,11 +6548,6 @@ async fn application_authorization_subjects(
         .db
         .list_organization_members(&application.organization_id)
         .await?;
-    let organization_user_ids = organization_members
-        .iter()
-        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
-        .map(|member| member.user_id.clone())
-        .collect::<BTreeSet<_>>();
     let users = organization_members
         .into_iter()
         .filter(|member| member.is_active == 1 && member.archived_at.is_none())
@@ -5991,24 +6564,19 @@ async fn application_authorization_subjects(
             updated_at: member.membership_updated_at,
         })
         .collect();
-    let mut groups = Vec::new();
-    for group in state.db.list_groups().await? {
-        let has_organization_member = state
-            .db
-            .list_group_members(&group.id)
-            .await?
-            .iter()
-            .any(|member| organization_user_ids.contains(&member.id));
-        if has_organization_member {
-            groups.push(ApplicationAuthorizationGroupResponse {
-                id: group.id,
-                name: group.name,
-                description: group.description,
-                created_at: group.created_at,
-                updated_at: group.updated_at,
-            });
-        }
-    }
+    let groups = state
+        .db
+        .list_application_authorization_groups(&application.organization_id)
+        .await?
+        .into_iter()
+        .map(|group| ApplicationAuthorizationGroupResponse {
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            created_at: group.created_at,
+            updated_at: group.updated_at,
+        })
+        .collect();
     Ok(Json(ApplicationAuthorizationSubjectsResponse {
         users,
         groups,
@@ -6018,108 +6586,6 @@ async fn application_authorization_subjects(
             organizations::ROLE_MEMBER.to_string(),
         ],
     }))
-}
-
-async fn create_application_role(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-    Json(payload): Json<ApplicationRoleInput>,
-) -> AppResult<Json<ApplicationRoleResponse>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    let role = state
-        .db
-        .upsert_application_role(
-            &id,
-            NewApplicationRole {
-                name: payload.name,
-                description: payload.description,
-                permissions: payload.permissions,
-                is_default: payload.is_default,
-                is_active: payload.is_active,
-            },
-        )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.role.create",
-            "application_role",
-            Some(role.id.clone()),
-            serde_json::json!({
-                "application_id": application.id,
-                "organization_id": application.organization_id,
-                "role": role.name,
-            }),
-        ))
-        .await?;
-    Ok(Json(application_role_response(role)?))
-}
-
-async fn update_application_role(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, role_id)): Path<(String, String)>,
-    Json(payload): Json<ApplicationRoleInput>,
-) -> AppResult<Json<ApplicationRoleResponse>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    state
-        .db
-        .find_application_role_by_id(&id, &role_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let role = state
-        .db
-        .update_application_role(
-            &id,
-            &role_id,
-            NewApplicationRole {
-                name: payload.name,
-                description: payload.description,
-                permissions: payload.permissions,
-                is_default: payload.is_default,
-                is_active: payload.is_active,
-            },
-        )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.role.update",
-            "application_role",
-            Some(role.id.clone()),
-            serde_json::json!({
-                "application_id": application.id,
-                "organization_id": application.organization_id,
-            }),
-        ))
-        .await?;
-    Ok(Json(application_role_response(role)?))
-}
-
-async fn delete_application_role(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, role_id)): Path<(String, String)>,
-) -> AppResult<Json<serde_json::Value>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    state.db.delete_application_role(&id, &role_id).await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.role.delete",
-            "application_role",
-            Some(role_id),
-            serde_json::json!({
-                "application_id": application.id,
-                "organization_id": application.organization_id,
-            }),
-        ))
-        .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn managed_authorization_profile(
@@ -6177,63 +6643,34 @@ async fn application_authorization_user(
 ) -> AppResult<crate::db::UserRecord> {
     let user = state
         .db
-        .find_user_by_id(user_id)
+        .find_application_authorization_user(&application.id, user_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let belongs_to_application = state
-        .db
-        .list_organization_members(&application.organization_id)
-        .await?
-        .into_iter()
-        .any(|member| {
-            member.user_id == user.id && member.is_active == 1 && member.archived_at.is_none()
-        });
-    if !belongs_to_application {
-        return Err(AppError::NotFound);
-    }
     Ok(user)
-}
-
-async fn application_authorization_group(
-    state: &AppState,
-    application: &ApplicationRecord,
-    group_id: &str,
-) -> AppResult<GroupRecord> {
-    let group = state
-        .db
-        .find_group_by_id(group_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let organization_user_ids = state
-        .db
-        .list_organization_members(&application.organization_id)
-        .await?
-        .into_iter()
-        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
-        .map(|member| member.user_id)
-        .collect::<BTreeSet<_>>();
-    let belongs_to_application = state
-        .db
-        .list_group_members(&group.id)
-        .await?
-        .into_iter()
-        .any(|member| organization_user_ids.contains(&member.id));
-    if !belongs_to_application {
-        return Err(AppError::NotFound);
-    }
-    Ok(group)
 }
 
 async fn authorization_profile_response(
     state: &AppState,
     profile: ApplicationAuthorizationProfileRecord,
 ) -> AppResult<ApplicationAuthorizationProfileResponse> {
-    let definitions = state
+    let counts = state
         .db
-        .list_application_permission_definitions(&profile.id)
+        .list_application_authorization_profile_counts(std::slice::from_ref(&profile.id))
         .await?;
-    let roles = state.db.list_application_profile_roles(&profile.id).await?;
-    Ok(ApplicationAuthorizationProfileResponse {
+    let (permission_count, role_count) = counts.get(&profile.id).copied().unwrap_or((0, 0));
+    Ok(authorization_profile_response_with_counts(
+        profile,
+        permission_count.max(0) as usize,
+        role_count.max(0) as usize,
+    ))
+}
+
+fn authorization_profile_response_with_counts(
+    profile: ApplicationAuthorizationProfileRecord,
+    permission_count: usize,
+    role_count: usize,
+) -> ApplicationAuthorizationProfileResponse {
+    ApplicationAuthorizationProfileResponse {
         id: profile.id,
         profile_key: profile.profile_key,
         connection_kind: profile.connection_kind,
@@ -6244,14 +6681,11 @@ async fn authorization_profile_response(
         sync_status: profile.sync_status,
         last_synced_at: profile.last_synced_at,
         last_error: profile.last_error,
-        permission_count: definitions
-            .iter()
-            .filter(|item| item.is_active == 1)
-            .count(),
-        role_count: roles.iter().filter(|item| item.is_active == 1).count(),
+        permission_count,
+        role_count,
         created_at: profile.created_at,
         updated_at: profile.updated_at,
-    })
+    }
 }
 
 async fn list_application_authorization_profiles(
@@ -6260,11 +6694,29 @@ async fn list_application_authorization_profiles(
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<ApplicationAuthorizationProfileResponse>>> {
     let (_current, application) = managed_application(&state, &jar, &id).await?;
-    let profiles = ensure_application_authorization_profiles(&state, &application).await?;
-    let mut response = Vec::with_capacity(profiles.len());
-    for profile in profiles {
-        response.push(authorization_profile_response(&state, profile).await?);
-    }
+    let profiles = state
+        .db
+        .list_application_authorization_profiles(&application.id)
+        .await?;
+    let profile_ids = profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    let counts = state
+        .db
+        .list_application_authorization_profile_counts(&profile_ids)
+        .await?;
+    let response = profiles
+        .into_iter()
+        .map(|profile| {
+            let (permission_count, role_count) = counts.get(&profile.id).copied().unwrap_or((0, 0));
+            authorization_profile_response_with_counts(
+                profile,
+                permission_count.max(0) as usize,
+                role_count.max(0) as usize,
+            )
+        })
+        .collect();
     Ok(Json(response))
 }
 
@@ -6308,6 +6760,74 @@ async fn application_profile_permission_catalog(
     definitions.sort_by(|left, right| left.key.cmp(&right.key));
     definitions.dedup_by(|left, right| left.key == right.key);
     Ok(Json(definitions))
+}
+
+async fn get_application_authorization_bindings(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+) -> AppResult<Json<AuthorizationBindingsSnapshot>> {
+    let (_current, application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    Ok(Json(
+        state
+            .db
+            .read_application_authorization_bindings(&application.id, &profile.id)
+            .await?,
+    ))
+}
+
+async fn update_application_authorization_bindings(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, profile_id)): Path<(String, String)>,
+    Json(payload): Json<ApplicationAuthorizationBindingsInput>,
+) -> AppResult<Json<AuthorizationBindingsSnapshot>> {
+    let (current, application, profile) =
+        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
+    let user_id = payload.user_id.clone();
+    let group_id = payload.group_id.clone();
+    let user_role_ids = payload.user_role_ids.clone();
+    let group_role_ids = payload.group_role_ids.clone();
+    let organization_role_bindings = payload.organization_role_bindings.clone();
+    let snapshot = state
+        .db
+        .replace_application_authorization_bindings_with_audit(
+            &application.id,
+            &profile.id,
+            AuthorizationBindingsUpdate {
+                user_id: payload.user_id,
+                group_id: payload.group_id,
+                user_role_ids: payload.user_role_ids,
+                user_permission_overrides: payload
+                    .user_permission_overrides
+                    .into_iter()
+                    .map(|value| AuthorizationBindingPermissionOverride {
+                        permission: value.permission,
+                        effect: value.effect,
+                    })
+                    .collect(),
+                group_role_ids: payload.group_role_ids,
+                organization_role_bindings: payload.organization_role_bindings,
+            },
+            audit::management_event(
+                current.user.id,
+                "application.authorization_profile.bindings.update",
+                "application_authorization_profile",
+                Some(profile.id.clone()),
+                serde_json::json!({
+                    "application_id": application.id,
+                    "profile_id": profile.id,
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "user_role_ids": user_role_ids,
+                    "group_role_ids": group_role_ids,
+                    "organization_role_bindings": organization_role_bindings,
+                }),
+            ),
+        )
+        .await?;
+    Ok(Json(snapshot))
 }
 
 async fn list_application_profile_roles(
@@ -6439,219 +6959,25 @@ async fn delete_application_profile_role(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn list_application_profile_user_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, user_id)): Path<(String, String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    application_authorization_user(&state, &application, &user_id).await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_user_role_ids(&profile_id, &user_id)
-            .await?,
-    ))
-}
-
-async fn update_application_profile_user_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, user_id)): Path<(String, String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let user = application_authorization_user(&state, &application, &user_id).await?;
-    state
-        .db
-        .replace_application_profile_user_role_ids(&profile_id, &user.id, payload.role_ids)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.authorization_profile.user_roles.update",
-            "application_authorization_profile",
-            Some(profile_id.clone()),
-            serde_json::json!({ "application_id": application.id, "user_id": user.id }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_user_role_ids(&profile_id, &user_id)
-            .await?,
-    ))
-}
-
-async fn list_application_profile_group_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, group_id)): Path<(String, String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    application_authorization_group(&state, &application, &group_id).await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_group_role_ids(&profile_id, &group_id)
-            .await?,
-    ))
-}
-
-async fn update_application_profile_group_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, group_id)): Path<(String, String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    application_authorization_group(&state, &application, &group_id).await?;
-    state
-        .db
-        .replace_application_profile_group_role_ids(&profile_id, &group_id, payload.role_ids)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.authorization_profile.group_roles.update",
-            "application_authorization_profile",
-            Some(profile_id.clone()),
-            serde_json::json!({ "application_id": application.id, "group_id": group_id }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_group_role_ids(&profile_id, &group_id)
-            .await?,
-    ))
-}
-
-async fn list_application_profile_organization_role_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, organization_role)): Path<(String, String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let organization_role = organizations::normalize_role(&organization_role)?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_organization_role_ids(&profile_id, &organization_role)
-            .await?,
-    ))
-}
-
-async fn update_application_profile_organization_role_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, organization_role)): Path<(String, String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    let organization_role = organizations::normalize_role(&organization_role)?;
-    state
-        .db
-        .replace_application_profile_organization_role_ids(
-            &profile_id,
-            &organization_role,
-            payload.role_ids,
-        )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.authorization_profile.organization_roles.update",
-            "application_authorization_profile",
-            Some(profile_id.clone()),
-            serde_json::json!({
-                "application_id": application.id,
-                "organization_role": organization_role,
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_organization_role_ids(&profile_id, &organization_role)
-            .await?,
-    ))
-}
-
-async fn list_application_profile_user_permission_overrides(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, user_id)): Path<(String, String, String)>,
-) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
-    let (_current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    application_authorization_user(&state, &application, &user_id).await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_user_permission_overrides(&profile_id, &user_id)
-            .await?
-            .into_iter()
-            .map(|value| ApplicationPermissionOverrideResponse {
-                permission: value.permission,
-                effect: value.effect,
-            })
-            .collect(),
-    ))
-}
-
-async fn update_application_profile_user_permission_overrides(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, profile_id, user_id)): Path<(String, String, String)>,
-    Json(payload): Json<ApplicationPermissionOverridesInput>,
-) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
-    let (current, application, _profile) =
-        managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
-    application_authorization_user(&state, &application, &user_id).await?;
-    state
-        .db
-        .replace_application_profile_user_permission_overrides(
-            &profile_id,
-            &user_id,
-            payload
-                .overrides
-                .into_iter()
-                .map(|item| (item.permission, item.effect))
-                .collect(),
-        )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.authorization_profile.user_permission_overrides.update",
-            "application_authorization_profile",
-            Some(profile_id.clone()),
-            serde_json::json!({ "application_id": application.id, "user_id": user_id }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_profile_user_permission_overrides(&profile_id, &user_id)
-            .await?
-            .into_iter()
-            .map(|value| ApplicationPermissionOverrideResponse {
-                permission: value.permission,
-                effect: value.effect,
-            })
-            .collect(),
-    ))
+/// The entitlement resolver keeps its protocol claims in a dedicated map so
+/// OIDC, JWT, SAML, and CAS adapters can share one source of truth.  The
+/// administrative preview is a diagnostic representation, however, and its
+/// callers expect those claims alongside the typed summary fields.  Merge the
+/// claims here at the transport boundary instead of coupling the domain model
+/// to one management response shape.
+fn authorization_preview_entitlements(
+    entitlements: authorization::ApplicationEntitlements,
+) -> AppResult<serde_json::Value> {
+    let claims = entitlements.claims.clone();
+    let mut value = serde_json::to_value(entitlements).map_err(|error| {
+        AppError::Internal(format!("failed to serialize entitlements: {error}"))
+    })?;
+    if let serde_json::Value::Object(object) = &mut value {
+        for (key, claim) in claims {
+            object.entry(key).or_insert(claim);
+        }
+    }
+    Ok(value)
 }
 
 async fn application_profile_authorization_preview(
@@ -6664,10 +6990,10 @@ async fn application_profile_authorization_preview(
     let user = application_authorization_user(&state, &application, &user_id).await?;
     let decision = authorization::check_login_access(&state, &application, &user.id).await?;
     let entitlements = if decision.allowed {
-        Some(
+        Some(authorization_preview_entitlements(
             authorization::resolve_entitlements_for_profile(&state, &application, &profile, &user)
                 .await?,
-        )
+        )?)
     } else {
         None
     };
@@ -6677,244 +7003,18 @@ async fn application_profile_authorization_preview(
     })))
 }
 
-async fn list_application_user_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, user_id)): Path<(String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_user_role_ids(&id, &user_id)
-            .await?,
-    ))
-}
-
-async fn update_application_user_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, user_id)): Path<(String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    let user = state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .replace_application_user_role_ids(&id, &user.id, payload.role_ids)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.user_roles.update",
-            "application",
-            Some(id.clone()),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "user_id": user.id,
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_user_role_ids(&id, &user_id)
-            .await?,
-    ))
-}
-
-async fn list_application_group_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, group_id)): Path<(String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    state
-        .db
-        .find_group_by_id(&group_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok(Json(
-        state
-            .db
-            .list_application_group_role_ids(&id, &group_id)
-            .await?,
-    ))
-}
-
-async fn update_application_group_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, group_id)): Path<(String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    state
-        .db
-        .find_group_by_id(&group_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .replace_application_group_role_ids(&id, &group_id, payload.role_ids)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.group_roles.update",
-            "application",
-            Some(id.clone()),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "group_id": group_id,
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_group_role_ids(&id, &group_id)
-            .await?,
-    ))
-}
-
-async fn list_application_organization_role_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, organization_role)): Path<(String, String)>,
-) -> AppResult<Json<Vec<String>>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    let organization_role = organizations::normalize_role(&organization_role)?;
-    Ok(Json(
-        state
-            .db
-            .list_application_organization_role_ids(&id, &organization_role)
-            .await?,
-    ))
-}
-
-async fn update_application_organization_role_roles(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, organization_role)): Path<(String, String)>,
-    Json(payload): Json<ApplicationRoleIdsInput>,
-) -> AppResult<Json<Vec<String>>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    let organization_role = organizations::normalize_role(&organization_role)?;
-    state
-        .db
-        .replace_application_organization_role_ids(&id, &organization_role, payload.role_ids)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.organization_role_mapping.update",
-            "application",
-            Some(id.clone()),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "organization_role": organization_role,
-            }),
-        ))
-        .await?;
-    Ok(Json(
-        state
-            .db
-            .list_application_organization_role_ids(&id, &organization_role)
-            .await?,
-    ))
-}
-
-async fn list_application_user_permission_overrides(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, user_id)): Path<(String, String)>,
-) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    let values = state
-        .db
-        .list_application_user_permission_overrides(&id, &user_id)
-        .await?
-        .into_iter()
-        .map(|value| ApplicationPermissionOverrideResponse {
-            permission: value.permission,
-            effect: value.effect,
-        })
-        .collect();
-    Ok(Json(values))
-}
-
-async fn update_application_user_permission_overrides(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path((id, user_id)): Path<(String, String)>,
-    Json(payload): Json<ApplicationPermissionOverridesInput>,
-) -> AppResult<Json<Vec<ApplicationPermissionOverrideResponse>>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .replace_application_user_permission_overrides(
-            &id,
-            &user_id,
-            payload
-                .overrides
-                .into_iter()
-                .map(|item| (item.permission, item.effect))
-                .collect(),
-        )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.user_permission_overrides.update",
-            "application",
-            Some(id.clone()),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "user_id": user_id,
-            }),
-        ))
-        .await?;
-    let values = state
-        .db
-        .list_application_user_permission_overrides(&id, &user_id)
-        .await?
-        .into_iter()
-        .map(|value| ApplicationPermissionOverrideResponse {
-            permission: value.permission,
-            effect: value.effect,
-        })
-        .collect();
-    Ok(Json(values))
-}
-
 async fn application_authorization_preview(
     State(state): State<AppState>,
     jar: CookieJar,
     Path((id, user_id)): Path<(String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
     let (_current, application) = managed_application(&state, &jar, &id).await?;
-    let user = state
-        .db
-        .find_user_by_id(&user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let user = application_authorization_user(&state, &application, &user_id).await?;
     let decision = authorization::check_login_access(&state, &application, &user.id).await?;
     let entitlements = if decision.allowed {
-        Some(authorization::resolve_entitlements(&state, &application, &user).await?)
+        Some(authorization_preview_entitlements(
+            authorization::resolve_entitlements(&state, &application, &user).await?,
+        )?)
     } else {
         None
     };
@@ -6931,26 +7031,32 @@ async fn create_application(
 ) -> AppResult<Json<ApplicationResponse>> {
     let (current, organization) = current_organization_context(&state, &jar).await?;
     require_organization_manager_for(&state, &current, &organization.id).await?;
+    let website_url = payload.website_url.clone().unwrap_or_default();
+    let protocols_config = applications::normalize_module_config(
+        "protocols",
+        serde_json::json!({ "website_url": website_url }),
+    )?;
+    let protocols_config = util::to_json(&protocols_config)?;
+    let application_input = application_input_to_new(organization.id.clone(), payload, false)?;
+    let slug = application_input.slug.clone();
     let application = state
         .db
-        .insert_application(application_input_to_new(
-            organization.id.clone(),
-            payload,
+        .insert_application_with_module_with_audit(
+            application_input,
+            "protocols",
+            &protocols_config,
             false,
-        )?)
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.create",
-            "application",
-            Some(application.id.clone()),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "slug": application.slug,
-            }),
-        ))
+            audit::management_event(
+                current.user.id.clone(),
+                "application.create",
+                "application",
+                None,
+                serde_json::json!({
+                    "organization_id": organization.id,
+                    "slug": slug,
+                }),
+            ),
+        )
         .await?;
     Ok(Json(application_response(&state, application).await?))
 }
@@ -6968,22 +7074,20 @@ async fn update_application(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &existing.organization_id).await?;
+    let organization_id = existing.organization_id.clone();
     let application = state
         .db
-        .update_application(
+        .update_application_with_audit(
             &id,
             application_input_to_new(existing.organization_id.clone(), payload, false)?,
+            audit::management_event(
+                current.user.id.clone(),
+                "application.update",
+                "application",
+                Some(id.clone()),
+                serde_json::json!({ "organization_id": organization_id }),
+            ),
         )
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.update",
-            "application",
-            Some(application.id.clone()),
-            serde_json::json!({ "organization_id": application.organization_id }),
-        ))
         .await?;
     Ok(Json(application_response(&state, application).await?))
 }
@@ -7000,21 +7104,19 @@ async fn delete_application(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &existing.organization_id).await?;
-    // An enrollment capability must never outlive the application that owns
-    // it. Deleting it also revokes the restricted sessions it created.
-    for invitation in state.db.list_application_enrollment_codes(&id).await? {
-        state.db.delete_invitation(&invitation.id).await?;
-    }
-    state.db.delete_application(&id).await?;
     state
         .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.delete",
-            "application",
-            Some(id),
-            serde_json::json!({ "organization_id": existing.organization_id }),
-        ))
+        .delete_application_with_expected_organization_and_audit(
+            &id,
+            &existing.organization_id,
+            audit::management_event(
+                current.user.id,
+                "application.delete",
+                "application",
+                Some(id.clone()),
+                serde_json::json!({ "organization_id": existing.organization_id }),
+            ),
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -7031,98 +7133,12 @@ async fn list_application_client_bindings(
         .await?
         .ok_or(AppError::NotFound)?;
     require_organization_manager_for(&state, &current, &application.organization_id).await?;
-    let mut response = Vec::new();
-    for binding in state.db.list_application_client_bindings(&id).await? {
-        if let Some(binding) = application_client_binding_response(&state, binding).await? {
-            response.push(binding);
-        }
-    }
-    Ok(Json(response))
-}
-
-async fn replace_application_client_bindings(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-    Json(payload): Json<ApplicationClientBindingsInput>,
-) -> AppResult<Json<Vec<ApplicationClientBindingResponse>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
-    ensure_website_application_modules_editable(&state, &application).await?;
-
-    let mut requested = BTreeMap::new();
-    for binding in payload.bindings {
-        let client_id = binding.client_id.trim().to_string();
-        let protocol = binding.protocol.trim().to_ascii_lowercase();
-        let profile_id = binding.authorization_profile_id.trim().to_string();
-        if client_id.is_empty() || profile_id.is_empty() {
-            return Err(AppError::BadRequest(
-                "client binding requires client_id and authorization_profile_id".to_string(),
-            ));
-        }
-        if !matches!(
-            protocol.as_str(),
-            "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
-        ) {
-            return Err(AppError::BadRequest(
-                "unsupported client binding protocol".to_string(),
-            ));
-        }
-        let client = state
-            .db
-            .find_client_by_id(&client_id)
-            .await?
-            .ok_or_else(|| AppError::BadRequest("client does not exist".to_string()))?;
-        if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
-            return Err(AppError::Forbidden);
-        }
-        if profile_id != "default" {
-            let profile = state
-                .db
-                .find_application_authorization_profile_by_id(&profile_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::BadRequest("authorization profile does not exist".to_string())
-                })?;
-            if profile.application_id != application.id {
-                return Err(AppError::BadRequest(
-                    "authorization profile belongs to another application".to_string(),
-                ));
-            }
-        }
-        requested.insert(client_id, (protocol, profile_id));
-    }
-
-    for binding in state.db.list_application_client_bindings(&id).await? {
-        if !requested.contains_key(&binding.client_db_id) {
-            state
-                .db
-                .unlink_client_from_application(&binding.client_db_id)
-                .await?;
-        }
-    }
-    for (client_id, (protocol, profile_id)) in &requested {
-        state
-            .db
-            .link_client_to_application(&id, client_id, protocol, profile_id)
-            .await?;
-    }
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.client_bindings.update",
-            "application",
-            Some(id.clone()),
-            serde_json::json!({ "bindings": requested }),
-        ))
-        .await?;
-    list_application_client_bindings(State(state), jar, Path(id)).await
+    let graph = state.db.read_application_graph(&id).await?;
+    Ok(Json(application_client_binding_responses_from_graph(
+        &graph,
+        None,
+        MissingApplicationClientPolicy::Skip,
+    )?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7184,16 +7200,7 @@ async fn active_application_client_ids(
     application: &ApplicationRecord,
 ) -> AppResult<Vec<String>> {
     let mut client_ids = Vec::new();
-    for client_db_id in state
-        .db
-        .list_application_client_ids(&application.id)
-        .await?
-    {
-        let client = state
-            .db
-            .find_client_by_id(&client_db_id)
-            .await?
-            .ok_or(AppError::NotFound)?;
+    for client in state.db.list_application_clients(&application.id).await? {
         if client.organization_id.as_deref() != Some(application.organization_id.as_str()) {
             return Err(AppError::Internal(
                 "application has an OIDC connection from a different organization".to_string(),
@@ -7413,78 +7420,112 @@ async fn list_iap_applications(
     ))
 }
 
-async fn create_iap_application(
+async fn list_application_iap_rules(
     State(state): State<AppState>,
     jar: CookieJar,
-    Json(payload): Json<IapApplicationInput>,
-) -> AppResult<Json<PublicIapApplication>> {
-    let current = require_iap_manager(&state, &jar).await?;
-    let app = iap_application_input_to_new(&state, payload).await?;
-    let created = state.db.insert_iap_application(app).await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "iap_application.create",
-            "iap_application",
-            Some(created.id.clone()),
-            serde_json::json!({
-                "slug": created.slug.clone(),
-                "external_host": created.external_host.clone(),
-                "path_prefix": created.path_prefix.clone()
-            }),
-        ))
-        .await?;
-    Ok(Json(created.public()?))
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<PublicIapApplication>>> {
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
+    Ok(Json(
+        state
+            .db
+            .list_iap_applications_for_application(&id)
+            .await?
+            .into_iter()
+            .map(|rule| rule.public())
+            .collect::<AppResult<Vec<_>>>()?,
+    ))
 }
 
-async fn update_iap_application(
+async fn create_application_iap_rule(
     State(state): State<AppState>,
     jar: CookieJar,
     Path(id): Path<String>,
     Json(payload): Json<IapApplicationInput>,
 ) -> AppResult<Json<PublicIapApplication>> {
-    let current = require_iap_manager(&state, &jar).await?;
-    let app = iap_application_input_to_new(&state, payload).await?;
-    let updated = state.db.update_iap_application(&id, app).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
+    let rule = state
+        .db
+        .insert_iap_application(iap_application_input_to_new(&state, &id, payload).await?)
+        .await?;
     state
         .db
         .record_audit_event(audit::management_event(
             current.user.id,
-            "iap_application.update",
-            "iap_application",
+            "application.iap_rule.create",
+            "application",
             Some(id),
             serde_json::json!({
-                "slug": updated.slug.clone(),
-                "external_host": updated.external_host.clone(),
-                "path_prefix": updated.path_prefix.clone(),
-                "is_active": updated.is_active == 1
+                "rule_id": rule.id,
+                "slug": rule.slug,
+                "external_host": rule.external_host,
+                "path_prefix": rule.path_prefix,
             }),
         ))
         .await?;
-    Ok(Json(updated.public()?))
+    Ok(Json(rule.public()?))
 }
 
-async fn delete_iap_application(
+async fn update_application_iap_rule(
     State(state): State<AppState>,
     jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
-    let current = require_iap_manager(&state, &jar).await?;
+    Path((id, rule_id)): Path<(String, String)>,
+    Json(payload): Json<IapApplicationInput>,
+) -> AppResult<Json<PublicIapApplication>> {
+    let (current, application) = managed_application(&state, &jar, &id).await?;
+    ensure_website_application_modules_editable(&state, &application).await?;
     let existing = state
         .db
-        .find_iap_application_by_id(&id)
+        .find_iap_application_by_id(&rule_id)
         .await?
+        .filter(|rule| rule.application_id.as_deref() == Some(id.as_str()))
         .ok_or(AppError::NotFound)?;
-    state.db.delete_iap_application(&id).await?;
+    let rule = state
+        .db
+        .update_iap_application(
+            &existing.id,
+            iap_application_input_to_new(&state, &id, payload).await?,
+        )
+        .await?;
     state
         .db
         .record_audit_event(audit::management_event(
             current.user.id,
-            "iap_application.delete",
-            "iap_application",
+            "application.iap_rule.update",
+            "application",
             Some(id),
-            serde_json::json!({ "slug": existing.slug }),
+            serde_json::json!({
+                "rule_id": rule.id,
+                "slug": rule.slug,
+                "is_active": rule.is_active == 1,
+            }),
+        ))
+        .await?;
+    Ok(Json(rule.public()?))
+}
+
+async fn delete_application_iap_rule(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path((id, rule_id)): Path<(String, String)>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (current, _application) = managed_application(&state, &jar, &id).await?;
+    let existing = state
+        .db
+        .find_iap_application_by_id(&rule_id)
+        .await?
+        .filter(|rule| rule.application_id.as_deref() == Some(id.as_str()))
+        .ok_or(AppError::NotFound)?;
+    state.db.delete_iap_application(&existing.id).await?;
+    state
+        .db
+        .record_audit_event(audit::management_event(
+            current.user.id,
+            "application.iap_rule.delete",
+            "application",
+            Some(id),
+            serde_json::json!({ "rule_id": existing.id, "slug": existing.slug }),
         ))
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -9067,11 +9108,24 @@ async fn normalize_client_organization_id(
 
 async fn iap_application_input_to_new(
     state: &AppState,
+    application_id: &str,
     payload: IapApplicationInput,
 ) -> AppResult<NewIapApplication> {
     let required_organization_id =
         normalize_client_organization_id(state, payload.required_organization_id).await?;
+    let application = state
+        .db
+        .find_application_by_id(application_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if required_organization_id
+        .as_deref()
+        .is_some_and(|organization_id| organization_id != application.organization_id)
+    {
+        return Err(AppError::Forbidden);
+    }
     iap::normalize_iap_application(NewIapApplication {
+        application_id: application_id.to_string(),
         slug: payload.slug,
         name: payload.name,
         description: payload.description,
@@ -9218,6 +9272,39 @@ mod tests {
             user_list_scope(Some("authorization_code")),
             Ok(UserListScope::AuthorizationCode)
         ));
+    }
+
+    #[test]
+    fn user_list_query_defaults_to_a_bounded_first_page() {
+        let parsed = parse_user_list_query(UserListQuery::default()).unwrap();
+        assert_eq!(parsed.page, 1);
+        assert_eq!(parsed.page_size, USER_DIRECTORY_DEFAULT_PAGE_SIZE);
+        assert_eq!(parsed.offset, 0);
+        assert!(parsed.filters.organization_id.is_none());
+    }
+
+    #[test]
+    fn user_list_query_accepts_zero_offset_and_normalizes_day_end() {
+        let parsed = parse_user_list_query(UserListQuery {
+            offset: Some("0".to_string()),
+            limit: Some("50".to_string()),
+            created_from: Some("2026-01-01".to_string()),
+            created_to: Some("2026-01-31".to_string()),
+            linked_identity: Some("linked".to_string()),
+            role: Some("admin".to_string()),
+            ..UserListQuery::default()
+        })
+        .unwrap();
+        assert_eq!(parsed.page, 1);
+        assert_eq!(parsed.page_size, 50);
+        assert_eq!(parsed.offset, 0);
+        assert_eq!(
+            parsed.filters.linked_identity,
+            UserListLinkedIdentityFilter::Linked
+        );
+        assert_eq!(parsed.filters.role, UserListRoleFilter::Admin);
+        assert_eq!(parsed.filters.created_from, Some(1_767_225_600));
+        assert_eq!(parsed.filters.created_to, Some(1_769_904_000));
     }
 
     #[test]

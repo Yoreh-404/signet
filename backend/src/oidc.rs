@@ -4,8 +4,8 @@ use crate::{
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
     auth_domain::ApplicationAuthContext,
-    auth_flow, authorization, authorization_details,
-    claim_mapper::{self, ClaimContext, ClaimOutputTarget},
+    auth_flow, authorization_details,
+    claim_mapper::ClaimOutputTarget,
     client_assertion,
     client_policy::{
         AuthorizationRequestSecurityView, AuthorizationRequestSource, ClientSecurityPolicy,
@@ -23,9 +23,12 @@ use crate::{
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
+    oauth_targets::{self, AudienceValidationError, ResourceValidationError},
+    oidc_authorization::{AuthorizationSnapshot, ClientClaimsSnapshot},
     oidc_claims::{
         self, DefaultEmailVerifiedClaimPolicy, EmailVerifiedClaimPolicy, RequestedClaims,
     },
+    oidc_client_auth::{ClientAuthFields, ClientAuthForm, diagnostic_client_id},
     redirects, security_policy,
     service_accounts::ServiceAccountProfile,
     subject, util,
@@ -38,11 +41,15 @@ use axum::{
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use time::Duration;
 use url::Url;
+
+#[cfg(test)]
+pub(crate) use crate::oidc_client_auth::service_client_endpoint_request;
 
 pub(crate) const OIDC_LOGIN_GRANT_TTL_SECONDS: i64 = 180;
 
@@ -494,6 +501,7 @@ async fn authorize(
     let Some(current) = auth::current_user_from_cookie(&state, &jar).await? else {
         let request = resolve_authorize_request(&state, &headers, query).await?;
         let client = validate_authorize_request(&state, &request).await?;
+        let runtime = AuthorizationSnapshot::load_runtime(&state, &client).await?;
         let prompt = prompt_behavior_for_client(&client, &request)?;
         if prompt.none {
             return redirect_authorization_error(
@@ -519,13 +527,13 @@ async fn authorize(
             && request.selected_user_id.is_none()
             && request.selected_session_id.is_none();
         let has_remembered_accounts = if may_offer_remembered_accounts {
-            has_selectable_browser_accounts(&state, &jar, Some(&client)).await?
+            has_selectable_browser_accounts(&state, &jar, Some(&runtime)).await?
         } else {
             false
         };
         if request.account_selection_required
             || prompt.select_account
-            || client_requires_account_selection(&state, &client, &request).await?
+            || client_requires_account_selection(&client, Some(&runtime.application), &request)
             || has_remembered_accounts
         {
             let return_to = authorize_return_to_for_account_selection(&state, &request).await?;
@@ -546,6 +554,8 @@ async fn authorize(
     };
     let request = resolve_authorize_request(&state, &headers, query).await?;
     let client = validate_authorize_request(&state, &request).await?;
+    let authorization_snapshot =
+        AuthorizationSnapshot::load(&state, &client, &current.user).await?;
     if !trial_enrollment_allows_client(&state, &current, &client).await? {
         return redirect_authorization_error(
             &state,
@@ -624,7 +634,11 @@ async fn authorize(
     }
     if (request.account_selection_required
         || prompt.select_account
-        || client_requires_account_selection(&state, &client, &request).await?)
+        || client_requires_account_selection(
+            &client,
+            authorization_snapshot.application.as_ref(),
+            &request,
+        ))
         && !request.account_selection_prompted
     {
         if prompt.none {
@@ -727,6 +741,7 @@ async fn authorize(
         &current.user,
         &session,
         &client,
+        &authorization_snapshot,
         request,
         requested_scopes,
     )
@@ -763,7 +778,7 @@ async fn authorize_with_admin_universal_login_grant(
     let preview = crate::par::peek_interaction_request(state, interaction_request)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    let client = validate_authorize_request(state, &preview).await?;
+    let (client, _runtime) = validate_authorize_request_with_runtime(state, &preview).await?;
     if grant.client_id != client.client_id {
         return Err(AppError::Unauthorized);
     }
@@ -973,6 +988,8 @@ async fn authorize_consent(
         return Err(AppError::Unauthorized);
     }
     let client = validate_authorize_request(&state, &request).await?;
+    let authorization_snapshot =
+        AuthorizationSnapshot::load(&state, &client, &current.user).await?;
     if !trial_enrollment_allows_client(&state, &current, &client).await? {
         return redirect_authorization_error(
             &state,
@@ -1057,6 +1074,7 @@ async fn authorize_consent(
                 &current.user,
                 &session,
                 &client,
+                &authorization_snapshot,
                 request,
                 requested_scopes,
             )
@@ -1209,13 +1227,26 @@ async fn issue_authorization_code_redirect(
     user: &UserRecord,
     session: &SessionRecord,
     client: &ClientRecord,
+    authorization_snapshot: &AuthorizationSnapshot,
     request: ResolvedAuthorizeRequest,
     requested_scopes: Vec<String>,
 ) -> AppResult<Response> {
     ensure_trial_enrollment_client_allowed_for_user(context.state, &user.id, &client.client_id)
         .await?;
-    let (_application, client_binding) =
-        applications::authorize_user_for_application(context.state, client, user).await?;
+    if !authorization_snapshot.policy.is_authorizable
+        || authorization_snapshot.policy.user_id != user.id
+        || authorization_snapshot.policy.client_id.as_deref() != Some(client.id.as_str())
+    {
+        return Err(AppError::Forbidden);
+    }
+    let application = authorization_snapshot
+        .application
+        .as_ref()
+        .ok_or(AppError::Forbidden)?;
+    let client_binding = authorization_snapshot
+        .binding
+        .as_ref()
+        .ok_or(AppError::Forbidden)?;
     let code = util::random_token(32);
     let session_assurance = session.authentication_assurance();
     let requested_assurance = request.requested_assurance()?;
@@ -1283,7 +1314,7 @@ async fn issue_authorization_code_redirect(
             code: code.clone(),
             client_id: client.client_id.clone(),
             user_id: user.id.clone(),
-            application_id: Some(_application.id.clone()),
+            application_id: Some(application.id.clone()),
             authorization_profile_id: Some(client_binding.authorization_profile_id.clone()),
             auth_context_id: Some(auth_context_id),
             session_id: Some(util::session_public_id(&session.id)),
@@ -1490,14 +1521,18 @@ async fn validate_authorize_request(
         .await?
         .ok_or_else(|| AppError::Oidc("unknown client_id".to_string()))?;
     validate_authorize_request_for_client(&client, request)?;
-    // Resolve the website boundary before starting any browser interaction.
-    // This keeps an archived application or a disabled OAuth/OIDC module from
-    // reaching the login page and then failing only after the user has
-    // authenticated. Unbound historical clients intentionally remain on the
-    applications::authorize_application_client(state, &client, "oauth2_oidc")
+    Ok(client)
+}
+
+async fn validate_authorize_request_with_runtime(
+    state: &AppState,
+    request: &ResolvedAuthorizeRequest,
+) -> AppResult<(ClientRecord, applications::ApplicationRuntimeSnapshot)> {
+    let client = validate_authorize_request(state, request).await?;
+    let runtime = AuthorizationSnapshot::load_runtime(state, &client)
         .await
         .map_err(|_| AppError::Oidc("client application is unavailable".to_string()))?;
-    Ok(client)
+    Ok((client, runtime))
 }
 
 pub(crate) fn validate_authorize_request_for_client(
@@ -1631,39 +1666,14 @@ async fn ensure_trial_enrollment_client_allowed_for_user(
     Ok(())
 }
 
-async fn ensure_application_client_allowed_for_user(
-    state: &AppState,
-    user: &UserRecord,
-    client: &ClientRecord,
-) -> AppResult<()> {
-    // Older platform clients may predate the Application model.  They do not
-    // have a website boundary to enforce, so keep their existing behavior;
-    // clients attached to an Application must pass the live website and
-    // account eligibility checks below.
-    if state
-        .db
-        .find_application_for_client(&client.id)
-        .await?
-        .is_none()
-    {
-        return Ok(());
-    }
-
-    applications::authorize_user_for_application(state, client, user)
-        .await
-        .map(|_| ())
-}
-
 #[derive(Debug, Deserialize)]
 struct TokenRequest {
     grant_type: String,
     code: Option<String>,
     device_code: Option<String>,
     redirect_uri: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
+    #[serde(flatten)]
+    client_auth: ClientAuthForm,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
     scope: Option<String>,
@@ -1676,32 +1686,20 @@ struct TokenRequest {
     actor_token: Option<String>,
 }
 
-pub(crate) trait ClientAuthFields {
-    fn client_id(&self) -> Option<&str>;
-    fn client_secret(&self) -> Option<&str>;
-    fn client_assertion_type(&self) -> Option<&str> {
-        None
-    }
-    fn client_assertion(&self) -> Option<&str> {
-        None
-    }
-}
-
 impl ClientAuthFields for TokenRequest {
-    fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
+    fn client_auth(&self) -> &ClientAuthForm {
+        &self.client_auth
     }
 
-    fn client_secret(&self) -> Option<&str> {
-        self.client_secret.as_deref()
-    }
-
-    fn client_assertion_type(&self) -> Option<&str> {
-        self.client_assertion_type.as_deref()
-    }
-
-    fn client_assertion(&self) -> Option<&str> {
-        self.client_assertion.as_deref()
+    fn defers_application_runtime_gate(&self) -> bool {
+        matches!(
+            self.grant_type.as_str(),
+            "authorization_code"
+                | "refresh_token"
+                | "client_credentials"
+                | crate::device::DEVICE_CODE_GRANT
+                | crate::token_exchange::TOKEN_EXCHANGE_GRANT
+        )
     }
 }
 
@@ -1766,7 +1764,7 @@ async fn token(
             token_from_device_code(state, client, payload, issuer, dpop).await
         }
         crate::token_exchange::TOKEN_EXCHANGE_GRANT => {
-            token_from_token_exchange(state, headers, client, payload, issuer).await
+            token_from_token_exchange(state, headers, client, payload, issuer, dpop).await
         }
         _ => Err(AppError::Oidc("unsupported grant_type".to_string())),
     };
@@ -1789,15 +1787,25 @@ async fn token_from_client_credentials(
     issuer: String,
     dpop: Option<DpopBinding>,
 ) -> AppResult<Json<TokenResponse>> {
-    if !client
-        .grant_types()?
-        .iter()
-        .any(|value| value == "client_credentials")
+    // Client credentials are machine authorization. Load the application,
+    // client binding, organization, and discovery boundary once here and use
+    // that same value for both the gate and access-token claims. This path is
+    // intentionally separate from the user authorization snapshot.
+    if client.service_account_enabled != 1
+        || !client
+            .grant_types()
+            .map_err(|_| AppError::Unauthorized)?
+            .iter()
+            .any(|value| value == "client_credentials")
     {
-        return Err(AppError::Oidc(
-            "client cannot use client_credentials grant".to_string(),
-        ));
+        return Err(AppError::Unauthorized);
     }
+    let runtime = applications::ApplicationRuntimeSnapshot::load(&state, &client, None)
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+    runtime
+        .require_service()
+        .map_err(|_| AppError::Unauthorized)?;
     let scope = normalize_client_credentials_scope(&client, payload.scope.as_deref())?;
     let resource = resolve_client_credentials_audience(
         &client,
@@ -1809,16 +1817,14 @@ async fn token_from_client_credentials(
         payload.authorization_details.as_deref(),
     )?;
     let mut access_claims = serde_json::Map::new();
-    if let Some(binding) = state.db.find_application_client_binding(&client.id).await? {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(binding.application_id),
-        );
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(binding.authorization_profile_id),
-        );
-    }
+    access_claims.insert(
+        "application_id".to_string(),
+        serde_json::Value::String(runtime.application.id.clone()),
+    );
+    access_claims.insert(
+        "authorization_profile_id".to_string(),
+        serde_json::Value::String(runtime.binding.authorization_profile_id.clone()),
+    );
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
     let service_account_permissions = if client.service_account_enabled() {
@@ -2012,6 +2018,7 @@ async fn token_from_token_exchange(
     client: ClientRecord,
     payload: TokenRequest,
     issuer: String,
+    dpop: Option<DpopBinding>,
 ) -> AppResult<Json<TokenResponse>> {
     let input = crate::token_exchange::TokenExchangeInput {
         subject_token: payload
@@ -2025,6 +2032,7 @@ async fn token_from_token_exchange(
         resource: payload.resource,
         audience: payload.audience,
         actor_token: payload.actor_token,
+        dpop,
     };
     let exchanged =
         crate::token_exchange::exchange_token(&state, &headers, &issuer, &client, input).await?;
@@ -2084,12 +2092,15 @@ async fn token_from_refresh_token(
         }
     }
     let user = load_active_user(&state, &record.user_id).await?;
-    // Refresh tokens can outlive both the browser session and the original
-    // authorization-code exchange. Re-run the live Application/enterprise
-    // gate before minting another token so disabling a website or its tenant
-    // revokes access immediately rather than waiting for token expiry.
-    ensure_application_client_allowed_for_user(&state, &user, &client).await?;
-    let binding = state.db.find_application_client_binding(&client.id).await?;
+    if !introspected_refresh_grant_is_live(&state, &user.id, &client.client_id).await? {
+        return Err(invalid_refresh_token_grant());
+    }
+    // The single AuthorizationSnapshot below is the live application/client /
+    // user gate for refresh issuance. Do not run an independent application
+    // lookup before it: that would let the claim projection and the gate see
+    // different policy revisions.
+    let authorization_snapshot = AuthorizationSnapshot::load(&state, &client, &user).await?;
+    let binding = authorization_snapshot.binding.clone();
     if let Some(binding) = binding.as_ref() {
         if record.application_id.as_deref() != Some(binding.application_id.as_str())
             || record.authorization_profile_id.as_deref()
@@ -2105,14 +2116,12 @@ async fn token_from_refresh_token(
         payload.authorization_details,
         &client,
     )?;
-    let mut access_claims = mapped_claims_for_user(
-        &state,
+    let mut access_claims = authorization_snapshot.claims_for_user(
         &client,
         &user,
         &scope,
         ClaimOutputTarget::AccessToken,
-    )
-    .await?;
+    )?;
     if let Some(application_id) = record.application_id.as_deref() {
         access_claims.insert(
             "application_id".to_string(),
@@ -2144,9 +2153,12 @@ async fn token_from_refresh_token(
         access_claims,
     )?;
     let id_token = if scope.split_whitespace().any(|scope| scope == "openid") {
-        let id_claims =
-            mapped_claims_for_user(&state, &client, &user, &scope, ClaimOutputTarget::IdToken)
-                .await?;
+        let id_claims = authorization_snapshot.claims_for_user(
+            &client,
+            &user,
+            &scope,
+            ClaimOutputTarget::IdToken,
+        )?;
         let subject_identifier = subject::subject_for_client(&issuer, &user, &client)?;
         Some(state.jwt.sign_id_token_with_subject_and_claims(
             &issuer,
@@ -2253,9 +2265,23 @@ async fn issue_tokens_for_user(
     // enrollment code also blocks a previously issued OAuth code at token
     // exchange time.
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
-    ensure_application_client_allowed_for_user(state, &user, client).await?;
-    let binding = state.db.find_application_client_binding(&client.id).await?;
-    if let Some(binding) = binding.as_ref() {
+    let authorization_snapshot = if login_code_level.is_none() {
+        Some(AuthorizationSnapshot::load(state, client, &user).await?)
+    } else {
+        if application_id.is_some() || authorization_profile_id.is_some() {
+            return Err(invalid_refresh_token_grant());
+        }
+        None
+    };
+    let client_claims_snapshot = if authorization_snapshot.is_none() {
+        Some(ClientClaimsSnapshot::load(state, client).await?)
+    } else {
+        None
+    };
+    let binding = authorization_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.binding.as_ref());
+    if let Some(binding) = binding {
         if application_id
             .as_deref()
             .is_some_and(|value| value != binding.application_id)
@@ -2274,15 +2300,20 @@ async fn issue_tokens_for_user(
         issuer,
         "issuing OIDC tokens"
     );
-    let mut access_claims =
-        mapped_claims_for_user(state, client, &user, &scope, ClaimOutputTarget::AccessToken)
-            .await?;
+    let mut access_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
+        snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+    } else {
+        client_claims_snapshot
+            .as_ref()
+            .ok_or(AppError::Forbidden)?
+            .claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+    };
     if let Some(application_id) = application_id.as_deref() {
         access_claims.insert(
             "application_id".to_string(),
             serde_json::Value::String(application_id.to_string()),
         );
-    } else if let Some(binding) = binding.as_ref() {
+    } else if let Some(binding) = binding {
         access_claims.insert(
             "application_id".to_string(),
             serde_json::Value::String(binding.application_id.clone()),
@@ -2293,7 +2324,7 @@ async fn issue_tokens_for_user(
             "authorization_profile_id".to_string(),
             serde_json::Value::String(profile_id.to_string()),
         );
-    } else if let Some(binding) = binding.as_ref() {
+    } else if let Some(binding) = binding {
         access_claims.insert(
             "authorization_profile_id".to_string(),
             serde_json::Value::String(binding.authorization_profile_id.clone()),
@@ -2323,9 +2354,15 @@ async fn issue_tokens_for_user(
         state.settings.oidc.access_token_ttl_seconds,
         access_claims,
     )?;
-    let mut id_claims =
-        mapped_claims_for_user(state, client, &user, &scope, ClaimOutputTarget::IdToken).await?;
-    if let Some(binding) = binding.as_ref() {
+    let mut id_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
+        snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::IdToken)?
+    } else {
+        client_claims_snapshot
+            .as_ref()
+            .ok_or(AppError::Forbidden)?
+            .claims_for_user(client, &user, &scope, ClaimOutputTarget::IdToken)?
+    };
+    if let Some(binding) = binding {
         id_claims.insert(
             "application_id".to_string(),
             serde_json::Value::String(binding.application_id.clone()),
@@ -2409,47 +2446,6 @@ async fn issue_tokens_for_user(
     }))
 }
 
-async fn mapped_claims_for_user(
-    state: &AppState,
-    client: &ClientRecord,
-    user: &UserRecord,
-    scope: &str,
-    target: ClaimOutputTarget,
-) -> AppResult<serde_json::Map<String, serde_json::Value>> {
-    let records = state.db.list_client_claim_mappers(&client.id).await?;
-    let mut claims = serde_json::Map::new();
-    claims.insert(
-        "email_verified".to_string(),
-        serde_json::Value::Bool(DefaultEmailVerifiedClaimPolicy.email_verified(user, client)),
-    );
-    claims.extend(claim_mapper::mapped_claims(
-        &records,
-        &ClaimContext {
-            user,
-            client,
-            scope,
-        },
-        target,
-    )?);
-
-    // Client claim mappers describe the protocol connection; application
-    // entitlements describe the website that owns that connection.  Keep the
-    // latter as a separate, live policy layer so role/group changes are
-    // visible on the next token or UserInfo request and cannot be hidden by a
-    // stale mapper configuration.
-    if let Some(application) = state.db.find_application_for_client(&client.id).await? {
-        let entitlements =
-            authorization::resolve_entitlements_for_client(state, &application, client, user)
-                .await?;
-        claims.extend(entitlements.claims);
-        claims.insert(
-            "policy_version".to_string(),
-            serde_json::Value::String(entitlements.policy_version),
-        );
-    }
-    Ok(claims)
-}
-
 fn insert_sid_claim(claims: &mut serde_json::Map<String, serde_json::Value>, sid: Option<&str>) {
     if let Some(sid) = sid.filter(|value| !value.trim().is_empty()) {
         claims.insert(
@@ -2507,7 +2503,27 @@ async fn userinfo(
     }
     let user = load_oidc_user(&state, &claims.sub).await?;
     ensure_trial_enrollment_client_allowed_for_user(&state, &user.id, &client.client_id).await?;
-    ensure_application_client_allowed_for_user(&state, &user, &client).await?;
+    if !introspected_user_grant_is_live(
+        &state,
+        &user.id,
+        &claims.client_id,
+        &claims.scope,
+        claims.grant_id.as_deref(),
+    )
+    .await?
+    {
+        return Err(AppError::Unauthorized);
+    }
+    let authorization_snapshot = if claims.gpt_sso_login_code_level.is_none() {
+        Some(AuthorizationSnapshot::load(&state, &client, &user).await?)
+    } else {
+        None
+    };
+    let client_claims_snapshot = if authorization_snapshot.is_none() {
+        Some(ClientClaimsSnapshot::load(&state, &client).await?)
+    } else {
+        None
+    };
     tracing::info!(
         client_id = %client.client_id,
         user_id = %user.id,
@@ -2540,16 +2556,15 @@ async fn userinfo(
         "preferred_username".to_string(),
         serde_json::Value::String(user.username.clone()),
     );
-    response.extend(
-        mapped_claims_for_user(
-            &state,
-            &client,
-            &user,
-            &claims.scope,
-            ClaimOutputTarget::UserInfo,
-        )
-        .await?,
-    );
+    let mapped_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
+        snapshot.claims_for_user(&client, &user, &claims.scope, ClaimOutputTarget::UserInfo)?
+    } else {
+        client_claims_snapshot
+            .as_ref()
+            .ok_or(AppError::Unauthorized)?
+            .claims_for_user(&client, &user, &claims.scope, ClaimOutputTarget::UserInfo)?
+    };
+    response.extend(mapped_claims);
     Ok(Json(serde_json::Value::Object(response)))
 }
 
@@ -2557,27 +2572,13 @@ async fn userinfo(
 struct IntrospectionRequest {
     token: String,
     token_type_hint: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
+    #[serde(flatten)]
+    client_auth: ClientAuthForm,
 }
 
 impl ClientAuthFields for IntrospectionRequest {
-    fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
-    }
-
-    fn client_secret(&self) -> Option<&str> {
-        self.client_secret.as_deref()
-    }
-
-    fn client_assertion_type(&self) -> Option<&str> {
-        self.client_assertion_type.as_deref()
-    }
-
-    fn client_assertion(&self) -> Option<&str> {
-        self.client_assertion.as_deref()
+    fn client_auth(&self) -> &ClientAuthForm {
+        &self.client_auth
     }
 }
 
@@ -2599,27 +2600,8 @@ async fn introspect(
         .verify_access_token_for_introspection(&payload.token, &issuer_refs)
     {
         let source_client = state.db.find_client_by_client_id(&claims.client_id).await?;
-        let boundary_matches = if let Some(source_client) = source_client.as_ref() {
-            match state
-                .db
-                .find_application_client_binding(&source_client.id)
-                .await?
-            {
-                Some(binding) => {
-                    claims.application_id.as_deref() == Some(binding.application_id.as_str())
-                        && claims.authorization_profile_id.as_deref()
-                            == Some(binding.authorization_profile_id.as_str())
-                }
-                None => {
-                    claims.application_id.is_none() && claims.authorization_profile_id.is_none()
-                }
-            }
-        } else {
-            false
-        };
         let active = claims.exp > util::now_ts()
             && claims.aud == expected_audience
-            && boundary_matches
             && source_client
                 .as_ref()
                 .is_some_and(|source_client| source_client.is_active == 1)
@@ -2669,16 +2651,49 @@ async fn introspect(
             == expected_audience
     {
         let source_client = state.db.find_client_by_client_id(&record.client_id).await?;
-        let user = source_client
+        let user = if source_client
             .as_ref()
-            .filter(|source_client| source_client.is_active == 1)
-            .and_then(|_| Some(record.user_id.clone()));
-        let user_active = if let Some(user_id) = user {
-            load_oidc_user(&state, &user_id).await.is_ok()
+            .is_some_and(|source_client| source_client.is_active == 1)
+        {
+            load_oidc_user(&state, &record.user_id).await.ok()
+        } else {
+            None
+        };
+        let runtime_active = if let (Some(source_client), Some(user)) =
+            (source_client.as_ref(), user.as_ref())
+        {
+            match state
+                .db
+                .load_client_policy_snapshot_for_protocol(
+                    &source_client.id,
+                    &user.id,
+                    "oauth2_oidc",
+                )
+                .await
+            {
+                Ok(policy) => match policy.binding.as_ref() {
+                    Some(binding) => {
+                        policy.is_authorizable
+                            && policy.is_interactive_client_runtime_active()
+                            && policy.client_id.as_deref() == Some(source_client.id.as_str())
+                            && policy.user_id == user.id
+                            && record.application_id.as_deref()
+                                == Some(binding.application_id.as_str())
+                            && record.authorization_profile_id.as_deref()
+                                == Some(binding.authorization_profile_id.as_str())
+                    }
+                    None => {
+                        // Legacy refresh tokens have no application boundary;
+                        // a token carrying one cannot survive an unbind.
+                        record.application_id.is_none() && record.authorization_profile_id.is_none()
+                    }
+                },
+                Err(_) => false,
+            }
         } else {
             false
         };
-        let consent_active = if user_active {
+        let consent_active = if runtime_active {
             introspected_refresh_grant_is_live(&state, &record.user_id, &record.client_id).await?
         } else {
             false
@@ -2734,20 +2749,61 @@ async fn introspected_access_token_is_live(
     source_client: Option<&ClientRecord>,
     claims: &TokenClaims,
 ) -> AppResult<bool> {
-    if claims.sub == claims.client_id || claims.sub.starts_with("service-account:") {
-        return Ok(true);
-    }
     let Some(source_client) = source_client else {
         return Ok(false);
     };
+
+    // Machine tokens have no user policy graph, but they still carry the
+    // application/profile boundary.  Resolve the complete runtime snapshot
+    // before reporting active so disabling the application, organization,
+    // discovery revision, or binding invalidates an already signed token.
+    if is_machine_token_claims(claims) {
+        let runtime = match applications::ApplicationRuntimeSnapshot::load(
+            state,
+            source_client,
+            None,
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return Ok(false),
+        };
+        if !token_claims_match_application_binding(claims, Some(&runtime.binding)) {
+            return Ok(false);
+        }
+        if !service_account_claim_is_live(source_client, claims) {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
     let user = match load_oidc_user(state, &claims.sub).await {
         Ok(user) => user,
         Err(_) => return Ok(false),
     };
-    if ensure_application_client_allowed_for_user(state, &user, source_client)
+    // This is the only source binding read for the access-token path.  Keep
+    // the policy snapshot next to the grant check so a stale outer binding
+    // read cannot make the token appear active after an unbind or rebind.
+    let policy = match state
+        .db
+        .load_client_policy_snapshot_for_protocol(&source_client.id, &user.id, "oauth2_oidc")
         .await
-        .is_err()
     {
+        Ok(policy) => policy,
+        Err(_) => return Ok(false),
+    };
+    if let Some(binding) = policy.binding.as_ref() {
+        if !policy.is_authorizable
+            || !policy.is_interactive_client_runtime_active()
+            || policy.client_id.as_deref() != Some(source_client.id.as_str())
+            || policy.user_id != user.id
+            || !token_claims_match_application_binding(claims, Some(binding))
+        {
+            return Ok(false);
+        }
+    } else if !token_claims_match_application_binding(claims, None) {
+        // Preserve the historical unbound-client policy, but never treat a
+        // token with application claims as legacy after its binding vanished.
         return Ok(false);
     }
     introspected_user_grant_is_live(
@@ -2758,6 +2814,39 @@ async fn introspected_access_token_is_live(
         claims.grant_id.as_deref(),
     )
     .await
+}
+
+fn is_machine_token_claims(claims: &TokenClaims) -> bool {
+    claims.sub.starts_with("service-account:")
+        || (claims.sub == claims.client_id && claims.email.is_empty())
+}
+
+fn service_account_claim_is_live(client: &ClientRecord, claims: &TokenClaims) -> bool {
+    client.service_account_enabled()
+        && client
+            .grant_types()
+            .ok()
+            .is_some_and(|grants| grants.iter().any(|grant| grant == "client_credentials"))
+        && (claims.sub == client.service_account_subject()
+            // Tokens issued before explicit service-account subjects were
+            // introduced used the client_id as their subject. Keep that
+            // compatibility shape, but apply the same live service-account
+            // gate so disabling/revoking the client invalidates both forms.
+            || (claims.sub == client.client_id && claims.email.is_empty()))
+}
+
+fn token_claims_match_application_binding(
+    claims: &TokenClaims,
+    binding: Option<&crate::db::ApplicationClientBindingRecord>,
+) -> bool {
+    match binding {
+        Some(binding) => {
+            claims.application_id.as_deref() == Some(binding.application_id.as_str())
+                && claims.authorization_profile_id.as_deref()
+                    == Some(binding.authorization_profile_id.as_str())
+        }
+        None => claims.application_id.is_none() && claims.authorization_profile_id.is_none(),
+    }
 }
 
 async fn introspected_user_grant_is_live(
@@ -2814,27 +2903,13 @@ fn grants_all_scopes(granted_scopes: &str, requested_scope: &str) -> bool {
 struct RevocationRequest {
     token: String,
     token_type_hint: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
+    #[serde(flatten)]
+    client_auth: ClientAuthForm,
 }
 
 impl ClientAuthFields for RevocationRequest {
-    fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
-    }
-
-    fn client_secret(&self) -> Option<&str> {
-        self.client_secret.as_deref()
-    }
-
-    fn client_assertion_type(&self) -> Option<&str> {
-        self.client_assertion_type.as_deref()
-    }
-
-    fn client_assertion(&self) -> Option<&str> {
-        self.client_assertion.as_deref()
+    fn client_auth(&self) -> &ClientAuthForm {
+        &self.client_auth
     }
 }
 
@@ -3476,13 +3551,6 @@ async fn login_form(
     Ok((jar, Redirect::to(&return_to)).into_response())
 }
 
-struct ClientCredentials {
-    client_id: String,
-    client_secret: Option<String>,
-    client_assertion_type: Option<String>,
-    client_assertion: Option<String>,
-}
-
 pub(crate) struct AuthorizationLoginContext {
     pub(crate) client: Option<ClientRecord>,
     pub(crate) application: Option<ApplicationRecord>,
@@ -3495,120 +3563,7 @@ pub(crate) async fn authenticate_client_at<T: ClientAuthFields>(
     payload: &T,
     endpoint_path: &str,
 ) -> AppResult<ClientRecord> {
-    let credentials = client_credentials(headers, payload)?;
-    let client = state
-        .db
-        .find_client_by_client_id(&credentials.client_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    if client.is_active != 1 {
-        return Err(AppError::Unauthorized);
-    }
-    applications::authorize_application_client(state, &client, "oauth2_oidc")
-        .await
-        .map_err(|_| AppError::Unauthorized)?;
-    if client.require_confidential_client == 1 && client.token_endpoint_auth_method == "none" {
-        return Err(AppError::Unauthorized);
-    }
-    match client.token_endpoint_auth_method.as_str() {
-        "none" => Ok(client),
-        "client_secret_post" | "client_secret_basic" => {
-            let Some(hash) = &client.client_secret_hash else {
-                return Err(AppError::Unauthorized);
-            };
-            let secret = credentials.client_secret.ok_or(AppError::Unauthorized)?;
-            if util::verify_password(hash, &secret) {
-                Ok(client)
-            } else {
-                Err(AppError::Unauthorized)
-            }
-        }
-        client_assertion::CLIENT_SECRET_JWT => {
-            let audiences = client_auth_audiences(state, headers, endpoint_path).await?;
-            client_assertion::authenticate_client_secret_jwt(
-                state,
-                &client,
-                credentials.client_assertion_type.as_deref(),
-                credentials.client_assertion.as_deref(),
-                &audiences,
-            )
-            .await?;
-            Ok(client)
-        }
-        client_assertion::PRIVATE_KEY_JWT => {
-            let audiences = client_auth_audiences(state, headers, endpoint_path).await?;
-            client_assertion::authenticate_private_key_jwt(
-                state,
-                &client,
-                credentials.client_assertion_type.as_deref(),
-                credentials.client_assertion.as_deref(),
-                &audiences,
-            )
-            .await?;
-            Ok(client)
-        }
-        _ => Err(AppError::Unauthorized),
-    }
-}
-
-fn client_credentials<T: ClientAuthFields>(
-    headers: &HeaderMap,
-    payload: &T,
-) -> AppResult<ClientCredentials> {
-    if let Some(header) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        && let Some(encoded) = header.strip_prefix("Basic ")
-    {
-        let decoded = STANDARD
-            .decode(encoded)
-            .map_err(|_| AppError::Unauthorized)?;
-        let decoded = String::from_utf8(decoded).map_err(|_| AppError::Unauthorized)?;
-        let (client_id, client_secret) = decoded.split_once(':').ok_or(AppError::Unauthorized)?;
-        return Ok(ClientCredentials {
-            client_id: url_decode(client_id),
-            client_secret: Some(url_decode(client_secret)),
-            client_assertion_type: None,
-            client_assertion: None,
-        });
-    }
-    if let Some(assertion) = payload.client_assertion() {
-        let client_id = payload
-            .client_id()
-            .map(ToOwned::to_owned)
-            .map(Ok)
-            .unwrap_or_else(|| client_assertion::client_id_from_assertion(assertion))?;
-        return Ok(ClientCredentials {
-            client_id,
-            client_secret: None,
-            client_assertion_type: payload.client_assertion_type().map(ToOwned::to_owned),
-            client_assertion: Some(assertion.to_string()),
-        });
-    }
-    Ok(ClientCredentials {
-        client_id: payload
-            .client_id()
-            .map(ToOwned::to_owned)
-            .ok_or(AppError::Unauthorized)?,
-        client_secret: payload.client_secret().map(ToOwned::to_owned),
-        client_assertion_type: None,
-        client_assertion: None,
-    })
-}
-
-fn diagnostic_client_id<T: ClientAuthFields>(headers: &HeaderMap, payload: &T) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Basic "))
-        .and_then(|encoded| STANDARD.decode(encoded).ok())
-        .and_then(|decoded| String::from_utf8(decoded).ok())
-        .and_then(|decoded| {
-            decoded
-                .split_once(':')
-                .map(|(client_id, _)| url_decode(client_id))
-        })
-        .or_else(|| payload.client_id().map(ToOwned::to_owned))
+    crate::oidc_client_auth::authenticate_client_at(state, headers, payload, endpoint_path).await
 }
 
 fn authorization_token(headers: &HeaderMap) -> AppResult<(&'static str, &str)> {
@@ -3623,22 +3578,6 @@ fn authorization_token(headers: &HeaderMap) -> AppResult<(&'static str, &str)> {
         return Ok((dpop::TOKEN_TYPE, token));
     }
     Err(AppError::Unauthorized)
-}
-
-async fn client_auth_audiences(
-    state: &AppState,
-    headers: &HeaderMap,
-    endpoint_path: &str,
-) -> AppResult<Vec<String>> {
-    let mut audiences = state
-        .accepted_issuers(headers)
-        .await?
-        .into_iter()
-        .map(|issuer| absolute(&issuer, endpoint_path))
-        .collect::<Vec<_>>();
-    audiences.sort();
-    audiences.dedup();
-    Ok(audiences)
 }
 
 fn normalize_client_credentials_scope(
@@ -3664,17 +3603,20 @@ fn normalize_client_credentials_scope(
 }
 
 pub(crate) fn normalize_resource(resource: Option<&str>) -> AppResult<Option<String>> {
-    let Some(resource) = resource.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let parsed = Url::parse(resource)
-        .map_err(|err| AppError::Oidc(format!("invalid resource parameter: {err}")))?;
-    if parsed.fragment().is_some() {
-        return Err(AppError::Oidc(
-            "resource parameter must not include a fragment".to_string(),
-        ));
-    }
-    Ok(Some(resource.to_string()))
+    oauth_targets::normalize_resource(resource).map_err(|error| match error {
+        ResourceValidationError::Empty => {
+            AppError::Oidc("invalid resource parameter: value is empty".to_string())
+        }
+        ResourceValidationError::Whitespace => {
+            AppError::Oidc("invalid resource parameter: value contains whitespace".to_string())
+        }
+        ResourceValidationError::InvalidUrl(error) => {
+            AppError::Oidc(format!("invalid resource parameter: {error}"))
+        }
+        ResourceValidationError::Fragment => {
+            AppError::Oidc("resource parameter must not include a fragment".to_string())
+        }
+    })
 }
 
 fn resolve_client_credentials_audience(
@@ -3708,10 +3650,8 @@ fn resolve_client_credentials_audience(
 }
 
 fn normalize_audience(audience: &str) -> AppResult<String> {
-    if audience.len() > 2048 || audience.chars().any(char::is_whitespace) {
-        return Err(AppError::Oidc("invalid audience parameter".to_string()));
-    }
-    Ok(audience.to_string())
+    oauth_targets::normalize_audience(audience)
+        .map_err(|AudienceValidationError| AppError::Oidc("invalid audience parameter".to_string()))
 }
 
 fn merge_token_resource(
@@ -3777,7 +3717,7 @@ async fn load_oidc_user(state: &AppState, user_id: &str) -> AppResult<UserRecord
     }
 }
 
-fn absolute(base_url: &str, path: &str) -> String {
+pub(crate) fn absolute(base_url: &str, path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         path.to_string()
     } else {
@@ -3961,20 +3901,16 @@ fn account_selection_prompted_request(
     request
 }
 
-async fn client_requires_account_selection(
-    state: &AppState,
+fn client_requires_account_selection(
     client: &ClientRecord,
+    application: Option<&ApplicationRecord>,
     request: &ResolvedAuthorizeRequest,
-) -> AppResult<bool> {
+) -> bool {
     if request.account_selection_prompted {
-        return Ok(false);
+        return false;
     }
-    Ok(client.require_account_selection == 1
-        || state
-            .db
-            .find_application_for_client(&client.id)
-            .await?
-            .is_some_and(|application| application.requires_account_selection()))
+    client.require_account_selection == 1
+        || application.is_some_and(ApplicationRecord::requires_account_selection)
 }
 
 fn reauthentication_pending(request: &ResolvedAuthorizeRequest) -> bool {
@@ -3992,7 +3928,7 @@ fn session_binding_satisfies_reauthentication(
 async fn has_selectable_browser_accounts(
     state: &AppState,
     jar: &CookieJar,
-    client: Option<&ClientRecord>,
+    runtime: Option<&applications::ApplicationRuntimeSnapshot>,
 ) -> AppResult<bool> {
     let Some(context_id) = auth::browser_context_id_from_jar(state, jar) else {
         return Ok(false);
@@ -4000,30 +3936,21 @@ async fn has_selectable_browser_accounts(
     if state.db.find_browser_context(&context_id).await?.is_none() {
         return Ok(false);
     }
-    for account in state.db.list_browser_context_accounts(&context_id).await? {
-        let Some(user) = state.db.find_user_by_id(&account.user_id).await? else {
-            continue;
-        };
-        let Some(session) = state
-            .db
-            .find_session(&account.session_id)
-            .await?
-            .filter(|session| session.expires_at >= util::now_ts())
-        else {
-            continue;
-        };
-        let trial_enrollment = state.db.find_trial_enrollment_for_user(&user.id).await?;
+    for option in state
+        .db
+        .list_browser_context_account_options(&context_id)
+        .await?
+    {
+        let user = option.user;
+        let session = option.session;
+        let trial_enrollment = option.trial_enrollment;
         if trial_enrollment
             .as_ref()
             .is_some_and(|enrollment| !enrollment.is_active_at(util::now_ts()))
         {
             continue;
         }
-        let has_redemption = if user.archived_at.is_some() {
-            state.db.user_has_invitation_redemption(&user.id).await?
-        } else {
-            false
-        };
+        let has_redemption = user.archived_at.is_some() && option.has_authorization_code_redemption;
         if auth::AccountSessionKind::for_session_with_trial_enrollment(
             &user,
             &session,
@@ -4032,10 +3959,20 @@ async fn has_selectable_browser_accounts(
         )
         .is_some()
         {
-            if let Some(client) = client
-                && !applications::user_can_authorize_client(state, client, &user).await?
-            {
-                continue;
+            if runtime.is_some() {
+                if runtime
+                    .is_none_or(|runtime| !runtime.policy.is_interactive_client_runtime_active())
+                {
+                    continue;
+                }
+                // The application runtime snapshot already proves the
+                // application/organization/client boundary.  Account
+                // selection only needs the account/session boundary here;
+                // the selected user receives the full AuthorizationSnapshot
+                // before a code is issued.
+                if user.is_active != 1 || user.archived_at.is_some() {
+                    continue;
+                }
             }
             return Ok(true);
         }
@@ -4111,11 +4048,8 @@ pub(crate) async fn authorization_login_context_from_return_to(
     } else {
         resolve_authorize_request(state, headers, query).await?
     };
-    let client = validate_authorize_request(state, &request).await?;
-    let application = state.db.find_application_for_client(&client.id).await?;
-    if let Some(application) = application.as_ref() {
-        applications::ensure_application_runtime_active(state, application).await?;
-    }
+    let (client, runtime) = validate_authorize_request_with_runtime(state, &request).await?;
+    let application = Some(runtime.application.clone());
     let requested_assurance = request.requested_assurance()?;
     Ok(AuthorizationLoginContext {
         client: Some(client),
@@ -4161,7 +4095,7 @@ pub(crate) async fn verified_oidc_login_interaction_from_return_to(
     let request = crate::par::peek_interaction_request(state, &interaction_request)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    let client = validate_authorize_request(state, &request).await?;
+    let (client, _runtime) = validate_authorize_request_with_runtime(state, &request).await?;
     let requested_scopes = util::normalize_scopes(
         request.scope.as_deref(),
         &state.settings.oidc.supported_scopes,
@@ -4198,7 +4132,7 @@ pub(crate) async fn browser_account_interaction_context(
     else {
         return Err(AppError::Unauthorized);
     };
-    let client = validate_authorize_request(state, &request).await?;
+    let (client, _runtime) = validate_authorize_request_with_runtime(state, &request).await?;
     let prompt = request.prompt_behavior()?;
     Ok(Some(BrowserAccountInteractionContext {
         client_id: client.client_id,
@@ -4236,7 +4170,7 @@ pub(crate) async fn complete_browser_account_selection(
         .filter(|user| user.is_active == 1)
         .ok_or(AppError::Unauthorized)?;
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
-    ensure_application_client_allowed_for_user(state, &user, &client).await?;
+    AuthorizationSnapshot::load(state, &client, &user).await?;
     let trial_enrollment = state.db.find_trial_enrollment_for_user(&user.id).await?;
     if trial_enrollment
         .as_ref()
@@ -4312,7 +4246,7 @@ pub(crate) async fn complete_browser_account_reauthentication(
     if !reauthentication_pending(&request) {
         return Ok(false);
     }
-    validate_authorize_request(state, &request).await?;
+    let _ = validate_authorize_request_with_runtime(state, &request).await?;
     if request
         .selected_user_id
         .as_deref()
@@ -6358,7 +6292,7 @@ mod tests {
         state
             .db
             .insert_refresh_token(
-                "client-a".to_string(),
+                "demo-web".to_string(),
                 RefreshTokenInput {
                     token_hash: util::token_hash(refresh_token),
                     user_id: user.id,
@@ -6373,7 +6307,7 @@ mod tests {
             .await
             .unwrap();
 
-        let client = test_refresh_client();
+        let client = test_refresh_client(&state).await;
         let issuer = state.settings.oidc.issuer.clone();
         let (first, second) = tokio::join!(
             token_from_refresh_token(
@@ -6442,7 +6376,7 @@ mod tests {
         state
             .db
             .insert_refresh_token(
-                "client-a".to_string(),
+                "demo-web".to_string(),
                 RefreshTokenInput {
                     token_hash: refresh_hash.clone(),
                     user_id: user.id,
@@ -6457,7 +6391,7 @@ mod tests {
             .await
             .unwrap();
 
-        let client = test_refresh_client();
+        let client = test_refresh_client(&state).await;
         let issuer = state.settings.oidc.issuer.clone();
         let dpop_error = token_from_refresh_token(
             state.clone(),
@@ -6675,10 +6609,10 @@ mod tests {
             code: None,
             device_code: None,
             redirect_uri: None,
-            client_id: Some("client-a".to_string()),
-            client_secret: None,
-            client_assertion_type: None,
-            client_assertion: None,
+            client_auth: ClientAuthForm {
+                client_id: Some("demo-web".to_string()),
+                ..Default::default()
+            },
             code_verifier: None,
             refresh_token: Some(refresh_token.to_string()),
             scope: None,
@@ -6698,10 +6632,10 @@ mod tests {
             code: Some(code.to_string()),
             device_code: None,
             redirect_uri: Some("http://localhost:3000/callback".to_string()),
-            client_id: Some("demo-web".to_string()),
-            client_secret: None,
-            client_assertion_type: None,
-            client_assertion: None,
+            client_auth: ClientAuthForm {
+                client_id: Some("demo-web".to_string()),
+                ..Default::default()
+            },
             code_verifier: None,
             refresh_token: None,
             scope: None,
@@ -6715,10 +6649,13 @@ mod tests {
         }
     }
 
-    fn test_refresh_client() -> ClientRecord {
-        let mut client = test_client();
-        client.grant_types = serde_json::json!(["refresh_token"]).to_string();
-        client
+    async fn test_refresh_client(state: &AppState) -> ClientRecord {
+        state
+            .db
+            .find_client_by_client_id("demo-web")
+            .await
+            .unwrap()
+            .expect("test bootstrap client")
     }
 
     #[cfg(feature = "sqlite")]
@@ -7073,5 +7010,96 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn service_introspection_uses_machine_policy_without_interactive_oidc() {
+        let mut client = test_client();
+        client.service_account_enabled = 1;
+        client.grant_types = serde_json::json!(["client_credentials"]).to_string();
+
+        assert!(service_client_endpoint_request(
+            &client,
+            "/oauth2/introspect"
+        ));
+        assert!(!service_client_endpoint_request(&client, "/oauth2/revoke"));
+
+        client.service_account_enabled = 0;
+        assert!(!service_client_endpoint_request(
+            &client,
+            "/oauth2/introspect"
+        ));
+    }
+
+    #[test]
+    fn service_account_introspection_rechecks_current_client_lifecycle() {
+        let mut client = test_client();
+        client.service_account_enabled = 1;
+        client.grant_types = serde_json::json!(["client_credentials"]).to_string();
+        let claims = crate::jwt::TokenClaims {
+            iss: "https://issuer.example".to_string(),
+            sub: "service-account:client-a".to_string(),
+            aud: "client-a".to_string(),
+            exp: 2,
+            iat: 1,
+            jti: Some("jti-1".to_string()),
+            token_use: "access_token".to_string(),
+            client_id: "client-a".to_string(),
+            application_id: None,
+            authorization_profile_id: None,
+            scope: String::new(),
+            email: String::new(),
+            email_verified: false,
+            name: None,
+            preferred_username: "client-a".to_string(),
+            nonce: None,
+            auth_time: None,
+            sid: None,
+            cnf: None,
+            authorization_details: None,
+            act: None,
+            grant_id: None,
+            gpt_sso_login_code_level: None,
+        };
+        assert!(service_account_claim_is_live(&client, &claims));
+        let mut legacy_claims = claims.clone();
+        legacy_claims.sub = client.client_id.clone();
+        legacy_claims.email.clear();
+        assert!(service_account_claim_is_live(&client, &legacy_claims));
+        client.service_account_enabled = 0;
+        assert!(!service_account_claim_is_live(&client, &claims));
+        assert!(!service_account_claim_is_live(&client, &legacy_claims));
+    }
+
+    #[test]
+    fn machine_token_detection_does_not_skip_user_runtime_checks() {
+        let mut claims = crate::jwt::TokenClaims {
+            iss: "https://issuer.example".to_string(),
+            sub: "client-a".to_string(),
+            aud: "client-a".to_string(),
+            exp: 2,
+            iat: 1,
+            jti: None,
+            token_use: "access_token".to_string(),
+            client_id: "client-a".to_string(),
+            application_id: None,
+            authorization_profile_id: None,
+            scope: String::new(),
+            email: "user@example.com".to_string(),
+            email_verified: true,
+            name: Some("User".to_string()),
+            preferred_username: "client-a".to_string(),
+            nonce: None,
+            auth_time: None,
+            sid: None,
+            cnf: None,
+            authorization_details: None,
+            act: None,
+            grant_id: None,
+            gpt_sso_login_code_level: None,
+        };
+        assert!(!is_machine_token_claims(&claims));
+        claims.email.clear();
+        assert!(is_machine_token_claims(&claims));
     }
 }

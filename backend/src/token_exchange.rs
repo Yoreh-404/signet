@@ -1,11 +1,15 @@
 use crate::{
     AppState,
+    applications::ApplicationRuntimeSnapshot,
     audit::{self, AuditOutcome, AuditSink},
     claim_mapper::{self, ClaimContext, ClaimOutputTarget},
     config::DelegatedAllowlistEntry,
-    db::{ClientGrantRecord, ClientRecord, UserRecord},
+    db::{AuthorizationPolicySnapshot, ClientGrantRecord, ClientRecord, UserRecord},
+    dpop::{self, DpopBinding},
     error::{AppError, AppResult},
     jwt::TokenSubject,
+    oauth_targets,
+    service_accounts::ServiceAccountProfile,
 };
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,7 @@ pub struct TokenExchangeInput {
     pub resource: Option<String>,
     pub audience: Option<String>,
     pub actor_token: Option<String>,
+    pub dpop: Option<DpopBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +91,12 @@ impl TokenExchangePolicy for DefaultTokenExchangePolicy<'_> {
                 .cloned()
                 .collect()
         });
+        if explicit.is_some() && !requested.is_subset(&subject_scopes) {
+            return Err(oauth_error(
+                "invalid_scope",
+                "token exchange cannot increase the subject token scope",
+            ));
+        }
         for scope in &requested {
             if scope.ends_with(".service") {
                 return Err(oauth_error(
@@ -116,7 +127,11 @@ impl TokenExchangePolicy for DefaultTokenExchangePolicy<'_> {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(normalize_resource)
+            .map(|resource| {
+                oauth_targets::normalize_resource_value(resource).map_err(|error| {
+                    oauth_error("invalid_target", &format!("resource is invalid: {error}"))
+                })
+            })
             .transpose()?;
         let audience = self
             .input
@@ -124,7 +139,10 @@ impl TokenExchangePolicy for DefaultTokenExchangePolicy<'_> {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(normalize_audience)
+            .map(|audience| {
+                oauth_targets::normalize_audience(audience)
+                    .map_err(|_| oauth_error("invalid_target", "audience is invalid"))
+            })
             .transpose()?;
         if let (Some(resource), Some(audience)) = (&resource, &audience)
             && resource != audience
@@ -157,6 +175,11 @@ pub async fn exchange_token(
     validate_token_type(&input)?;
     let policy = DefaultTokenExchangePolicy::new(&input);
     policy.assert_client_allowed(client)?;
+    // Token exchange is intentionally deferred by `authenticate_client_at` so
+    // this handler can keep the target runtime decision next to the token
+    // claims it emits.  The snapshot also preserves the current legacy rule:
+    // an unbound client remains eligible under the pre-Application policy.
+    let target_runtime = load_target_runtime(state, client).await?;
     let target_audience = policy.target_audience(client)?;
     let issuers = state.accepted_issuers(headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
@@ -179,6 +202,16 @@ pub async fn exchange_token(
             "authorization-code login tokens cannot be used as subject_token",
         ));
     }
+    if subject_claims.cnf.is_some() {
+        // The token-endpoint proof is for the new target token and is not an
+        // `ath` proof for the subject token. Until that possession check is
+        // modeled explicitly, exchanging a DPoP-bound subject as a bearer
+        // input would silently weaken its binding.
+        return Err(oauth_error(
+            "invalid_grant",
+            "DPoP-bound subject tokens cannot be exchanged",
+        ));
+    }
     let subject_client = state
         .db
         .find_client_by_client_id(&subject_claims.client_id)
@@ -190,31 +223,18 @@ pub async fn exchange_token(
             "subject token client is inactive",
         ));
     }
-    let subject_binding = state
-        .db
-        .find_application_client_binding(&subject_client.id)
-        .await?;
-    if let Some(binding) = subject_binding.as_ref()
-        && (subject_claims.application_id.as_deref() != Some(binding.application_id.as_str())
-            || subject_claims.authorization_profile_id.as_deref()
-                != Some(binding.authorization_profile_id.as_str()))
-    {
-        return Err(oauth_error(
-            "invalid_grant",
-            "subject token application boundary is invalid",
-        ));
-    }
-    let target_binding = state.db.find_application_client_binding(&client.id).await?;
-    if let (Some(subject_binding), Some(target_binding)) =
-        (subject_binding.as_ref(), target_binding.as_ref())
-        && subject_binding.application_id != target_binding.application_id
-    {
+    let user = load_active_user(state, &subject_claims.sub, &client.client_id).await?;
+    let source_policy = load_subject_policy(state, &subject_client, &user, &subject_claims).await?;
+    let source_binding = source_policy
+        .as_ref()
+        .and_then(|policy| policy.binding.as_ref());
+    let target_binding = target_runtime.as_ref().map(|runtime| &runtime.binding);
+    if !same_application_boundary(source_binding, target_binding) {
         return Err(oauth_error(
             "invalid_target",
             "token exchange cannot cross application boundaries",
         ));
     }
-    let user = load_active_user(state, &subject_claims.sub).await?;
     let scope = policy.requested_scope(client, &subject_claims.scope)?;
     assert_allowlisted_delegated_scope(
         &state.settings.oidc.delegated_allowlist,
@@ -243,6 +263,14 @@ pub async fn exchange_token(
                 "actor_token was issued to a different client",
             ));
         }
+        if !claims_match_binding(&actor_claims, target_binding)
+            || !service_account_actor_is_live(client, &actor_claims)
+        {
+            return Err(oauth_error(
+                "invalid_grant",
+                "actor_token runtime boundary is unavailable",
+            ));
+        }
         serde_json::json!({
             "sub": actor_claims.sub,
             "client_id": actor_claims.client_id,
@@ -251,7 +279,14 @@ pub async fn exchange_token(
         serde_json::json!({ "sub": client.client_id })
     };
 
-    let mapper_records = state.db.list_client_claim_mappers(&client.id).await?;
+    let mapper_records = if let Some(runtime) = target_runtime.as_ref() {
+        runtime.policy.claim_mappers.clone()
+    } else {
+        // Historical unbound clients do not have a runtime snapshot to carry
+        // their mappers. Keep that compatibility path explicit; bound clients
+        // reuse the already-loaded request-local policy graph.
+        state.db.list_client_claim_mappers(&client.id).await?
+    };
     let mut extra_claims = claim_mapper::mapped_claims(
         &mapper_records,
         &ClaimContext {
@@ -269,7 +304,8 @@ pub async fn exchange_token(
     if let Some(authorization_details) = subject_claims.authorization_details.clone() {
         extra_claims.insert("authorization_details".to_string(), authorization_details);
     }
-    if let Some(binding) = target_binding.as_ref() {
+    dpop::add_cnf_claim(&mut extra_claims, input.dpop.as_ref());
+    if let Some(binding) = target_binding {
         extra_claims.insert(
             "application_id".to_string(),
             Value::String(binding.application_id.clone()),
@@ -311,11 +347,152 @@ pub async fn exchange_token(
     Ok(ExchangedToken {
         access_token,
         issued_token_type: ACCESS_TOKEN_TYPE,
-        token_type: "Bearer",
+        token_type: dpop::token_type(input.dpop.as_ref()),
         expires_in: ttl,
         scope,
         authorization_details: subject_claims.authorization_details,
     })
+}
+
+/// Loads the target's application boundary exactly once.  `ApplicationRuntimeSnapshot::load`
+/// is intentionally not called after this read: doing so would reopen the
+/// pool and could make the gate and the emitted application/profile claims
+/// observe different bindings.  An absent binding is the legacy/unbound
+/// policy and is represented by `None`.
+async fn load_target_runtime(
+    state: &AppState,
+    client: &ClientRecord,
+) -> AppResult<Option<ApplicationRuntimeSnapshot>> {
+    let policy = state
+        .db
+        .load_client_runtime_snapshot(&client.id, Some("oauth2_oidc"))
+        .await?;
+    target_runtime_from_policy(policy, client)
+}
+
+fn target_runtime_from_policy(
+    policy: AuthorizationPolicySnapshot,
+    client: &ClientRecord,
+) -> AppResult<Option<ApplicationRuntimeSnapshot>> {
+    if policy.client_id.as_deref() != Some(client.id.as_str())
+        || policy.client_organization_id.as_deref() != client.organization_id.as_deref()
+        || !policy.client_active
+    {
+        return Err(oauth_error(
+            "unauthorized_client",
+            "target client is inactive",
+        ));
+    }
+    let Some(binding) = policy.binding.clone() else {
+        // Historical clients without an application binding keep the current
+        // token-exchange behavior.  They have no application boundary to
+        // compare, but a token carrying boundary claims is never accepted as
+        // an implicit legacy token below.
+        return Ok(None);
+    };
+    if !policy.is_interactive_client_runtime_active() {
+        return Err(oauth_error(
+            "unauthorized_client",
+            "target client application is unavailable",
+        ));
+    }
+    let application = policy.application.clone().ok_or_else(|| {
+        oauth_error(
+            "unauthorized_client",
+            "target client application is unavailable",
+        )
+    })?;
+    Ok(Some(ApplicationRuntimeSnapshot {
+        policy,
+        application,
+        binding,
+    }))
+}
+
+/// A bound source token must be authorized by the current user policy, not
+/// just by the signed application/profile claims.  An unbound source keeps
+/// the legacy path, but only when it really has no boundary claims; this
+/// prevents a token issued while bound from surviving an unbind operation.
+async fn load_subject_policy(
+    state: &AppState,
+    subject_client: &ClientRecord,
+    user: &UserRecord,
+    claims: &crate::jwt::TokenClaims,
+) -> AppResult<Option<AuthorizationPolicySnapshot>> {
+    let policy = state
+        .db
+        .load_client_policy_snapshot_for_protocol(&subject_client.id, &user.id, "oauth2_oidc")
+        .await?;
+    if policy.client_id.as_deref() != Some(subject_client.id.as_str())
+        || policy.client_organization_id.as_deref() != subject_client.organization_id.as_deref()
+        || !policy.client_active
+        || policy.user_id != user.id
+        || !policy.user_active
+    {
+        return Err(oauth_error(
+            "invalid_grant",
+            "subject token runtime boundary is unavailable",
+        ));
+    }
+    let Some(binding) = policy.binding.as_ref() else {
+        if !claims_match_binding(claims, None) {
+            return Err(oauth_error(
+                "invalid_grant",
+                "subject token application boundary is invalid",
+            ));
+        }
+        return Ok(None);
+    };
+    if !policy.is_authorizable
+        || !policy.is_interactive_client_runtime_active()
+        || policy.client_id.as_deref() != Some(subject_client.id.as_str())
+        || policy.user_id != user.id
+        || !claims_match_binding(claims, Some(binding))
+    {
+        return Err(oauth_error(
+            "invalid_grant",
+            "subject token runtime boundary is unavailable",
+        ));
+    }
+    Ok(Some(policy))
+}
+
+fn claims_match_binding(
+    claims: &crate::jwt::TokenClaims,
+    binding: Option<&crate::db::ApplicationClientBindingRecord>,
+) -> bool {
+    match binding {
+        Some(binding) => {
+            claims.application_id.as_deref() == Some(binding.application_id.as_str())
+                && claims.authorization_profile_id.as_deref()
+                    == Some(binding.authorization_profile_id.as_str())
+        }
+        None => claims.application_id.is_none() && claims.authorization_profile_id.is_none(),
+    }
+}
+
+fn same_application_boundary(
+    source: Option<&crate::db::ApplicationClientBindingRecord>,
+    target: Option<&crate::db::ApplicationClientBindingRecord>,
+) -> bool {
+    match (source, target) {
+        (Some(source), Some(target)) => source.application_id == target.application_id,
+        // A bound and an unbound client cannot be compared safely. Requiring
+        // both sides to share the same explicit application prevents an
+        // application-scoped subject from being delegated to a legacy target.
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
+fn service_account_actor_is_live(client: &ClientRecord, claims: &crate::jwt::TokenClaims) -> bool {
+    !claims.sub.starts_with("service-account:")
+        || (client.service_account_enabled()
+            && client
+                .grant_types()
+                .ok()
+                .is_some_and(|grants| grants.iter().any(|grant| grant == "client_credentials"))
+            && claims.sub == client.service_account_subject())
 }
 
 fn validate_token_type(input: &TokenExchangeInput) -> AppResult<()> {
@@ -334,29 +511,6 @@ fn validate_token_type(input: &TokenExchangeInput) -> AppResult<()> {
         ));
     }
     Ok(())
-}
-
-fn normalize_resource(resource: &str) -> AppResult<String> {
-    let trimmed = resource.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
-        return Err(oauth_error("invalid_target", "resource is invalid"));
-    }
-    if let Ok(parsed) = url::Url::parse(trimmed)
-        && parsed.fragment().is_some()
-    {
-        return Err(oauth_error(
-            "invalid_target",
-            "resource must not include a fragment",
-        ));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn normalize_audience(audience: &str) -> AppResult<String> {
-    if audience.len() > 2048 || audience.chars().any(char::is_whitespace) {
-        return Err(oauth_error("invalid_target", "audience is invalid"));
-    }
-    Ok(audience.to_string())
 }
 
 fn assert_allowlisted_delegated_scope(
@@ -442,24 +596,30 @@ pub fn exchanged_token_ttl(access_token_ttl_seconds: i64) -> i64 {
     )
 }
 
-async fn load_active_user(state: &AppState, user_id: &str) -> AppResult<UserRecord> {
+async fn load_active_user(
+    state: &AppState,
+    user_id: &str,
+    target_client_id: &str,
+) -> AppResult<UserRecord> {
     let user = state
         .db
         .find_user_by_id(user_id)
         .await?
         .ok_or_else(|| oauth_error("invalid_grant", "subject user does not exist"))?;
-    if user.is_active == 1
-        && user.archived_at.is_none()
-        && state
-            .db
-            .find_trial_enrollment_for_user(&user.id)
-            .await?
-            .is_none_or(|enrollment| enrollment.is_active_at(crate::util::now_ts()))
-    {
-        Ok(user)
-    } else {
-        Err(oauth_error("invalid_grant", "subject user is not active"))
+    if user.is_active != 1 || user.archived_at.is_some() {
+        return Err(oauth_error("invalid_grant", "subject user is not active"));
     }
+    if let Some(enrollment) = state.db.find_trial_enrollment_for_user(&user.id).await? {
+        if !enrollment.is_active_at(crate::util::now_ts())
+            || !enrollment.allows_client(target_client_id)?
+        {
+            return Err(oauth_error(
+                "invalid_grant",
+                "subject user is not eligible for this client",
+            ));
+        }
+    }
+    Ok(user)
 }
 
 fn scope_set(value: &str) -> BTreeSet<String> {
@@ -481,8 +641,54 @@ fn oauth_error(error: &str, description: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_allowlisted_delegated_scope, token_exchange_forbidden_login_code_level};
-    use crate::config::DelegatedAllowlistEntry;
+    use super::{
+        assert_allowlisted_delegated_scope, claims_match_binding, same_application_boundary,
+        token_exchange_forbidden_login_code_level,
+    };
+    use crate::{
+        config::DelegatedAllowlistEntry, db::ApplicationClientBindingRecord, jwt::TokenClaims,
+    };
+
+    fn claims(application_id: Option<&str>, profile_id: Option<&str>) -> TokenClaims {
+        TokenClaims {
+            iss: "https://issuer.example".to_string(),
+            sub: "user-1".to_string(),
+            aud: "client-a".to_string(),
+            exp: 2,
+            iat: 1,
+            jti: Some("jti-1".to_string()),
+            token_use: "access_token".to_string(),
+            client_id: "client-a".to_string(),
+            application_id: application_id.map(str::to_string),
+            authorization_profile_id: profile_id.map(str::to_string),
+            scope: "openid".to_string(),
+            email: "user@example.com".to_string(),
+            email_verified: true,
+            name: Some("User".to_string()),
+            preferred_username: "user".to_string(),
+            nonce: None,
+            auth_time: None,
+            sid: None,
+            cnf: None,
+            authorization_details: None,
+            act: None,
+            grant_id: None,
+            gpt_sso_login_code_level: None,
+        }
+    }
+
+    fn binding(application_id: &str, client_db_id: &str) -> ApplicationClientBindingRecord {
+        ApplicationClientBindingRecord {
+            application_id: application_id.to_string(),
+            client_db_id: client_db_id.to_string(),
+            protocol: "oidc".to_string(),
+            authorization_profile_id: "profile-1".to_string(),
+            auth_domain_id: "domain-1".to_string(),
+            is_active: 1,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
 
     #[test]
     fn ordinary_access_tokens_remain_eligible_for_exchange() {
@@ -541,5 +747,37 @@ mod tests {
         assert_eq!(super::exchanged_token_ttl(900), 600);
         assert_eq!(super::exchanged_token_ttl(300), 300);
         assert_eq!(super::exchanged_token_ttl(60), 300);
+    }
+
+    #[test]
+    fn bound_subject_claims_must_match_the_current_binding() {
+        let current = binding("app-1", "client-db-1");
+        assert!(claims_match_binding(
+            &claims(Some("app-1"), Some("profile-1")),
+            Some(&current),
+        ));
+        assert!(!claims_match_binding(
+            &claims(Some("app-1"), Some("old-profile")),
+            Some(&current),
+        ));
+        assert!(!claims_match_binding(
+            &claims(Some("app-1"), Some("profile-1")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn only_two_bound_clients_must_share_an_application() {
+        let source = binding("app-1", "source-db");
+        let same_target = binding("app-1", "target-db");
+        let other_target = binding("app-2", "target-db");
+        assert!(same_application_boundary(Some(&source), Some(&same_target)));
+        assert!(!same_application_boundary(
+            Some(&source),
+            Some(&other_target)
+        ));
+        assert!(!same_application_boundary(Some(&source), None));
+        assert!(!same_application_boundary(None, Some(&other_target)));
+        assert!(same_application_boundary(None, None));
     }
 }

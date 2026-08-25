@@ -5,8 +5,6 @@ const ALL_TABS: Tab[] = [
   "overview",
   "users",
   "applications",
-  "clients",
-  "iap",
   "organizations",
   "invitations",
   "billing",
@@ -23,7 +21,8 @@ const APPLICATION_SECTIONS: ApplicationSection[] = [
   "login_adapters",
   "directory_sync",
   "authorization",
-  "billing"
+  "billing",
+  "iap"
 ];
 
 export type NavigationState = {

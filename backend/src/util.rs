@@ -114,10 +114,12 @@ pub fn encrypt_discovery_secret(key: &str, secret: &str) -> AppResult<String> {
         .map_err(|_| AppError::Configuration("discovery encryption key is invalid".to_string()))?;
     let mut nonce_bytes = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| {
+        AppError::Internal("failed to construct discovery encryption nonce".to_string())
+    })?;
     let ciphertext = cipher
         .encrypt(
-            nonce,
+            &nonce,
             aes_gcm::aead::Payload {
                 msg: secret.as_bytes(),
                 aad: DISCOVERY_SECRET_AAD,
@@ -164,9 +166,12 @@ pub fn decrypt_discovery_secret(key: &str, ciphertext: &str) -> AppResult<String
     let key = decode_discovery_key(key)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| AppError::Configuration("discovery encryption key is invalid".to_string()))?;
+    let nonce = Nonce::try_from(&nonce[..]).map_err(|_| {
+        AppError::Configuration("discovery fetch secret ciphertext is invalid".to_string())
+    })?;
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             aes_gcm::aead::Payload {
                 msg: &ciphertext_bytes,
                 aad: DISCOVERY_SECRET_AAD,

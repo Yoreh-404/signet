@@ -1,19 +1,21 @@
 //! Application authorization and entitlement resolution.
 //!
 //! Authentication answers whether a Signet account may establish a session
-//! with a website.  This module answers a different question: what that
-//! account may do after the website has accepted the protocol response.  The
-//! separation is intentional; an application role must never become an
-//! accidental login allowlist.
+//! with a website.  This module answers a separate question: what that
+//! account may do after the protocol response is accepted.  Database reads
+//! are confined to the snapshot loaders; the resolver below is deliberately
+//! pure in-memory policy evaluation.
 
 use crate::{
-    AppState, applications,
-    db::{ApplicationAuthorizationProfileRecord, ApplicationRecord, ClientRecord, UserRecord},
+    AppState,
+    db::{ApplicationProfileRoleRecord, ApplicationRecord, UserRecord},
     error::{AppError, AppResult},
     util,
 };
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub use crate::db::AuthorizationPolicySnapshot;
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ApplicationEntitlements {
@@ -32,23 +34,35 @@ pub struct ApplicationAccessDecision {
     pub policy_version: String,
 }
 
-/// Performs the live login gate and returns a stable decision object.  No
-/// application membership or application-local identity binding is consulted
-/// here: those are legacy admission concepts and are not part of a website's
-/// Signet login boundary.
+/// Performs the live account/application gate.  Session credentials are not
+/// read here: a session authenticates a subject, while this snapshot only
+/// describes the subject's current policy inputs.
 pub async fn check_login_access(
     state: &AppState,
     application: &ApplicationRecord,
     user_id: &str,
 ) -> AppResult<ApplicationAccessDecision> {
-    let allowed = state
+    let snapshot = state
         .db
-        .user_can_access_application(application, user_id)
+        .load_application_access_snapshot(&application.id, user_id)
         .await?;
-    let policy_version = application_policy_version(state, application).await?;
+    if snapshot
+        .application
+        .as_ref()
+        .is_none_or(|loaded| loaded.id != application.id)
+    {
+        return Err(AppError::Forbidden);
+    }
+    let loaded_application = snapshot.application.as_ref().ok_or(AppError::Forbidden)?;
+    let policy_version = util::sha256_base64url(&format!(
+        "signet:application-policy:v2:{}:{}:{}",
+        loaded_application.id,
+        loaded_application.updated_at,
+        serde_json::to_string(&snapshot.authorization_config).unwrap_or_default()
+    ));
     Ok(ApplicationAccessDecision {
-        allowed,
-        reason: if allowed {
+        allowed: snapshot.is_authorizable,
+        reason: if snapshot.is_authorizable {
             "active_account"
         } else {
             "inactive_account_or_tenant"
@@ -57,311 +71,194 @@ pub async fn check_login_access(
     })
 }
 
-/// Resolves the effective application permissions at request time.
-///
-/// Existing enterprise roles/groups are used as the compatibility source
-/// while the normalized application-role tables are introduced.  Application
-/// configuration can add a default role, explicit permissions, permission
-/// denials, and deterministic organization/group mappings.  All collections
-/// are sorted before being emitted, so the same policy produces stable claims
-/// across OAuth/OIDC, JWT, SAML, and CAS adapters.
+/// Resolves an application-wide policy from one transactionally materialized
+/// subject snapshot.
 pub async fn resolve_entitlements(
     state: &AppState,
     application: &ApplicationRecord,
     user: &UserRecord,
 ) -> AppResult<ApplicationEntitlements> {
-    let decision = check_login_access(state, application, &user.id).await?;
-    if !decision.allowed {
-        return Err(AppError::Forbidden);
-    }
-
-    let config = applications::enabled_module_config(state, &application.id, "authorization")
-        .await?
-        .unwrap_or_default();
-    let inherit_enterprise = config
-        .get("inherit_enterprise_roles")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-
-    let mut roles = BTreeSet::new();
-    let mut permissions = BTreeSet::new();
-    let mut groups = BTreeSet::new();
-    let mut organization_role = None;
-
-    if inherit_enterprise {
-        for role in state.db.list_user_roles(&user.id).await? {
-            roles.insert(role.name.clone());
-            permissions.extend(state.db.list_role_permissions(&role.id).await?);
-        }
-        for group in state.db.list_user_groups(&user.id).await? {
-            groups.insert(group.name.clone());
-            for role in state.db.list_group_roles(&group.id).await? {
-                roles.insert(role.name.clone());
-                permissions.extend(state.db.list_role_permissions(&role.id).await?);
-            }
-        }
-        for membership in state.db.list_user_organizations(&user.id).await? {
-            if membership.id == application.organization_id && membership.is_active == 1 {
-                organization_role = Some(membership.role.clone());
-                roles.insert(format!("enterprise:{}", membership.role));
-                break;
-            }
-        }
-    }
-
-    // Normalized application roles take precedence over the compatibility
-    // JSON role definitions.  The tables are intentionally read on every
-    // decision so an administrator can revoke a grant without waiting for a
-    // token/session cache to expire.
-    let application_roles = state.db.list_application_roles(&application.id).await?;
-    let role_by_id = application_roles
-        .iter()
-        .filter(|role| role.is_active == 1)
-        .map(|role| (role.id.clone(), role))
-        .collect::<BTreeMap<_, _>>();
-    for role in application_roles
-        .iter()
-        .filter(|role| role.is_active == 1 && role.is_default == 1)
-    {
-        add_application_role(role, &mut roles, &mut permissions)?;
-    }
-    for role_id in state
+    let snapshot = state
         .db
-        .list_application_user_role_ids(&application.id, &user.id)
-        .await?
-    {
-        if let Some(role) = role_by_id.get(&role_id) {
-            add_application_role(role, &mut roles, &mut permissions)?;
-        }
-    }
-    for group in state.db.list_user_groups(&user.id).await? {
-        for role_id in state
-            .db
-            .list_application_group_role_ids(&application.id, &group.id)
-            .await?
-        {
-            if let Some(role) = role_by_id.get(&role_id) {
-                add_application_role(role, &mut roles, &mut permissions)?;
-            }
-        }
-    }
-    if let Some(org_role) = organization_role.as_deref() {
-        for role_id in state
-            .db
-            .list_application_organization_role_ids(&application.id, org_role)
-            .await?
-        {
-            if let Some(role) = role_by_id.get(&role_id) {
-                add_application_role(role, &mut roles, &mut permissions)?;
-            }
-        }
-    }
-
-    if application_roles.is_empty() {
-        // Keep the JSON representation as a read-compatible fallback for
-        // applications created before the normalized role tables existed.
-        // Once an application has real roles, those rows are the authority;
-        // otherwise a renamed/deleted role could silently come back from the
-        // old config and re-grant access.
-        apply_application_role_config(
-            &config,
-            &mut roles,
-            &mut permissions,
-            &mut organization_role,
-            &groups,
-        );
-    } else {
-        apply_application_explicit_permissions(&config, &mut permissions);
-    }
-
-    let mut denied = string_set(&config, "denied_permissions")?;
-    for override_record in state
-        .db
-        .list_application_user_permission_overrides(&application.id, &user.id)
-        .await?
-    {
-        if override_record.effect == "deny" {
-            denied.insert(override_record.permission);
-        } else if override_record.effect == "allow" {
-            permissions.insert(override_record.permission);
-        }
-    }
-    permissions.retain(|permission| !denied.contains(permission));
-
-    let roles_vec = roles.into_iter().collect::<Vec<_>>();
-    let permissions_vec = permissions.into_iter().collect::<Vec<_>>();
-    let groups_vec = groups.into_iter().collect::<Vec<_>>();
-    let policy_version = policy_version(application, &config, &roles_vec, &permissions_vec);
-    let claims = build_claims(
-        application,
-        &roles_vec,
-        &permissions_vec,
-        &groups_vec,
-        organization_role.as_deref(),
-        &config,
-    );
-
-    Ok(ApplicationEntitlements {
-        roles: roles_vec,
-        permissions: permissions_vec,
-        groups: groups_vec,
-        organization_role,
-        policy_version,
-        claims,
-    })
-}
-
-/// Resolves the policy attached to one OIDC connection.  A website may have
-/// several clients under the same Application; profile-scoped roles keep
-/// their permission vocabularies and assignments independent.  Applications
-/// created before profiles existed retain the application-wide compatibility
-/// resolver above.
-pub async fn resolve_entitlements_for_client(
-    state: &AppState,
-    application: &ApplicationRecord,
-    client: &ClientRecord,
-    user: &UserRecord,
-) -> AppResult<ApplicationEntitlements> {
-    let profile = if let Some(binding) = state.db.find_application_client_binding(&client.id).await? {
-        if binding.authorization_profile_id == "default" {
-            state
-                .db
-                .find_application_authorization_profile(&application.id, "default")
-                .await?
-        } else {
-            state
-                .db
-                .find_application_authorization_profile_by_id(&binding.authorization_profile_id)
-                .await?
-        }
-    } else {
-        state
-            .db
-            .find_application_authorization_profile(&application.id, &client.client_id)
-            .await?
-    };
-    let Some(profile) = profile else {
-        return resolve_entitlements(state, application, user).await;
-    };
-    resolve_entitlements_for_profile(state, application, &profile, user).await
+        .load_application_policy_snapshot(&application.id, &user.id)
+        .await?;
+    validate_application_boundary(&snapshot, application.id.as_str())?;
+    resolve_entitlements_from_snapshot(&snapshot, user)
 }
 
 pub async fn resolve_entitlements_for_profile(
     state: &AppState,
     application: &ApplicationRecord,
-    profile: &ApplicationAuthorizationProfileRecord,
+    profile: &crate::db::ApplicationAuthorizationProfileRecord,
     user: &UserRecord,
 ) -> AppResult<ApplicationEntitlements> {
-    let decision = check_login_access(state, application, &user.id).await?;
-    if !decision.allowed {
+    let snapshot = state
+        .db
+        .load_profile_policy_snapshot(&application.id, &profile.id, &user.id)
+        .await?;
+    validate_application_boundary(&snapshot, application.id.as_str())?;
+    if snapshot.profile.as_ref().map(|value| value.id.as_str()) != Some(profile.id.as_str()) {
         return Err(AppError::Forbidden);
     }
+    resolve_entitlements_from_snapshot(&snapshot, user)
+}
+
+fn validate_application_boundary(
+    snapshot: &AuthorizationPolicySnapshot,
+    application_id: &str,
+) -> AppResult<()> {
+    if snapshot.client_id.is_some()
+        || snapshot
+            .application
+            .as_ref()
+            .is_none_or(|application| application.id != application_id)
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Pure entitlement resolution.  This function intentionally has no `AppState`
+/// parameter: a code review can therefore verify that it cannot reopen a
+/// second connection after the policy snapshot was captured.
+pub fn resolve_entitlements_from_snapshot(
+    snapshot: &AuthorizationPolicySnapshot,
+    user: &UserRecord,
+) -> AppResult<ApplicationEntitlements> {
+    let application = snapshot.application.as_ref().ok_or(AppError::Forbidden)?;
+    if !snapshot.is_authorizable
+        || snapshot.user_id != user.id
+        || user.is_active != 1
+        || user.archived_at.is_some()
+    {
+        return Err(AppError::Forbidden);
+    }
+
+    let config = &snapshot.authorization_config;
+    let inherit_enterprise = config
+        .get("inherit_enterprise_roles")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let member = snapshot.organization_active
+        && snapshot
+            .membership
+            .as_ref()
+            .is_some_and(|membership| membership.is_active == 1);
+    let group_ids = snapshot
+        .groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect::<BTreeSet<_>>();
 
     let mut roles = BTreeSet::new();
     let mut permissions = BTreeSet::new();
     let mut groups = BTreeSet::new();
     let mut organization_role = None;
-    let profile_roles = state.db.list_application_profile_roles(&profile.id).await?;
-    let active_roles = profile_roles
+
+    if member && inherit_enterprise {
+        apply_enterprise_entitlements(
+            snapshot,
+            &mut roles,
+            &mut permissions,
+            &mut groups,
+            &mut organization_role,
+        )?;
+    }
+
+    let profile = snapshot.profile.as_ref().ok_or(AppError::Forbidden)?;
+    let active_roles = snapshot
+        .profile_roles
         .iter()
-        .filter(|role| role.is_active == 1)
-        .map(|role| (role.id.clone(), role))
+        .filter(|role| role.profile_id == profile.id && role.is_active == 1)
+        .map(|role| (role.id.as_str(), role))
         .collect::<BTreeMap<_, _>>();
-    let application_membership = state
-        .db
-        .list_user_organizations(&user.id)
-        .await?
-        .into_iter()
-        .find(|membership| {
-            membership.id == application.organization_id && membership.is_active == 1
-        });
-
-    for role in profile_roles
-        .iter()
-        .filter(|role| role.is_active == 1 && role.is_default == 1)
-    {
-        add_profile_role(role, &mut roles, &mut permissions)?;
+    let default_roles = active_roles
+        .values()
+        .filter(|role| role.is_default == 1)
+        .collect::<Vec<_>>();
+    if default_roles.len() > 1 {
+        // A profile has one default-role slot. If old data or a failed
+        // external write violates that invariant, fail closed instead of
+        // silently unioning multiple policy roots.
+        return Err(AppError::Forbidden);
     }
-    if application_membership.is_some() {
-        for role_id in state
-            .db
-            .list_application_profile_user_role_ids(&profile.id, &user.id)
-            .await?
+    let mut applied_role_ids = BTreeSet::new();
+    for role in default_roles {
+        if applied_role_ids.insert(role.id.clone()) {
+            add_profile_role(role, &mut roles, &mut permissions)?;
+        }
+    }
+    if member {
+        for assignment in snapshot
+            .profile_user_assignments
+            .iter()
+            .filter(|assignment| assignment.is_active == 1 && assignment.subject_id == user.id)
         {
-            if let Some(role) = active_roles.get(&role_id) {
-                add_profile_role(role, &mut roles, &mut permissions)?;
-            }
+            add_profile_assignment_role(
+                &active_roles,
+                assignment.role_id.as_str(),
+                &mut applied_role_ids,
+                &mut roles,
+                &mut permissions,
+            )?;
         }
-
-        for group in state.db.list_user_groups(&user.id).await? {
-            groups.insert(group.name.clone());
-            for role_id in state
-                .db
-                .list_application_profile_group_role_ids(&profile.id, &group.id)
-                .await?
-            {
-                if let Some(role) = active_roles.get(&role_id) {
-                    add_profile_role(role, &mut roles, &mut permissions)?;
-                }
-            }
+        for assignment in snapshot
+            .profile_group_assignments
+            .iter()
+            .filter(|assignment| {
+                assignment.is_active == 1 && group_ids.contains(assignment.subject_id.as_str())
+            })
+        {
+            add_profile_assignment_role(
+                &active_roles,
+                assignment.role_id.as_str(),
+                &mut applied_role_ids,
+                &mut roles,
+                &mut permissions,
+            )?;
         }
-
-        if let Some(membership) = application_membership.as_ref() {
-            organization_role = Some(membership.role.clone());
-            for role_id in state
-                .db
-                .list_application_profile_organization_role_ids(&profile.id, &membership.role)
-                .await?
+        if let Some(membership_role) = snapshot
+            .membership
+            .as_ref()
+            .map(|membership| membership.role.as_str())
+        {
+            for assignment in
+                snapshot
+                    .profile_organization_assignments
+                    .iter()
+                    .filter(|assignment| {
+                        assignment.is_active == 1 && assignment.organization_role == membership_role
+                    })
             {
-                if let Some(role) = active_roles.get(&role_id) {
-                    add_profile_role(role, &mut roles, &mut permissions)?;
-                }
+                add_profile_assignment_role(
+                    &active_roles,
+                    assignment.role_id.as_str(),
+                    &mut applied_role_ids,
+                    &mut roles,
+                    &mut permissions,
+                )?;
             }
         }
     }
-
-    let mut denied = BTreeSet::new();
-    for override_record in state
-        .db
-        .list_application_profile_user_permission_overrides(&profile.id, &user.id)
-        .await?
-    {
-        if override_record.effect == "deny" {
-            denied.insert(override_record.permission);
-        } else if override_record.effect == "allow" {
-            permissions.insert(override_record.permission);
-        }
-    }
-    permissions.retain(|permission| !denied.contains(permission));
+    apply_base_permissions(config, &mut permissions)?;
+    apply_profile_overrides(snapshot, member, &mut permissions, config)?;
 
     let roles_vec = roles.into_iter().collect::<Vec<_>>();
     let permissions_vec = permissions.into_iter().collect::<Vec<_>>();
     let groups_vec = groups.into_iter().collect::<Vec<_>>();
-    let policy_version = util::sha256_base64url(&format!(
-        "signet:application-profile-entitlements:v1:{}:{}:{}:{}:{}:{}",
-        application.id,
-        profile.id,
-        profile.updated_at,
-        profile.remote_digest.as_deref().unwrap_or_default(),
-        serde_json::to_string(&roles_vec).unwrap_or_default(),
-        serde_json::to_string(&permissions_vec).unwrap_or_default(),
-    ));
-    let config = applications::enabled_module_config(state, &application.id, "authorization")
-        .await?
-        .unwrap_or_default();
     let mut claims = build_claims(
         application,
         &roles_vec,
         &permissions_vec,
         &groups_vec,
         organization_role.as_deref(),
-        &config,
+        config,
     );
     claims.insert(
         "authorization_profile".to_string(),
         Value::String(profile.profile_key.clone()),
     );
-
+    let policy_version = profile_policy_version(snapshot, profile, &roles_vec, &permissions_vec);
     Ok(ApplicationEntitlements {
         roles: roles_vec,
         permissions: permissions_vec,
@@ -372,18 +269,64 @@ pub async fn resolve_entitlements_for_profile(
     })
 }
 
-fn add_application_role(
-    role: &crate::db::ApplicationRoleRecord,
+fn apply_enterprise_entitlements(
+    snapshot: &AuthorizationPolicySnapshot,
+    roles: &mut BTreeSet<String>,
+    permissions: &mut BTreeSet<String>,
+    groups: &mut BTreeSet<String>,
+    organization_role: &mut Option<String>,
+) -> AppResult<()> {
+    for role in &snapshot.enterprise_roles {
+        roles.insert(role.name.clone());
+        permissions.extend(
+            snapshot
+                .enterprise_role_permissions
+                .get(&role.id)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+    }
+    for group in &snapshot.groups {
+        groups.insert(group.name.clone());
+        if let Some(group_roles) = snapshot.enterprise_group_roles.get(&group.id) {
+            for role in group_roles {
+                roles.insert(role.name.clone());
+                permissions.extend(
+                    snapshot
+                        .enterprise_role_permissions
+                        .get(&role.id)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+        }
+    }
+    if let Some(membership) = snapshot.membership.as_ref() {
+        organization_role.replace(membership.role.clone());
+        roles.insert(format!("enterprise:{}", membership.role));
+    }
+    Ok(())
+}
+
+fn add_profile_assignment_role(
+    active_roles: &BTreeMap<&str, &ApplicationProfileRoleRecord>,
+    role_id: &str,
+    applied_role_ids: &mut BTreeSet<String>,
     roles: &mut BTreeSet<String>,
     permissions: &mut BTreeSet<String>,
 ) -> AppResult<()> {
-    roles.insert(role.name.clone());
-    permissions.extend(role.permission_keys()?);
+    if let Some(role) = active_roles.get(role_id)
+        && applied_role_ids.insert(role.id.clone())
+    {
+        add_profile_role(role, roles, permissions)?;
+    }
     Ok(())
 }
 
 fn add_profile_role(
-    role: &crate::db::ApplicationProfileRoleRecord,
+    role: &ApplicationProfileRoleRecord,
     roles: &mut BTreeSet<String>,
     permissions: &mut BTreeSet<String>,
 ) -> AppResult<()> {
@@ -392,113 +335,37 @@ fn add_profile_role(
     Ok(())
 }
 
-async fn application_policy_version(
-    state: &AppState,
-    application: &ApplicationRecord,
-) -> AppResult<String> {
-    let config = applications::enabled_module_config(state, &application.id, "authorization")
-        .await?
-        .unwrap_or_default();
-    Ok(util::sha256_base64url(&format!(
-        "signet:application-policy:v1:{}:{}:{}",
-        application.id,
-        application.updated_at,
-        serde_json::to_string(&config).unwrap_or_default()
-    )))
-}
-
-fn apply_application_role_config(
-    config: &Map<String, Value>,
-    roles: &mut BTreeSet<String>,
+fn apply_profile_overrides(
+    snapshot: &AuthorizationPolicySnapshot,
+    member: bool,
     permissions: &mut BTreeSet<String>,
-    organization_role: &mut Option<String>,
-    groups: &BTreeSet<String>,
-) {
-    if let Some(default_role) = config
-        .get("default_role")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        roles.insert(default_role.to_string());
-        permissions.extend(role_permissions(config, default_role));
+    config: &Map<String, Value>,
+) -> AppResult<()> {
+    if !member {
+        return Ok(());
     }
-
-    if let Some(current_org_role) = organization_role.as_deref() {
-        if let Some(mapped_role) = config
-            .get("organization_role_mappings")
-            .and_then(Value::as_object)
-            .and_then(|mappings| mappings.get(current_org_role))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            roles.insert(mapped_role.to_string());
-            permissions.extend(role_permissions(config, mapped_role));
+    for override_record in &snapshot.profile_permission_overrides {
+        match override_record.effect.as_str() {
+            "allow" => {
+                permissions.insert(override_record.permission.clone());
+            }
+            "deny" => {
+                permissions.remove(&override_record.permission);
+            }
+            _ => {}
         }
     }
-
-    if let Some(mapping_values) = config.get("group_mappings").and_then(Value::as_array) {
-        for mapping in mapping_values {
-            let Some(mapping) = mapping.as_object() else {
-                continue;
-            };
-            let Some(group_name) = mapping.get("group").and_then(Value::as_str) else {
-                continue;
-            };
-            if !groups.iter().any(|group| group == group_name) {
-                continue;
-            }
-            let Some(role) = mapping.get("role").and_then(Value::as_str) else {
-                continue;
-            };
-            let role = role.trim();
-            if role.is_empty() {
-                continue;
-            }
-            roles.insert(role.to_string());
-            permissions.extend(role_permissions(config, role));
-        }
-    }
-
-    if let Ok(explicit) = string_set(config, "permissions") {
-        permissions.extend(explicit);
-    }
+    let denied = string_set(config, "denied_permissions")?;
+    permissions.retain(|permission| !denied.contains(permission));
+    Ok(())
 }
 
-fn apply_application_explicit_permissions(
+fn apply_base_permissions(
     config: &Map<String, Value>,
     permissions: &mut BTreeSet<String>,
-) {
-    if let Ok(explicit) = string_set(config, "permissions") {
-        permissions.extend(explicit);
-    }
-}
-
-fn role_permissions(config: &Map<String, Value>, role_name: &str) -> BTreeSet<String> {
-    config
-        .get("custom_roles")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_object)
-        .find(|role| {
-            role.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name == role_name)
-        })
-        .and_then(|role| role.get("permissions"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+) -> AppResult<()> {
+    permissions.extend(string_set(config, "permissions")?);
+    Ok(())
 }
 
 fn string_set(config: &Map<String, Value>, key: &str) -> AppResult<BTreeSet<String>> {
@@ -517,22 +384,27 @@ fn string_set(config: &Map<String, Value>, key: &str) -> AppResult<BTreeSet<Stri
         .iter()
         .filter_map(Value::as_str)
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect())
 }
 
-fn policy_version(
-    application: &ApplicationRecord,
-    config: &Map<String, Value>,
+fn profile_policy_version(
+    snapshot: &AuthorizationPolicySnapshot,
+    profile: &crate::db::ApplicationAuthorizationProfileRecord,
     roles: &[String],
     permissions: &[String],
 ) -> String {
     util::sha256_base64url(&format!(
-        "signet:application-entitlements:v1:{}:{}:{}:{}:{}",
-        application.id,
-        application.updated_at,
-        serde_json::to_string(config).unwrap_or_default(),
+        "signet:application-profile-entitlements:v2:{}:{}:{}:{}:{}:{}",
+        snapshot
+            .application
+            .as_ref()
+            .map(|value| value.id.as_str())
+            .unwrap_or_default(),
+        profile.id,
+        profile.updated_at,
+        profile.remote_digest.as_deref().unwrap_or_default(),
         serde_json::to_string(roles).unwrap_or_default(),
         serde_json::to_string(permissions).unwrap_or_default(),
     ))
@@ -565,16 +437,11 @@ fn build_claims(
             Value::String(role.to_string()),
         );
     }
-
     if let Some(requested) = config
         .get("claims")
         .and_then(Value::as_array)
         .filter(|requested| !requested.is_empty())
     {
-        // `claims` is an application-level allowlist. Identity and policy
-        // metadata stay mandatory; all entitlement collections are emitted
-        // only when the administrator selected them. This prevents a broad
-        // default claim set from becoming an accidental data disclosure.
         let requested = requested
             .iter()
             .filter_map(Value::as_str)
@@ -597,7 +464,7 @@ mod tests {
 
     #[test]
     fn profile_permissions_are_exact_strings() {
-        let role = crate::db::ApplicationProfileRoleRecord {
+        let role = ApplicationProfileRoleRecord {
             id: "role-1".to_string(),
             profile_id: "profile-1".to_string(),
             role_key: "invoice-admin".to_string(),
@@ -623,44 +490,13 @@ mod tests {
     }
 
     #[test]
-    fn application_role_config_merges_default_group_and_explicit_permissions() {
-        let config = serde_json::json!({
-            "default_role": "member",
-            "permissions": ["reports.read"],
-            "custom_roles": [{"name": "member", "permissions": ["app.read"]}],
-            "group_mappings": [{"group": "support", "role": "operator"}],
-            "organization_role_mappings": {"admin": "owner"}
-        });
-        let mut roles = BTreeSet::new();
+    fn base_permissions_are_independent_from_profile_roles() {
+        let config = serde_json::json!({"permissions": ["reports.read", "app.read"]});
         let mut permissions = BTreeSet::new();
-        let mut organization_role = Some("admin".to_string());
-        let groups = BTreeSet::from(["support".to_string()]);
-        apply_application_role_config(
-            config.as_object().unwrap(),
-            &mut roles,
-            &mut permissions,
-            &mut organization_role,
-            &groups,
-        );
-        assert_eq!(
-            roles.into_iter().collect::<Vec<_>>(),
-            vec!["member", "operator", "owner"]
-        );
+        apply_base_permissions(config.as_object().unwrap(), &mut permissions).unwrap();
         assert_eq!(
             permissions.into_iter().collect::<Vec<_>>(),
             vec!["app.read", "reports.read"]
-        );
-    }
-
-    #[test]
-    fn denied_permissions_are_removed_after_resolution() {
-        let config = serde_json::json!({"permissions": ["app.read", "app.write"], "denied_permissions": ["app.write"]});
-        let mut permissions = string_set(config.as_object().unwrap(), "permissions").unwrap();
-        let denied = string_set(config.as_object().unwrap(), "denied_permissions").unwrap();
-        permissions.retain(|permission| !denied.contains(permission));
-        assert_eq!(
-            permissions.into_iter().collect::<Vec<_>>(),
-            vec!["app.read"]
         );
     }
 }

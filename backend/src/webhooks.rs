@@ -7,7 +7,12 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -19,6 +24,11 @@ const MAX_ACTIONS: usize = 50;
 const MAX_ACTION_LEN: usize = 128;
 const MIN_TIMEOUT_SECONDS: i32 = 1;
 const MAX_TIMEOUT_SECONDS: i32 = 30;
+const OUTBOX_BATCH_SIZE: i64 = 100;
+const OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const OUTBOX_NOTIFY_CAPACITY: usize = 32;
+
+static AUDIT_WEBHOOK_WORKER_NOTIFY: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditWebhookInput {
@@ -67,18 +77,159 @@ pub fn update_webhook(input: AuditWebhookInput) -> AppResult<UpdateAuditWebhook>
     })
 }
 
-pub fn spawn_audit_webhook_delivery(db: Db, event: AuditEventRecord) {
-    tokio::spawn(async move {
-        if let Err(err) = deliver_audit_event(db, event).await {
-            tracing::warn!(error = %err, "audit webhook dispatch failed");
-        }
-    });
+/// Handle for the single process-local audit webhook scheduler.
+///
+/// Delivery itself is durably represented by `audit_webhook_outbox`, so the
+/// worker can be stopped and restarted without losing events. The channel is
+/// only a bounded wake-up hint; the periodic tick remains the recovery path
+/// when a notification is dropped or the process starts with pending rows.
+pub struct AuditWebhookWorker {
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
 }
 
-async fn deliver_audit_event(db: Db, event: AuditEventRecord) -> AppResult<()> {
-    let webhooks = db.list_audit_webhooks().await?;
+impl AuditWebhookWorker {
+    pub async fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+/// Starts the one bounded audit-webhook worker and immediately wakes it so
+/// rows left by an earlier process are recovered during startup.
+pub fn spawn_audit_webhook_worker(db: Db) -> AuditWebhookWorker {
+    let (notify_tx, notify_rx) = mpsc::channel(OUTBOX_NOTIFY_CAPACITY);
+    if AUDIT_WEBHOOK_WORKER_NOTIFY.set(notify_tx.clone()).is_err() {
+        tracing::warn!("audit webhook worker notifier was already initialized");
+    }
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run_audit_webhook_worker(db, notify_rx, stop_rx));
+    let _ = notify_tx.try_send(());
+    AuditWebhookWorker {
+        stop_tx: Some(stop_tx),
+        task,
+    }
+}
+
+/// Wakes the bounded worker after a committed audit transaction. The durable
+/// outbox is authoritative, so a full channel is harmless: the next worker
+/// tick will find the row. This function retains its old public shape for the
+/// existing post-commit call sites, but it never creates a task per event.
+pub fn spawn_audit_webhook_delivery(_db: Db, _event: AuditEventRecord) {
+    let Some(notify) = AUDIT_WEBHOOK_WORKER_NOTIFY.get() else {
+        // Startup always performs a full sweep after initializing the worker.
+        // An audit event can legitimately be written before that point (for
+        // example during seed), so leave it in the durable outbox.
+        return;
+    };
+    if let Err(error) = notify.try_send(()) {
+        if !matches!(error, mpsc::error::TrySendError::Full(_)) {
+            tracing::debug!(error = %error, "audit webhook worker is no longer available");
+        }
+    }
+}
+
+async fn run_audit_webhook_worker(
+    db: Db,
+    mut notify_rx: mpsc::Receiver<()>,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    let client = reqwest::Client::new();
+    let mut ticker =
+        tokio::time::interval_at(Instant::now() + OUTBOX_POLL_INTERVAL, OUTBOX_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // The initial notification is sent by spawn_audit_webhook_worker. Keep
+    // the loop event driven for fresh writes while retaining periodic
+    // recovery for dropped notifications and expired leases.
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => break,
+            notification = notify_rx.recv() => {
+                if notification.is_none() {
+                    break;
+                }
+                if let Err(error) = drain_audit_webhook_outbox(&db, &client).await {
+                    tracing::warn!(error = %error, "audit webhook outbox sweep failed");
+                }
+            }
+            _ = ticker.tick() => {
+                if let Err(error) = drain_audit_webhook_outbox(&db, &client).await {
+                    tracing::warn!(error = %error, "audit webhook outbox sweep failed");
+                }
+            }
+        }
+    }
+    tracing::debug!("audit webhook worker stopped");
+}
+
+async fn drain_audit_webhook_outbox(db: &Db, client: &reqwest::Client) -> AppResult<()> {
+    loop {
+        let claimed = db.claim_audit_webhook_outbox(OUTBOX_BATCH_SIZE).await?;
+        if claimed.is_empty() {
+            return Ok(());
+        }
+
+        // A single snapshot per claimed batch avoids the old one-query-per-
+        // event path while still allowing webhook changes to take effect on
+        // the next batch.
+        let webhooks = db.list_audit_webhooks().await?;
+        for work in claimed {
+            let result = match db.find_audit_event(&work.event_id).await? {
+                Some(event) => deliver_audit_event(db, client, &event, &webhooks).await,
+                None => {
+                    tracing::error!(
+                        outbox_id = %work.id,
+                        event_id = %work.event_id,
+                        "audit webhook outbox references a missing audit event"
+                    );
+                    // The event cannot become deliverable by retrying. Mark
+                    // this corrupt row complete so it cannot poison the
+                    // queue forever; the log remains operator-visible.
+                    Ok(())
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    if !db
+                        .complete_audit_webhook_outbox(
+                            &work.id,
+                            work.lease_owner.as_deref().unwrap_or_default(),
+                        )
+                        .await?
+                    {
+                        tracing::debug!(outbox_id = %work.id, "audit webhook outbox completion lost its lease");
+                    }
+                }
+                Err(error) => {
+                    if !db
+                        .retry_audit_webhook_outbox(
+                            &work.id,
+                            work.lease_owner.as_deref().unwrap_or_default(),
+                            work.attempts,
+                            error.to_string(),
+                        )
+                        .await?
+                    {
+                        tracing::debug!(outbox_id = %work.id, "audit webhook outbox retry lost its lease");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn deliver_audit_event(
+    db: &Db,
+    client: &reqwest::Client,
+    event: &AuditEventRecord,
+    webhooks: &[AuditWebhookRecord],
+) -> AppResult<()> {
     let matching = webhooks
-        .into_iter()
+        .iter()
         .filter(|webhook| webhook.is_active == 1)
         .filter(|webhook| webhook_matches(webhook, &event.action))
         .collect::<Vec<_>>();
@@ -86,45 +237,40 @@ async fn deliver_audit_event(db: Db, event: AuditEventRecord) -> AppResult<()> {
         return Ok(());
     }
 
-    let payload = payload_for_event(&event);
+    let payload = payload_for_event(event);
     let body = serde_json::to_vec(&payload)
         .map_err(|err| AppError::Internal(format!("failed to encode webhook payload: {err}")))?;
-
+    let mut failures = Vec::new();
     for webhook in matching {
-        deliver_to_webhook(&db, &webhook, &event, body.clone()).await;
+        if let Err(error) = deliver_to_webhook(db, client, webhook, event, body.clone()).await {
+            failures.push(format!("{}: {error}", webhook.id));
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Internal(format!(
+            "audit webhook delivery failed: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 async fn deliver_to_webhook(
     db: &Db,
+    client: &reqwest::Client,
     webhook: &AuditWebhookRecord,
     event: &AuditEventRecord,
     body: Vec<u8>,
-) {
+) -> Result<(), String> {
     let timeout = webhook
         .timeout_seconds
         .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout as u64))
-        .build()
-    {
-        Ok(value) => value,
-        Err(err) => {
-            update_delivery_status(
-                db,
-                webhook,
-                None,
-                Some(format!("failed to build HTTP client: {err}")),
-            )
-            .await;
-            return;
-        }
-    };
 
     let delivery_id = uuid::Uuid::new_v4().to_string();
     let mut request = client
         .post(&webhook.url)
+        .timeout(Duration::from_secs(timeout as u64))
         .header("content-type", "application/json")
         .header("user-agent", "signet-webhook/0.1")
         .header("x-gpt-sso-event-id", event.id.as_str())
@@ -136,8 +282,9 @@ async fn deliver_to_webhook(
                 request = request.header("x-gpt-sso-signature", format!("sha256={signature}"));
             }
             Err(err) => {
-                update_delivery_status(db, webhook, None, Some(err.to_string())).await;
-                return;
+                let error = err.to_string();
+                update_delivery_status(db, webhook, None, Some(error.clone())).await;
+                return Err(error);
             }
         }
     }
@@ -147,10 +294,16 @@ async fn deliver_to_webhook(
             let status = response.status().as_u16() as i32;
             let error = (!response.status().is_success())
                 .then(|| format!("HTTP {}", response.status().as_u16()));
-            update_delivery_status(db, webhook, Some(status), error).await;
+            update_delivery_status(db, webhook, Some(status), error.clone()).await;
+            match error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         Err(err) => {
-            update_delivery_status(db, webhook, None, Some(err.to_string())).await;
+            let error = err.to_string();
+            update_delivery_status(db, webhook, None, Some(error.clone())).await;
+            Err(error)
         }
     }
 }

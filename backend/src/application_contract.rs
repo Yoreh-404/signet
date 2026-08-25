@@ -269,8 +269,7 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
                 client.client_id
             ));
         }
-        if client.profiles.contains(&IntegrationProfile::LegacyProxy)
-            && protocol != "forward_auth"
+        if client.profiles.contains(&IntegrationProfile::LegacyProxy) && protocol != "forward_auth"
         {
             return invalid(format!(
                 "legacy_proxy client {} must use forward_auth",
@@ -281,10 +280,7 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
             || client.profiles.contains(&IntegrationProfile::SpaOidc))
             && protocol != "oidc"
         {
-            return invalid(format!(
-                "OIDC client {} must use oidc",
-                client.client_id
-            ));
+            return invalid(format!("OIDC client {} must use oidc", client.client_id));
         }
         if client.credential_ref.is_some() {
             return invalid(format!(

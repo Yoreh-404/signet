@@ -1,6 +1,9 @@
 use crate::{
     AppState, applications, auth,
-    db::{BrowserContextAccountRecord, BrowserContextRecord, PublicUser, UserRecord},
+    db::{
+        BrowserContextAccountOption, BrowserContextAccountRecord, BrowserContextRecord, PublicUser,
+        UserRecord,
+    },
     error::{AppError, AppResult},
     redirects, util,
 };
@@ -67,20 +70,57 @@ async fn list_accounts(
     let return_to = redirects::local_return_to(query.return_to.as_deref());
     let interaction = crate::oidc::browser_account_interaction_context(&state, &return_to).await?;
     let (jar, context, current) = ensure_browser_context(&state, jar).await?;
-    let mut accounts = Vec::new();
-    for account in state.db.list_browser_context_accounts(&context.id).await? {
-        let Some(user) = state.db.find_user_by_id(&account.user_id).await? else {
-            continue;
-        };
-        let Some(session) = state
+    let interaction_client = if let Some(interaction) = interaction.as_ref() {
+        state
             .db
-            .find_session(&account.session_id)
+            .find_client_by_client_id(&interaction.client_id)
             .await?
-            .filter(|session| session.user_id == user.id && session.expires_at >= util::now_ts())
-        else {
-            continue;
-        };
-        let trial_enrollment = state.db.find_trial_enrollment_for_user(&user.id).await?;
+    } else {
+        None
+    };
+    let interaction_application = if let Some(client) = interaction_client.as_ref() {
+        state.db.find_application_for_client(&client.id).await?
+    } else {
+        None
+    };
+    let interaction_protocol_enabled = if let Some(application) = interaction_application.as_ref() {
+        applications::application_protocol_enabled(&state, &application.id, "oauth2_oidc").await?
+    } else {
+        false
+    };
+    let options = state
+        .db
+        .list_browser_context_account_options(&context.id)
+        .await?;
+    let interaction_allowed_user_ids = if interaction.is_some() && interaction_protocol_enabled {
+        if let Some(application) = interaction_application.as_ref() {
+            let user_ids = options
+                .iter()
+                .map(|option| option.user.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            Some(
+                state
+                    .db
+                    .users_can_access_application(application, &user_ids)
+                    .await?,
+            )
+        } else {
+            Some(std::collections::BTreeSet::new())
+        }
+    } else {
+        None
+    };
+    let mut accounts = Vec::new();
+    for option in options {
+        let BrowserContextAccountOption {
+            account,
+            user,
+            session,
+            trial_enrollment,
+            has_authorization_code_redemption,
+        } = option;
         if trial_enrollment
             .as_ref()
             .is_some_and(|enrollment| !enrollment.is_active_at(util::now_ts()))
@@ -96,14 +136,10 @@ async fn list_accounts(
             continue;
         }
         if let Some(interaction) = interaction.as_ref() {
-            let Some(client) = state
-                .db
-                .find_client_by_client_id(&interaction.client_id)
-                .await?
-            else {
-                continue;
-            };
-            if !applications::user_can_authorize_client(&state, &client, &user).await? {
+            let application_allows_user = interaction_allowed_user_ids
+                .as_ref()
+                .is_some_and(|user_ids| user_ids.contains(&user.id));
+            if interaction.client_id.is_empty() || !application_allows_user {
                 // The active-account boundary and factor uniqueness are
                 // enforced server-side. Hiding ineligible remembered
                 // identities keeps the chooser actionable but is never the
@@ -111,11 +147,7 @@ async fn list_accounts(
                 continue;
             }
         }
-        let has_redemption = if user.archived_at.is_some() {
-            state.db.user_has_invitation_redemption(&user.id).await?
-        } else {
-            false
-        };
+        let has_redemption = user.archived_at.is_some() && has_authorization_code_redemption;
         let Some(session_kind) = auth::AccountSessionKind::for_session_with_trial_enrollment(
             &user,
             &session,

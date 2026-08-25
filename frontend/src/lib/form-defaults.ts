@@ -1,6 +1,5 @@
 import type {
   AuthorizationCodeType,
-  ClientClaimMapperForm,
   LoginAuthorizationCodeLevel,
   OrganizationMemberRole
 } from "../types";
@@ -35,56 +34,7 @@ export const emptyPasswordResetForm = {
   password: ""
 };
 
-export const emptyClientForm = {
-  id: "",
-  client_id: "",
-  client_name: "",
-  logo_uri: "",
-  organization_id: "",
-  client_secret: "",
-  redirect_uris: "http://localhost:3000/callback",
-  post_logout_redirect_uris: "http://localhost:3000/",
-  scopes: "openid profile email offline_access",
-  grant_types: "authorization_code refresh_token",
-  response_types: "code",
-  token_endpoint_auth_method: "client_secret_basic",
-  require_pkce: false,
-  require_mfa: false,
-  require_pushed_authorization_requests: false,
-  require_s256_pkce: false,
-  require_confidential_client: false,
-  require_dpop: false,
-  require_account_selection: false,
-  trust_email_verified: false,
-  authorization_details_types: "",
-  subject_type: "public",
-  sector_identifier_uri: "",
-  jwks_uri: "",
-  jwks: "",
-  backchannel_logout_uri: "",
-  backchannel_logout_session_required: false,
-  frontchannel_logout_uri: "",
-  frontchannel_logout_session_required: false,
-  service_account_enabled: false,
-  service_account_permissions: "",
-  is_active: true,
-  claim_mappers: [] as ClientClaimMapperForm[]
-};
-
-export const emptyIapApplicationForm = {
-  id: "",
-  slug: "",
-  name: "",
-  description: "",
-  external_host: "",
-  path_prefix: "/",
-  required_organization_id: "",
-  required_organization_roles: [] as string[],
-  required_permissions: "",
-  is_active: true
-};
-
-export const emptyApplicationForm = {
+const applicationFormDefaults = {
   id: "",
   slug: "",
   name: "",
@@ -95,21 +45,16 @@ export const emptyApplicationForm = {
   is_active: true
 };
 
-export function emptyClaimMapperForm(sortOrder: number): ClientClaimMapperForm {
+export function createEmptyApplicationForm(): typeof applicationFormDefaults {
   return {
-    claim_name: "",
-    source: "user_field",
-    source_value: "username",
-    value_type: "string",
-    include_in_id_token: true,
-    include_in_access_token: false,
-    include_in_userinfo: true,
-    is_active: true,
-    sort_order: sortOrder
+    ...applicationFormDefaults,
+    unique_identity_factors: []
   };
 }
 
-export const emptyInvitationForm = {
+export const emptyApplicationForm = createEmptyApplicationForm();
+
+const invitationFormDefaults = {
   id: "",
   code_type: "registration" as AuthorizationCodeType,
   login_code_level: "account_recovery" as LoginAuthorizationCodeLevel,
@@ -125,6 +70,15 @@ export const emptyInvitationForm = {
   is_active: true
 };
 
+export function createEmptyInvitationForm(): typeof invitationFormDefaults {
+  return {
+    ...invitationFormDefaults,
+    allowed_client_ids: []
+  };
+}
+
+export const emptyInvitationForm = createEmptyInvitationForm();
+
 export const emptyQuickLinkForm = {
   id: "",
   label: "",
@@ -132,20 +86,39 @@ export const emptyQuickLinkForm = {
   is_active: true
 };
 
-export const emptyRoleForm = {
+const roleFormDefaults = {
   id: "",
   name: "",
   description: "",
   permissions: [] as string[]
 };
 
-export const emptyGroupForm = {
+export function createEmptyRoleForm(): typeof roleFormDefaults {
+  return {
+    ...roleFormDefaults,
+    permissions: []
+  };
+}
+
+export const emptyRoleForm = createEmptyRoleForm();
+
+const groupFormDefaults = {
   id: "",
   name: "",
   description: "",
   role_ids: [] as string[],
   user_ids: [] as string[]
 };
+
+export function createEmptyGroupForm(): typeof groupFormDefaults {
+  return {
+    ...groupFormDefaults,
+    role_ids: [],
+    user_ids: []
+  };
+}
+
+export const emptyGroupForm = createEmptyGroupForm();
 
 export const emptyOrganizationForm = {
   id: "",

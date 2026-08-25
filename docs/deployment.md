@@ -58,6 +58,24 @@ docker run --rm -p 8080:8080 \
 
 如果只设置 `SSO_PUBLIC_BASE_URL`，它也会作为 issuer。`SSO_CONFIG` 可指向另一份配置文件；`SSO_DATABASE_KIND`、`SSO_DATABASE_URL`、`SSO_RSA_PRIVATE_KEY_PEM` 和 `SSO_BOOTSTRAP_ADMIN_PASSWORD` 可覆盖对应设置。
 
+## 网站自动注册
+
+部署可以让网站通过签名的 `/.well-known/signet-authorization.json` 自动加入 Signet。自动注册只接受精确 origin 白名单；首次请求使用 HTTPS challenge，网站必须在签名 JWS 中回显 challenge 和应用元数据，Signet 才会创建应用并在完整 manifest 应用成功后激活它。不会因为网站自行声明域名而获得信任。
+
+Compose 部署可通过 `SSO_AUTO_REGISTRATION_ALLOWLIST_JSON` 提供白名单，例如：
+
+```json
+[{"id":"docs","origin":"https://docs.example.com","organization_id":"00000000-0000-4000-8000-000000000001","application_ids":["docs"],"auto_activate":true}]
+```
+
+白名单非空时还必须设置 `SSO_DISCOVERY_CHALLENGE_SECRET`，长度至少为 32
+字符，并把相同的值注入 Signet 与被发现的网站服务。网站只需验证并回显
+Signet 发出的 challenge；真实部署应通过 secret manager 注入该值，不能写入
+仓库。`organization_id` 和 `application_ids` 必须由部署方预先分配，不能由网站
+在 manifest 中自行扩大。
+
+同时设置 `SSO_AUTO_REGISTRATION_ENABLED=true` 和 `SSO_AUTO_REGISTRATION_STARTUP_SCAN=true` 即可在启动扫描和周期扫描中自动发现；`SSO_AUTO_REGISTRATION_CHALLENGE_TTL_SECONDS`（1–900，默认 300）和 `SSO_AUTO_REGISTRATION_MAX_CONCURRENCY`（1–32，默认 4）可限制挑战有效期和并发抓取数。若通过管理 API 手动触发，重复请求应携带同一个 `idempotency_key`；同一组织中相同 key 绑定不同 origin 或请求时会被拒绝，已完成请求会返回原应用结果。
+
 ## 反向代理
 
 将 TLS 终止在可信反向代理上，并把请求转发到 Signet 的 HTTP 监听端口。公网地址应由 `public_base_url` 固定提供；只有代理会正确设置且外部网络不能绕过它时，才开启：

@@ -8,7 +8,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+use tokio::net::lookup_host;
 use url::Url;
 
 pub const PRIVATE_KEY_JWT: &str = "private_key_jwt";
@@ -94,9 +98,19 @@ pub fn validate_jwks_uri(value: &str) -> AppResult<String> {
     }
     let url = Url::parse(trimmed)
         .map_err(|err| AppError::BadRequest(format!("client jwks_uri is invalid: {err}")))?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(AppError::BadRequest(
-            "client jwks_uri must be an absolute http(s) URL".to_string(),
+            "client jwks_uri must be an absolute http(s) URL without credentials".to_string(),
+        ));
+    }
+    if let Some(host) = url.host_str()
+        && host_is_private_or_local(host)
+    {
+        return Err(AppError::BadRequest(
+            "client jwks_uri must not target a private or local address".to_string(),
         ));
     }
     Ok(trimmed.to_string())
@@ -252,13 +266,20 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     if jwks_uri.is_empty() {
         return Err(AppError::Unauthorized);
     }
-    validate_jwks_uri(jwks_uri).map_err(|_| AppError::Unauthorized)?;
-    let mut response = reqwest::Client::builder()
+    let (jwks_url, resolved_address) = resolve_public_jwks_url(jwks_uri).await?;
+    let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    if let (Some(host), Some(address)) = (jwks_url.host_str(), resolved_address) {
+        // Pin the DNS answer which was checked above. This prevents a simple
+        // DNS rebinding between validation and the actual request.
+        client_builder = client_builder.resolve(host, address);
+    }
+    let client = client_builder
         .build()
-        .map_err(|err| AppError::Internal(format!("failed to build jwks client: {err}")))?
-        .get(jwks_uri)
+        .map_err(|err| AppError::Internal(format!("failed to build jwks client: {err}")))?;
+    let mut response = client
+        .get(jwks_url)
         .send()
         .await
         .map_err(|_| AppError::Unauthorized)?;
@@ -281,6 +302,71 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     let jwks = serde_json::from_slice::<ClientJwks>(&body).map_err(|_| AppError::Unauthorized)?;
     validate_jwks(&jwks).map_err(|_| AppError::Unauthorized)?;
     Ok(jwks)
+}
+
+async fn resolve_public_jwks_url(value: &str) -> AppResult<(Url, Option<SocketAddr>)> {
+    let url = Url::parse(value).map_err(|_| AppError::Unauthorized)?;
+    validate_jwks_uri(value).map_err(|_| AppError::Unauthorized)?;
+    let Some(host) = url.host_str() else {
+        return Err(AppError::Unauthorized);
+    };
+    let port = url.port_or_known_default().ok_or(AppError::Unauthorized)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if forbidden_remote_ip(ip) {
+            return Err(AppError::Unauthorized);
+        }
+        return Ok((url, None));
+    }
+    let addresses = lookup_host((host, port))
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .collect::<Vec<_>>();
+    let Some(first) = addresses.first().copied() else {
+        return Err(AppError::Unauthorized);
+    };
+    if addresses
+        .iter()
+        .any(|address| forbidden_remote_ip(address.ip()))
+    {
+        return Err(AppError::Unauthorized);
+    }
+    Ok((url, Some(first)))
+}
+
+fn host_is_private_or_local(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(forbidden_remote_ip)
+        .unwrap_or(false)
+}
+
+fn forbidden_remote_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| forbidden_remote_ip(IpAddr::V4(mapped)))
+        }
+    }
 }
 
 fn verify_signed_client_jwt_with_jwks<T>(
@@ -563,5 +649,13 @@ mod tests {
     fn jwks_json_must_have_supported_key() {
         let err = normalize_jwks_json(r#"{"keys":[]}"#).unwrap_err();
         assert!(err.to_string().contains("RSA signing key"));
+    }
+
+    #[test]
+    fn jwks_uri_rejects_local_and_credentialed_endpoints() {
+        assert!(validate_jwks_uri("http://127.0.0.1/keys").is_err());
+        assert!(validate_jwks_uri("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_jwks_uri("https://user:secret@example.test/keys").is_err());
+        assert!(validate_jwks_uri("https://keys.example.test/jwks").is_ok());
     }
 }

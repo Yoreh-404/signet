@@ -55,10 +55,32 @@ sync_interval_seconds = 300
 allow_private_networks = false
 encryption_key = ""
 
+# Automatic registration is inert until an origin is explicitly listed below.
+# It performs machine verification (HTTPS, whitelist, challenge and JWS); no
+# human approval is required after the deployment-owned whitelist is present.
+[discovery.auto_registration]
+enabled = true
+startup_scan = true
+challenge_ttl_seconds = 300
+max_concurrency = 4
+# [[discovery.auto_registration.allowlist]]
+# id = "axon"
+# origin = "https://axon.example.com"
+# organization_id = "tenant-organization-id"
+# application_ids = ["axon"]
+# auto_activate = true
+
 [billing]
 enabled = true
 default_currency = "CNY"
 reservation_ttl_seconds = 900
+# Durable provider reconciliation starts after this interval and then runs
+# periodically. Instances coordinate through payment_orders leases.
+reconcile_interval_seconds = 30
+reconcile_batch_size = 32
+reconcile_lease_seconds = 120
+reconcile_retry_base_seconds = 10
+reconcile_retry_max_seconds = 900
 
 [[billing.supported_currencies]]
 code = "CNY"
@@ -145,6 +167,9 @@ session_ttl_seconds = 28800
 password_min_length = 10
 # Optional RS256 private key. If empty, the server generates a key and persists it in the database.
 rsa_private_key_pem = ""
+# Required to enable TOTP. Supply a deployment-owned base64/base64url 32-byte
+# key through this field or SSO_TOTP_ENCRYPTION_KEY; never store it in the DB.
+totp_encryption_key = ""
 key_id = "dev-key-1"
 # SAML IdP signing material. The private key may be left blank to reuse the
 # active JWT key, but the matching X.509 certificate is required when SAML is enabled.

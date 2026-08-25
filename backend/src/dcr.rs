@@ -419,14 +419,12 @@ pub async fn register_client(
     let registrar = DynamicClientRegistrar::new(state.settings.oidc.supported_scopes.clone());
     let (client, client_secret) = registrar.new_client(payload, None)?;
     let registration_access_token = util::random_token(32);
-    let client = state.db.insert_client(client).await?;
-    // Dynamic registration creates a new integration rather than migrating an
-    // existing one. Keep its automatically-created Signet application closed
-    // until an administrator deliberately configures account access.
-    state.db.harden_new_client_application(&client.id).await?;
-    state
+    // Dynamic registration is one aggregate command. A client without its
+    // application/profile/binding/registration record is not a usable OIDC
+    // connection, so those rows must never become independently visible.
+    let client = state
         .db
-        .upsert_client_registration(&client.id, util::token_hash(&registration_access_token))
+        .register_dynamic_client_graph(client, util::token_hash(&registration_access_token))
         .await?;
     state
         .db

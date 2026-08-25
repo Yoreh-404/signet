@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, env, fs, net::SocketAddr, str::FromStr};
+use url::Url;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Settings {
@@ -36,6 +37,17 @@ pub struct DiscoverySettings {
     /// from Signet's JWT/SAML signing material.
     #[serde(default)]
     pub encryption_key: String,
+    /// Shared secret used to authenticate one-request discovery challenges.
+    /// It is never persisted and is required when challenge-based automatic
+    /// registration is enabled.
+    #[serde(default)]
+    pub challenge_secret: String,
+    /// Allow Signet to discover and provision applications whose exact origin
+    /// is explicitly mapped to an organization and manifest application ID.
+    /// The whitelist is intentionally deployment-owned; a website can never
+    /// add itself to this list through the discovery document.
+    #[serde(default)]
+    pub auto_registration: AutoRegistrationSettings,
 }
 
 impl Default for DiscoverySettings {
@@ -44,8 +56,56 @@ impl Default for DiscoverySettings {
             sync_interval_seconds: default_discovery_sync_interval_seconds(),
             allow_private_networks: false,
             encryption_key: String::new(),
+            challenge_secret: String::new(),
+            auto_registration: AutoRegistrationSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AutoRegistrationSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub startup_scan: bool,
+    #[serde(default = "default_discovery_challenge_ttl_seconds")]
+    pub challenge_ttl_seconds: i64,
+    #[serde(default = "default_discovery_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default)]
+    pub allowlist: Vec<AutoRegistrationAllowlistEntry>,
+}
+
+impl Default for AutoRegistrationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            startup_scan: true,
+            challenge_ttl_seconds: default_discovery_challenge_ttl_seconds(),
+            max_concurrency: default_discovery_concurrency(),
+            allowlist: Vec::new(),
+        }
+    }
+}
+
+fn default_discovery_challenge_ttl_seconds() -> i64 {
+    300
+}
+
+fn default_discovery_concurrency() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AutoRegistrationAllowlistEntry {
+    pub id: String,
+    /// Exact canonical origin. Wildcard matching is deliberately not enabled
+    /// in v1 because the scheduler cannot safely enumerate wildcard hosts.
+    pub origin: String,
+    pub organization_id: String,
+    pub application_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub auto_activate: bool,
 }
 
 fn default_discovery_sync_interval_seconds() -> i64 {
@@ -62,6 +122,26 @@ pub struct BillingSettings {
     pub supported_currencies: Vec<CurrencySettings>,
     #[serde(default = "default_reservation_ttl_seconds")]
     pub reservation_ttl_seconds: i64,
+    /// Delay between durable reconciliation sweeps. The first worker sweep
+    /// is intentionally delayed by this interval after startup.
+    #[serde(default = "default_billing_reconcile_interval_seconds")]
+    pub reconcile_interval_seconds: i64,
+    /// Maximum number of payment orders claimed by one sweep on one instance.
+    #[serde(default = "default_billing_reconcile_batch_size")]
+    pub reconcile_batch_size: usize,
+    /// How long an instance owns a claimed order before another instance may
+    /// fence and recover it. This must cover the normal provider timeout.
+    #[serde(
+        default = "default_billing_reconcile_lease_seconds",
+        alias = "reconcile_lease_ttl_seconds"
+    )]
+    pub reconcile_lease_seconds: i64,
+    /// Base delay for an unknown provider outcome before the next query.
+    #[serde(default = "default_billing_reconcile_retry_base_seconds")]
+    pub reconcile_retry_base_seconds: i64,
+    /// Upper bound for exponential retry delay.
+    #[serde(default = "default_billing_reconcile_retry_max_seconds")]
+    pub reconcile_retry_max_seconds: i64,
     #[serde(default)]
     pub providers: Vec<PaymentProviderSettings>,
 }
@@ -118,6 +198,11 @@ impl Default for BillingSettings {
             default_currency: default_billing_currency(),
             supported_currencies: default_billing_currencies(),
             reservation_ttl_seconds: default_reservation_ttl_seconds(),
+            reconcile_interval_seconds: default_billing_reconcile_interval_seconds(),
+            reconcile_batch_size: default_billing_reconcile_batch_size(),
+            reconcile_lease_seconds: default_billing_reconcile_lease_seconds(),
+            reconcile_retry_base_seconds: default_billing_reconcile_retry_base_seconds(),
+            reconcile_retry_max_seconds: default_billing_reconcile_retry_max_seconds(),
             providers: Vec::new(),
         }
     }
@@ -135,6 +220,26 @@ fn default_billing_currencies() -> Vec<CurrencySettings> {
 }
 
 fn default_reservation_ttl_seconds() -> i64 {
+    900
+}
+
+fn default_billing_reconcile_interval_seconds() -> i64 {
+    30
+}
+
+fn default_billing_reconcile_batch_size() -> usize {
+    32
+}
+
+fn default_billing_reconcile_lease_seconds() -> i64 {
+    120
+}
+
+fn default_billing_reconcile_retry_base_seconds() -> i64 {
+    10
+}
+
+fn default_billing_reconcile_retry_max_seconds() -> i64 {
     900
 }
 
@@ -242,6 +347,11 @@ pub struct SecuritySettings {
     pub session_ttl_seconds: i64,
     pub password_min_length: usize,
     pub rsa_private_key_pem: String,
+    /// Base64/base64url encoded 32-byte key used to encrypt recoverable
+    /// authentication secrets such as TOTP seeds. It must be supplied by the
+    /// deployment and is never stored in the database.
+    #[serde(default)]
+    pub totp_encryption_key: String,
     pub key_id: String,
     /// Optional SAML IdP signing key. When empty, the active JWT signing key
     /// is reused; the certificate must still match the selected private key.
@@ -476,8 +586,36 @@ impl Settings {
         if let Ok(value) = env::var("SSO_DATABASE_URL") {
             self.database.url = value;
         }
+        if let Ok(value) = env::var("SSO_BILLING_RECONCILE_INTERVAL_SECONDS") {
+            self.billing.reconcile_interval_seconds = value
+                .parse()
+                .with_context(|| "SSO_BILLING_RECONCILE_INTERVAL_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_BILLING_RECONCILE_BATCH_SIZE") {
+            self.billing.reconcile_batch_size = value
+                .parse()
+                .with_context(|| "SSO_BILLING_RECONCILE_BATCH_SIZE must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_BILLING_RECONCILE_LEASE_SECONDS") {
+            self.billing.reconcile_lease_seconds = value
+                .parse()
+                .with_context(|| "SSO_BILLING_RECONCILE_LEASE_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_BILLING_RECONCILE_RETRY_BASE_SECONDS") {
+            self.billing.reconcile_retry_base_seconds = value
+                .parse()
+                .with_context(|| "SSO_BILLING_RECONCILE_RETRY_BASE_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_BILLING_RECONCILE_RETRY_MAX_SECONDS") {
+            self.billing.reconcile_retry_max_seconds = value
+                .parse()
+                .with_context(|| "SSO_BILLING_RECONCILE_RETRY_MAX_SECONDS must be an integer")?;
+        }
         if let Ok(value) = env::var("SSO_RSA_PRIVATE_KEY_PEM") {
             self.security.rsa_private_key_pem = value;
+        }
+        if let Ok(value) = env::var("SSO_TOTP_ENCRYPTION_KEY") {
+            self.security.totp_encryption_key = value;
         }
         if let Ok(value) = env::var("SSO_SAML_PRIVATE_KEY_PEM") {
             self.security.saml_private_key_pem = value;
@@ -488,11 +626,42 @@ impl Settings {
         if let Ok(value) = env::var("SSO_DISCOVERY_ENCRYPTION_KEY") {
             self.discovery.encryption_key = value;
         }
+        if let Ok(value) = env::var("SSO_DISCOVERY_CHALLENGE_SECRET") {
+            self.discovery.challenge_secret = value;
+        }
         if let Ok(value) = env::var("SSO_DISCOVERY_ALLOW_PRIVATE_NETWORKS") {
             self.discovery.allow_private_networks = matches!(
                 value.to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             );
+        }
+        if let Ok(value) = env::var("SSO_AUTO_REGISTRATION_ALLOWLIST_JSON")
+            && !value.trim().is_empty()
+        {
+            self.discovery.auto_registration.allowlist = serde_json::from_str(&value)
+                .with_context(|| "SSO_AUTO_REGISTRATION_ALLOWLIST_JSON must be a JSON array")?;
+        }
+        if let Ok(value) = env::var("SSO_AUTO_REGISTRATION_ENABLED") {
+            self.discovery.auto_registration.enabled = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(value) = env::var("SSO_AUTO_REGISTRATION_STARTUP_SCAN") {
+            self.discovery.auto_registration.startup_scan = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(value) = env::var("SSO_AUTO_REGISTRATION_CHALLENGE_TTL_SECONDS") {
+            self.discovery.auto_registration.challenge_ttl_seconds = value.parse().with_context(
+                || "SSO_AUTO_REGISTRATION_CHALLENGE_TTL_SECONDS must be an integer",
+            )?;
+        }
+        if let Ok(value) = env::var("SSO_AUTO_REGISTRATION_MAX_CONCURRENCY") {
+            self.discovery.auto_registration.max_concurrency = value
+                .parse()
+                .with_context(|| "SSO_AUTO_REGISTRATION_MAX_CONCURRENCY must be an integer")?;
         }
         if let Ok(value) = env::var("SSO_BOOTSTRAP_ADMIN_PASSWORD") {
             self.bootstrap.admin.password = value;
@@ -558,6 +727,8 @@ impl Settings {
     }
 
     fn validate(&self) -> Result<()> {
+        validate_public_origin(&self.server.public_base_url, "server.public_base_url")?;
+        validate_public_origin(&self.oidc.issuer, "oidc.issuer")?;
         if self.oidc.issuer.trim().is_empty() {
             anyhow::bail!("oidc.issuer cannot be empty");
         }
@@ -572,6 +743,78 @@ impl Settings {
         validate_billing_settings(&self.billing)?;
         if self.discovery.sync_interval_seconds < 30 {
             anyhow::bail!("discovery.sync_interval_seconds must be at least 30");
+        }
+        if self.discovery.auto_registration.challenge_ttl_seconds <= 0
+            || self.discovery.auto_registration.challenge_ttl_seconds > 900
+        {
+            anyhow::bail!(
+                "discovery.auto_registration.challenge_ttl_seconds must be between 1 and 900"
+            );
+        }
+        if self.discovery.auto_registration.max_concurrency == 0
+            || self.discovery.auto_registration.max_concurrency > 32
+        {
+            anyhow::bail!("discovery.auto_registration.max_concurrency must be between 1 and 32");
+        }
+        let mut allowlist_ids = BTreeSet::new();
+        let mut allowlist_origins = BTreeSet::new();
+        for entry in &self.discovery.auto_registration.allowlist {
+            let id = entry.id.trim();
+            if id.is_empty() || !allowlist_ids.insert(id.to_string()) {
+                anyhow::bail!(
+                    "discovery.auto_registration allowlist IDs must be unique and non-empty"
+                );
+            }
+            let origin = entry.origin.trim();
+            let parsed = url::Url::parse(origin).map_err(|_| {
+                anyhow::anyhow!(
+                    "discovery.auto_registration.allowlist {} has an invalid origin",
+                    entry.id
+                )
+            })?;
+            if parsed.scheme() != "https"
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || !matches!(parsed.path(), "" | "/")
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !allowlist_origins.insert(origin.trim_end_matches('/').to_ascii_lowercase())
+            {
+                anyhow::bail!(
+                    "discovery.auto_registration.allowlist {} must contain a unique HTTPS origin",
+                    entry.id
+                );
+            }
+            if entry.organization_id.trim().is_empty() || entry.application_ids.is_empty() {
+                anyhow::bail!(
+                    "discovery.auto_registration.allowlist {} requires organization_id and application_ids",
+                    entry.id
+                );
+            }
+            let mut application_ids = BTreeSet::new();
+            if entry.application_ids.iter().any(|application_id| {
+                let application_id = application_id.trim();
+                application_id.is_empty()
+                    || crate::applications::normalize_application_slug(application_id)
+                        .ok()
+                        .as_deref()
+                        != Some(application_id)
+                    || !application_ids.insert(application_id.to_string())
+            }) {
+                anyhow::bail!(
+                    "discovery.auto_registration.allowlist {} contains an invalid or duplicate application ID",
+                    entry.id
+                );
+            }
+        }
+        if self.discovery.auto_registration.enabled
+            && !self.discovery.auto_registration.allowlist.is_empty()
+            && self.discovery.challenge_secret.trim().len() < 32
+        {
+            anyhow::bail!(
+                "discovery.challenge_secret must contain at least 32 characters when automatic registration is enabled"
+            );
         }
         if !self.discovery.encryption_key.trim().is_empty() {
             validate_discovery_encryption_key(&self.discovery.encryption_key)?;
@@ -635,8 +878,7 @@ impl Settings {
                 );
             }
             if application.management_mode == "website_managed"
-                && (!application.fetch_secret.trim().is_empty()
-                    || !application.signing_public_jwks.trim().is_empty())
+                && !application.fetch_secret.trim().is_empty()
                 && self.discovery.encryption_key.trim().is_empty()
             {
                 anyhow::bail!(
@@ -788,6 +1030,35 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Validates the origin used to construct browser redirects, issuer claims
+/// and WebAuthn origins.  Plain HTTP is intentionally limited to loopback
+/// development hosts; accepting arbitrary HTTP here turns a runtime setting
+/// into a transport-security downgrade.
+pub fn validate_public_origin(value: &str, field: &str) -> Result<String> {
+    let value = value.trim().trim_end_matches('/');
+    let url = Url::parse(value).map_err(|err| anyhow::anyhow!("{field} is invalid: {err}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{field} has no host"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || (url.path() != "" && url.path() != "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("{field} must be an absolute HTTP(S) origin without credentials or path");
+    }
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    );
+    if url.scheme() == "http" && !loopback {
+        anyhow::bail!("{field} must use HTTPS outside localhost development");
+    }
+    Ok(value.to_string())
 }
 
 fn validate_bootstrap_application(application: &BootstrapApplication) -> Result<()> {
@@ -1013,6 +1284,28 @@ fn validate_billing_settings(settings: &BillingSettings) -> Result<()> {
     if settings.reservation_ttl_seconds <= 0 {
         anyhow::bail!("billing.reservation_ttl_seconds must be positive");
     }
+    if settings.reconcile_interval_seconds <= 0 {
+        anyhow::bail!("billing.reconcile_interval_seconds must be positive");
+    }
+    if settings.reconcile_batch_size == 0 || settings.reconcile_batch_size > 500 {
+        anyhow::bail!("billing.reconcile_batch_size must be between 1 and 500");
+    }
+    if settings.reconcile_lease_seconds < settings.reconcile_interval_seconds {
+        anyhow::bail!(
+            "billing.reconcile_lease_seconds must be at least reconcile_interval_seconds"
+        );
+    }
+    if settings.reconcile_retry_base_seconds <= 0 {
+        anyhow::bail!("billing.reconcile_retry_base_seconds must be positive");
+    }
+    if settings.reconcile_retry_max_seconds < settings.reconcile_retry_base_seconds {
+        anyhow::bail!(
+            "billing.reconcile_retry_max_seconds must be at least reconcile_retry_base_seconds"
+        );
+    }
+    if settings.reconcile_retry_max_seconds > 7 * 24 * 60 * 60 {
+        anyhow::bail!("billing.reconcile_retry_max_seconds must be at most 604800 seconds");
+    }
     let mut seen_providers = BTreeSet::new();
     for provider in &settings.providers {
         let slug = provider.slug.trim();
@@ -1156,6 +1449,22 @@ mod tests {
     }
 
     #[test]
+    fn public_origins_require_https_outside_loopback() {
+        let mut settings = default_settings();
+        settings.server.public_base_url = "http://signet.example.test".to_string();
+        assert!(settings.validate().is_err());
+
+        settings.server.public_base_url = "https://signet.example.test".to_string();
+        settings.oidc.issuer = "https://signet.example.test".to_string();
+        assert!(settings.validate().is_ok());
+
+        assert!(validate_public_origin("http://localhost:8080", "origin").is_ok());
+        assert!(validate_public_origin("http://127.0.0.1:8080", "origin").is_ok());
+        assert!(validate_public_origin("http://example.test", "origin").is_err());
+        assert!(validate_public_origin("https://example.test/path", "origin").is_err());
+    }
+
+    #[test]
     fn credentialed_cors_rejects_wildcard_origins() {
         let mut settings = default_settings();
         settings.cors.allow_credentials = true;
@@ -1164,6 +1473,64 @@ mod tests {
 
         settings.cors.allowed_origins = vec!["https://console.example".to_string()];
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn billing_reconcile_settings_require_safe_retry_and_lease_bounds() {
+        let mut settings = default_settings();
+        settings.billing.reconcile_batch_size = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = default_settings();
+        settings.billing.reconcile_lease_seconds = settings.billing.reconcile_interval_seconds - 1;
+        assert!(settings.validate().is_err());
+
+        let mut settings = default_settings();
+        settings.billing.reconcile_retry_max_seconds =
+            settings.billing.reconcile_retry_base_seconds - 1;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn auto_registration_allowlist_rejects_embedded_user_info() {
+        let mut settings = default_settings();
+        settings
+            .discovery
+            .auto_registration
+            .allowlist
+            .push(AutoRegistrationAllowlistEntry {
+                id: "example".to_string(),
+                origin: "https://user:password@example.test".to_string(),
+                organization_id: "org-1".to_string(),
+                application_ids: vec!["example".to_string()],
+                auto_activate: true,
+            });
+        assert!(settings.validate().is_err());
+
+        settings.discovery.auto_registration.allowlist[0].origin =
+            "https://user@example.test".to_string();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn auto_registration_allowlist_requires_unique_application_slugs() {
+        let mut settings = default_settings();
+        settings
+            .discovery
+            .auto_registration
+            .allowlist
+            .push(AutoRegistrationAllowlistEntry {
+                id: "example".to_string(),
+                origin: "https://example.test".to_string(),
+                organization_id: "org-1".to_string(),
+                application_ids: vec!["Bad_ID".to_string()],
+                auto_activate: true,
+            });
+        assert!(settings.validate().is_err());
+
+        settings.discovery.auto_registration.allowlist[0].application_ids =
+            vec!["example".to_string(), "example".to_string()];
+        assert!(settings.validate().is_err());
     }
 
     #[test]

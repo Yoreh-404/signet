@@ -1,7 +1,7 @@
 use crate::{
     AppState, applications,
     audit::{self, AuditOutcome, AuditSink},
-    auth, authorization,
+    auth, authorization, browser_accounts,
     config::VerificationChannelSettings,
     db::{
         AdminLoginCodeRedemptionInput, ApplicationRecord, AuthorizationCodeType,
@@ -361,24 +361,24 @@ async fn complete_password_reset(
             username: &user.username,
         },
     )?;
+    let ip_address = state.request_ip(&headers, Some(remote_addr)).await?;
     state
         .db
-        .set_user_password(&user.id, util::hash_password(&payload.password)?)
-        .await?;
-    state.db.clear_user_auth_state(&user.id).await?;
-    state
-        .db
-        .record_audit_event(audit::AuditEvent {
-            actor_user_id: Some(user.id.clone()),
-            actor_client_id: None,
-            action: "password.reset".to_string(),
-            target_kind: "user".to_string(),
-            target_id: Some(user.id),
-            outcome: AuditOutcome::Success,
-            ip_address: state.request_ip(&headers, Some(remote_addr)).await?,
-            user_agent: util::user_agent(&headers),
-            details: serde_json::json!({ "email": email }),
-        })
+        .replace_user_password_with_audit(
+            &user.id,
+            util::hash_password(&payload.password)?,
+            audit::AuditEvent {
+                actor_user_id: Some(user.id.clone()),
+                actor_client_id: None,
+                action: "password.reset".to_string(),
+                target_kind: "user".to_string(),
+                target_id: Some(user.id.clone()),
+                outcome: AuditOutcome::Success,
+                ip_address,
+                user_agent: util::user_agent(&headers),
+                details: serde_json::json!({ "email": email }),
+            },
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1428,25 +1428,27 @@ struct OidcStartQuery {
 struct ExternalOidcReturnContext {
     return_to: Option<String>,
     account_flow: Option<String>,
+    /// External IdP callbacks are bound to the browser context which started
+    /// them.  Keeping this in the server-side state payload prevents a
+    /// transferable callback URL from creating a session in another browser.
+    browser_context_id: Option<String>,
 }
 
 fn external_oidc_return_context(
     return_to: Option<String>,
     account_flow: Option<String>,
+    browser_context_id: String,
 ) -> AppResult<Option<String>> {
     let context = ExternalOidcReturnContext {
         return_to: redirects::optional_local_return_to(return_to),
         account_flow: account_flow
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        browser_context_id: Some(browser_context_id),
     };
-    if context.return_to.is_none() && context.account_flow.is_none() {
-        Ok(None)
-    } else {
-        serde_json::to_string(&context)
-            .map(Some)
-            .map_err(|err| AppError::Internal(err.to_string()))
-    }
+    serde_json::to_string(&context)
+        .map(Some)
+        .map_err(|err| AppError::Internal(err.to_string()))
 }
 
 fn parse_external_oidc_return_context(value: Option<String>) -> ExternalOidcReturnContext {
@@ -1456,15 +1458,18 @@ fn parse_external_oidc_return_context(value: Option<String>) -> ExternalOidcRetu
     serde_json::from_str(&value).unwrap_or_else(|_| ExternalOidcReturnContext {
         return_to: redirects::optional_local_return_to(Some(value)),
         account_flow: None,
+        browser_context_id: None,
     })
 }
 
 async fn external_oidc_start(
     State(state): State<AppState>,
+    jar: CookieJar,
     headers: HeaderMap,
     Path(slug): Path<String>,
     Query(query): Query<OidcStartQuery>,
 ) -> AppResult<Response> {
+    let (jar, browser_context, _) = browser_accounts::ensure_browser_context(&state, jar).await?;
     let provider = enabled_provider(&state, &slug).await?;
     let target_application =
         registration_target_application(&state, &headers, query.return_to.as_deref()).await?;
@@ -1506,7 +1511,7 @@ async fn external_oidc_start(
             state_token.clone(),
             provider.slug.clone(),
             nonce.clone(),
-            external_oidc_return_context(query.return_to, query.account_flow)?,
+            external_oidc_return_context(query.return_to, query.account_flow, browser_context.id)?,
             600,
         )
         .await?;
@@ -1523,7 +1528,7 @@ async fn external_oidc_start(
     if let Some(login_hint) = optional_login_hint(&query.login_hint)? {
         url.query_pairs_mut().append_pair("login_hint", &login_hint);
     }
-    Ok(Redirect::to(url.as_str()).into_response())
+    Ok((jar, Redirect::to(url.as_str()).into_response()).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1544,7 +1549,8 @@ async fn external_oidc_callback(
 ) -> AppResult<Response> {
     if let Some(error) = query.error {
         let message = query.error_description.unwrap_or(error);
-        let return_to = external_oidc_error_return_to(&state, &slug, query.state.as_deref()).await;
+        let return_to =
+            external_oidc_error_return_to(&state, &jar, &slug, query.state.as_deref()).await;
         return Ok(Redirect::to(&redirects::frontend_auth_error_url(
             return_to.as_deref(),
             &message,
@@ -1563,6 +1569,15 @@ async fn external_oidc_callback(
     }
     let provider = enabled_provider(&state, &slug).await?;
     let return_context = parse_external_oidc_return_context(oidc_state.return_to);
+    let expected_context = return_context
+        .browser_context_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("OIDC browser context is required".to_string()))?;
+    if auth::browser_context_id_from_jar(&state, &jar).as_deref() != Some(expected_context) {
+        return Err(AppError::BadRequest(
+            "OIDC callback does not belong to the initiating browser".to_string(),
+        ));
+    }
     let target_application =
         registration_target_application(&state, &headers, return_context.return_to.as_deref())
             .await?;
@@ -1688,13 +1703,18 @@ async fn external_oidc_callback(
 
 async fn external_oidc_error_return_to(
     state: &AppState,
+    jar: &CookieJar,
     slug: &str,
     state_value: Option<&str>,
 ) -> Option<String> {
     let state_value = state_value?;
     match state.db.consume_external_oidc_state(state_value).await {
         Ok(oidc_state) if oidc_state.provider_slug == slug => {
-            parse_external_oidc_return_context(oidc_state.return_to).return_to
+            let context = parse_external_oidc_return_context(oidc_state.return_to);
+            let current_context = auth::browser_context_id_from_jar(state, jar);
+            (context.browser_context_id.as_deref() == current_context.as_deref())
+                .then_some(context.return_to)
+                .flatten()
         }
         Ok(_) => None,
         Err(err) => {

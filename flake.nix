@@ -203,6 +203,25 @@
           ln -s ${signetBinary}/bin/sso-backend $out/bin/signet
         '';
 
+        # Keep the compiler closure out of the image.  cargo2nix embeds
+        # references to Rust source/toolchain paths in the release binary;
+        # these are not needed to start Signet and would otherwise pull the
+        # full Rust toolchain into dockerTools' runtime closure.
+        signetRuntime = pkgs.runCommand "signet-runtime-binary" {
+          nativeBuildInputs = [ pkgs.nukeReferences ];
+        } ''
+          mkdir -p $out/bin
+          cp -L ${signetBinary}/bin/sso-backend $out/bin/signet
+          nuke-refs \
+            -e ${pkgs.glibc} \
+            -e ${pkgs.stdenv.cc.cc.lib} \
+            -e ${pkgs.openssl} \
+            -e ${pkgs.sqlite} \
+            -e ${pkgs.postgresql} \
+            -e ${pkgs.mariadb-connector-c} \
+            $out/bin/signet
+        '';
+
         runtimeConfig = pkgs.runCommand "signet-runtime-config" {} ''
           mkdir -p $out/app/config
           sed 's/host = "127.0.0.1"/host = "0.0.0.0"/' \
@@ -213,7 +232,7 @@
           name = "signet";
           tag = "local";
           contents = [
-            signet
+            signetRuntime
             runtimeConfig
             pkgs.cacert
             pkgs.curl
@@ -227,15 +246,16 @@
             mkdir -p app/data
           '';
           config = {
-            Cmd = [ "${signet}/bin/signet" ];
+            Cmd = [ "${signetRuntime}/bin/signet" ];
             WorkingDir = "/app";
-            # The Rust build links OpenSSL/SQLite dynamically, while the
-            # minimal image has no conventional /lib search path. Keep the
-            # runtime search path explicit so the binary can resolve the
-            # libraries already included in the image.
+            # The Rust build links OpenSSL/SQLite/PostgreSQL/MariaDB
+            # dynamically, while the minimal image has no conventional /lib
+            # search path. MariaDB Connector/C keeps libmariadb.so under a
+            # nested lib/mariadb directory, which makeLibraryPath does not
+            # include, so keep that directory explicit as well.
             Env = [
               "SSO_CONFIG=/app/config/default.toml"
-              "LD_LIBRARY_PATH=${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite pkgs.postgresql pkgs.mariadb-connector-c ]}"
+              "LD_LIBRARY_PATH=${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite pkgs.postgresql pkgs.mariadb-connector-c ]}:${pkgs.mariadb-connector-c}/lib/mariadb"
             ];
             ExposedPorts = { "8080/tcp" = {}; };
             Volumes = { "/app/data" = {}; };
@@ -267,6 +287,7 @@
           ];
           LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
           shellHook = ''
+            export LD_LIBRARY_PATH="${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite pkgs.postgresql pkgs.mariadb-connector-c ]}:${pkgs.mariadb-connector-c}/lib/mariadb:$LD_LIBRARY_PATH"
             source ${./scripts/opensponge-cargo-cache.sh}
           '';
         };
