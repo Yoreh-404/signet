@@ -1459,4 +1459,4 @@ export const translations = {
   }
 };
 
-export type TranslationKey = keyof typeof translations["zh-CN"];
+export type TranslationKey = keyof typeof translations["zh-CN"] & keyof typeof translations["en-US"];

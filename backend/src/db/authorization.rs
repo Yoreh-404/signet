@@ -5,6 +5,8 @@
 //! that aggregate: every row which can affect one application/profile + user
 //! decision is copied while one connection is inside one read transaction.
 
+use super::*;
+
 use super::{
     ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord, ApplicationModuleRecord,
     ApplicationProfilePermissionOverrideRecord, ApplicationProfileRoleRecord, ApplicationRecord,
@@ -1440,22 +1442,37 @@ impl Db {
                         (false, None, false)
                     };
 
-                let authorization_config = if let Some(application) = application.as_ref() {
+                let application_modules = if let Some(application) = application.as_ref() {
                     let module_sql = format!(
-                        "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key = {}",
+                        "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key IN ({}, {})",
                         ph(kind, 1),
-                        ph(kind, 2)
+                        ph(kind, 2),
+                        ph(kind, 3)
                     );
-                    let module = sql_query(module_sql)
+                    let modules = sql_query(module_sql)
                         .bind::<Text, _>(&application.id)
                         .bind::<Text, _>("authorization")
-                        .get_result::<ApplicationModuleRecord>(conn)
-                        .optional()
+                        .bind::<Text, _>("protocols")
+                        .load::<ApplicationModuleRecord>(conn)
                         .map_err(AppError::from)?;
-                    authorization_config(module)?
+                    let mut modules_by_key = BTreeMap::new();
+                    for module in modules {
+                        if modules_by_key
+                            .insert(module.module_key.clone(), module)
+                            .is_some()
+                        {
+                            return Err(AppError::Internal(
+                                "duplicate application module key".to_string(),
+                            ));
+                        }
+                    }
+                    modules_by_key
                 } else {
-                    Map::new()
+                    BTreeMap::new()
                 };
+                let authorization_config = authorization_config(
+                    application_modules.get("authorization").cloned(),
+                )?;
                 let required_protocol = match &boundary {
                     PolicyBoundary::Client {
                         required_protocol, ..
@@ -1469,18 +1486,10 @@ impl Db {
                             .map(|value| value.protocol.as_str())
                     });
                     if let Some(application) = application.as_ref() {
-                        let module_sql = format!(
-                            "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key = {}",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let module = sql_query(module_sql)
-                            .bind::<Text, _>(&application.id)
-                            .bind::<Text, _>("protocols")
-                            .get_result::<ApplicationModuleRecord>(conn)
-                            .optional()
-                            .map_err(AppError::from)?;
-                        protocol_module_enabled(module, protocol)?
+                        protocol_module_enabled(
+                            application_modules.get("protocols").cloned(),
+                            protocol,
+                        )?
                     } else {
                         false
                     }

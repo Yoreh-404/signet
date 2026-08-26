@@ -1,10 +1,10 @@
 import {
   arrayResponse,
   objectResponse,
-  pathSegment,
   readCached,
   writeJson
 } from "./transport";
+import { appendPathSegment } from "./path-helpers";
 import type {
   ApiMutationOptions,
   ApiOkResponse,
@@ -36,7 +36,7 @@ export function applicationsPath(): string {
 }
 
 export function applicationPath(applicationId: string): string {
-  return `${APPLICATIONS_PATH}/${pathSegment(applicationId)}`;
+  return appendPathSegment(APPLICATIONS_PATH, applicationId);
 }
 
 export function applicationDiscoveryPath(applicationId: string): string {
@@ -61,7 +61,7 @@ export function applicationOidcClientsPath(applicationId: string): string {
 
 /** `clientId` is the application binding's database id, not an OIDC client_id. */
 export function applicationOidcClientPath(applicationId: string, clientId: string): string {
-  return `${applicationOidcClientsPath(applicationId)}/${pathSegment(clientId)}`;
+  return appendPathSegment(applicationOidcClientsPath(applicationId), clientId);
 }
 
 export function applicationModulesPath(applicationId: string): string {
@@ -69,7 +69,7 @@ export function applicationModulesPath(applicationId: string): string {
 }
 
 export function applicationModulePath(applicationId: string, moduleKey: ApplicationModuleKey): string {
-  return `${applicationModulesPath(applicationId)}/${pathSegment(moduleKey)}`;
+  return appendPathSegment(applicationModulesPath(applicationId), moduleKey);
 }
 
 export function applicationBillingSettingsPath(applicationId: string): string {
@@ -81,7 +81,7 @@ export function applicationIapRulesPath(applicationId: string): string {
 }
 
 export function applicationIapRulePath(applicationId: string, ruleId: string): string {
-  return `${applicationIapRulesPath(applicationId)}/${pathSegment(ruleId)}`;
+  return appendPathSegment(applicationIapRulesPath(applicationId), ruleId);
 }
 
 export function applicationDirectorySyncRunsPath(applicationId: string): string {
@@ -89,7 +89,7 @@ export function applicationDirectorySyncRunsPath(applicationId: string): string 
 }
 
 export function applicationDirectorySyncRunPath(applicationId: string, providerId: string): string {
-  return `${applicationPath(applicationId)}/directory-sync/${pathSegment(providerId)}/run`;
+  return `${appendPathSegment(`${applicationPath(applicationId)}/directory-sync`, providerId)}/run`;
 }
 
 export function applicationJwtClientPath(applicationId: string): string {
@@ -109,7 +109,7 @@ export function applicationScimTokensPath(applicationId: string): string {
 }
 
 export function applicationScimTokenPath(applicationId: string, tokenId: string): string {
-  return `${applicationScimTokensPath(applicationId)}/${pathSegment(tokenId)}`;
+  return appendPathSegment(applicationScimTokensPath(applicationId), tokenId);
 }
 
 export function applicationEnrollmentCodesPath(applicationId: string): string {
@@ -117,7 +117,7 @@ export function applicationEnrollmentCodesPath(applicationId: string): string {
 }
 
 export function applicationEnrollmentCodePath(applicationId: string, codeId: string): string {
-  return `${applicationEnrollmentCodesPath(applicationId)}/${pathSegment(codeId)}`;
+  return appendPathSegment(applicationEnrollmentCodesPath(applicationId), codeId);
 }
 
 export type ApplicationInput = {

@@ -6,7 +6,16 @@
 //! transaction, and one audit event is committed with the state change.
 
 use super::*;
+
+use super::{
+    AuditEventRecord, AuthorizationCodeType, Db, LoginCodeLevel, USER_PERMANENT_DEPENDENT_TABLES,
+    UserRecord, bind_text_list, ph, select_user_sql,
+};
 use crate::config::DatabaseKind;
+use crate::{
+    error::{AppError, AppResult},
+    util,
+};
 use diesel::{
     Connection, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text},
@@ -101,7 +110,6 @@ macro_rules! clear_user_auth_state_for_users {
         for (table, column) in super::USER_AUTH_STATE_TABLES {
             delete_user_rows!(conn, kind, table, column, ids)?;
         }
-        delete_user_rows!(conn, kind, "application_identity_bindings", "user_id", ids)?;
         Ok::<(), AppError>(())
     }};
 }
@@ -265,31 +273,17 @@ impl Db {
                     }
                     UserLifecycleBatchAction::Disable => {
                         clear_user_auth_state_for_users!(conn, kind, &ids)?;
+                        delete_user_rows!(conn, kind, "application_identity_bindings", "user_id", &ids)?;
                         update_lifecycle_state!(conn, kind, &ids, 0, None::<i64>, now)?;
                     }
                     UserLifecycleBatchAction::Archive => {
                         clear_user_auth_state_for_users!(conn, kind, &ids)?;
+                        delete_user_rows!(conn, kind, "application_identity_bindings", "user_id", &ids)?;
                         update_lifecycle_state!(conn, kind, &ids, 0, Some(now), now)?;
                     }
                     UserLifecycleBatchAction::Delete => {
                         clear_user_auth_state_for_users!(conn, kind, &ids)?;
-                        for table in [
-                            "client_grants",
-                            "user_roles",
-                            "group_members",
-                            "organization_members",
-                            "application_members",
-                            "application_identity_bindings",
-                            "mfa_totp_methods",
-                            "mfa_totp_setups",
-                            "mfa_recovery_codes",
-                            "mfa_challenges",
-                            "passkeys",
-                            "linked_identities",
-                            "login_events",
-                            "invitation_redemptions",
-                            "trial_enrollments",
-                        ] {
+                        for table in super::USER_PERMANENT_DEPENDENT_TABLES {
                             delete_user_rows!(conn, kind, table, "user_id", &ids)?;
                         }
                         let id_count = ids.len();

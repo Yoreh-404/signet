@@ -7,6 +7,8 @@
 //! the same commit.  Webhook delivery starts only after the transaction has
 //! committed.
 
+use super::*;
+
 use super::{
     AppError, AuditEventRecord, CountRow, DatabaseKind, Db, USER_AUTH_STATE_TABLES,
     UserIdentityCandidate, UserRecord, UserUpdate, blocking, count_user_identity_conflicts_sql, ph,
@@ -18,6 +20,16 @@ use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text},
 };
+
+macro_rules! select_user_by_id_on_conn {
+    ($conn:expr, $kind:expr, $user_id:expr) => {{
+        let select_sql = format!("{} WHERE id = {}", select_user_sql(), ph($kind, 1));
+        sql_query(select_sql)
+            .bind::<Text, _>($user_id)
+            .get_result::<UserRecord>($conn)
+            .map_err(AppError::from)?
+    }};
+}
 
 impl Db {
     /// Replaces an existing account password and revokes every authentication
@@ -54,11 +66,7 @@ impl Db {
                     return Err(AppError::NotFound);
                 }
 
-                let select_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
-                let user = sql_query(select_sql)
-                    .bind::<Text, _>(&user_id)
-                    .get_result::<UserRecord>(conn)
-                    .map_err(AppError::from)?;
+                let user = select_user_by_id_on_conn!(conn, kind, &user_id);
                 let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
                 Ok((user, audit_event))
             })
@@ -171,11 +179,7 @@ impl Db {
                     return Err(AppError::NotFound);
                 }
 
-                let select_sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
-                let user = sql_query(select_sql)
-                    .bind::<Text, _>(&id)
-                    .get_result::<UserRecord>(conn)
-                    .map_err(AppError::from)?;
+                let user = select_user_by_id_on_conn!(conn, kind, &id);
                 let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
                 Ok((user, audit_event))
             })

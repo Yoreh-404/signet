@@ -5,6 +5,61 @@
 
 use super::*;
 
+use super::{
+    ApplicationAuthContextRecord, ApplicationAuthDomainRecord,
+    ApplicationAuthorizationProfileCountRow, ApplicationAuthorizationProfileRecord,
+    ApplicationCasTicketRecord, ApplicationClientBindingRecord,
+    ApplicationDiscoveryIdempotencyClaim, ApplicationDiscoveryIdempotencyRecord,
+    ApplicationDiscoveryJoinRecord, ApplicationDiscoveryLease, ApplicationDiscoveryRecord,
+    ApplicationGraphRecordSet, ApplicationIdentityBindingRecord, ApplicationJwtClientRecord,
+    ApplicationJwtClientSecretRecord, ApplicationJwtCodeRecord, ApplicationMemberRecord,
+    ApplicationMemberWithUserRecord, ApplicationModuleRecord,
+    ApplicationPermissionDefinitionRecord, ApplicationProfileRoleRecord, ApplicationRecord,
+    ApplicationSamlInteractionRecord, ApplicationSamlSessionRecord, ApplicationScimTokenRecord,
+    AuditEventRecord, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
+    GroupRecord, InvitationRecord, NewApplication, NewApplicationAuthContext,
+    NewApplicationAuthorizationProfile, NewApplicationCasTicket, NewApplicationDiscovery,
+    NewApplicationJwtClient, NewApplicationJwtCode, NewApplicationMember,
+    NewApplicationSamlInteraction, NewApplicationSamlSession, NewApplicationScimToken, NewClient,
+    NewClientClaimMapper, NewGroup, NewInvitation, NewOrganization, OrganizationRecord,
+    UserEmailIdRow, UserIdentityConflictRow, application_slug_base,
+    application_slug_collision_candidate, bind_text_list, blocking, dedupe_nonempty,
+    ldap_provider_key, ph, select_application_authorization_profile_sql,
+    select_application_cas_ticket_sql, select_application_discovery_sql,
+    select_application_identity_binding_sql, select_application_jwt_client_sql,
+    select_application_jwt_secret_sql, select_application_member_sql,
+    select_application_module_sql, select_application_permission_definition_sql,
+    select_application_profile_role_sql, select_application_saml_interaction_sql,
+    select_application_saml_session_sql, select_application_scim_token_sql, select_application_sql,
+    select_client_claim_mapper_sql, select_client_sql, select_group_sql, select_invitation_sql,
+    select_oidc_login_grant_sql, select_organization_sql,
+};
+use crate::config::DatabaseSettings;
+use crate::error::{AppError, AppResult};
+use crate::util;
+use diesel::sql_query;
+use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+use diesel::{Connection, OptionalExtension, RunQueryDsl};
+use std::collections::{BTreeMap, BTreeSet};
+
+fn cached_profile_role_id<F>(
+    cache: &mut BTreeMap<(String, String), Option<String>>,
+    profile_id: &str,
+    role_key: &str,
+    load: F,
+) -> AppResult<Option<String>>
+where
+    F: FnOnce() -> AppResult<Option<String>>,
+{
+    let cache_key = (profile_id.to_string(), role_key.to_string());
+    if let Some(role_id) = cache.get(&cache_key) {
+        return Ok(role_id.clone());
+    }
+    let role_id = load()?;
+    cache.insert(cache_key, role_id.clone());
+    Ok(role_id)
+}
+
 /// Creates the locked compatibility aggregate for a protocol client while
 /// the owning application deletion transaction is still open. Keeping this
 /// primitive on the same connection makes the "client is never unowned"
@@ -1846,55 +1901,75 @@ impl Db {
                     }
                 }
                 let existing_clients_sql = format!(
-                    "SELECT client_db_id FROM application_client_bindings WHERE application_id = {} AND is_active = 1",
+                    "SELECT application_client_bindings.client_db_id, clients.client_id FROM application_client_bindings INNER JOIN clients ON clients.id = application_client_bindings.client_db_id WHERE application_client_bindings.application_id = {} AND application_client_bindings.is_active = 1",
                     ph(kind, 1)
                 );
                 #[derive(diesel::QueryableByName)]
-                struct ClientIdRow {
+                struct ClientBindingIdRow {
                     #[diesel(sql_type = Text)]
                     client_db_id: String,
+                    #[diesel(sql_type = Text)]
+                    client_id: String,
                 }
                 if manifest.revoke_removed_clients {
-                    for row in sql_query(existing_clients_sql)
+                    let removed_client_db_ids = sql_query(existing_clients_sql)
                         .bind::<Text, _>(&application_id)
-                        .load::<ClientIdRow>(conn)
+                        .load::<ClientBindingIdRow>(conn)
                         .map_err(AppError::from)?
-                    {
-                        let client_sql = format!(
-                            "SELECT client_id FROM clients WHERE id = {}",
+                        .into_iter()
+                        .filter(|row| !client_ids.contains(&row.client_id))
+                        .map(|row| row.client_db_id)
+                        .collect::<Vec<_>>();
+                    if !removed_client_db_ids.is_empty() {
+                        let now = util::now_ts();
+                        if matches!(kind, DatabaseKind::Postgres) {
+                            let placeholders = (1..=removed_client_db_ids.len())
+                                .map(|index| ph(kind, index))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let deactivate_sql = format!(
+                                "UPDATE clients SET is_active = {}, updated_at = {} WHERE id IN ({placeholders})",
+                                ph(kind, removed_client_db_ids.len() + 1),
+                                ph(kind, removed_client_db_ids.len() + 2)
+                            );
+                            bind_text_list(conn, sql_query(deactivate_sql), &removed_client_db_ids)
+                                .bind::<Integer, _>(0)
+                                .bind::<BigInt, _>(now)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
+                        } else {
+                            let placeholders = (0..removed_client_db_ids.len())
+                                .map(|_| "?")
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let deactivate_sql = format!(
+                                "UPDATE clients SET is_active = ?, updated_at = ? WHERE id IN ({placeholders})"
+                            );
+                            let mut query = sql_query(deactivate_sql).into_boxed::<_>();
+                            query = query
+                                .bind::<Integer, _>(0)
+                                .bind::<BigInt, _>(now);
+                            for client_db_id in &removed_client_db_ids {
+                                query = query.bind::<Text, _>(client_db_id.clone());
+                            }
+                            query.execute(conn).map_err(AppError::from)?;
+                        }
+
+                        let placeholders = (2..=removed_client_db_ids.len() + 1)
+                            .map(|index| ph(kind, index))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let unlink_sql = format!(
+                            "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id IN ({placeholders})",
                             ph(kind, 1)
                         );
-                        #[derive(diesel::QueryableByName)]
-                        struct ClientNameRow {
-                            #[diesel(sql_type = Text)]
-                            client_id: String,
+                        let mut query = sql_query(unlink_sql)
+                            .into_boxed::<_>()
+                            .bind::<Text, _>(&application_id);
+                        for client_db_id in &removed_client_db_ids {
+                            query = query.bind::<Text, _>(client_db_id.clone());
                         }
-                        let current_client = sql_query(client_sql)
-                            .bind::<Text, _>(&row.client_db_id)
-                            .get_result::<ClientNameRow>(conn)
-                            .map_err(AppError::from)?;
-                        if !client_ids.contains(&current_client.client_id) {
-                            let deactivate_sql = format!(
-                                "UPDATE clients SET is_active = {}, updated_at = {} WHERE id = {}",
-                                ph(kind, 1), ph(kind, 2), ph(kind, 3)
-                            );
-                            sql_query(deactivate_sql)
-                                .bind::<Integer, _>(0)
-                                .bind::<BigInt, _>(util::now_ts())
-                                .bind::<Text, _>(&row.client_db_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                            let unlink_sql = format!(
-                    "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            sql_query(unlink_sql)
-                                .bind::<Text, _>(&application_id)
-                                .bind::<Text, _>(&row.client_db_id)
-                                .execute(conn)
-                                .map_err(AppError::from)?;
-                        }
+                        query.execute(conn).map_err(AppError::from)?;
                     }
                 }
 
@@ -2102,6 +2177,7 @@ impl Db {
                     // assignments remain in the separate user-role table and
                     // are never present in the website manifest.
                     let profile_ids = profile_db_ids.values().cloned().collect::<Vec<_>>();
+                    let mut profile_role_ids: BTreeMap<(String, String), Option<String>> = BTreeMap::new();
                     for profile_id in &profile_ids {
                         for table in [
                             "application_profile_group_roles",
@@ -2134,20 +2210,29 @@ impl Db {
                                     "website authorization references unknown group: {}",
                                     mapping.group
                                 ))
-                            })?
+                        })?
                             .id;
                         for profile_id in &profile_ids {
-                            let role_sql = format!(
-                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            let role_id = sql_query(role_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(&mapping.role)
-                                .get_result::<IdRow>(conn)
-                                .optional()
-                                .map_err(AppError::from)?;
+                            let role_id = cached_profile_role_id(
+                                &mut profile_role_ids,
+                                profile_id,
+                                &mapping.role,
+                                || {
+                                let role_sql = format!(
+                                    "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                                    ph(kind, 1),
+                                    ph(kind, 2)
+                                );
+                                let role_id = sql_query(role_sql)
+                                    .bind::<Text, _>(profile_id)
+                                    .bind::<Text, _>(&mapping.role)
+                                    .get_result::<IdRow>(conn)
+                                    .optional()
+                                    .map_err(AppError::from)?
+                                    .map(|row| row.id);
+                                Ok(role_id)
+                            },
+                            )?;
                             let Some(role_id) = role_id else {
                                 if profile_id == default_profile_id {
                                     return Err(AppError::BadRequest(format!(
@@ -2169,7 +2254,7 @@ impl Db {
                             sql_query(insert_sql)
                                 .bind::<Text, _>(profile_id)
                                 .bind::<Text, _>(group_id.clone())
-                                .bind::<Text, _>(role_id.id)
+                                .bind::<Text, _>(role_id)
                                 .bind::<BigInt, _>(now)
                                 .bind::<BigInt, _>(now)
                                 .execute(conn)
@@ -2178,17 +2263,26 @@ impl Db {
                     }
                     for mapping in &manifest.authorization_mappings.organization_role_mappings {
                         for profile_id in &profile_ids {
-                            let role_sql = format!(
-                                "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
-                                ph(kind, 1),
-                                ph(kind, 2)
-                            );
-                            let role_id = sql_query(role_sql)
-                                .bind::<Text, _>(profile_id)
-                                .bind::<Text, _>(&mapping.role)
-                                .get_result::<IdRow>(conn)
-                                .optional()
-                                .map_err(AppError::from)?;
+                            let role_id = cached_profile_role_id(
+                                &mut profile_role_ids,
+                                profile_id,
+                                &mapping.role,
+                                || {
+                                let role_sql = format!(
+                                    "SELECT id FROM application_profile_roles WHERE profile_id = {} AND role_key = {} AND is_active = 1",
+                                    ph(kind, 1),
+                                    ph(kind, 2)
+                                );
+                                let role_id = sql_query(role_sql)
+                                    .bind::<Text, _>(profile_id)
+                                    .bind::<Text, _>(&mapping.role)
+                                    .get_result::<IdRow>(conn)
+                                    .optional()
+                                    .map_err(AppError::from)?
+                                    .map(|row| row.id);
+                                Ok(role_id)
+                            },
+                            )?;
                             let Some(role_id) = role_id else {
                                 if profile_id == default_profile_id {
                                     return Err(AppError::BadRequest(format!(
@@ -2210,7 +2304,7 @@ impl Db {
                             sql_query(insert_sql)
                                 .bind::<Text, _>(profile_id)
                                 .bind::<Text, _>(&mapping.organization_role)
-                                .bind::<Text, _>(role_id.id)
+                                .bind::<Text, _>(role_id)
                                 .bind::<BigInt, _>(now)
                                 .bind::<BigInt, _>(now)
                                 .execute(conn)
@@ -3614,23 +3708,40 @@ impl Db {
                     .optional()
                     .map_err(AppError::from)?
                     .ok_or(AppError::NotFound)?;
-                for member in &members {
+                #[derive(diesel::QueryableByName)]
+                struct ActiveUserIdRow {
+                    #[diesel(sql_type = Text)]
+                    id: String,
+                }
+                const USER_VALIDATION_BATCH_SIZE: usize = 400;
+                let requested_user_ids = members
+                    .iter()
+                    .map(|member| member.user_id.clone())
+                    .collect::<Vec<_>>();
+                let mut active_user_ids = BTreeSet::new();
+                for user_id_batch in requested_user_ids.chunks(USER_VALIDATION_BATCH_SIZE) {
+                    let placeholders = (1..=user_id_batch.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let user_sql = format!(
-                        "SELECT COUNT(*) AS count FROM users WHERE id = {} AND is_active = 1 AND archived_at IS NULL",
-                        ph(kind, 1)
+                        "SELECT id FROM users WHERE id IN ({placeholders}) AND is_active = 1 AND archived_at IS NULL"
                     );
-                    if sql_query(user_sql)
-                        .bind::<Text, _>(&member.user_id)
-                        .get_result::<CountRow>(conn)
-                        .map_err(AppError::from)?
-                        .count
-                        == 0
-                    {
-                        return Err(AppError::BadRequest(format!(
-                            "active user does not exist: {}",
-                            member.user_id
-                        )));
-                    }
+                    active_user_ids.extend(
+                        bind_text_list(conn, sql_query(user_sql), user_id_batch)
+                            .load::<ActiveUserIdRow>(conn)
+                            .map_err(AppError::from)?
+                            .into_iter()
+                            .map(|user| user.id),
+                    );
+                }
+                if let Some(missing_user_id) = requested_user_ids
+                    .iter()
+                    .find(|user_id| !active_user_ids.contains(*user_id))
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "active user does not exist: {missing_user_id}"
+                    )));
                 }
                 let active_member_ids = members
                     .iter()
@@ -3874,6 +3985,40 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_profile_role_id_loads_each_key_once_including_missing_roles() {
+        let mut cache = BTreeMap::new();
+        let mut loads = 0;
+
+        let first = cached_profile_role_id(&mut cache, "profile", "member", || {
+            loads += 1;
+            Ok(Some("role-id".to_string()))
+        })
+        .unwrap();
+        let second = cached_profile_role_id(&mut cache, "profile", "member", || {
+            loads += 1;
+            Ok(Some("unexpected-role-id".to_string()))
+        })
+        .unwrap();
+        assert_eq!(first.as_deref(), Some("role-id"));
+        assert_eq!(second.as_deref(), Some("role-id"));
+        assert_eq!(loads, 1);
+
+        let missing = cached_profile_role_id(&mut cache, "profile", "missing", || {
+            loads += 1;
+            Ok(None)
+        })
+        .unwrap();
+        let missing_again = cached_profile_role_id(&mut cache, "profile", "missing", || {
+            loads += 1;
+            Ok(Some("unexpected-role-id".to_string()))
+        })
+        .unwrap();
+        assert!(missing.is_none());
+        assert!(missing_again.is_none());
+        assert_eq!(loads, 2);
+    }
 
     #[cfg(feature = "sqlite")]
     async fn sqlite_test_db() -> (Db, std::path::PathBuf) {

@@ -5,6 +5,8 @@
 //! application, lifecycle, and directory module reads together so protocol
 //! handlers do not reopen the same application context one row at a time.
 
+use super::*;
+
 use super::{
     ApplicationClientBindingRecord, ApplicationModuleRecord, ApplicationRecord,
     ApplicationScimTokenRecord, DatabaseKind, Db, blocking, ph,

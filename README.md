@@ -1,5 +1,9 @@
 # Signet
 
+> **重建入口**：[`docs/rebuild-guide.md`](docs/rebuild-guide.md)。Signet 统一
+> 管理账户、组织、网站应用和多种身份协议；应用接入、浏览器安全、目录同步
+> 与密钥轮换是不同边界，不能按通用登录回调服务重写。
+
 模块化设计和用户文档以 AnchorDocs 为准；本仓库 README 与 docs 保留可离线使用的部署、安全、协议和开发 fallback。设计变更前先读取 AnchorDocs，不要在本地技术参考中另起一套状态。
 
 一个自托管的身份认证中心和 OIDC Provider。用一个统一的登录入口管理用户、组织和应用访问，让你的应用不必各自维护一套账号体系。

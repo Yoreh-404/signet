@@ -432,6 +432,13 @@ pub fn url_encode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
+pub fn url_decode(value: &str) -> String {
+    url::form_urlencoded::parse(value.as_bytes())
+        .map(|(key, _)| key.into_owned())
+        .next()
+        .unwrap_or_else(|| value.to_string())
+}
+
 pub fn to_json<T: Serialize>(value: &T) -> AppResult<String> {
     serde_json::to_string(value).map_err(|err| AppError::Internal(err.to_string()))
 }

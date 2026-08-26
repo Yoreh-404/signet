@@ -9,7 +9,8 @@ use crate::{
     AppState, applications, client_assertion,
     db::ClientRecord,
     error::{AppError, AppResult},
-    oidc, util,
+    oidc,
+    util::{self, url_decode},
 };
 use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -252,13 +253,6 @@ async fn client_auth_audiences(
     audiences.sort();
     audiences.dedup();
     Ok(audiences)
-}
-
-fn url_decode(value: &str) -> String {
-    url::form_urlencoded::parse(value.as_bytes())
-        .map(|(key, _)| key.into_owned())
-        .next()
-        .unwrap_or_else(|| value.to_string())
 }
 
 #[cfg(test)]

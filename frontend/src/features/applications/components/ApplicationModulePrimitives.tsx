@@ -51,6 +51,21 @@ export function ModuleSave({
   );
 }
 
+export function ModuleFeedback({
+  message,
+  errorMessages = []
+}: {
+  message: string;
+  errorMessages?: readonly string[];
+}) {
+  if (!message) return null;
+  return (
+    <p className={errorMessages.includes(message) ? "module-save-error" : "module-save-feedback"} role="status">
+      {message}
+    </p>
+  );
+}
+
 export function Toggle({
   label,
   hint,

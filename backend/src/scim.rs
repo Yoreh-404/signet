@@ -6,8 +6,7 @@ use crate::{
     db::{
         ApplicationRecord, GroupListFilter, GroupPatchPlan, GroupRecord, NewBulkProvisionedUser,
         NewUser, ScimApplicationContext, ScimGroupMemberRecord, ScimUserMutationPlan,
-        ScimUserMutationScope,
-        UserListFilter, UserListScope, UserRecord,
+        ScimUserMutationScope, UserListFilter, UserListScope, UserRecord,
     },
     error::AppError,
     security_policy::{self, PasswordPolicy, PasswordSubject},
@@ -790,7 +789,10 @@ async fn delete_user(
     }
     state
         .db
-        .disable_scim_user(&id, scim_user_mutation_scope(&principal).unwrap_or_default())
+        .disable_scim_user(
+            &id,
+            scim_user_mutation_scope(&principal).unwrap_or_default(),
+        )
         .await?;
     audit_scim(
         &state,
@@ -1603,7 +1605,10 @@ async fn ensure_scim_user_scope(
 
 fn scim_user_mutation_scope(principal: &ScimPrincipal) -> Option<ScimUserMutationScope> {
     let scope = ScimUserMutationScope {
-        application_id: principal.application.as_ref().map(|application| application.id.clone()),
+        application_id: principal
+            .application
+            .as_ref()
+            .map(|application| application.id.clone()),
         organization_id: principal.organization_id.clone(),
     };
     (scope.application_id.is_some() || scope.organization_id.is_some()).then_some(scope)

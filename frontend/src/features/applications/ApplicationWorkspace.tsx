@@ -5,40 +5,34 @@ import {
   type ApplicationRequestGuard,
   type ApplicationRequestToken
 } from "./application-request-guard";
-import {
-  APPLICATION_AUTHORIZATION_DIRTY_SOURCE,
-  ApplicationAuthorizationModule
-} from "./ApplicationAuthorizationModule";
-import { BillingModule } from "./BillingModule";
-import { IapModule } from "./IapModule";
+import { APPLICATION_AUTHORIZATION_DIRTY_SOURCE } from "./ApplicationAuthorizationModule";
 import { ApplicationLoginAdaptersEditor } from "./ApplicationLoginAdaptersEditor";
 import {
   APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE,
-  ApplicationDirectorySyncModule,
   applicationDirectorySyncConfig
 } from "./ApplicationDirectorySyncModule";
 import {
   APPLICATION_PROTOCOLS_DIRTY_SOURCE,
-  ApplicationProtocolsModule,
   applicationProtocolsConfig
 } from "./ApplicationProtocolsModule";
 import {
   ApplicationBasics,
   type ApplicationBasicsCommands,
-  type ApplicationBasicsReadModel
 } from "./ApplicationBasics";
 import { APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE } from "./ApplicationOidcClients";
+import { ApplicationWorkspaceModuleContent } from "./ApplicationWorkspaceModuleContent";
+import { buildApplicationBasicsReadModel } from "./application-basics-read-model";
 import {
   booleanValue,
   record,
-  stringList,
-  stringValue
+  stringList
 } from "./application-module-values";
+import { useApplicationModuleState } from "./use-application-module-state";
+import { getApplicationWorkspaceDirtyState } from "./application-workspace-dirty";
 import type {
   DirtyNavigationController,
   DirtyNavigationSourceHandle
 } from "../navigation/useDirtyNavigation";
-import { stableDomainEqual } from "../admin/stable-domain-comparator";
 import type {
   ApplicationSection,
   ApplicationModule,
@@ -51,7 +45,7 @@ import type {
   TenantApplication
 } from "../../types";
 
-type Copy = {
+export type ApplicationWorkspaceCopy = {
   applications: string;
   websites: string;
   applicationIntro: string;
@@ -299,7 +293,7 @@ type Copy = {
   configure: string;
 };
 
-const ZH: Copy = {
+const ZH: ApplicationWorkspaceCopy = {
   applications: "应用",
   websites: "应用",
   applicationIntro: "每个应用在自己的工作区创建并管理 OIDC 客户端。协议、登录适配器、目录同步、IAP 和余额策略都归属于应用。",
@@ -547,7 +541,7 @@ const ZH: Copy = {
   configure: "去配置"
 };
 
-const EN: Copy = {
+const EN: ApplicationWorkspaceCopy = {
   applications: "Applications",
   websites: "Applications",
   applicationIntro: "Create and manage OIDC clients inside each application. Protocols, login adapters, directory sync, IAP, and billing policies belong to the application.",
@@ -797,26 +791,6 @@ const EN: Copy = {
 
 const APPLICATION_WORKSPACE_DIRTY_SOURCE = "applications.workspace";
 
-function moduleConfig(
-  application: TenantApplication,
-  key: "login_adapters" | "authorization"
-): Record<string, unknown> {
-  const module = (application.modules ?? []).find((item) => item.module_key === key);
-  const defaults = key === "login_adapters"
-    ? { enabled: true, provider_ids: [], allow_signet_password: true }
-    : { inherit_enterprise_roles: true, permissions: [], denied_permissions: [], claims: [] };
-  return { ...defaults, ...record(module?.config) };
-}
-
-function moduleEnabled(application: TenantApplication, key: ApplicationModuleKey): boolean {
-  const module = (application.modules ?? []).find((item) => item.module_key === key);
-  return module?.is_enabled ?? (
-    key === "authorization"
-    || key === "login_adapters"
-    || (key === "protocols" && application.client_bindings.length > 0)
-  );
-}
-
 export function ApplicationWorkspace({
   applications,
   providers,
@@ -948,35 +922,24 @@ export function ApplicationWorkspace({
     setSavingKey(null);
   }, [selectedId]);
 
-  function hasUnsavedDrafts(): boolean {
-    if (!selected) return false;
-    const sources = dirtyNavigation.getSnapshot().sources;
-    if (
-      sources[APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE]
-      || sources[APPLICATION_AUTHORIZATION_DIRTY_SOURCE]
-      || sources[APPLICATION_PROTOCOLS_DIRTY_SOURCE]
-      || sources[APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE]
-      || iapRuleDirty
-    ) return true;
-    if (billingDirty) return true;
-    return Object.entries(drafts).some(([key, draft]) => (
-      draft !== undefined
-      && !stableDomainEqual(draft, moduleConfig(selected, key as "login_adapters"))
-    ));
-  }
+  const { moduleConfig, moduleEnabled } = useApplicationModuleState(selected);
 
-  function hasWorkspaceDrafts(): boolean {
-    if (billingDirty || iapRuleDirty || !selected) return billingDirty || iapRuleDirty;
-    return Object.entries(drafts).some(([key, draft]) => (
-      draft !== undefined
-      && !stableDomainEqual(draft, moduleConfig(selected, key as "login_adapters"))
-    ));
+  function getWorkspaceDirtyState(sources = dirtyNavigation.getSnapshot().sources) {
+    return getApplicationWorkspaceDirtyState({
+      selected: Boolean(selected),
+      drafts,
+      billingDirty,
+      iapRuleDirty,
+      sources,
+      moduleConfig
+    });
   }
 
   function syncWorkspaceDirtySource() {
     const sources = dirtyNavigation.getSnapshot().sources;
+    const dirtyState = getWorkspaceDirtyState(sources);
     dirtySourceRef.current?.setDirty(
-      hasWorkspaceDrafts()
+      dirtyState.hasWorkspaceDrafts
       || sources[APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE]
       || sources[APPLICATION_AUTHORIZATION_DIRTY_SOURCE]
       || sources[APPLICATION_PROTOCOLS_DIRTY_SOURCE]
@@ -1026,7 +989,7 @@ export function ApplicationWorkspace({
 
   function draftFor(key: "login_adapters"): Record<string, unknown> {
     if (!selected) return {};
-    return drafts[key] ?? moduleConfig(selected, key);
+    return drafts[key] ?? moduleConfig(key);
   }
 
   function updateDraft(key: "login_adapters", next: Record<string, unknown>) {
@@ -1091,7 +1054,7 @@ export function ApplicationWorkspace({
 
   function selectApplication(nextId: string) {
     if (nextId === selectedId) return;
-    if (hasUnsavedDrafts() && !window.confirm(`${c.unsavedChanges}\n${c.discardChanges}?`)) return;
+    if (getWorkspaceDirtyState().hasUnsavedDrafts && !window.confirm(`${c.unsavedChanges}\n${c.discardChanges}?`)) return;
     resetWorkspaceDrafts();
     invalidateApplicationRequests(nextId);
     setSelectedId(nextId);
@@ -1107,7 +1070,7 @@ export function ApplicationWorkspace({
 
   function openSection(next: "overview" | ApplicationModuleKey | "billing" | "iap") {
     if (next === section) return;
-    if (hasUnsavedDrafts()) {
+    if (getWorkspaceDirtyState().hasUnsavedDrafts) {
       if (onRequestConfirmation) {
         onRequestConfirmation(
           () => {
@@ -1139,7 +1102,7 @@ export function ApplicationWorkspace({
     return <ApplicationLoginAdaptersEditor
       providers={providers}
       organizationId={selected.organization_id}
-      enabled={booleanValue(config.enabled, moduleEnabled(selected, "login_adapters"))}
+      enabled={booleanValue(config.enabled, moduleEnabled("login_adapters"))}
       providerIds={stringList(config.provider_ids)}
       allowSignetPassword={booleanValue(config.allow_signet_password, true)}
       saving={savingKey === "login_adapters"}
@@ -1168,40 +1131,33 @@ export function ApplicationWorkspace({
       ? protocolReadModel.config
       : applicationProtocolsConfig(selected)
     : {};
-  const enabledProtocolCount = selected
-    ? ["oauth2_oidc", "saml2", "cas", "jwt"].filter((key) => booleanValue(record(protocolConfig[key]).enabled)).length
-    : 0;
-  const enabledIdentityCount = selected ? stringList(record(draftFor("login_adapters")).provider_ids).length : 0;
+  const loginAdaptersConfig = record(draftFor("login_adapters"));
   const directoryConfig = selected
     ? directoryReadModel?.applicationId === selected.id
       ? directoryReadModel.config
       : applicationDirectorySyncConfig(selected)
     : {};
-  const enabledSyncCount = selected
-    ? stringList(directoryConfig.ldap_provider_ids).length
-      + (booleanValue(directoryConfig.scim_enabled) ? 1 : 0)
-    : 0;
-  const readModel: ApplicationBasicsReadModel = {
+  const readModel = buildApplicationBasicsReadModel({
     applications,
     selected,
     section,
-    // Read-only projection. The App basics editor is the sole writer of this
-    // protocol config field; module editors never update website_url.
-    websiteUrl: stringValue(protocolConfig.website_url),
-    enabledProtocolCount,
-    enabledIdentityCount,
-    enabledSyncCount,
-    identitySourceCount: providers.filter((provider) => provider.is_active).length + ldapProviders.filter((provider) => provider.is_active).length,
-    authorizationSummary: booleanValue(record(selected ? moduleConfig(selected, "authorization") : {}).inherit_enterprise_roles, true) ? c.inheritEnterprise : c.notConfigured,
+    protocolConfig,
+    loginAdaptersConfig,
+    directoryConfig,
+    providers,
+    ldapProviders,
+    authorizationConfig: record(selected ? moduleConfig("authorization") : {}),
     moduleEnabled: {
-      protocols: selected ? moduleEnabled(selected, "protocols") : false,
-      login_adapters: selected ? moduleEnabled(selected, "login_adapters") : false,
-      directory_sync: selected ? moduleEnabled(selected, "directory_sync") : false,
-      authorization: selected ? moduleEnabled(selected, "authorization") : false
+      protocols: selected ? moduleEnabled("protocols") : false,
+      login_adapters: selected ? moduleEnabled("login_adapters") : false,
+      directory_sync: selected ? moduleEnabled("directory_sync") : false,
+      authorization: selected ? moduleEnabled("authorization") : false
     },
+    inheritEnterprise: c.inheritEnterprise,
+    notConfigured: c.notConfigured,
     billingEnabled,
     iapRuleCount
-  };
+  });
   const commands: ApplicationBasicsCommands = {
     createApplication: onCreateApplication,
     editApplication: onEditApplication,
@@ -1216,67 +1172,32 @@ export function ApplicationWorkspace({
       copy={c}
       canManage={canManage}
     >
-            {section === "protocols" && selected && <ApplicationProtocolsModule
-              key={selected.id}
-              application={selected}
-              canManage={canManage}
+            <ApplicationWorkspaceModuleContent
+              section={section}
+              selected={selected}
+              providers={providers}
+              ldapProviders={ldapProviders}
+              organizationOptions={organizationOptions}
               locale={locale}
+              canManage={canManage}
               copy={c}
               requestGuard={requestGuard}
               dirtyNavigation={dirtyNavigation}
+              identityEditor={renderIdentityEditor()}
               onDirtyChange={syncWorkspaceDirtySource}
-              onReadModelChange={updateProtocolReadModel}
+              onProtocolReadModelChange={updateProtocolReadModel}
+              onDirectoryReadModelChange={updateDirectoryReadModel}
               onApplicationModuleChanged={onApplicationModuleChanged}
               onApplicationOidcClientsChanged={onApplicationOidcClientsChanged}
               onRequestConfirmation={onRequestConfirmation}
-            />}
-            {section === "login_adapters" && renderIdentityEditor()}
-            {section === "directory_sync" && selected && <ApplicationDirectorySyncModule
-              key={selected.id}
-              application={selected}
-              ldapProviders={ldapProviders}
-              locale={locale}
-              canManage={canManage}
-              copy={c}
-              requestGuard={requestGuard}
-              dirtyNavigation={dirtyNavigation}
-              onDirtyChange={syncWorkspaceDirtySource}
-              onReadModelChange={updateDirectoryReadModel}
-              onApplicationModuleChanged={onApplicationModuleChanged}
-              onRequestConfirmation={onRequestConfirmation}
-            />}
-            {section === "authorization" && selected && <ApplicationAuthorizationModule
-              key={selected.id}
-              application={selected}
-              authorizationConfig={moduleConfig(selected, "authorization")}
-              canManage={canManage}
-              copy={c}
-              requestGuard={requestGuard}
-              dirtyNavigation={dirtyNavigation}
-              onApplicationModuleChanged={onApplicationModuleChanged}
-              hasUnsavedChanges={hasUnsavedDrafts}
+              authorizationConfig={moduleConfig("authorization")}
+              hasUnsavedChanges={() => getWorkspaceDirtyState().hasUnsavedDrafts}
               onDiscardChanges={resetWorkspaceDrafts}
-              onRequestConfirmation={onRequestConfirmation}
-            />}
-            {section === "iap" && selected && <IapModule
-              applicationId={selected.id}
-              organizationId={selected.organization_id}
-              organizationOptions={organizationOptions}
-              canManage={canManage}
-              copy={c}
-              requestGuard={requestGuard}
-              onDirtyChange={setIapRuleDirty}
-              onRulesCountChange={setIapRuleCount}
-              onRequestConfirmation={onRequestConfirmation}
-            />}
-            {section === "billing" && selected && <BillingModule
-              applicationId={selected.id}
-              canManage={canManage}
-              copy={c}
-              requestGuard={requestGuard}
-              onDirtyChange={setBillingDirty}
-              onEnabledChange={setBillingEnabled}
-            />}
+              onIapDirtyChange={setIapRuleDirty}
+              onIapRulesCountChange={setIapRuleCount}
+              onBillingDirtyChange={setBillingDirty}
+              onBillingEnabledChange={setBillingEnabled}
+            />
     </ApplicationBasics>
   );
 }

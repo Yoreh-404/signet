@@ -7,6 +7,23 @@
 
 use super::*;
 
+use super::{
+    ApplicationProfileRoleRecord, DatabaseKind, Db, NewApplicationProfileRole,
+    normalize_application_entitlement_keys, ph, select_application_profile_role_sql,
+};
+use crate::error::{AppError, AppResult};
+use crate::util;
+use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+use diesel::{Connection, OptionalExtension, RunQueryDsl, sql_query};
+
+fn list_application_profile_roles_sql(kind: DatabaseKind) -> String {
+    format!(
+        "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC, id ASC",
+        select_application_profile_role_sql(),
+        ph(kind, 1)
+    )
+}
+
 impl Db {
     pub async fn list_application_profile_roles(
         &self,
@@ -14,11 +31,7 @@ impl Db {
     ) -> AppResult<Vec<ApplicationProfileRoleRecord>> {
         let profile_id = profile_id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC",
-                select_application_profile_role_sql(),
-                ph(kind, 1)
-            );
+            let sql = list_application_profile_roles_sql(kind);
             sql_query(sql)
                 .bind::<Text, _>(profile_id)
                 .load::<ApplicationProfileRoleRecord>(&mut conn)
@@ -250,5 +263,23 @@ impl Db {
                 Ok(())
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_application_profile_roles_sql;
+    use crate::config::DatabaseKind;
+
+    #[test]
+    fn list_application_profile_roles_sql_is_stably_ordered() {
+        assert_eq!(
+            list_application_profile_roles_sql(DatabaseKind::Sqlite),
+            "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles WHERE profile_id = ? ORDER BY is_active DESC, name ASC, id ASC"
+        );
+        assert_eq!(
+            list_application_profile_roles_sql(DatabaseKind::Postgres),
+            "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles WHERE profile_id = $1 ORDER BY is_active DESC, name ASC, id ASC"
+        );
     }
 }

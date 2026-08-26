@@ -1,46 +1,50 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, cachedApi, cachedApiValue } from "../../lib/api";
-import { adminUserOptionsPath } from "../../lib/api/admin";
+import { loadAdminApplicationsQuery } from "./admin-applications-query";
+import { loadAdminSecurityQuery } from "./admin-security-query";
+import {
+  loadAdminPortalQuery,
+  loadAdminRegistrationQuery,
+  loadAdminRuntimeSettingsQuery
+} from "./admin-settings-query";
+import { ignoreForbiddenRead } from "./admin-read-query";
+import { loadAdminOrganizationsQuery } from "./admin-organizations-query";
+import { loadAdminProvidersQuery } from "./admin-providers-query";
+import {
+  createAdminReadModelSetters,
+  createEmptyAdminReadModel,
+  resolveAdminReadModelUpdateValue,
+  type AdminReadModel,
+  type AdminReadModelSetters,
+  type AdminReadModelUpdater
+} from "./admin-read-model";
+export type {
+  AdminReadModel,
+  AdminReadModelSetters,
+  AdminReadModelUpdate,
+  AdminReadModelUpdater
+} from "./admin-read-model";
 import type { SessionController } from "../session/useSessionController";
 import type {
-  AccessGroup,
   AuditEvent,
   AuditWebhook,
   Client,
   ExternalProvider,
-  ExternalProviderTemplate,
   Invitation,
-  LdapProvider,
   LoginSettings,
   LoginSettingsDraft,
   Organization,
   OrganizationOption,
   Overview,
-  PermissionInfo,
   RegistrationSettings,
-  Role,
   RuntimeSettings,
-  SecurityPolicy,
-  SettingsSummary,
-  SigningKey,
   Tab,
-  TenantApplication,
-  UserOption
+  SecurityPolicy,
+  TenantApplication
 } from "../../types";
 
 const AUTHORIZATION_CODES_API = "/api/admin/authorization-codes";
-
-/**
- * Some admin tabs intentionally probe related resources for optional
- * selectors. Only an explicit permission denial is an empty optional result;
- * transport and server failures must reach the page instead of looking like
- * an empty list.
- */
-function ignoreForbiddenRead(error: unknown): undefined {
-  if (error instanceof ApiError && error.status === 403) return undefined;
-  throw error;
-}
 
 export type AdminDataLoaderOptions = {
   tab: Tab;
@@ -66,127 +70,6 @@ export type AdminDataLoaderOptions = {
  * abort/scope/cache invariants explicit and leaves App responsible only for
  * composing forms and commands.
  */
-export type AdminReadModel = {
-  overview: Overview | null;
-  userOptions: UserOption[];
-  clients: Client[];
-  applications: TenantApplication[];
-  invitations: Invitation[];
-  registrationSettings: RegistrationSettings | null;
-  registrationSettingsBaseline: RegistrationSettings | null;
-  providers: ExternalProvider[];
-  providerTemplates: ExternalProviderTemplate[];
-  ldapProviders: LdapProvider[];
-  auditEvents: AuditEvent[];
-  auditWebhooks: AuditWebhook[];
-  permissionCatalog: PermissionInfo[];
-  roles: Role[];
-  groups: AccessGroup[];
-  organizations: Organization[];
-  organizationOptions: OrganizationOption[];
-  signingKeys: SigningKey[];
-  settings: SettingsSummary | null;
-  runtimeSettings: RuntimeSettings | null;
-  runtimeSettingsBaseline: RuntimeSettings | null;
-  loginSettings: LoginSettings | null;
-  loginSettingsBaseline: LoginSettingsDraft | null;
-  securityPolicy: SecurityPolicy | null;
-  securityPolicyBaseline: SecurityPolicy | null;
-};
-
-export type AdminReadModelUpdate<K extends keyof AdminReadModel> =
-  | AdminReadModel[K]
-  | ((current: AdminReadModel[K]) => AdminReadModel[K]);
-
-export type AdminReadModelUpdater = <K extends keyof AdminReadModel>(
-  key: K,
-  update: AdminReadModelUpdate<K>
-) => void;
-
-type AdminReadModelSetters = {
-  [K in keyof AdminReadModel as `set${Capitalize<K & string>}`]:
-    (update: AdminReadModelUpdate<K>) => void;
-};
-
-function createEmptyAdminReadModel(): AdminReadModel {
-  return {
-    overview: null,
-    userOptions: [],
-    clients: [],
-    applications: [],
-    invitations: [],
-    registrationSettings: null,
-    registrationSettingsBaseline: null,
-    providers: [],
-    providerTemplates: [],
-    ldapProviders: [],
-    auditEvents: [],
-    auditWebhooks: [],
-    permissionCatalog: [],
-    roles: [],
-    groups: [],
-    organizations: [],
-    organizationOptions: [],
-    signingKeys: [],
-    settings: null,
-    runtimeSettings: null,
-    runtimeSettingsBaseline: null,
-    loginSettings: null,
-    loginSettingsBaseline: null,
-    securityPolicy: null,
-    securityPolicyBaseline: null
-  };
-}
-
-function resolveAdminReadModelUpdate<K extends keyof AdminReadModel>(
-  current: AdminReadModel[K],
-  update: AdminReadModelUpdate<K>
-): AdminReadModel[K] {
-  if (typeof update === "function") {
-    return (update as (current: AdminReadModel[K]) => AdminReadModel[K])(current);
-  }
-  return update;
-}
-
-function createAdminReadModelSetter<K extends keyof AdminReadModel>(
-  key: K,
-  updateReadModel: AdminReadModelUpdater
-): (update: AdminReadModelUpdate<K>) => void {
-  return (update) => updateReadModel(key, update);
-}
-
-function createAdminReadModelSetters(updateReadModel: AdminReadModelUpdater): AdminReadModelSetters {
-  // These setters cross the composition-root boundary. Keep the map explicit
-  // so a renamed read-model key cannot silently become a runtime API change.
-  return {
-    setOverview: createAdminReadModelSetter("overview", updateReadModel),
-    setUserOptions: createAdminReadModelSetter("userOptions", updateReadModel),
-    setClients: createAdminReadModelSetter("clients", updateReadModel),
-    setApplications: createAdminReadModelSetter("applications", updateReadModel),
-    setInvitations: createAdminReadModelSetter("invitations", updateReadModel),
-    setRegistrationSettings: createAdminReadModelSetter("registrationSettings", updateReadModel),
-    setRegistrationSettingsBaseline: createAdminReadModelSetter("registrationSettingsBaseline", updateReadModel),
-    setProviders: createAdminReadModelSetter("providers", updateReadModel),
-    setProviderTemplates: createAdminReadModelSetter("providerTemplates", updateReadModel),
-    setLdapProviders: createAdminReadModelSetter("ldapProviders", updateReadModel),
-    setAuditEvents: createAdminReadModelSetter("auditEvents", updateReadModel),
-    setAuditWebhooks: createAdminReadModelSetter("auditWebhooks", updateReadModel),
-    setPermissionCatalog: createAdminReadModelSetter("permissionCatalog", updateReadModel),
-    setRoles: createAdminReadModelSetter("roles", updateReadModel),
-    setGroups: createAdminReadModelSetter("groups", updateReadModel),
-    setOrganizations: createAdminReadModelSetter("organizations", updateReadModel),
-    setOrganizationOptions: createAdminReadModelSetter("organizationOptions", updateReadModel),
-    setSigningKeys: createAdminReadModelSetter("signingKeys", updateReadModel),
-    setSettings: createAdminReadModelSetter("settings", updateReadModel),
-    setRuntimeSettings: createAdminReadModelSetter("runtimeSettings", updateReadModel),
-    setRuntimeSettingsBaseline: createAdminReadModelSetter("runtimeSettingsBaseline", updateReadModel),
-    setLoginSettings: createAdminReadModelSetter("loginSettings", updateReadModel),
-    setLoginSettingsBaseline: createAdminReadModelSetter("loginSettingsBaseline", updateReadModel),
-    setSecurityPolicy: createAdminReadModelSetter("securityPolicy", updateReadModel),
-    setSecurityPolicyBaseline: createAdminReadModelSetter("securityPolicyBaseline", updateReadModel)
-  };
-}
-
 export type AdminDataLoaderResult = AdminReadModel & AdminReadModelSetters & {
   readModel: AdminReadModel;
   updateReadModel: AdminReadModelUpdater;
@@ -226,7 +109,7 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
 
   const updateReadModel = useCallback<AdminReadModelUpdater>((key, update) => {
     setReadModel((current) => {
-      const nextValue = resolveAdminReadModelUpdate(current[key], update);
+      const nextValue = resolveAdminReadModelUpdateValue(current[key], update);
       if (Object.is(current[key], nextValue)) return current;
       const next = { ...current };
       next[key] = nextValue;
@@ -343,49 +226,20 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
           ).catch(ignoreForbiddenRead);
           break;
         case "applications":
-          if (!canManageActiveOrganization) break;
-          await Promise.all([
-            loadCached<TenantApplication[]>(
-              "/api/admin/applications",
-              (next) => updateReadModel("applications", next)
-            ),
-            loadCached<Client[]>("/api/admin/clients", (next) => updateReadModel("clients", next)).catch(ignoreForbiddenRead),
-            loadCached<OrganizationOption[]>(
-              "/api/admin/organization-options",
-              (next) => updateReadModel("organizationOptions", next)
-            ).catch(ignoreForbiddenRead),
-            loadCached<ExternalProvider[]>(
-              "/api/admin/external-oidc-providers",
-              (next) => updateReadModel("providers", next)
-            ).catch(ignoreForbiddenRead),
+          await loadAdminApplicationsQuery({
+            loadCached,
+            updateReadModel,
+            canManageActiveOrganization,
             canManagePlatformProviders
-              ? loadCached<LdapProvider[]>(
-                  "/api/admin/ldap-providers",
-                  (next) => updateReadModel("ldapProviders", next)
-                ).catch(ignoreForbiddenRead)
-              : Promise.resolve(undefined),
-            // Organization membership editing owns its query in
-            // useOrganizationController; the applications tab must not
-            // preload an unrelated organization aggregate.
-          ]);
+          });
           break;
         case "organizations":
-          if (!canReadOrganizations) break;
-          await Promise.all([
-            loadCached<Organization[]>("/api/admin/organizations", (next) => {
-              updateReadModel("organizations", next);
-              updateReadModel(
-                "organizationOptions",
-                next.map(({ id, slug, name, kind, is_active }) => ({ id, slug, name, kind, is_active }))
-              );
-            }),
+          await loadAdminOrganizationsQuery({
+            loadCached,
+            updateReadModel,
+            canReadOrganizations,
             canManageOrganizations
-              ? loadCached<UserOption[]>(
-                  adminUserOptionsPath({ status: "live", limit: 200 }),
-                  (next) => updateReadModel("userOptions", next)
-                )
-              : Promise.resolve(undefined)
-          ]);
+          });
           break;
         case "invitations":
           if (!canManageAuthorizationCodes) break;
@@ -399,100 +253,25 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
           ]);
           break;
         case "registration":
-          if (!canManageSettings) break;
-          await loadCached<RegistrationSettings>("/api/admin/registration-settings", (next) => {
-            updateReadModel("registrationSettings", next);
-            updateReadModel("registrationSettingsBaseline", next);
-          });
+          await loadAdminRegistrationQuery({ loadCached, updateReadModel, canManageSettings, onLoginSettingsLoaded });
           break;
         case "providers": {
           if (!canManageProviders) break;
-          const requests: Promise<unknown>[] = [
-            loadCached<ExternalProvider[]>(
-              "/api/admin/external-oidc-providers",
-              (next) => updateReadModel("providers", next)
-            ),
-            loadCached<ExternalProviderTemplate[]>(
-              "/api/admin/external-oidc-provider-templates",
-              (next) => updateReadModel("providerTemplates", next)
-            )
-          ];
-          if (canManagePlatformProviders) {
-            requests.push(
-              loadCached<LdapProvider[]>(
-                "/api/admin/ldap-providers",
-                (next) => updateReadModel("ldapProviders", next)
-              ),
-              loadCached<OrganizationOption[]>(
-                "/api/admin/organization-options",
-                (next) => updateReadModel("organizationOptions", next)
-              )
-            );
-          }
-          await Promise.all(requests);
+          await loadAdminProvidersQuery({
+            loadCached,
+            updateReadModel,
+            canManagePlatformProviders
+          });
           break;
         }
         case "portal":
-          if (!canManageSettings) break;
-          await loadCached<LoginSettings>("/api/admin/login-settings", (next) => {
-            updateReadModel("loginSettings", next);
-            const draft: LoginSettingsDraft = {
-              brand_logo_url: next.brand_logo_url,
-              email_domains: next.email_domains.join("\n"),
-              quick_links: next.quick_links
-            };
-            onLoginSettingsLoaded(draft);
-            updateReadModel("loginSettingsBaseline", draft);
-          });
+          await loadAdminPortalQuery({ loadCached, updateReadModel, canManageSettings, onLoginSettingsLoaded });
           break;
         case "security":
-          if (!canManageSecurity && !canReadAudit) break;
-          await Promise.all([
-            canManageSecurity
-              ? loadCached<SecurityPolicy>("/api/admin/security-policy", (next) => {
-                  updateReadModel("securityPolicy", next);
-                  updateReadModel("securityPolicyBaseline", next);
-                })
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<SigningKey[]>("/api/admin/signing-keys", (next) => updateReadModel("signingKeys", next))
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<PermissionInfo[]>(
-                  "/api/admin/access/permissions",
-                  (next) => updateReadModel("permissionCatalog", next)
-                )
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<Role[]>("/api/admin/access/roles", (next) => updateReadModel("roles", next))
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<AccessGroup[]>("/api/admin/access/groups", (next) => updateReadModel("groups", next))
-              : Promise.resolve(undefined),
-            canManageSecurity
-              ? loadCached<UserOption[]>(
-                  adminUserOptionsPath({ status: "live", limit: 200 }),
-                  (next) => updateReadModel("userOptions", next)
-                )
-              : Promise.resolve(undefined),
-            canReadAudit
-              ? loadCached<AuditEvent[]>("/api/admin/audit-events", (next) => updateReadModel("auditEvents", next))
-              : Promise.resolve(undefined),
-            loadCached<AuditWebhook[]>(
-              "/api/admin/audit-webhooks",
-              (next) => updateReadModel("auditWebhooks", next)
-            )
-          ]);
+          await loadAdminSecurityQuery({ loadCached, updateReadModel, canManageSecurity, canReadAudit });
           break;
         case "settings":
-          if (!canManageSettings) break;
-          await Promise.all([
-            loadCached<RuntimeSettings>("/api/admin/runtime-settings", (next) => {
-              updateReadModel("runtimeSettings", next);
-              updateReadModel("runtimeSettingsBaseline", next);
-            }),
-            loadCached<SettingsSummary>("/api/admin/settings", (next) => updateReadModel("settings", next))
-          ]);
+          await loadAdminRuntimeSettingsQuery({ loadCached, updateReadModel, canManageSettings, onLoginSettingsLoaded });
           break;
         case "billing":
           break;

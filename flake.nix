@@ -40,11 +40,20 @@
             in name != "node_modules" && name != "dist";
         };
 
-        # The image target is x86_64-linux. Keep the lockfile portable in
-        # git, but avoid fetching native optional packages for Android,
-        # Darwin, Windows, and other Linux architectures in the Nix cache.
-        # The selected GNU x86_64 packages are the only native artifacts
-        # needed by this build.
+        # Keep the lockfile portable in git, but retain only the native GNU
+        # optional packages needed by the current Nix build platform.
+        nativeRolldownBinding = if system == "aarch64-linux"
+          then "node_modules/@rolldown/binding-linux-arm64-gnu"
+          else "node_modules/@rolldown/binding-linux-x64-gnu";
+        nativeRolldownName = if system == "aarch64-linux"
+          then "@rolldown/binding-linux-arm64-gnu"
+          else "@rolldown/binding-linux-x64-gnu";
+        nativeLightningcssBinding = if system == "aarch64-linux"
+          then "node_modules/lightningcss-linux-arm64-gnu"
+          else "node_modules/lightningcss-linux-x64-gnu";
+        nativeLightningcssName = if system == "aarch64-linux"
+          then "lightningcss-linux-arm64-gnu"
+          else "lightningcss-linux-x64-gnu";
         lockPatch = ''
           jq '
             def remove_platform($prefix; $keep):
@@ -55,17 +64,17 @@
               );
             remove_platform(
               "node_modules/@rolldown/binding-";
-              "node_modules/@rolldown/binding-linux-x64-gnu"
+              "${nativeRolldownBinding}"
             )
             | remove_platform(
                 "node_modules/lightningcss-";
-                "node_modules/lightningcss-linux-x64-gnu"
-              )
+                "${nativeLightningcssBinding}"
+            )
             | del(.packages["node_modules/fsevents"])
             | .packages["node_modules/rolldown"].optionalDependencies |=
-                with_entries(select(.key == "@rolldown/binding-linux-x64-gnu"))
+                with_entries(select(.key == "${nativeRolldownName}"))
             | .packages["node_modules/lightningcss"].optionalDependencies |=
-                with_entries(select(.key == "lightningcss-linux-x64-gnu"))
+                with_entries(select(.key == "${nativeLightningcssName}"))
             | del(.packages["node_modules/vite"].optionalDependencies.fsevents)
           ' package-lock.json > package-lock.json.tmp
           mv package-lock.json.tmp package-lock.json
@@ -76,7 +85,7 @@
           src = frontendSource;
           nativeBuildInputs = [ pkgs.jq ];
           postPatch = lockPatch;
-          hash = "sha256-mhjQzbivyvbwROle+PreGiHBl9Gc8kMZ/wSKnZmT/4E=";
+          hash = "sha256-qLJHg9aBOml03EnPd+/cD6X0r7kXV+xcMRsQjDR3dKQ=";
         };
 
         frontend = pkgs.buildNpmPackage {

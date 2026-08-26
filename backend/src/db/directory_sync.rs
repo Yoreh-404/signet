@@ -6,10 +6,12 @@
 //! aggregate here avoids leaking provider protocol details into the generic
 //! database methods and prevents a failed reconcile from leaving a half-sync.
 
+use super::*;
+
 use super::{
     CountRow, Db, DirectorySyncGroupRecord, DirectorySyncMembershipRecord, DirectorySyncRunRecord,
-    LinkedIdentityRecord, UserRecord, UserRegistrationSource, bind_text_list, blocking, ph,
-    select_user_sql,
+    LinkedIdentityRecord, UpdatedAtRow, UserRecord, UserRegistrationSource, bind_text_list,
+    blocking, ph, select_user_sql,
 };
 use crate::{
     config::DatabaseKind,
@@ -18,7 +20,7 @@ use crate::{
     util,
 };
 use diesel::{
-    Connection, RunQueryDsl, sql_query,
+    Connection, OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -406,37 +408,6 @@ macro_rules! load_other_managed_owner_ids {
     }};
 }
 
-macro_rules! load_group_mappings_by_external_ids {
-    ($conn:expr, $kind:expr, $application_id:expr, $provider_id:expr, $external_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let application_id = $application_id;
-        let provider_id = $provider_id;
-        let external_ids = $external_ids;
-    let mut mappings = BTreeMap::new();
-    for chunk in external_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 2) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = vec![application_id.to_string(), provider_id.to_string()];
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id IN ({})",
-            ph(kind, 1),
-            ph(kind, 2),
-            text_placeholders(kind, 3, chunk.len())
-        );
-        for mapping in bind_text_list(conn, sql_query(sql), &values)
-            .load::<DirectorySyncGroupRecord>(conn)
-            .map_err(AppError::from)?
-        {
-            mappings.insert(mapping.external_id.clone(), mapping);
-        }
-    }
-        Ok::<BTreeMap<String, DirectorySyncGroupRecord>, AppError>(mappings)
-    }};
-}
-
 macro_rules! load_archived_group_members_by_group_ids {
     ($conn:expr, $kind:expr, $organization_id:expr, $group_ids:expr $(,)?) => {{
         let conn = &mut *$conn;
@@ -504,70 +475,70 @@ fn replace_identity_owner(
     owners.insert(new_value.to_string(), user_id.to_string());
 }
 
-macro_rules! delete_application_group_binding {
-    ($conn:expr, $kind:expr, $application_id:expr, $group_id:expr $(,)?) => {{
-        let role_sql = format!(
-            "DELETE FROM application_profile_group_roles WHERE profile_id IN (SELECT id FROM application_authorization_profiles WHERE application_id = {}) AND group_id = {}",
-            ph($kind, 1),
-            ph($kind, 2)
-        );
-        sql_query(role_sql)
-            .bind::<Text, _>($application_id.to_string())
-            .bind::<Text, _>($group_id.to_string())
-            .execute($conn)
-            .map_err(AppError::from)?;
-        let binding_sql = format!(
-            "DELETE FROM application_scim_groups WHERE application_id = {} AND group_id = {}",
-            ph($kind, 1),
-            ph($kind, 2)
-        );
-        sql_query(binding_sql)
-            .bind::<Text, _>($application_id.to_string())
-            .bind::<Text, _>($group_id.to_string())
-            .execute($conn)
-            .map_err(AppError::from)?;
-        let scim_sql = format!(
-            "SELECT COUNT(*) AS count FROM application_scim_groups WHERE group_id = {}",
-            ph($kind, 1)
-        );
-        let scim_references = sql_query(scim_sql)
-            .bind::<Text, _>($group_id.to_string())
-            .get_result::<CountRow>($conn)
-            .map_err(AppError::from)?
-            .count;
-        let profile_role_ref_sql = format!(
-            "SELECT COUNT(*) AS count FROM application_profile_group_roles WHERE group_id = {}",
-            ph($kind, 1)
-        );
-        let profile_role_references = sql_query(profile_role_ref_sql)
-            .bind::<Text, _>($group_id.to_string())
-            .get_result::<CountRow>($conn)
-            .map_err(AppError::from)?
-            .count;
-        let directory_ref_sql = format!(
-            "SELECT COUNT(*) AS count FROM directory_sync_groups WHERE group_id = {}",
-            ph($kind, 1)
-        );
-        let directory_references = sql_query(directory_ref_sql)
-            .bind::<Text, _>($group_id.to_string())
-            .get_result::<CountRow>($conn)
-            .map_err(AppError::from)?
-            .count;
-        if scim_references == 0
-            && profile_role_references == 0
-            && directory_references == 0
-        {
-            for table in ["group_members", "group_roles"] {
-                let sql = format!("DELETE FROM {table} WHERE group_id = {}", ph($kind, 1));
-                sql_query(sql)
-                    .bind::<Text, _>($group_id.to_string())
-                    .execute($conn)
+fn index_seen_group_mappings(
+    mappings: &[DirectorySyncGroupRecord],
+    seen_external_ids: &BTreeSet<String>,
+) -> BTreeMap<String, DirectorySyncGroupRecord> {
+    mappings
+        .iter()
+        .filter(|mapping| seen_external_ids.contains(&mapping.external_id))
+        .map(|mapping| (mapping.external_id.clone(), mapping.clone()))
+        .collect()
+}
+
+macro_rules! delete_application_group_bindings_batch {
+    ($conn:expr, $kind:expr, $application_id:expr, $group_ids:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let kind = $kind;
+        let application_id = $application_id;
+        let group_ids = $group_ids;
+        for chunk in group_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 1) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let group_placeholders = text_placeholders(kind, 2, chunk.len());
+            let role_sql = format!(
+                "DELETE FROM application_profile_group_roles WHERE profile_id IN (SELECT id FROM application_authorization_profiles WHERE application_id = {}) AND group_id IN ({group_placeholders})",
+                ph(kind, 1),
+            );
+            let mut role_query = sql_query(role_sql).into_boxed::<_>();
+            role_query = role_query.bind::<Text, _>(application_id.to_string());
+            for group_id in chunk {
+                role_query = role_query.bind::<Text, _>(group_id.clone());
+            }
+            role_query.execute(conn).map_err(AppError::from)?;
+
+            let binding_sql = format!(
+                "DELETE FROM application_scim_groups WHERE application_id = {} AND group_id IN ({group_placeholders})",
+                ph(kind, 1),
+            );
+            let mut binding_query = sql_query(binding_sql).into_boxed::<_>();
+            binding_query = binding_query.bind::<Text, _>(application_id.to_string());
+            for group_id in chunk {
+                binding_query = binding_query.bind::<Text, _>(group_id.clone());
+            }
+            binding_query.execute(conn).map_err(AppError::from)?;
+
+            let group_placeholders = text_placeholders(kind, 1, chunk.len());
+            for (table, qualified_group_id) in [
+                ("group_members", "group_members.group_id"),
+                ("group_roles", "group_roles.group_id"),
+            ] {
+                let sql = format!(
+                    "DELETE FROM {table} WHERE {}",
+                    format!(
+                        "group_id IN ({group_placeholders}) AND NOT EXISTS (SELECT 1 FROM application_scim_groups WHERE group_id = {qualified_group_id}) AND NOT EXISTS (SELECT 1 FROM application_profile_group_roles WHERE group_id = {qualified_group_id}) AND NOT EXISTS (SELECT 1 FROM directory_sync_groups WHERE group_id = {qualified_group_id})"
+                    )
+                );
+                bind_text_list(conn, sql_query(sql), chunk)
+                    .execute(conn)
                     .map_err(AppError::from)?;
             }
-            let delete_group_sql = format!("DELETE FROM access_groups WHERE id = {}", ph($kind, 1));
-            sql_query(delete_group_sql)
-                .bind::<Text, _>($group_id.to_string())
-                .execute($conn)
+            let delete_group_sql = format!(
+                "DELETE FROM access_groups WHERE id IN ({group_placeholders}) AND NOT EXISTS (SELECT 1 FROM application_scim_groups WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM application_profile_group_roles WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM directory_sync_groups WHERE group_id = access_groups.id)"
+            );
+            bind_text_list(conn, sql_query(delete_group_sql), chunk)
+                .execute(conn)
                 .map_err(AppError::from)?;
         }
         Ok::<(), AppError>(())
@@ -1863,11 +1834,7 @@ impl Db {
                     .filter(|membership| {
                         !provider_subjects_by_user
                             .get(&membership.user_id)
-                            .is_some_and(|subjects| {
-                                subjects
-                                    .iter()
-                                    .any(|subject| seen_subjects.contains(subject))
-                            })
+                            .is_some_and(|subjects| !subjects.is_disjoint(&seen_subjects))
                     })
                     .collect::<Vec<_>>();
                 let managed_stale_user_ids = stale_memberships
@@ -1921,18 +1888,6 @@ impl Db {
                     &stale_membership_user_ids,
                 )?;
 
-                let external_ids = snapshot
-                    .groups
-                    .iter()
-                    .map(|directory_group| directory_group.external_id.clone())
-                    .collect::<Vec<_>>();
-                let group_mappings_by_external_id = load_group_mappings_by_external_ids!(
-                    conn,
-                    kind,
-                    &application_id,
-                    &provider_id,
-                    &external_ids,
-                )?;
                 let existing_group_mappings_sql = format!(
                     "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {}",
                     ph(kind, 1),
@@ -1943,6 +1898,8 @@ impl Db {
                     .bind::<Text, _>(&provider_id)
                     .load::<DirectorySyncGroupRecord>(conn)
                     .map_err(AppError::from)?;
+                let group_mappings_by_external_id =
+                    index_seen_group_mappings(&existing_group_mappings, &seen_groups);
                 let mapped_group_ids = group_mappings_by_external_id
                     .values()
                     .map(|mapping| mapping.group_id.clone())
@@ -1976,9 +1933,7 @@ impl Db {
                         })
                         .collect::<BTreeSet<_>>();
                     if let Some(archived_members) = archived_members_by_group.get(&group_id)
-                        && let Some(user_id) = archived_members
-                            .iter()
-                            .find(|user_id| !member_ids.contains(*user_id))
+                        && let Some(user_id) = archived_members.difference(&member_ids).next()
                     {
                         return Err(AppError::BadRequest(format!(
                             "archived group member cannot be removed: {}",
@@ -2056,20 +2011,746 @@ impl Db {
                     }
                     query.execute(conn).map_err(AppError::from)?;
                 }
-                for mapping in stale_mappings {
-                    delete_application_group_binding!(
-                        conn,
-                        kind,
-                        &application_id,
-                        &mapping.group_id,
-                    )?;
-                }
+                let stale_group_ids = stale_mappings
+                    .iter()
+                    .map(|mapping| mapping.group_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                delete_application_group_bindings_batch!(
+                    conn,
+                    kind,
+                    &application_id,
+                    &stale_group_ids,
+                )?;
                 Ok(stats)
             })
         })
     }
-}
 
+    pub async fn deprovision_directory_sync_membership(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        organization_id: &str,
+        user_id: &str,
+    ) -> AppResult<bool> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let organization_id = organization_id.to_string();
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<bool, AppError, _>(|conn| {
+                let membership_sql = format!(
+                    "SELECT application_id, provider_id, user_id, managed, last_seen_at, created_at, updated_at FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                let Some(membership) = sql_query(membership_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&user_id)
+                    .get_result::<DirectorySyncMembershipRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+                else {
+                    return Ok(false);
+                };
+
+                let mut removed_organization_membership = false;
+                if membership.managed == 1 {
+                    let member_sql = format!(
+                        "SELECT updated_at FROM organization_members WHERE organization_id = {} AND user_id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    );
+                    let member_updated_at = sql_query(member_sql)
+                        .bind::<Text, _>(&organization_id)
+                        .bind::<Text, _>(&user_id)
+                        .get_result::<UpdatedAtRow>(conn)
+                        .optional()
+                        .map_err(AppError::from)?
+                        .map(|row| row.updated_at);
+
+                    let other_owner_sql = format!(
+                        "SELECT COUNT(*) AS count FROM directory_sync_memberships INNER JOIN applications ON applications.id = directory_sync_memberships.application_id WHERE directory_sync_memberships.user_id = {} AND directory_sync_memberships.managed = 1 AND applications.organization_id = {} AND NOT (directory_sync_memberships.application_id = {} AND directory_sync_memberships.provider_id = {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4)
+                    );
+                    let has_other_owner = sql_query(other_owner_sql)
+                        .bind::<Text, _>(&user_id)
+                        .bind::<Text, _>(&organization_id)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(&provider_id)
+                        .get_result::<CountRow>(conn)
+                        .map_err(AppError::from)?
+                        .count
+                        > 0;
+
+                    // A membership changed after the sync last saw it is
+                    // treated as a manual enterprise decision. Preserve it
+                    // even when the directory user disappears.
+                    if !has_other_owner
+                        && member_updated_at.is_some_and(|updated_at| {
+                            updated_at <= membership.last_seen_at
+                        })
+                    {
+                        let delete_member_sql = format!(
+                            "DELETE FROM organization_members WHERE organization_id = {} AND user_id = {}",
+                            ph(kind, 1),
+                            ph(kind, 2)
+                        );
+                        sql_query(delete_member_sql)
+                            .bind::<Text, _>(&organization_id)
+                            .bind::<Text, _>(&user_id)
+                            .execute(conn)
+                            .map_err(AppError::from)?;
+                        removed_organization_membership = true;
+                    }
+                }
+
+                let delete_sync_sql = format!(
+                    "DELETE FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                sql_query(delete_sync_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&user_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                Ok(removed_organization_membership)
+            })
+        })
+    }
+
+    pub async fn find_directory_sync_group(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        external_id: &str,
+    ) -> AppResult<Option<DirectorySyncGroupRecord>> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let external_id = external_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .bind::<Text, _>(external_id)
+                .get_result::<DirectorySyncGroupRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_directory_sync_groups(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+    ) -> AppResult<Vec<DirectorySyncGroupRecord>> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} ORDER BY external_id ASC",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .load::<DirectorySyncGroupRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn upsert_directory_sync_group(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        external_id: &str,
+        group_id: &str,
+        last_seen_at: i64,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let external_id = external_id.to_string();
+        let group_id = group_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let exists_sql = format!(
+                "SELECT COUNT(*) AS count FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            let exists = sql_query(exists_sql)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
+                .bind::<Text, _>(&external_id)
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                > 0;
+            if exists {
+                let update_sql = format!(
+                    "UPDATE directory_sync_groups SET group_id = {}, last_seen_at = {}, updated_at = {} WHERE application_id = {} AND provider_id = {} AND external_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(update_sql)
+                    .bind::<Text, _>(&group_id)
+                    .bind::<BigInt, _>(last_seen_at)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&external_id)
+                    .execute(&mut conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            } else {
+                let insert_sql = format!(
+                    "INSERT INTO directory_sync_groups (application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&external_id)
+                    .bind::<Text, _>(&group_id)
+                    .bind::<BigInt, _>(last_seen_at)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
+    pub async fn delete_directory_sync_group(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        external_id: &str,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let external_id = external_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "DELETE FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .bind::<Text, _>(external_id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+    }
+    pub async fn start_directory_sync_run(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+    ) -> AppResult<DirectorySyncRunRecord> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let now = util::now_ts();
+        let expires_at = now + DIRECTORY_SYNC_LEASE_TTL_SECONDS;
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<DirectorySyncRunRecord, AppError, _>(|conn| {
+                // The lease row is the concurrency boundary.  A check-then-
+                // insert on directory_sync_runs is racy under PostgreSQL and
+                // MySQL's default isolation: two workers can both observe no
+                // running row.  First reclaim only an expired lease with a
+                // compare-and-set update, then attempt the unique-key insert
+                // for a previously unseen pair.
+                let abandon_sql = format!(
+                    "UPDATE directory_sync_runs SET status = 'failed', error = {}, finished_at = {} WHERE status = 'running' AND id IN (SELECT owner_run_id FROM directory_sync_leases WHERE application_id = {} AND provider_id = {} AND expires_at < {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                sql_query(abandon_sql)
+                    .bind::<Nullable<Text>, _>(Some(
+                        "directory synchronization lease expired".to_string(),
+                    ))
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let reclaim_sql = format!(
+                    "UPDATE directory_sync_leases SET owner_run_id = {}, acquired_at = {}, heartbeat_at = {}, expires_at = {} WHERE application_id = {} AND provider_id = {} AND expires_at < {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7)
+                );
+                let reclaimed = sql_query(reclaim_sql)
+                    .bind::<Text, _>(&run_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(expires_at)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if reclaimed == 0 {
+                    let insert_lease_sql = format!(
+                        "INSERT INTO directory_sync_leases (application_id, provider_id, owner_run_id, acquired_at, heartbeat_at, expires_at) VALUES ({}, {}, {}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6)
+                    );
+                    let insert_result = sql_query(insert_lease_sql)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<Text, _>(&provider_id)
+                        .bind::<Text, _>(&run_id)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(expires_at)
+                        .execute(conn);
+                    match insert_result {
+                        Ok(_) => {}
+                        Err(diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::UniqueViolation,
+                            _,
+                        )) => {
+                            return Err(AppError::BadRequest(
+                                "directory synchronization is already running".to_string(),
+                            ));
+                        }
+                        Err(error) => return Err(AppError::from(error)),
+                    }
+                }
+                let insert_sql = format!(
+                    "INSERT INTO directory_sync_runs (id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at) VALUES ({}, {}, {}, 'running', 0, 0, 0, 0, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&run_id)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<Nullable<Text>, _>(None::<String>)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "SELECT id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at FROM directory_sync_runs WHERE id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(&run_id)
+                    .get_result::<DirectorySyncRunRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn finish_directory_sync_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        total_seen: i64,
+        created_count: i64,
+        updated_count: i64,
+        disabled_count: i64,
+        error: Option<String>,
+        cursor: Option<String>,
+    ) -> AppResult<DirectorySyncRunRecord> {
+        let run_id = run_id.to_string();
+        let status = status.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<DirectorySyncRunRecord, AppError, _>(|conn| {
+                let update_sql = format!(
+                    "UPDATE directory_sync_runs SET status = {}, total_seen = {}, created_count = {}, updated_count = {}, disabled_count = {}, error = {}, cursor = {}, finished_at = {} WHERE id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7),
+                    ph(kind, 8),
+                    ph(kind, 9)
+                );
+                let affected = sql_query(update_sql)
+                    .bind::<Text, _>(&status)
+                    .bind::<BigInt, _>(total_seen)
+                    .bind::<BigInt, _>(created_count)
+                    .bind::<BigInt, _>(updated_count)
+                    .bind::<BigInt, _>(disabled_count)
+                    .bind::<Nullable<Text>, _>(error)
+                    .bind::<Nullable<Text>, _>(cursor)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&run_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                if affected == 0 {
+                    return Err(AppError::NotFound);
+                }
+                let release_sql = format!(
+                    "DELETE FROM directory_sync_leases WHERE owner_run_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(release_sql)
+                    .bind::<Text, _>(&run_id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                let select_sql = format!(
+                    "SELECT id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at FROM directory_sync_runs WHERE id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(select_sql)
+                    .bind::<Text, _>(&run_id)
+                    .get_result::<DirectorySyncRunRecord>(conn)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    /// Renews a directory-sync lease only for its current owner.  A stale
+    /// worker must fail closed after another worker reclaimed the lease.
+    pub async fn renew_directory_sync_lease(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        run_id: &str,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let run_id = run_id.to_string();
+        let now = util::now_ts();
+        let expires_at = now + DIRECTORY_SYNC_LEASE_TTL_SECONDS;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE directory_sync_leases SET heartbeat_at = {}, expires_at = {} WHERE application_id = {} AND provider_id = {} AND owner_run_id = {} AND expires_at >= {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+                ph(kind, 5),
+                ph(kind, 6)
+            );
+            let affected = sql_query(sql)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(expires_at)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
+                .bind::<Text, _>(&run_id)
+                .bind::<BigInt, _>(now)
+                .execute(&mut conn)
+                .map_err(AppError::from)?;
+            if affected != 1 {
+                return Err(AppError::BadRequest(
+                    "directory synchronization lease was lost".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    pub async fn list_directory_sync_runs(
+        &self,
+        application_id: &str,
+        limit: i64,
+    ) -> AppResult<Vec<DirectorySyncRunRecord>> {
+        let application_id = application_id.to_string();
+        let limit = limit.clamp(1, 100);
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, application_id, provider_id, status, total_seen, created_count, updated_count, disabled_count, error, cursor, started_at, finished_at FROM directory_sync_runs WHERE application_id = {} ORDER BY started_at DESC LIMIT {limit}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .load::<DirectorySyncRunRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+    pub async fn find_directory_sync_checkpoint(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+    ) -> AppResult<Option<DirectorySyncCheckpointRecord>> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, provider_id, cursor, last_success_at, consecutive_failures, updated_at FROM directory_sync_checkpoints WHERE application_id = {} AND provider_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .get_result::<DirectorySyncCheckpointRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn record_directory_sync_checkpoint(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        cursor: Option<String>,
+        success: bool,
+    ) -> AppResult<DirectorySyncCheckpointRecord> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let existing_sql = format!(
+                "SELECT application_id, provider_id, cursor, last_success_at, consecutive_failures, updated_at FROM directory_sync_checkpoints WHERE application_id = {} AND provider_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            let existing = sql_query(existing_sql)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
+                .get_result::<DirectorySyncCheckpointRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)?;
+            let failures = if success {
+                0
+            } else {
+                existing
+                    .as_ref()
+                    .map(|record| record.consecutive_failures.saturating_add(1))
+                    .unwrap_or(1)
+            };
+            let last_success_at = if success {
+                now
+            } else {
+                existing
+                    .as_ref()
+                    .map(|record| record.last_success_at)
+                    .unwrap_or(0)
+            };
+            let next_cursor = if success {
+                cursor
+            } else {
+                existing.as_ref().and_then(|record| record.cursor.clone())
+            };
+            if existing.is_some() {
+                let update_sql = format!(
+                    "UPDATE directory_sync_checkpoints SET cursor = {}, last_success_at = {}, consecutive_failures = {}, updated_at = {} WHERE application_id = {} AND provider_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(update_sql)
+                    .bind::<Nullable<Text>, _>(next_cursor)
+                    .bind::<BigInt, _>(last_success_at)
+                    .bind::<Integer, _>(failures)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            } else {
+                let insert_sql = format!(
+                    "INSERT INTO directory_sync_checkpoints (application_id, provider_id, cursor, last_success_at, consecutive_failures, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Nullable<Text>, _>(next_cursor)
+                    .bind::<BigInt, _>(last_success_at)
+                    .bind::<Integer, _>(failures)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                    .map_err(AppError::from)?;
+            }
+            let select_sql = format!(
+                "SELECT application_id, provider_id, cursor, last_success_at, consecutive_failures, updated_at FROM directory_sync_checkpoints WHERE application_id = {} AND provider_id = {}",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(select_sql)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
+                .get_result::<DirectorySyncCheckpointRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn upsert_directory_sync_membership(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        user_id: &str,
+        managed: bool,
+        last_seen_at: i64,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let user_id = user_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let exists_sql = format!(
+                "SELECT COUNT(*) AS count FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            let exists = sql_query(exists_sql)
+                .bind::<Text, _>(&application_id)
+                .bind::<Text, _>(&provider_id)
+                .bind::<Text, _>(&user_id)
+                .get_result::<CountRow>(&mut conn)
+                .map_err(AppError::from)?
+                .count
+                > 0;
+            if exists {
+                let update_sql = format!(
+                    "UPDATE directory_sync_memberships SET last_seen_at = {}, updated_at = {} WHERE application_id = {} AND provider_id = {} AND user_id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5)
+                );
+                sql_query(update_sql)
+                    .bind::<BigInt, _>(last_seen_at)
+                    .bind::<BigInt, _>(now)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&user_id)
+                    .execute(&mut conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            } else {
+                let insert_sql = format!(
+                    "INSERT INTO directory_sync_memberships (application_id, provider_id, user_id, managed, last_seen_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6),
+                    ph(kind, 7)
+                );
+                sql_query(insert_sql)
+                    .bind::<Text, _>(&application_id)
+                    .bind::<Text, _>(&provider_id)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Integer, _>(i32::from(managed))
+                    .bind::<BigInt, _>(last_seen_at)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
+    pub async fn list_directory_sync_memberships(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+    ) -> AppResult<Vec<DirectorySyncMembershipRecord>> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT application_id, provider_id, user_id, managed, last_seen_at, created_at, updated_at FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} ORDER BY user_id ASC",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .load::<DirectorySyncMembershipRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn delete_directory_sync_membership(
+        &self,
+        application_id: &str,
+        provider_id: &str,
+        user_id: &str,
+    ) -> AppResult<()> {
+        let application_id = application_id.to_string();
+        let provider_id = provider_id.to_string();
+        let user_id = user_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "DELETE FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(provider_id)
+                .bind::<Text, _>(user_id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2134,6 +2815,37 @@ mod tests {
         );
         assert!(!username_owners.contains_key("old-user"));
         assert_eq!(username_owners.get("new-user"), Some(&"user-1".to_string()));
+    }
+
+    #[test]
+    fn seen_group_mapping_index_excludes_stale_rows() {
+        let mappings = vec![
+            DirectorySyncGroupRecord {
+                application_id: "app-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                external_id: "current".to_string(),
+                group_id: "group-current".to_string(),
+                last_seen_at: 1,
+                created_at: 1,
+                updated_at: 1,
+            },
+            DirectorySyncGroupRecord {
+                application_id: "app-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                external_id: "stale".to_string(),
+                group_id: "group-stale".to_string(),
+                last_seen_at: 1,
+                created_at: 1,
+                updated_at: 1,
+            },
+        ];
+        let seen = BTreeSet::from(["current".to_string()]);
+
+        let indexed = index_seen_group_mappings(&mappings, &seen);
+
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed["current"].group_id, "group-current");
+        assert!(!indexed.contains_key("stale"));
     }
 
     #[cfg(feature = "sqlite")]
@@ -2297,6 +3009,68 @@ mod tests {
         assert_eq!(retry_stats.created_count, 0);
         assert_eq!(retry_stats.updated_count, user_count as i64);
         assert_eq!(retry_stats.disabled_count, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn directory_sync_removes_multiple_stale_groups_in_one_batch() {
+        let (db, path) = sqlite_directory_sync_db().await;
+        let (organization_id, application_id) =
+            directory_sync_fixture(&db, "stale-groups-org", "stale-groups-app").await;
+        let run = db
+            .start_directory_sync_run(&application_id, "provider-1")
+            .await
+            .unwrap();
+        let groups = (0..3)
+            .map(|index| DirectorySyncGroupPlan {
+                external_id: format!("stale-group-{index}"),
+                display_name: format!("Stale Group {index}"),
+                member_subjects: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        db.apply_directory_sync_snapshot(
+            directory_sync_context(&application_id, &organization_id, &run.id),
+            DirectorySyncSnapshotPlan {
+                users: Vec::new(),
+                groups,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.list_application_scim_groups(&application_id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        db.apply_directory_sync_snapshot(
+            directory_sync_context(&application_id, &organization_id, &run.id),
+            DirectorySyncSnapshotPlan {
+                users: Vec::new(),
+                groups: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.list_directory_sync_groups(&application_id, "provider-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_application_scim_groups(&application_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         drop(db);
         let _ = std::fs::remove_file(path);

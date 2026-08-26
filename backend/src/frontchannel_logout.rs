@@ -2,6 +2,7 @@ use crate::{
     AppState,
     db::{ClientRecord, UserRecord},
     error::{AppError, AppResult},
+    html::escape as html_escape,
 };
 use axum::response::Html;
 use serde::Serialize;
@@ -147,15 +148,6 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.host_str().map(str::to_ascii_lowercase)
             == right.host_str().map(str::to_ascii_lowercase)
         && left.port_or_known_default() == right.port_or_known_default()
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]

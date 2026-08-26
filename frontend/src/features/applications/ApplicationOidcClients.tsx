@@ -1,27 +1,24 @@
-import { ArrowRight, Pencil, Plus, Trash2 } from "lucide-react";
 import type { FormEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import * as applicationApi from "../../lib/api/applications";
 import type {
   ApiMutationOptions,
-  ApplicationOidcClientInput
+  ApplicationOidcClientInput,
 } from "../../lib/api/applications";
 import type { Client, TenantApplication } from "../../types";
-import type {
-  DirtyNavigationController,
-  DirtyNavigationSourceHandle
-} from "../navigation/useDirtyNavigation";
-import {
-  Input,
-  Toggle
-} from "./components/ApplicationModulePrimitives";
+import type { DirtyNavigationController } from "../navigation/useDirtyNavigation";
+import { ModuleFeedback } from "./components/ApplicationModulePrimitives";
+import { ApplicationOidcClientEditor } from "./ApplicationOidcClientEditor";
+import { ApplicationOidcClientList } from "./ApplicationOidcClientList";
 import type {
   ApplicationRequestGuard,
-  ApplicationRequestToken
+  ApplicationRequestToken,
 } from "./application-request-guard";
+import { useApplicationModuleLifecycle } from "./use-application-module-lifecycle";
 
-export const APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE = "applications.oidc-clients";
+export const APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE =
+  "applications.oidc-clients";
 
 export type ApplicationOidcClientsCopy = {
   oidcClients: string;
@@ -53,7 +50,7 @@ export type ApplicationOidcClientsCopy = {
   saveFailed: string;
 };
 
-type OidcClientDraft = {
+export type OidcClientDraft = {
   id: string;
   client_id: string;
   client_name: string;
@@ -100,7 +97,7 @@ export type ApplicationOidcClientsProps = {
   onRequestConfirmation?: (
     action: () => Promise<void> | void,
     title: string,
-    description: string
+    description: string,
   ) => void;
 };
 
@@ -139,11 +136,14 @@ function emptyOidcClientDraft(organizationId: string): OidcClientDraft {
     service_account_enabled: false,
     service_account_permissions: "",
     is_active: true,
-    claim_mappers: []
+    claim_mappers: [],
   };
 }
 
-function toOidcClientDraft(client: Client, organizationId: string): OidcClientDraft {
+function toOidcClientDraft(
+  client: Client,
+  organizationId: string,
+): OidcClientDraft {
   return {
     id: client.id,
     client_id: client.client_id,
@@ -160,7 +160,8 @@ function toOidcClientDraft(client: Client, organizationId: string): OidcClientDr
     token_endpoint_auth_method: client.token_endpoint_auth_method,
     require_pkce: client.require_pkce,
     require_mfa: client.require_mfa,
-    require_pushed_authorization_requests: client.require_pushed_authorization_requests,
+    require_pushed_authorization_requests:
+      client.require_pushed_authorization_requests,
     require_s256_pkce: client.require_s256_pkce,
     require_confidential_client: client.require_confidential_client,
     require_dpop: client.require_dpop,
@@ -172,29 +173,43 @@ function toOidcClientDraft(client: Client, organizationId: string): OidcClientDr
     jwks_uri: client.jwks_uri,
     jwks: client.jwks,
     backchannel_logout_uri: client.backchannel_logout_uri,
-    backchannel_logout_session_required: client.backchannel_logout_session_required,
+    backchannel_logout_session_required:
+      client.backchannel_logout_session_required,
     frontchannel_logout_uri: client.frontchannel_logout_uri,
-    frontchannel_logout_session_required: client.frontchannel_logout_session_required,
+    frontchannel_logout_session_required:
+      client.frontchannel_logout_session_required,
     service_account_enabled: client.service_account_enabled,
     service_account_permissions: client.service_account_permissions.join("\n"),
     is_active: client.is_active,
-    claim_mappers: client.claim_mappers
+    claim_mappers: client.claim_mappers,
   };
 }
 
 function tokenList(value: string): string[] {
-  return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+  return value
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
-function oidcClientPayload(draft: OidcClientDraft, organizationId: string): ApplicationOidcClientInput {
+function oidcClientPayload(
+  draft: OidcClientDraft,
+  organizationId: string,
+): ApplicationOidcClientInput {
   return {
     client_id: draft.client_id.trim(),
     client_name: draft.client_name.trim(),
     logo_uri: draft.logo_uri.trim(),
     organization_id: organizationId,
     client_secret: draft.client_secret.trim() || null,
-    redirect_uris: draft.redirect_uris.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
-    post_logout_redirect_uris: draft.post_logout_redirect_uris.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+    redirect_uris: draft.redirect_uris
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean),
+    post_logout_redirect_uris: draft.post_logout_redirect_uris
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean),
     scopes: tokenList(draft.scopes),
     audience: draft.audience.trim() || null,
     grant_types: tokenList(draft.grant_types),
@@ -202,7 +217,8 @@ function oidcClientPayload(draft: OidcClientDraft, organizationId: string): Appl
     token_endpoint_auth_method: draft.token_endpoint_auth_method,
     require_pkce: draft.require_pkce,
     require_mfa: draft.require_mfa,
-    require_pushed_authorization_requests: draft.require_pushed_authorization_requests,
+    require_pushed_authorization_requests:
+      draft.require_pushed_authorization_requests,
     require_s256_pkce: draft.require_s256_pkce,
     require_confidential_client: draft.require_confidential_client,
     require_dpop: draft.require_dpop,
@@ -214,9 +230,11 @@ function oidcClientPayload(draft: OidcClientDraft, organizationId: string): Appl
     jwks_uri: draft.jwks_uri.trim(),
     jwks: draft.jwks.trim(),
     backchannel_logout_uri: draft.backchannel_logout_uri.trim(),
-    backchannel_logout_session_required: draft.backchannel_logout_session_required,
+    backchannel_logout_session_required:
+      draft.backchannel_logout_session_required,
     frontchannel_logout_uri: draft.frontchannel_logout_uri.trim(),
-    frontchannel_logout_session_required: draft.frontchannel_logout_session_required,
+    frontchannel_logout_session_required:
+      draft.frontchannel_logout_session_required,
     service_account_enabled: draft.service_account_enabled,
     service_account_permissions: tokenList(draft.service_account_permissions),
     is_active: draft.is_active,
@@ -229,15 +247,15 @@ function oidcClientPayload(draft: OidcClientDraft, organizationId: string): Appl
       include_in_access_token: mapper.include_in_access_token,
       include_in_userinfo: mapper.include_in_userinfo,
       is_active: mapper.is_active,
-      sort_order: mapper.sort_order ?? index
-    }))
+      sort_order: mapper.sort_order ?? index,
+    })),
   };
 }
 
 function requestOptions(token: ApplicationRequestToken): ApiMutationOptions {
   return {
     signal: token.signal,
-    ...(token.idempotencyKey ? { idempotencyKey: token.idempotencyKey } : {})
+    ...(token.idempotencyKey ? { idempotencyKey: token.idempotencyKey } : {}),
   };
 }
 
@@ -248,51 +266,54 @@ export function ApplicationOidcClients({
   requestGuard,
   dirtyNavigation,
   onClientsChanged,
-  onRequestConfirmation
+  onRequestConfirmation,
 }: ApplicationOidcClientsProps) {
   const [clients, setClients] = useState<Client[]>([]);
   const [draft, setDraft] = useState<OidcClientDraft | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [feedback, setFeedback] = useState("");
-  const dirtySourceRef = useRef<DirtyNavigationSourceHandle | null>(null);
-
-  useEffect(() => {
-    const source = dirtyNavigation.registerSource(APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE);
-    dirtySourceRef.current = source;
-    return () => {
-      source.unregister();
-      if (dirtySourceRef.current === source) dirtySourceRef.current = null;
-    };
-  }, [dirtyNavigation.registerSource]);
-
-  useEffect(() => {
-    dirtySourceRef.current?.setDirty(draft !== null);
-  }, [draft]);
+  const {
+    saving,
+    setSaving,
+    feedback,
+    setFeedback,
+    beginRequest,
+    isCurrent,
+    finishRequest,
+  } = useApplicationModuleLifecycle({
+    applicationId: application.id,
+    dirtySource: APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE,
+    dirtyNavigation,
+    requestGuard,
+    dirty: draft !== null,
+  });
 
   useEffect(() => {
     setClients([]);
     setDraft(null);
     setSaving(false);
     setFeedback("");
-    const request = requestGuard.begin(application.id, {
-      scope: "protocols:oidc-clients",
-      kind: "read"
+    const request = beginRequest("protocols:oidc-clients", {
+      kind: "read",
     });
     if (!request) return;
-    void applicationApi.listApplicationOidcClients(application.id, requestOptions(request))
+    void applicationApi
+      .listApplicationOidcClients(application.id, requestOptions(request))
       .then((nextClients) => {
-        if (requestGuard.isCurrent(request)) setClients(nextClients);
+        if (isCurrent(request)) setClients(nextClients);
       })
       .catch(() => {
-        if (!requestGuard.isCurrent(request)) return;
+        if (!isCurrent(request)) return;
         // Bindings are part of the application read model. Keep this scoped
         // fallback for older servers while the dedicated collection catches
         // up, without allowing an older application response to win.
-        setClients(application.client_bindings.filter((binding) => binding.protocol === "oidc"));
+        setClients(
+          application.client_bindings.filter(
+            (binding) => binding.protocol === "oidc",
+          ),
+        );
         setFeedback(copy.loadFailed);
       });
-    return () => requestGuard.finish(request, false);
-  }, [application, copy.loadFailed, requestGuard]);
+    return () => finishRequest(request, false);
+  }, [application, beginRequest, copy.loadFailed, finishRequest, isCurrent]);
 
   function publishClients(nextClients: Client[]) {
     setClients(nextClients);
@@ -300,17 +321,20 @@ export function ApplicationOidcClients({
   }
 
   function openEditor(client?: Client) {
-    setDraft(client ? toOidcClientDraft(client, application.organization_id) : emptyOidcClientDraft(application.organization_id));
+    setDraft(
+      client
+        ? toOidcClientDraft(client, application.organization_id)
+        : emptyOidcClientDraft(application.organization_id),
+    );
     setFeedback("");
   }
 
   async function saveClient(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!draft || !canManage) return;
-    const request = requestGuard.begin(application.id, {
-      scope: `protocols:oidc-client:${draft.id || "new"}`,
+    const request = beginRequest(`protocols:oidc-client:${draft.id || "new"}`, {
       kind: "mutation",
-      payloadFingerprint: JSON.stringify(draft)
+      payloadFingerprint: JSON.stringify(draft),
     });
     if (!request) return;
     setSaving(true);
@@ -319,94 +343,95 @@ export function ApplicationOidcClients({
     try {
       const payload = oidcClientPayload(draft, application.organization_id);
       const saved = draft.id
-        ? await applicationApi.updateApplicationOidcClient(application.id, draft.id, payload, requestOptions(request))
-        : await applicationApi.createApplicationOidcClient(application.id, payload, requestOptions(request));
-      if (!requestGuard.isCurrent(request)) return;
+        ? await applicationApi.updateApplicationOidcClient(
+            application.id,
+            draft.id,
+            payload,
+            requestOptions(request),
+          )
+        : await applicationApi.createApplicationOidcClient(
+            application.id,
+            payload,
+            requestOptions(request),
+          );
+      if (!isCurrent(request)) return;
       const nextClients = draft.id
-        ? clients.map((client) => client.id === saved.id ? saved : client)
+        ? clients.map((client) => (client.id === saved.id ? saved : client))
         : [saved, ...clients];
       publishClients(nextClients);
       setDraft(null);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
   async function deleteClient(client: Client) {
-    const request = requestGuard.begin(application.id, {
-      scope: `protocols:oidc-client:${client.id}:delete`,
-      kind: "mutation"
+    const request = beginRequest(`protocols:oidc-client:${client.id}:delete`, {
+      kind: "mutation",
     });
     if (!request) return;
     setSaving(true);
     setFeedback("");
     let committed = false;
     try {
-      await applicationApi.deleteApplicationOidcClient(application.id, client.id, requestOptions(request));
-      if (!requestGuard.isCurrent(request)) return;
+      await applicationApi.deleteApplicationOidcClient(
+        application.id,
+        client.id,
+        requestOptions(request),
+      );
+      if (!isCurrent(request)) return;
       publishClients(clients.filter((item) => item.id !== client.id));
       if (draft?.id === client.id) setDraft(null);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
   return (
     <div className="application-connection-list application-oidc-manager">
-      <div className="subsection-heading">
-        <div><strong>{copy.oidcClients}</strong><p className="muted">{copy.oidcClientHint}</p></div>
-        <button type="button" className="secondary-button" onClick={() => openEditor()} disabled={!canManage || saving}><Plus size={14} />{copy.createOidcClient}</button>
-      </div>
-      {draft && (
-        <form className="application-client-editor" onSubmit={saveClient}>
-          <div className="form-grid-2 compact-form-grid">
-            <Input label={copy.clientId} value={draft.client_id} required onChange={(value) => setDraft((current) => current ? { ...current, client_id: value } : current)} />
-            <Input label={copy.clientName} value={draft.client_name} required onChange={(value) => setDraft((current) => current ? { ...current, client_name: value } : current)} />
-            <Input label={copy.clientSecret} hint={copy.clientSecretHint} type="password" value={draft.client_secret} required={!draft.id && draft.token_endpoint_auth_method !== "none"} onChange={(value) => setDraft((current) => current ? { ...current, client_secret: value } : current)} />
-            <Input label={copy.audience} value={draft.audience} onChange={(value) => setDraft((current) => current ? { ...current, audience: value } : current)} />
-          </div>
-          <Input label={copy.redirectUris} value={draft.redirect_uris} textarea required onChange={(value) => setDraft((current) => current ? { ...current, redirect_uris: value } : current)} />
-          <Input label={copy.postLogoutUris} value={draft.post_logout_redirect_uris} textarea onChange={(value) => setDraft((current) => current ? { ...current, post_logout_redirect_uris: value } : current)} />
-          <div className="form-grid-2 compact-form-grid">
-            <Input label={copy.scopes} value={draft.scopes} onChange={(value) => setDraft((current) => current ? { ...current, scopes: value } : current)} />
-            <Input label={copy.grantTypes} value={draft.grant_types} onChange={(value) => setDraft((current) => current ? { ...current, grant_types: value } : current)} />
-            <Input label={copy.responseTypes} value={draft.response_types} onChange={(value) => setDraft((current) => current ? { ...current, response_types: value } : current)} />
-            <label className="application-input"><span>{copy.tokenAuthMethod}</span><select value={draft.token_endpoint_auth_method} onChange={(event) => setDraft((current) => current ? { ...current, token_endpoint_auth_method: event.target.value } : current)}><option value="client_secret_basic">client_secret_basic</option><option value="client_secret_post">client_secret_post</option><option value="client_secret_jwt">client_secret_jwt</option><option value="private_key_jwt">private_key_jwt</option><option value="none">none</option></select></label>
-          </div>
-          <div className="application-toggle-grid">
-            <Toggle label={copy.requirePkce} checked={draft.require_pkce} onChange={(value) => setDraft((current) => current ? { ...current, require_pkce: value, require_s256_pkce: value ? current.require_s256_pkce : false } : current)} />
-            <Toggle label="S256 PKCE" checked={draft.require_s256_pkce} onChange={(value) => setDraft((current) => current ? { ...current, require_s256_pkce: value, require_pkce: value || current.require_pkce } : current)} />
-            <Toggle label={copy.requireMfa} checked={draft.require_mfa} onChange={(value) => setDraft((current) => current ? { ...current, require_mfa: value } : current)} />
-            <Toggle label={copy.active} checked={draft.is_active} onChange={(value) => setDraft((current) => current ? { ...current, is_active: value } : current)} />
-          </div>
-          <div className="application-module-actions">
-            <button type="button" className="secondary-button" onClick={() => setDraft(null)} disabled={saving}>{copy.discardChanges}</button>
-            <button type="submit" className="primary-action" disabled={saving}>{saving ? copy.saving : copy.save}<ArrowRight size={15} /></button>
-          </div>
-        </form>
-      )}
-      {feedback && <p className={feedback === copy.saveFailed ? "module-save-error" : "module-save-feedback"} role="status">{feedback}</p>}
-      <div className="application-oidc-client-cards">
-        {clients.map((client) => (
-          <article className="application-oidc-client-card" key={client.id}>
-            <div className="application-oidc-client-card-heading"><div><strong>{client.client_name}</strong><small><code>{client.client_id}</code></small></div><span className={`tab-status ${client.is_active ? "on" : ""}`}>{client.is_active ? copy.active : copy.disabled}</span></div>
-            <div className="tag-row"><span>{client.token_endpoint_auth_method}</span>{client.require_pkce && <span>{copy.requirePkce}</span>}<span>{client.scopes.join(" ")}</span></div>
-            <small>{client.redirect_uris.join(", ")}</small>
-            {canManage && <div className="actions"><button type="button" onClick={() => openEditor(client)} disabled={saving}><Pencil size={14} />{copy.edit}</button><button type="button" className="text-danger-button" onClick={() => onRequestConfirmation ? onRequestConfirmation(() => deleteClient(client), copy.delete, copy.oidcClientHint) : void deleteClient(client)} disabled={saving}><Trash2 size={14} />{copy.delete}</button></div>}
-          </article>
-        ))}
-        {clients.length === 0 && <p className="muted">{copy.noConnections}</p>}
-      </div>
+      <ApplicationOidcClientList
+        copy={copy}
+        canManage={canManage}
+        clients={clients}
+        saving={saving}
+        onCreate={() => openEditor()}
+        onEdit={openEditor}
+        onDelete={(client) =>
+          onRequestConfirmation
+            ? onRequestConfirmation(
+                () => deleteClient(client),
+                copy.delete,
+                copy.oidcClientHint,
+              )
+            : void deleteClient(client)
+        }
+      >
+        {draft && (
+          <ApplicationOidcClientEditor
+            copy={copy}
+            draft={draft}
+            saving={saving}
+            onChange={(next) =>
+              setDraft((current) =>
+                current ? { ...current, ...next } : current,
+              )
+            }
+            onDiscard={() => setDraft(null)}
+            onSubmit={saveClient}
+          />
+        )}
+        <ModuleFeedback message={feedback} errorMessages={[copy.saveFailed]} />
+      </ApplicationOidcClientList>
     </div>
   );
 }

@@ -5,6 +5,8 @@
 //! installs a fresh value and a stale worker can therefore never finalize the
 //! replacement owner's result.
 
+use super::*;
+
 use super::{Db, blocking, ph};
 use crate::{
     config::DatabaseKind,

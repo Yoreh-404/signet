@@ -3,7 +3,7 @@ import type { UserDirectoryCursorPage, UserDirectoryPage, UserDirectoryQuery } f
 import {
   fetchUserDirectoryCursorPage,
   fetchUserDirectoryPage,
-  parseUserDirectoryQuery,
+  normalizeUserDirectoryQuery,
   serializeUserDirectoryQuery
 } from "./user-directory";
 import type { UserDirectoryQueryInput } from "./user-directory";
@@ -58,8 +58,8 @@ function useDirectoryQuery<T>(
   { endpoint, query, enabled = true, scopeKey = null }: UseUserDirectoryOptions,
   fetchPage: DirectoryFetch<T>
 ): { data: T | null; loading: boolean; error: unknown | null; query: UserDirectoryQuery; queryString: string; reload: () => Promise<void> } {
-  const queryString = useMemo(() => serializeUserDirectoryQuery(query), [query]);
-  const normalizedQuery = useMemo(() => parseUserDirectoryQuery(queryString), [queryString]);
+  const normalizedQuery = useMemo(() => normalizeUserDirectoryQuery(query), [query]);
+  const queryString = useMemo(() => serializeUserDirectoryQuery(normalizedQuery), [normalizedQuery]);
   const [state, setState] = useState<{ data: T | null; loading: boolean; error: unknown | null }>({
     data: null,
     loading: false,

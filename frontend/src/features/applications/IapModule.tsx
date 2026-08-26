@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import * as applicationApi from "../../lib/api/applications";
 import type { IapApplication, OrganizationOption } from "../../types";
 import type { ApplicationRequestGuard } from "./application-request-guard";
-import { Input, ModuleHeader, Toggle } from "./components/ApplicationModulePrimitives";
+import { Input, ModuleFeedback, ModuleHeader, Toggle } from "./components/ApplicationModulePrimitives";
+import { useApplicationModuleLifecycle } from "./use-application-module-lifecycle";
 
 export type IapRuleDraft = {
   id: string;
@@ -103,8 +104,20 @@ export function IapModule({
 }) {
   const [rules, setRules] = useState<IapApplication[]>([]);
   const [draft, setDraft] = useState<IapRuleDraft | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [feedback, setFeedback] = useState("");
+  const {
+    saving,
+    setSaving,
+    feedback,
+    setFeedback,
+    beginRequest,
+    isCurrent,
+    finishRequest
+  } = useApplicationModuleLifecycle({
+    applicationId,
+    requestGuard,
+    onDirtyChange,
+    dirty: draft !== null
+  });
 
   useEffect(() => {
     setRules([]);
@@ -116,41 +129,36 @@ export function IapModule({
   }, [applicationId, onDirtyChange, onRulesCountChange]);
 
   useEffect(() => {
-    const request = requestGuard.begin(applicationId, { scope: "iap:rules", kind: "read" });
+    const request = beginRequest("iap:rules", { kind: "read" });
     if (!request) return;
     void applicationApi.listApplicationIapRules(applicationId, { signal: request.signal })
       .then((nextRules) => {
-        if (!requestGuard.isCurrent(request)) return;
+        if (!isCurrent(request)) return;
         setRules(nextRules);
         onRulesCountChange(nextRules.length);
       })
       .catch(() => {
-        if (!requestGuard.isCurrent(request)) return;
+        if (!isCurrent(request)) return;
         setRules([]);
         onRulesCountChange(0);
         setFeedback(copy.loadFailed);
       });
-    return () => requestGuard.finish(request, false);
-  }, [applicationId, copy.loadFailed, onRulesCountChange, requestGuard]);
+    return () => finishRequest(request, false);
+  }, [beginRequest, copy.loadFailed, finishRequest, isCurrent, onRulesCountChange]);
 
   useEffect(() => {
-    onDirtyChange(draft !== null);
-  }, [draft, onDirtyChange]);
-
-  // Section navigation unmounts this module. Clear the parent registry at
-  // the same boundary so a discarded IAP draft cannot keep the whole
-  // application workspace dirty after the editor is gone.
-  useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
+    onRulesCountChange(rules.length);
+  }, [onRulesCountChange, rules.length]);
 
   function openEditor(rule?: IapApplication) {
     setDraft(rule ? toIapRuleDraft(rule) : emptyIapRuleDraft());
+    setFeedback("");
   }
 
   async function saveRule(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!draft || !canManage) return;
-    const request = requestGuard.begin(applicationId, {
-      scope: `iap:rule:${draft.id || "new"}`,
+    const request = beginRequest(`iap:rule:${draft.id || "new"}`, {
       kind: "mutation",
       payloadFingerprint: JSON.stringify(draft)
     });
@@ -175,46 +183,42 @@ export function IapModule({
       const saved = draft.id
         ? await applicationApi.updateApplicationIapRule(applicationId, draft.id, payload, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined })
         : await applicationApi.createApplicationIapRule(applicationId, payload, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined });
-      if (!requestGuard.isCurrent(request)) return;
+      if (!isCurrent(request)) return;
       setRules((current) => {
-        const next = draft.id
+        return draft.id
           ? current.map((rule) => rule.id === saved.id ? saved : rule)
           : [saved, ...current];
-        onRulesCountChange(next.length);
-        return next;
       });
       setDraft(null);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
   async function deleteRule(rule: IapApplication) {
-    const request = requestGuard.begin(applicationId, { scope: `iap:rule:${rule.id}:delete`, kind: "mutation" });
+    const request = beginRequest(`iap:rule:${rule.id}:delete`, { kind: "mutation" });
     if (!request) return;
     setSaving(true);
     let committed = false;
     try {
       await applicationApi.deleteApplicationIapRule(applicationId, rule.id, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined });
-      if (!requestGuard.isCurrent(request)) return;
+      if (!isCurrent(request)) return;
       setRules((current) => {
-        const next = current.filter((item) => item.id !== rule.id);
-        onRulesCountChange(next.length);
-        return next;
+        return current.filter((item) => item.id !== rule.id);
       });
       setDraft((current) => current?.id === rule.id ? null : current);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
@@ -223,7 +227,7 @@ export function IapModule({
   return (
     <div className="application-module-content application-iap-editor">
       <ModuleHeader icon={<ShieldCheck size={19} />} title={copy.iapRules} description={copy.iapRulesHint} />
-      {feedback && <p className={feedback === copy.saveFailed || feedback === copy.loadFailed ? "module-save-error" : "module-save-feedback"} role="status">{feedback}</p>}
+      <ModuleFeedback message={feedback} errorMessages={[copy.saveFailed, copy.loadFailed]} />
       <div className="subsection-heading">
         <strong>{copy.iapRules}</strong>
         <button type="button" className="secondary-button" onClick={() => openEditor()} disabled={!canManage || saving}>

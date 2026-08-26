@@ -11,6 +11,7 @@ use crate::{
     authorization,
     db::{ApplicationRecord, NewApplicationSamlInteraction, NewApplicationSamlSession},
     error::{AppError, AppResult},
+    html::escape as html_escape,
     redirects, util,
 };
 use axum::{
@@ -1284,15 +1285,6 @@ fn reject_duplicate_query_keys(raw_query: &str, keys: &[&str]) -> AppResult<()> 
 fn inbound_saml_error(error: impl std::fmt::Display) -> AppError {
     tracing::debug!(error = %error, "SAML request validation failed");
     AppError::BadRequest("invalid SAML request".to_string())
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]

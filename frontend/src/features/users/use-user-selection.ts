@@ -10,6 +10,22 @@ export type UserSelectionOptions<T extends UserSelectionItem> = {
   setSelectedIds: Dispatch<SetStateAction<string[]>>;
 };
 
+export function updateVisibleUserSelection<T extends UserSelectionItem>(
+  currentIds: string[],
+  visibleUsers: T[],
+  selected: boolean
+): string[] {
+  if (selected) {
+    const next = new Set(currentIds);
+    for (const user of visibleUsers) next.add(user.id);
+    return [...next];
+  }
+
+  const visibleIdSet = new Set<string>();
+  for (const user of visibleUsers) visibleIdSet.add(user.id);
+  return currentIds.filter((id) => !visibleIdSet.has(id));
+}
+
 /**
  * Owns page selection mechanics separately from lifecycle commands. The
  * shell can decide what actions are allowed, while this hook only guarantees
@@ -39,12 +55,7 @@ export function useUserSelection<T extends UserSelectionItem>({
   }, [setSelectedIds]);
 
   const toggleVisible = useCallback((selected: boolean) => {
-    const visibleIds = visibleUsers.map((user) => user.id);
-    const visibleIdSet = new Set(visibleIds);
-    setSelectedIds((current) => {
-      if (selected) return [...new Set([...current, ...visibleIds])];
-      return current.filter((id) => !visibleIdSet.has(id));
-    });
+    setSelectedIds((current) => updateVisibleUserSelection(current, visibleUsers, selected));
   }, [setSelectedIds, visibleUsers]);
 
   return {

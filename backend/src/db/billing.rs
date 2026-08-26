@@ -1,4 +1,6 @@
-use super::{CountRow, Db, blocking, ph};
+use super::*;
+
+use super::{CountRow, Db, bind_text_list, blocking, ph};
 use crate::{
     config::DatabaseKind,
     error::{AppError, AppResult},
@@ -986,7 +988,7 @@ impl Db {
                     .bind::<BigInt, _>(limit)
                     .load::<PaymentOrderIdRow>(conn)
                     .map_err(AppError::from)?;
-                let mut claimed = Vec::with_capacity(candidates.len());
+                let mut claimed_ids = Vec::with_capacity(candidates.len());
                 for candidate in candidates {
                     let update_sql = format!(
                         "UPDATE payment_orders SET lease_owner = {}, lease_expires_at = {}, lease_generation = lease_generation + 1, attempt_count = attempt_count + 1, updated_at = {} WHERE id = {} AND status IN ('creating', 'reconcile', 'pending') AND (next_retry_at IS NULL OR next_retry_at <= {}) AND (lease_expires_at IS NULL OR lease_expires_at <= {})",
@@ -1010,15 +1012,29 @@ impl Db {
                     {
                         continue;
                     }
-                    let select_sql = format!("{} WHERE id = {}", select_payment_order_sql(), ph(kind, 1));
-                    claimed.push(
-                        sql_query(select_sql)
-                            .bind::<Text, _>(candidate.id)
-                            .get_result::<PaymentOrderRecord>(conn)
-                            .map_err(AppError::from)?,
-                    );
+                    claimed_ids.push(candidate.id);
                 }
-                Ok(claimed)
+                if claimed_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let select_sql = format!(
+                    "{} WHERE id IN ({})",
+                    select_payment_order_sql(),
+                    (1..=claimed_ids.len())
+                        .map(|index| ph(kind, index))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let claimed_by_id = bind_text_list(conn, sql_query(select_sql), &claimed_ids)
+                    .load::<PaymentOrderRecord>(conn)
+                    .map_err(AppError::from)?
+                    .into_iter()
+                    .map(|order| (order.id.clone(), order))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                claimed_ids
+                    .into_iter()
+                    .map(|id| claimed_by_id.get(&id).cloned().ok_or(AppError::NotFound))
+                    .collect()
             })
         })
     }
@@ -3431,6 +3447,66 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn payment_reconcile_claim_returns_all_claimed_orders() {
+        let (db, path) = sqlite_billing_test_db(2).await;
+        let first = db
+            .insert_payment_order(NewPaymentOrder {
+                user_id: "reconcile-batch-first-user".to_string(),
+                provider_slug: "test-provider".to_string(),
+                merchant_order_no: "reconcile-batch-first-order".to_string(),
+                idempotency_key: Some("reconcile-batch-first-key".to_string()),
+                currency: "CNY".to_string(),
+                amount_minor: 100,
+                subject: "reconcile batch first".to_string(),
+                checkout_kind: String::new(),
+                checkout_value: String::new(),
+                expires_at: util::now_ts() + 900,
+            })
+            .await
+            .unwrap();
+        let second = db
+            .insert_payment_order(NewPaymentOrder {
+                user_id: "reconcile-batch-second-user".to_string(),
+                provider_slug: "test-provider".to_string(),
+                merchant_order_no: "reconcile-batch-second-order".to_string(),
+                idempotency_key: Some("reconcile-batch-second-key".to_string()),
+                currency: "CNY".to_string(),
+                amount_minor: 200,
+                subject: "reconcile batch second".to_string(),
+                checkout_kind: String::new(),
+                checkout_value: String::new(),
+                expires_at: util::now_ts() + 900,
+            })
+            .await
+            .unwrap();
+
+        let claimed = db
+            .claim_payment_orders_for_reconcile("claim-batch", util::now_ts(), 120, 2)
+            .await
+            .unwrap();
+        let claimed_ids = claimed
+            .iter()
+            .map(|order| order.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed_ids,
+            std::collections::BTreeSet::from([first.id.as_str(), second.id.as_str()])
+        );
+        assert!(claimed.iter().all(|order| {
+            order.lease_owner.as_deref() == Some("claim-batch")
+                && order.lease_expires_at.is_some()
+                && order.lease_generation == 1
+                && order.attempt_count == 1
+        }));
+
         drop(db);
         let _ = std::fs::remove_file(path);
     }

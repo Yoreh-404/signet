@@ -5,6 +5,8 @@
 //! user role set, user overrides, group role set, and organization-role map
 //! cannot be observed or committed independently.
 
+use super::*;
+
 use super::{
     AuditEventRecord, CountRow, DatabaseKind, Db, bind_text_list, blocking, dedupe_nonempty,
     normalize_application_entitlement_keys, ph,
@@ -191,6 +193,22 @@ fn normalize_organization_role_bindings(
     Ok(normalized)
 }
 
+fn distinct_role_ids(
+    user_role_ids: &[String],
+    group_role_ids: &[String],
+    organization_role_bindings: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut role_ids = BTreeSet::new();
+    role_ids.extend(user_role_ids.iter().cloned());
+    role_ids.extend(group_role_ids.iter().cloned());
+    role_ids.extend(
+        organization_role_bindings
+            .values()
+            .flat_map(|role_ids| role_ids.iter().cloned()),
+    );
+    role_ids
+}
+
 fn normalize_update(
     update: AuthorizationBindingsUpdate,
 ) -> AppResult<NormalizedAuthorizationBindingsUpdate> {
@@ -214,14 +232,8 @@ fn normalize_update(
         ));
     }
 
-    let mut distinct_role_ids = BTreeSet::new();
-    distinct_role_ids.extend(user_role_ids.iter().cloned());
-    distinct_role_ids.extend(group_role_ids.iter().cloned());
-    distinct_role_ids.extend(
-        organization_role_bindings
-            .values()
-            .flat_map(|role_ids| role_ids.iter().cloned()),
-    );
+    let distinct_role_ids =
+        distinct_role_ids(&user_role_ids, &group_role_ids, &organization_role_bindings);
     if distinct_role_ids.len() > MAX_ROLE_IDS {
         return Err(AppError::BadRequest(
             "authorization bindings contain too many distinct role ids".to_string(),
@@ -520,18 +532,14 @@ impl Db {
                         }
                     }
 
-                    let mut role_ids = BTreeSet::new();
-                    role_ids.extend(normalized.user_role_ids.iter().cloned());
-                    role_ids.extend(normalized.group_role_ids.iter().cloned());
-                    role_ids.extend(
-                        normalized
-                            .organization_role_bindings
-                            .values()
-                            .flat_map(|values| values.iter().cloned()),
+                    let role_ids = distinct_role_ids(
+                        &normalized.user_role_ids,
+                        &normalized.group_role_ids,
+                        &normalized.organization_role_bindings,
                     );
                     if !role_ids.is_empty() {
-                        let role_ids = role_ids.into_iter().collect::<Vec<_>>();
-                        let placeholders = (2..=role_ids.len() + 1)
+                        let role_id_values = role_ids.iter().cloned().collect::<Vec<_>>();
+                        let placeholders = (2..=role_id_values.len() + 1)
                             .map(|index| ph(kind, index))
                             .collect::<Vec<_>>()
                             .join(", ");
@@ -539,17 +547,16 @@ impl Db {
                             "SELECT id FROM application_profile_roles WHERE profile_id = {} AND is_active = 1 AND id IN ({placeholders})",
                             ph(kind, 1)
                         );
-                        let mut values = Vec::with_capacity(role_ids.len() + 1);
+                        let mut values = Vec::with_capacity(role_id_values.len() + 1);
                         values.push(profile_id.clone());
-                        values.extend(role_ids.iter().cloned());
+                        values.extend(role_id_values);
                         let valid = bind_text_list(conn, sql_query(role_sql), &values)
                             .load::<ProfileRoleIdRow>(conn)
                             .map_err(AppError::from)?
                             .into_iter()
                             .map(|row| row.id)
                             .collect::<BTreeSet<_>>();
-                        if let Some(missing) = role_ids.iter().find(|role_id| !valid.contains(*role_id))
-                        {
+                        if let Some(missing) = role_ids.difference(&valid).next() {
                             return Err(AppError::BadRequest(format!(
                                 "unknown or inactive application profile role: {missing}"
                             )));
@@ -887,6 +894,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn distinct_role_ids_deduplicates_across_all_binding_sets() {
+        let organization_role_bindings = BTreeMap::from([
+            (
+                "member".to_string(),
+                vec!["role-a".to_string(), "role-c".to_string()],
+            ),
+            (
+                "owner".to_string(),
+                vec!["role-a".to_string(), "role-b".to_string()],
+            ),
+        ]);
+
+        assert_eq!(
+            distinct_role_ids(
+                &["role-a".to_string(), "role-b".to_string()],
+                &["role-b".to_string(), "role-c".to_string()],
+                &organization_role_bindings,
+            ),
+            BTreeSet::from([
+                "role-a".to_string(),
+                "role-b".to_string(),
+                "role-c".to_string(),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn rejects_cross_tenant_subjects_inside_the_write_transaction() {
         let (db, path, organization, application, profile, _user, _group, role_a, _role_b) =
@@ -1099,6 +1133,54 @@ mod tests {
                 .unwrap(),
             snapshot
         );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn writes_permission_overrides_in_batches() {
+        let (db, path, _organization, application, profile, user, _group, _role_a, _role_b) =
+            fixture().await;
+        let user_permission_overrides = (0..(WRITE_BATCH_SIZE + 1))
+            .map(|index| AuthorizationBindingPermissionOverride {
+                permission: format!("application.permission-{index}"),
+                effect: if index % 2 == 0 {
+                    "allow".to_string()
+                } else {
+                    "deny".to_string()
+                },
+            })
+            .collect();
+
+        let snapshot = db
+            .replace_application_authorization_bindings_with_audit(
+                &application.id,
+                &profile.id,
+                AuthorizationBindingsUpdate {
+                    user_id: Some(user.id.clone()),
+                    group_id: None,
+                    user_role_ids: Vec::new(),
+                    user_permission_overrides,
+                    group_role_ids: Vec::new(),
+                    organization_role_bindings: BTreeMap::new(),
+                },
+                audit_event(),
+            )
+            .await
+            .unwrap();
+
+        let overrides = &snapshot.user_bindings[&user.id].user_permission_overrides;
+        assert_eq!(overrides.len(), WRITE_BATCH_SIZE + 1);
+        assert_eq!(
+            overrides.first().unwrap().permission,
+            "application.permission-0"
+        );
+        assert_eq!(
+            overrides.last().unwrap().permission,
+            "application.permission-200"
+        );
+        assert_eq!(overrides[WRITE_BATCH_SIZE].effect, "deny");
+
         drop(db);
         let _ = std::fs::remove_file(path);
     }

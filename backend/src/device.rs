@@ -7,12 +7,14 @@ use crate::{
         ClientRecord, DeviceAuthorizationRecord, DeviceAuthorizationStatus, NewDeviceAuthorization,
     },
     error::{AppError, AppResult},
+    html::escape as html_escape,
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
     oidc,
     oidc_client_auth::{ClientAuthFields, ClientAuthForm},
-    redirects, util,
+    redirects,
+    util::{self, url_encode},
 };
 use axum::{
     Form, Json,
@@ -693,18 +695,6 @@ fn page_style() -> &'static str {
     button.secondary { margin-top: 10px; color: #344054; background: #eef2f6; }
     .error { margin: 0 0 14px; padding: 10px 12px; border-radius: 6px; border: 1px solid #fecaca; background: #fff1f2; color: #b42318; }
   </style>"#
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn url_encode(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 #[cfg(test)]

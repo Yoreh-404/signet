@@ -2,6 +2,7 @@ use crate::{
     AppState,
     db::ClientRecord,
     error::{AppError, AppResult},
+    html::escape as html_escape,
     oidc::ResolvedAuthorizeRequest,
 };
 use axum::{
@@ -273,14 +274,6 @@ fn normalized_mode(response_mode: Option<&str>) -> Option<&str> {
     response_mode
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn insert_optional(claims: &mut Map<String, Value>, key: &str, value: Option<&str>) {
