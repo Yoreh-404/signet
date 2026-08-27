@@ -71,6 +71,12 @@
                 "${nativeLightningcssBinding}"
             )
             | del(.packages["node_modules/fsevents"])
+            | .packages |= with_entries(
+                if (.value.resolved? // "") != ""
+                then .value.resolved |= sub("https://registry.npmjs.org/"; "https://registry.npmmirror.com/")
+                else .
+                end
+              )
             | .packages["node_modules/rolldown"].optionalDependencies |=
                 with_entries(select(.key == "${nativeRolldownName}"))
             | .packages["node_modules/lightningcss"].optionalDependencies |=
