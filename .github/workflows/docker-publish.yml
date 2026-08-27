@@ -16,7 +16,7 @@ env:
 
 jobs:
   publish:
-    runs-on: [self-hosted, linux-arm64]
+    runs-on: [self-hosted, arm-nixos]
     steps:
       - uses: actions/checkout@v4
 

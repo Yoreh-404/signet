@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   frontend:
-    runs-on: [self-hosted, linux-arm64]
+    runs-on: [self-hosted, arm-nixos]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -90,7 +90,7 @@ jobs:
           node scripts/browser-smoke.mjs
 
   backend:
-    runs-on: [self-hosted, linux-arm64]
+    runs-on: [self-hosted, arm-nixos]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
