@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, arm-nixos]
+    runs-on: [self-hosted, linux-arm64]
     timeout-minutes: 90
     steps:
       - name: Checkout
