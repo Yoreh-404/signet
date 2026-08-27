@@ -31,4 +31,12 @@ jobs:
         run: sudo -n /run/current-system/sw/bin/opensponge-deploy signet
 
       - name: Verify service readiness
-        run: curl --fail --silent --show-error http://127.0.0.1:18080/api/health/ready
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/api/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
