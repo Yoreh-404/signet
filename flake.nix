@@ -91,7 +91,7 @@
           src = frontendSource;
           nativeBuildInputs = [ pkgs.jq ];
           postPatch = lockPatch;
-          hash = "sha256-qLJHg9aBOml03EnPd+/cD6X0r7kXV+xcMRsQjDR3dKQ=";
+          hash = "sha256-vnl6WHZE2zuJQKFBS8Qtqq23jj4G5ziBivDvX1YeruA=";
         };
 
         frontend = pkgs.buildNpmPackage {
