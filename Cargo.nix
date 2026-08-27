@@ -22,6 +22,7 @@ args@{
   lib,
   workspaceSrc,
   ignoreLockHash,
+  pkgs ? null,
   cargoConfig ? {},
 }:
 let
@@ -34,7 +35,12 @@ let
 in if !lockHashIgnored && (nixifiedLockHash != currentLockHash) then
   throw ("Cargo.nix ${nixifiedLockHash} is out of sync with Cargo.lock ${currentLockHash}")
 else let
-  inherit (rustLib) fetchCratesIo fetchCrateLocal fetchCrateGit fetchCrateAlternativeRegistry expandFeatures decideProfile genDrvsByProfile;
+  inherit (rustLib) fetchCrateLocal fetchCrateGit fetchCrateAlternativeRegistry expandFeatures decideProfile genDrvsByProfile;
+  fetchCratesIo = { name, version, sha256 }: pkgs.fetchurl {
+    name = "${name}-${version}.tar.gz";
+    url = "https://static.crates.io/crates/${name}/${version}/download";
+    inherit sha256;
+  };
   cargoConfig' = if cargoConfig != {} then cargoConfig else
                  if builtins.pathExists ./.cargo/config then lib.importTOML ./.cargo/config else
                  if builtins.pathExists ./.cargo/config.toml then lib.importTOML ./.cargo/config.toml else {};
