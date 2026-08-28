@@ -23,7 +23,7 @@ jobs:
       - name: Build OCI image with local Nix
         run: |
           set -euo pipefail
-          image_path="$(nix build --option http2 false --no-link --print-build-logs --print-out-paths .#image)"
+          image_path="$(nix build --option http2 false --fallback --no-link --print-build-logs --print-out-paths .#image)"
           docker load < "$image_path"
           test "$(docker image inspect signet:local --format '{{.Architecture}}/{{.Os}}')" = arm64/linux
 
