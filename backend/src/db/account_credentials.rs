@@ -7,8 +7,6 @@
 //! the same commit.  Webhook delivery starts only after the transaction has
 //! committed.
 
-use super::*;
-
 use super::{
     AppError, AuditEventRecord, CountRow, DatabaseKind, Db, USER_AUTH_STATE_TABLES,
     UserIdentityCandidate, UserRecord, UserUpdate, blocking, count_user_identity_conflicts_sql, ph,

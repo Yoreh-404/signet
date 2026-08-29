@@ -1,6 +1,4 @@
-use super::*;
-
-use super::{AppError, AppResult, Db, ph};
+use super::{AppError, AppResult, DatabaseKind, Db, blocking, ph};
 use crate::util;
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,

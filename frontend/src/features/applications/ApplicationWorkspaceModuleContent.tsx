@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { lazy, Suspense } from "react";
 
 import type {
   DirtyNavigationController
@@ -13,13 +13,35 @@ import type {
   TenantApplication,
   Locale
 } from "../../types";
-import type { ApplicationRequestGuard } from "./application-request-guard";
-import { ApplicationAuthorizationModule } from "./ApplicationAuthorizationModule";
-import { BillingModule } from "./BillingModule";
-import { IapModule } from "./IapModule";
-import { ApplicationDirectorySyncModule } from "./ApplicationDirectorySyncModule";
-import { ApplicationProtocolsModule } from "./ApplicationProtocolsModule";
-import type { ApplicationWorkspaceCopy } from "./ApplicationWorkspace";
+import type { ApplicationWorkspaceOverviewProjection } from "./use-application-workspace-overview-projection";
+import type { ApplicationWorkspaceCopy } from "./application-workspace-copy";
+
+const ApplicationLoginAdaptersModule = lazy(() =>
+  import("./ApplicationLoginAdaptersModule").then(({ ApplicationLoginAdaptersModule }) => ({
+    default: ApplicationLoginAdaptersModule,
+  })),
+);
+const ApplicationAuthorizationModule = lazy(() =>
+  import("./ApplicationAuthorizationModule").then(({ ApplicationAuthorizationModule }) => ({
+    default: ApplicationAuthorizationModule,
+  })),
+);
+const BillingModule = lazy(() =>
+  import("./BillingModule").then(({ BillingModule }) => ({ default: BillingModule })),
+);
+const IapModule = lazy(() =>
+  import("./IapModule").then(({ IapModule }) => ({ default: IapModule })),
+);
+const ApplicationDirectorySyncModule = lazy(() =>
+  import("./ApplicationDirectorySyncModule").then(({ ApplicationDirectorySyncModule }) => ({
+    default: ApplicationDirectorySyncModule,
+  })),
+);
+const ApplicationProtocolsModule = lazy(() =>
+  import("./ApplicationProtocolsModule").then(({ ApplicationProtocolsModule }) => ({
+    default: ApplicationProtocolsModule,
+  })),
+);
 
 type ApplicationWorkspaceModuleContentProps = {
   section: ApplicationSection;
@@ -30,12 +52,10 @@ type ApplicationWorkspaceModuleContentProps = {
   locale: Locale;
   canManage: boolean;
   copy: ApplicationWorkspaceCopy;
-  requestGuard: ApplicationRequestGuard;
   dirtyNavigation: Pick<DirtyNavigationController, "getSnapshot" | "registerSource">;
-  identityEditor: ReactNode;
+  overviewProjection: ApplicationWorkspaceOverviewProjection;
+  onLoginAdaptersConfigChange: (config: Record<string, unknown> | null) => void;
   onDirtyChange: () => void;
-  onProtocolReadModelChange: (applicationId: string, config: Record<string, unknown> | null) => void;
-  onDirectoryReadModelChange: (applicationId: string, config: Record<string, unknown> | null) => void;
   onApplicationModuleChanged: (applicationId: string, module: ApplicationModule) => void;
   onApplicationOidcClientsChanged?: (applicationId: string, clients: Client[]) => void;
   onRequestConfirmation?: (
@@ -47,9 +67,7 @@ type ApplicationWorkspaceModuleContentProps = {
   hasUnsavedChanges: () => boolean;
   onDiscardChanges: () => void;
   onIapDirtyChange: (dirty: boolean) => void;
-  onIapRulesCountChange: (count: number) => void;
   onBillingDirtyChange: (dirty: boolean) => void;
-  onBillingEnabledChange: (enabled: boolean) => void;
 };
 
 export function ApplicationWorkspaceModuleContent({
@@ -61,12 +79,10 @@ export function ApplicationWorkspaceModuleContent({
   locale,
   canManage,
   copy,
-  requestGuard,
   dirtyNavigation,
-  identityEditor,
+  overviewProjection,
+  onLoginAdaptersConfigChange,
   onDirtyChange,
-  onProtocolReadModelChange,
-  onDirectoryReadModelChange,
   onApplicationModuleChanged,
   onApplicationOidcClientsChanged,
   onRequestConfirmation,
@@ -74,87 +90,104 @@ export function ApplicationWorkspaceModuleContent({
   hasUnsavedChanges,
   onDiscardChanges,
   onIapDirtyChange,
-  onIapRulesCountChange,
-  onBillingDirtyChange,
-  onBillingEnabledChange
+  onBillingDirtyChange
 }: ApplicationWorkspaceModuleContentProps) {
   if (!selected) return null;
 
   if (section === "protocols") {
-    return <ApplicationProtocolsModule
-      key={selected.id}
-      application={selected}
-      canManage={canManage}
-      locale={locale}
-      copy={copy}
-      requestGuard={requestGuard}
-      dirtyNavigation={dirtyNavigation}
-      onDirtyChange={onDirtyChange}
-      onReadModelChange={onProtocolReadModelChange}
-      onApplicationModuleChanged={onApplicationModuleChanged}
-      onApplicationOidcClientsChanged={onApplicationOidcClientsChanged}
-      onRequestConfirmation={onRequestConfirmation}
-    />;
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <ApplicationProtocolsModule
+        key={selected.id}
+        application={selected}
+        canManage={canManage}
+        locale={locale}
+        copy={copy}
+        dirtyNavigation={dirtyNavigation}
+        onDirtyChange={onDirtyChange}
+        onReadModelChange={overviewProjection.updateProtocolReadModel}
+        onApplicationModuleChanged={onApplicationModuleChanged}
+        onApplicationOidcClientsChanged={onApplicationOidcClientsChanged}
+        onRequestConfirmation={onRequestConfirmation}
+      />
+    </Suspense>;
   }
 
-  if (section === "login_adapters") return identityEditor;
+  if (section === "login_adapters") {
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <ApplicationLoginAdaptersModule
+        key={selected.id}
+        application={selected}
+        providers={providers}
+        canManage={canManage}
+        copy={copy}
+        dirtyNavigation={dirtyNavigation}
+        onApplicationModuleChanged={onApplicationModuleChanged}
+        savedMessage={copy.saved}
+        onConfigChange={onLoginAdaptersConfigChange}
+      />
+    </Suspense>;
+  }
 
   if (section === "directory_sync") {
-    return <ApplicationDirectorySyncModule
-      key={selected.id}
-      application={selected}
-      ldapProviders={ldapProviders}
-      locale={locale}
-      canManage={canManage}
-      copy={copy}
-      requestGuard={requestGuard}
-      dirtyNavigation={dirtyNavigation}
-      onDirtyChange={onDirtyChange}
-      onReadModelChange={onDirectoryReadModelChange}
-      onApplicationModuleChanged={onApplicationModuleChanged}
-      onRequestConfirmation={onRequestConfirmation}
-    />;
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <ApplicationDirectorySyncModule
+        key={selected.id}
+        application={selected}
+        ldapProviders={ldapProviders}
+        locale={locale}
+        canManage={canManage}
+        copy={copy}
+        dirtyNavigation={dirtyNavigation}
+        onDirtyChange={onDirtyChange}
+        onReadModelChange={overviewProjection.updateDirectoryReadModel}
+        onApplicationModuleChanged={onApplicationModuleChanged}
+        onRequestConfirmation={onRequestConfirmation}
+      />
+    </Suspense>;
   }
 
   if (section === "authorization") {
-    return <ApplicationAuthorizationModule
-      key={selected.id}
-      application={selected}
-      authorizationConfig={authorizationConfig}
-      canManage={canManage}
-      copy={copy}
-      requestGuard={requestGuard}
-      dirtyNavigation={dirtyNavigation}
-      onApplicationModuleChanged={onApplicationModuleChanged}
-      hasUnsavedChanges={hasUnsavedChanges}
-      onDiscardChanges={onDiscardChanges}
-      onRequestConfirmation={onRequestConfirmation}
-    />;
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <ApplicationAuthorizationModule
+        key={selected.id}
+        application={selected}
+        authorizationConfig={authorizationConfig}
+        canManage={canManage}
+        copy={copy}
+        dirtyNavigation={dirtyNavigation}
+        onApplicationModuleChanged={onApplicationModuleChanged}
+        hasUnsavedChanges={hasUnsavedChanges}
+        onDiscardChanges={onDiscardChanges}
+        onRequestConfirmation={onRequestConfirmation}
+      />
+    </Suspense>;
   }
 
   if (section === "iap") {
-    return <IapModule
-      applicationId={selected.id}
-      organizationId={selected.organization_id}
-      organizationOptions={organizationOptions}
-      canManage={canManage}
-      copy={copy}
-      requestGuard={requestGuard}
-      onDirtyChange={onIapDirtyChange}
-      onRulesCountChange={onIapRulesCountChange}
-      onRequestConfirmation={onRequestConfirmation}
-    />;
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <IapModule
+        applicationId={selected.id}
+        organizationId={selected.organization_id}
+        organizationOptions={organizationOptions}
+        canManage={canManage}
+        copy={copy}
+        onDirtyChange={onIapDirtyChange}
+        onRulesCountChange={overviewProjection.setIapRuleCount}
+        onRequestConfirmation={onRequestConfirmation}
+      />
+    </Suspense>;
   }
 
   if (section === "billing") {
-    return <BillingModule
-      applicationId={selected.id}
-      canManage={canManage}
-      copy={copy}
-      requestGuard={requestGuard}
-      onDirtyChange={onBillingDirtyChange}
-      onEnabledChange={onBillingEnabledChange}
-    />;
+    return <Suspense fallback={<div className="loading-state">Loading…</div>}>
+      <BillingModule
+        applicationId={selected.id}
+        canManage={canManage}
+        copy={copy}
+        onDirtyChange={onBillingDirtyChange}
+        onEnabledChange={overviewProjection.setBillingEnabled}
+      />
+    </Suspense>;
   }
 
   return null;

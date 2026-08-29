@@ -137,18 +137,23 @@ pub async fn authenticate_with_directories_for_application<A: DirectoryAuthentic
     application: Option<&ApplicationRecord>,
     authenticator: &A,
 ) -> AppResult<Option<DirectoryLogin>> {
+    let application_provider_allowlist = if let Some(application) = application {
+        applications::application_directory_provider_allowlist(state, &application.id).await?
+    } else {
+        None
+    };
     for provider in state.db.list_ldap_providers().await? {
         if provider.is_active != 1 || provider.allow_login != 1 {
             continue;
         }
         match application {
             Some(application)
-                if !applications::application_directory_provider_enabled(
-                    state,
-                    &application.id,
-                    &provider.id,
-                )
-                .await? =>
+                if !applications::organization_binding_is_allowed(
+                    &application.organization_id,
+                    provider.organization_id.as_deref(),
+                ) || application_provider_allowlist
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&provider.id)) =>
             {
                 continue;
             }

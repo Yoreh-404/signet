@@ -20,7 +20,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::{collections::HashSet, net::SocketAddr};
 
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
@@ -499,8 +499,9 @@ pub fn normalize_scopes(requested: Option<&str>, supported: &[String]) -> AppRes
     if scopes.is_empty() || !scopes.iter().any(|scope| scope == "openid") {
         return Err(AppError::Oidc("scope must include openid".to_string()));
     }
+    let supported_set = supported.iter().map(String::as_str).collect::<HashSet<_>>();
     for scope in &scopes {
-        if !supported.iter().any(|allowed| allowed == scope) {
+        if !supported_set.contains(scope.as_str()) {
             return Err(AppError::Oidc(format!("unsupported scope: {scope}")));
         }
     }
@@ -598,15 +599,6 @@ mod tests {
         let challenge = sha256_base64url(&verifier);
         assert!(check_pkce(Some(&challenge), Some("S256"), Some(&verifier), true, true,).is_ok());
         assert!(check_pkce(Some(&verifier), Some("plain"), Some(&verifier), true, true,).is_err());
-        assert!(
-            check_pkce(
-                Some(&"short".to_string()),
-                Some("plain"),
-                Some("short"),
-                true,
-                false,
-            )
-            .is_err()
-        );
+        assert!(check_pkce(Some("short"), Some("plain"), Some("short"), true, false,).is_err());
     }
 }

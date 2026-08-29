@@ -460,12 +460,11 @@ async fn validate_redirect_uri(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<_>>();
-    if allowed.is_empty() {
-        if let Some(website_url) =
+    if allowed.is_empty()
+        && let Some(website_url) =
             applications::application_website_url(state, &application.id).await?
-        {
-            allowed.insert(website_url);
-        }
+    {
+        allowed.insert(website_url);
     }
     if !allowed.contains(requested) {
         return Err(AppError::BadRequest(

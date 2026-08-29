@@ -5,8 +5,6 @@
 //! application, lifecycle, and directory module reads together so protocol
 //! handlers do not reopen the same application context one row at a time.
 
-use super::*;
-
 use super::{
     ApplicationClientBindingRecord, ApplicationModuleRecord, ApplicationRecord,
     ApplicationScimTokenRecord, DatabaseKind, Db, blocking, ph,
@@ -40,7 +38,7 @@ impl ScimApplicationContext {
         self.application.is_active == 1
             && self.organization_active
             && self.discovery.as_ref().is_none_or(|discovery| {
-                crate::application_discovery::website_discovery_runtime_active(
+                crate::application_discovery_contract::website_discovery_runtime_active(
                     &discovery.management_mode,
                     discovery.operator_disabled,
                     discovery.last_verified_revision,

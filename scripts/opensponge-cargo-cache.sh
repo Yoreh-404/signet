@@ -65,6 +65,10 @@ opensponge_cargo_cache_init() {
   if [ -z "${CARGO_HOME:-}" ]; then
     export CARGO_HOME="$cache_root/cargo-home"
   fi
+  export CARGO_REGISTRIES_CRATES_IO_PROTOCOL="${CARGO_REGISTRIES_CRATES_IO_PROTOCOL:-sparse}"
+  export CARGO_NET_RETRY="${CARGO_NET_RETRY:-5}"
+  export CARGO_HTTP_TIMEOUT="${CARGO_HTTP_TIMEOUT:-120}"
+  export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
   if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "${OPENSPONGE_DISABLE_SHARED_CARGO_TARGET:-0}" != "1" ]; then
     export CARGO_TARGET_DIR="$cache_root/cargo-target/$cache_variant"
   fi
@@ -83,6 +87,12 @@ opensponge_cargo_cache_init() {
   if [ "${OPENSPONGE_CARGO_CACHE_QUIET:-0}" != "1" ]; then
     printf 'OpenSponge Rust cache: target=%s sccache=%s\n' \
       "${CARGO_TARGET_DIR:-project-default}" "${SCCACHE_DIR:-disabled}"
+  fi
+
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    for variable in CARGO_HOME CARGO_TARGET_DIR SCCACHE_DIR CARGO_REGISTRIES_CRATES_IO_PROTOCOL CARGO_NET_RETRY CARGO_HTTP_TIMEOUT CARGO_HTTP_MULTIPLEXING RUSTC_WRAPPER; do
+      printf '%s=%s\n' "$variable" "${!variable:-}" >> "$GITHUB_ENV"
+    done
   fi
 }
 

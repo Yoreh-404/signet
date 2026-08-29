@@ -1,7 +1,9 @@
-import { APPLICATION_AUTHORIZATION_DIRTY_SOURCE } from "./ApplicationAuthorizationModule";
-import { APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE } from "./ApplicationDirectorySyncModule";
-import { APPLICATION_PROTOCOLS_DIRTY_SOURCE } from "./ApplicationProtocolsModule";
-import { APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE } from "./ApplicationOidcClients";
+import {
+  APPLICATION_AUTHORIZATION_DIRTY_SOURCE,
+  APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE,
+  APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE,
+  APPLICATION_PROTOCOLS_DIRTY_SOURCE,
+} from "./application-workspace-module-contracts";
 import { stableDomainEqual } from "../admin/stable-domain-comparator";
 
 export type ApplicationWorkspaceDrafts = Partial<Record<"login_adapters", Record<string, unknown>>>;

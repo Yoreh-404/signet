@@ -1,10 +1,9 @@
-use super::*;
-
 use super::{
     AppError, AppResult, ClientGrantRecord, ClientGrantWithClientRecord, Db, RefreshTokenInput,
-    RefreshTokenRecord, ph,
+    RefreshTokenRecord, bind_text_list, blocking, ph,
 };
-use crate::util;
+use crate::{config::DatabaseKind, util};
+use diesel::Connection;
 use diesel::{
     OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Nullable, Text},
@@ -201,6 +200,33 @@ impl Db {
                 .bind::<Text, _>(client_id)
                 .get_result::<ClientGrantRecord>(&mut conn)
                 .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_client_grants(
+        &self,
+        user_id: &str,
+        client_ids: &[String],
+    ) -> AppResult<Vec<ClientGrantRecord>> {
+        if client_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let user_id = user_id.to_string();
+        let client_ids = client_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (2..=client_ids.len() + 1)
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE client_id IN ({}) AND user_id = {} AND authorization_profile_id = 'default'",
+                placeholders.as_str(),
+                ph(kind, client_ids.len() + 1),
+            );
+            bind_text_list(&mut conn, sql_query(sql), &client_ids)
+                .bind::<Text, _>(user_id)
+                .load::<ClientGrantRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }

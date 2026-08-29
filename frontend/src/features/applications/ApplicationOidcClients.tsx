@@ -17,8 +17,8 @@ import type {
 } from "./application-request-guard";
 import { useApplicationModuleLifecycle } from "./use-application-module-lifecycle";
 
-export const APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE =
-  "applications.oidc-clients";
+import { APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE } from "./application-workspace-module-contracts";
+export { APPLICATION_OIDC_CLIENTS_DIRTY_SOURCE } from "./application-workspace-module-contracts";
 
 export type ApplicationOidcClientsCopy = {
   oidcClients: string;

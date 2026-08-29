@@ -4,6 +4,7 @@ import { emptyAuthorizationCodeLoginForm, emptyPasswordResetForm, emptyRegisterF
 import type {
   AuthorizationCodeInspection,
   BrowserAccount,
+  BrowserAccountContinuation,
   BrowserAccountsContext,
   AuthMode,
   LoginAuthorizationCodeLevel,
@@ -19,7 +20,6 @@ import type {
   User
 } from "../../types";
 
-export type BrowserAccountContinuation = () => Promise<void>;
 export type InitialAuthContext = ReturnType<typeof initialAuthContext>;
 
 export type AccountControllerOptions = {

@@ -4,9 +4,9 @@
 //! public `Db` methods remain unchanged so callers retain the same account
 //! ownership, single-use, and connection semantics.
 
-use super::*;
-
-use super::{AppError, AppResult, Db, PasskeyRecord, WebauthnChallengeRecord, ph};
+use super::{
+    AppError, AppResult, DatabaseKind, Db, PasskeyRecord, WebauthnChallengeRecord, blocking, ph,
+};
 use crate::util;
 use diesel::{
     OptionalExtension, RunQueryDsl, sql_query,
@@ -18,7 +18,7 @@ fn select_passkey_sql() -> &'static str {
 }
 
 fn select_webauthn_challenge_sql() -> &'static str {
-    "SELECT id, user_id, challenge, kind, expires_at, created_at FROM webauthn_challenges"
+    "SELECT id, user_id, purpose, state_json, expires_at, consumed_at, created_at FROM webauthn_challenges"
 }
 
 impl Db {

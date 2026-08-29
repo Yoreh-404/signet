@@ -1,16 +1,19 @@
 use crate::{
     AppState,
-    access::{Authorizer, Permission},
-    applications,
+    access::Permission,
     audit::{self, AuditSink},
     db::{
-        ApplicationRecord, GroupListFilter, GroupPatchPlan, GroupRecord, NewBulkProvisionedUser,
-        NewUser, ScimApplicationContext, ScimGroupMemberRecord, ScimUserMutationPlan,
-        ScimUserMutationScope, UserListFilter, UserListScope, UserRecord,
+        GroupListFilter, GroupPatchPlan, GroupRecord, NewBulkProvisionedUser, NewUser,
+        ScimGroupMemberRecord, ScimUserMutationPlan, ScimUserMutationScope, UserListFilter,
+        UserListScope, UserRecord,
     },
     error::AppError,
-    security_policy::{self, PasswordPolicy, PasswordSubject},
-    util,
+    security_policy, util,
+};
+#[cfg(test)]
+use crate::{
+    applications,
+    db::{ApplicationRecord, ScimApplicationContext},
 };
 use axum::{
     Json, Router,
@@ -20,14 +23,23 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
-const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
-const LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
+#[path = "scim_auth.rs"]
+mod scim_auth;
+#[path = "scim_protocol.rs"]
+mod scim_protocol;
+use scim_auth::{ScimAccess, ScimPrincipal, ensure_scim_groups_enabled, require_scim_permission};
+#[cfg(test)]
+use scim_auth::{bearer_token, ensure_application_scim_enabled, validate_scim_claims};
+use scim_protocol::{
+    GROUP_SCHEMA, LIST_SCHEMA, ListResponse, ScimEmail, ScimGroup, ScimMember, ScimName, ScimPhone,
+    ScimUserMapper, USER_SCHEMA, ensure_if_match, etag_for_serializable, generated_scim_password,
+    group_members_from_users, group_to_scim_with_members, member_ids, normalize_path,
+};
+
 const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 const SCIM_READ_SCOPE: &str = "scim.read";
 const SCIM_WRITE_SCOPE: &str = "scim.write";
@@ -56,86 +68,6 @@ pub fn routes() -> Router<AppState> {
                 .patch(patch_group)
                 .delete(delete_group),
         )
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScimUser {
-    schemas: Vec<&'static str>,
-    id: String,
-    user_name: String,
-    active: bool,
-    name: ScimName,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-    emails: Vec<ScimEmail>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    phone_numbers: Vec<ScimPhone>,
-    meta: ScimMeta,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScimGroup {
-    schemas: Vec<&'static str>,
-    id: String,
-    display_name: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    members: Vec<ScimMember>,
-    meta: ScimMeta,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ScimMember {
-    value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display: Option<String>,
-    #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
-    ref_: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct ScimName {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    formatted: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ScimEmail {
-    value: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    primary: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ScimPhone {
-    value: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    primary: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScimMeta {
-    resource_type: &'static str,
-    created: String,
-    last_modified: String,
-    location: String,
-    version: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListResponse<T> {
-    schemas: Vec<&'static str>,
-    total_results: usize,
-    start_index: usize,
-    items_per_page: usize,
-    #[serde(rename = "Resources")]
-    resources: Vec<T>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,36 +197,11 @@ struct AuthScheme {
 }
 
 #[derive(Debug)]
-struct ScimPrincipal {
-    user: Option<UserRecord>,
-    client_id: Option<String>,
-    application: Option<ApplicationRecord>,
-    token_id: Option<String>,
-    groups_enabled: bool,
-    organization_id: Option<String>,
-}
-
-#[derive(Debug)]
 struct ScimError {
     status: StatusCode,
     scim_type: Option<&'static str>,
     detail: String,
     www_authenticate: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScimAccess {
-    Read,
-    Write,
-}
-
-impl ScimAccess {
-    fn scope(self) -> &'static str {
-        match self {
-            Self::Read => SCIM_READ_SCOPE,
-            Self::Write => SCIM_WRITE_SCOPE,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -305,110 +212,6 @@ struct ScimErrorBody {
     scim_type: Option<&'static str>,
     detail: String,
     status: String,
-}
-
-trait ScimUserMapper {
-    fn to_scim_user(&self, state: &AppState, headers: &HeaderMap) -> ScimUser;
-}
-
-impl ScimUserMapper for UserRecord {
-    fn to_scim_user(&self, state: &AppState, headers: &HeaderMap) -> ScimUser {
-        let location = format!(
-            "{}/scim/v2/Users/{}",
-            scim_base_url(state, headers),
-            self.id
-        );
-        ScimUser {
-            schemas: vec![USER_SCHEMA],
-            id: self.id.clone(),
-            user_name: self.username.clone(),
-            active: self.is_active == 1 && self.archived_at.is_none(),
-            name: ScimName {
-                formatted: self.display_name.clone(),
-            },
-            display_name: self.display_name.clone(),
-            emails: vec![ScimEmail {
-                value: self.email.clone(),
-                kind: Some("work".to_string()),
-                primary: true,
-            }],
-            phone_numbers: self
-                .phone
-                .clone()
-                .map(|phone| {
-                    vec![ScimPhone {
-                        value: phone,
-                        kind: Some("work".to_string()),
-                        primary: true,
-                    }]
-                })
-                .unwrap_or_default(),
-            meta: ScimMeta {
-                resource_type: "User",
-                created: iso_ts(self.created_at),
-                last_modified: iso_ts(self.updated_at),
-                location,
-                version: self.scim_concurrency_version(),
-            },
-        }
-    }
-}
-
-async fn group_to_scim(
-    state: &AppState,
-    headers: &HeaderMap,
-    group: &GroupRecord,
-    principal: &ScimPrincipal,
-) -> Result<ScimGroup, ScimError> {
-    let members = list_scim_group_members(state, principal, &group.id)
-        .await?
-        .into_iter()
-        .map(|user| ScimGroupMemberRecord {
-            group_id: group.id.clone(),
-            user_id: user.id,
-            username: user.username,
-            display_name: user.display_name,
-        })
-        .collect();
-    Ok(group_to_scim_with_members(state, headers, group, members))
-}
-
-fn group_to_scim_with_members(
-    state: &AppState,
-    headers: &HeaderMap,
-    group: &GroupRecord,
-    members: Vec<ScimGroupMemberRecord>,
-) -> ScimGroup {
-    let location = format!(
-        "{}/scim/v2/Groups/{}",
-        scim_base_url(state, headers),
-        group.id
-    );
-    let members = members
-        .into_iter()
-        .map(|member| ScimMember {
-            ref_: Some(format!(
-                "{}/scim/v2/Users/{}",
-                scim_base_url(state, headers),
-                member.user_id
-            )),
-            display: member.display_name.or(Some(member.username)),
-            value: member.user_id,
-        })
-        .collect();
-    ScimGroup {
-        schemas: vec![GROUP_SCHEMA],
-        id: group.id.clone(),
-        display_name: group.name.clone(),
-        members,
-        meta: ScimMeta {
-            resource_type: "Group",
-            created: iso_ts(group.created_at),
-            last_modified: iso_ts(group.updated_at),
-            location,
-            version: group.version.to_string(),
-        },
-    }
 }
 
 enum ScimUserFilter {
@@ -556,9 +359,10 @@ async fn list_users(
         count,
     )
     .await?;
+    let base_url = scim_base_url(&state, &headers);
     let resources = users
         .iter()
-        .map(|user| user.to_scim_user(&state, &headers))
+        .map(|user| user.to_scim_user(&base_url))
         .collect::<Vec<_>>();
     Ok(scim_json(ListResponse {
         schemas: vec![LIST_SCHEMA],
@@ -576,13 +380,9 @@ async fn get_user(
 ) -> Result<Response, ScimError> {
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersRead, ScimAccess::Read).await?;
-    let user = state
-        .db
-        .find_user_by_id(&id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("user not found"))?;
-    ensure_scim_user_scope(&state, &principal, &user).await?;
-    Ok(scim_json(user.to_scim_user(&state, &headers)))
+    let user = scoped_scim_user(&state, &principal, &id).await?;
+    let base_url = scim_base_url(&state, &headers);
+    Ok(scim_json(user.to_scim_user(&base_url)))
 }
 
 async fn create_user(
@@ -606,7 +406,9 @@ async fn create_user(
         .password
         .clone()
         .unwrap_or_else(generated_scim_password);
-    validate_password_for_subject(&state, &password, &email, &username).await?;
+    security_policy::validate_password_for_subject(&state, &password, &email, &username)
+        .await
+        .map_err(ScimError::from)?;
     let new_user = NewUser {
         email: security_policy::normalize_login_subject(&email),
         username,
@@ -646,7 +448,7 @@ async fn create_user(
     .await?;
     Ok((
         StatusCode::CREATED,
-        scim_json(user.to_scim_user(&state, &headers)),
+        scim_json(user.to_scim_user(&scim_base_url(&state, &headers))),
     )
         .into_response())
 }
@@ -660,11 +462,10 @@ async fn replace_user(
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
             .await?;
-    let current = editable_user(&state, &id).await?;
-    ensure_scim_user_scope(&state, &principal, &current).await?;
+    let current = editable_user(&state, &principal, &id).await?;
     ensure_if_match(
         &headers,
-        &etag_for_serializable(&current.to_scim_user(&state, &headers)),
+        &etag_for_serializable(&current.to_scim_user(&scim_base_url(&state, &headers))),
     )?;
     let expected_version = current.scim_concurrency_version();
     let email = primary_email(&payload)?;
@@ -684,7 +485,9 @@ async fn replace_user(
         .map(ToOwned::to_owned);
     let email = security_policy::normalize_login_subject(&email);
     if let Some(password) = password.as_deref() {
-        validate_password_for_subject(&state, password, &email, &username).await?;
+        security_policy::validate_password_for_subject(&state, password, &email, &username)
+            .await
+            .map_err(ScimError::from)?;
     }
     let user = state
         .db
@@ -706,7 +509,6 @@ async fn replace_user(
             ),
         )
         .await?;
-    ensure_scim_user_scope(&state, &principal, &user).await?;
     audit_scim(
         &state,
         &principal,
@@ -715,7 +517,9 @@ async fn replace_user(
         serde_json::json!({ "email": user.email.clone() }),
     )
     .await?;
-    Ok(scim_json(user.to_scim_user(&state, &headers)))
+    Ok(scim_json(
+        user.to_scim_user(&scim_base_url(&state, &headers)),
+    ))
 }
 
 async fn patch_user(
@@ -727,11 +531,10 @@ async fn patch_user(
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
             .await?;
-    let user = editable_user(&state, &id).await?;
-    ensure_scim_user_scope(&state, &principal, &user).await?;
+    let user = editable_user(&state, &principal, &id).await?;
     ensure_if_match(
         &headers,
-        &etag_for_serializable(&user.to_scim_user(&state, &headers)),
+        &etag_for_serializable(&user.to_scim_user(&scim_base_url(&state, &headers))),
     )?;
     let expected_version = user.scim_concurrency_version();
     let mut draft = ScimUserMutationDraft::from_user(&user);
@@ -739,7 +542,14 @@ async fn patch_user(
         fold_user_patch_operation(&mut draft, operation)?;
     }
     if let Some(password) = draft.password.as_deref() {
-        validate_password_for_subject(&state, password, &draft.email, &draft.username).await?;
+        security_policy::validate_password_for_subject(
+            &state,
+            password,
+            &draft.email,
+            &draft.username,
+        )
+        .await
+        .map_err(ScimError::from)?;
     }
     let user = state
         .db
@@ -764,7 +574,9 @@ async fn patch_user(
         serde_json::json!({ "email": user.email.clone() }),
     )
     .await?;
-    Ok(scim_json(user.to_scim_user(&state, &headers)))
+    Ok(scim_json(
+        user.to_scim_user(&scim_base_url(&state, &headers)),
+    ))
 }
 
 async fn delete_user(
@@ -775,12 +587,7 @@ async fn delete_user(
     let principal =
         require_scim_permission(&state, &headers, Permission::UsersManage, ScimAccess::Write)
             .await?;
-    let user = state
-        .db
-        .find_user_by_id(&id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("user not found"))?;
-    ensure_scim_user_scope(&state, &principal, &user).await?;
+    let user = scoped_scim_user(&state, &principal, &id).await?;
     if user.archived_at.is_some() {
         return Err(ScimError::bad_request(
             "mutability",
@@ -834,6 +641,7 @@ async fn list_groups(
         count,
     )
     .await?;
+    let base_url = scim_base_url(&state, &headers);
     let member_refs = if groups.is_empty() {
         Vec::new()
     } else {
@@ -858,8 +666,7 @@ async fn list_groups(
         .iter()
         .map(|group| {
             group_to_scim_with_members(
-                &state,
-                &headers,
+                &base_url,
                 group,
                 members_by_group.remove(&group.id).unwrap_or_default(),
             )
@@ -891,7 +698,7 @@ async fn get_group(
         .await?
         .ok_or_else(|| ScimError::not_found("group not found"))?;
     Ok(scim_json(
-        group_to_scim(&state, &headers, &group, &principal).await?,
+        scim_group_resource(&state, &headers, &principal, &group).await?,
     ))
 }
 
@@ -933,11 +740,8 @@ async fn create_group(
         serde_json::json!({ "name": group.name.clone() }),
     )
     .await?;
-    Ok((
-        StatusCode::CREATED,
-        scim_json(group_to_scim(&state, &headers, &group, &principal).await?),
-    )
-        .into_response())
+    let resource = scim_group_resource(&state, &headers, &principal, &group).await?;
+    Ok((StatusCode::CREATED, scim_json(resource)).into_response())
 }
 
 async fn replace_group(
@@ -957,16 +761,17 @@ async fn replace_group(
     let existing = find_scim_group(&state, &principal, &id)
         .await?
         .ok_or_else(|| ScimError::not_found("group not found"))?;
-    let current = group_to_scim(&state, &headers, &existing, &principal).await?;
+    let existing_members = list_scim_group_members(&state, &principal, &id).await?;
+    let current = group_to_scim_with_members(
+        &scim_base_url(&state, &headers),
+        &existing,
+        group_members_from_users(&id, existing_members.clone()),
+    );
     ensure_if_match(&headers, &etag_for_serializable(&current))?;
     let member_ids = if let Some(members) = payload.members {
         member_ids(members)
     } else {
-        list_scim_group_members(&state, &principal, &id)
-            .await?
-            .into_iter()
-            .map(|user| user.id)
-            .collect()
+        existing_members.into_iter().map(|user| user.id).collect()
     };
     let group = state
         .db
@@ -981,6 +786,7 @@ async fn replace_group(
         })
         .await
         .map_err(ScimError::from)?;
+    let resource = scim_group_resource(&state, &headers, &principal, &group).await?;
     audit_scim(
         &state,
         &principal,
@@ -989,9 +795,7 @@ async fn replace_group(
         serde_json::json!({ "name": group.name.clone() }),
     )
     .await?;
-    Ok(scim_json(
-        group_to_scim(&state, &headers, &group, &principal).await?,
-    ))
+    Ok(scim_json(resource))
 }
 
 async fn patch_group(
@@ -1012,16 +816,11 @@ async fn patch_group(
         .await?
         .ok_or_else(|| ScimError::not_found("group not found"))?;
     let existing_members = list_scim_group_members(&state, &principal, &id).await?;
-    let current_members = existing_members
-        .iter()
-        .map(|user| ScimGroupMemberRecord {
-            group_id: group.id.clone(),
-            user_id: user.id.clone(),
-            username: user.username.clone(),
-            display_name: user.display_name.clone(),
-        })
-        .collect();
-    let current = group_to_scim_with_members(&state, &headers, &group, current_members);
+    let current = group_to_scim_with_members(
+        &scim_base_url(&state, &headers),
+        &group,
+        group_members_from_users(&id, existing_members.clone()),
+    );
     ensure_if_match(&headers, &etag_for_serializable(&current))?;
     let mut member_ids = existing_members
         .into_iter()
@@ -1043,6 +842,7 @@ async fn patch_group(
         })
         .await
         .map_err(ScimError::from)?;
+    let resource = scim_group_resource(&state, &headers, &principal, &group).await?;
     audit_scim(
         &state,
         &principal,
@@ -1051,9 +851,7 @@ async fn patch_group(
         serde_json::json!({ "name": group.name.clone() }),
     )
     .await?;
-    Ok(scim_json(
-        group_to_scim(&state, &headers, &group, &principal).await?,
-    ))
+    Ok(scim_json(resource))
 }
 
 async fn delete_group(
@@ -1252,307 +1050,30 @@ fn fold_group_patch_operation(
     }
 }
 
-async fn require_scim_permission(
+async fn scoped_scim_user(
     state: &AppState,
-    headers: &HeaderMap,
-    permission: Permission,
-    access: ScimAccess,
-) -> Result<ScimPrincipal, ScimError> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(bearer_token)
-        .ok_or_else(|| ScimError::bearer_invalid("missing bearer token"))?;
-    // `scim_v1_` credentials are opaque application credentials. Never send
-    // an expired/revoked one through the JWT fallback: that fallback would
-    // make an invalid opaque token depend on runtime JWT settings and could
-    // turn a normal authentication failure into a 404/500 response.
-    let is_application_token = token.starts_with("scim_v1_");
-    if let Some(principal) = application_scim_token_principal(state, token, access).await? {
-        return Ok(principal);
+    principal: &ScimPrincipal,
+    id: &str,
+) -> Result<UserRecord, ScimError> {
+    let user = match principal.organization_id.as_deref() {
+        Some(organization_id) => {
+            state
+                .db
+                .find_scim_user_in_scope(id, organization_id)
+                .await?
+        }
+        None => state.db.find_user_by_id(id).await?,
     }
-    if is_application_token {
-        return Err(ScimError::bearer_invalid("invalid application SCIM token"));
-    }
-    let issuers = state.accepted_issuers(headers).await?;
-    let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    // A service-account token may target the application's configured SCIM
-    // audience rather than the platform `/scim/v2` audience. Verify the
-    // signature and issuer first only to discover that application binding;
-    // both branches below perform a second, audience-enforcing verification
-    // before authorizing the request.
-    let bootstrap_claims = state
-        .jwt
-        .verify_access_token_for_generic_bearer(token, &issuer_refs)
-        .map_err(|_| ScimError::bearer_invalid("invalid bearer token"))?;
-    if bootstrap_claims.cnf.is_some() {
-        return Err(ScimError::bearer_invalid(
-            "DPoP-bound tokens require a DPoP-capable resource endpoint",
-        ));
-    }
-    if let Some(principal) =
-        application_scim_principal(state, token, &issuer_refs, &bootstrap_claims, access).await?
-    {
-        return Ok(principal);
-    }
-    let runtime = state.db.runtime_settings().await?;
-    let expected_audience = format!("{}/scim/v2", runtime.public_base_url.trim_end_matches('/'));
-    let audiences = [expected_audience.clone()];
-    let claims = state
-        .jwt
-        .verify_access_token_with_issuers_and_audiences(token, &issuer_refs, &audiences)
-        .map_err(|_| ScimError::bearer_invalid("token audience is not valid for SCIM"))?;
-    validate_scim_claims(&claims, &expected_audience, access)?;
-    let user = state
-        .db
-        .find_user_by_id(&claims.sub)
-        .await?
-        .ok_or_else(|| ScimError::bearer_invalid("subject user not found"))?;
-    if user.is_active != 1 || user.archived_at.is_some() {
-        return Err(ScimError::bearer_invalid("subject user is not active"));
-    }
-    if state
-        .db
-        .find_trial_enrollment_for_user(&user.id)
-        .await?
-        .is_some()
-    {
-        return Err(ScimError::bearer_invalid(
-            "trial enrollment accounts cannot access SCIM",
-        ));
-    }
-    state.db.require_permission(&user, permission).await?;
-    Ok(ScimPrincipal {
-        user: Some(user),
-        client_id: None,
-        application: None,
-        token_id: None,
-        groups_enabled: true,
-        organization_id: None,
-    })
+    .ok_or_else(|| ScimError::not_found("user not found"))?;
+    Ok(user)
 }
 
-/// An application SCIM token is deliberately opaque and has no user subject.
-/// It is looked up before JWT verification so a website can provision users
-/// without creating a global Signet user token or OAuth client credential.
-async fn application_scim_token_principal(
+async fn editable_user(
     state: &AppState,
-    raw_token: &str,
-    access: ScimAccess,
-) -> Result<Option<ScimPrincipal>, ScimError> {
-    let token_hash = util::token_hash(raw_token);
-    let Some(context) = state
-        .db
-        .find_scim_application_token_context(&token_hash)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let config = ensure_application_scim_enabled(&context.application)?;
-    let token = context.token;
-    let application = context.application.application;
-    let scopes: Vec<String> = util::from_json(&token.scopes).map_err(ScimError::from)?;
-    if !scopes.iter().any(|scope| scope == access.scope()) {
-        return Err(ScimError::insufficient_scope(access.scope()));
-    }
-    state.db.touch_application_scim_token(&token_hash).await?;
-    let organization_id = application.organization_id.clone();
-    Ok(Some(ScimPrincipal {
-        user: None,
-        client_id: Some(format!("scim-token:{}", token.id)),
-        application: Some(application),
-        token_id: Some(token.id),
-        groups_enabled: config
-            .get("sync_groups")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        organization_id: Some(organization_id),
-    }))
-}
-
-/// Application SCIM is authenticated with an OAuth client-credentials token,
-/// never with a browser session or a client credential that merely happens to
-/// have a `users.*` permission. The OIDC client must be attached to the
-/// application and the application must explicitly enable SCIM with the
-/// exact configured audience. This keeps a website's directory source from
-/// becoming an ambient global management token.
-async fn application_scim_principal(
-    state: &AppState,
-    raw_token: &str,
-    issuers: &[&str],
-    claims: &crate::jwt::TokenClaims,
-    access: ScimAccess,
-) -> Result<Option<ScimPrincipal>, ScimError> {
-    let expected_subject = format!("service-account:{}", claims.client_id);
-    if claims.sub != expected_subject {
-        return Ok(None);
-    }
-    let Some(context) = state
-        .db
-        .find_scim_service_account_context(&claims.client_id)
-        .await?
-    else {
-        return Err(ScimError::bearer_invalid("SCIM client is not registered"));
-    };
-    if !context.client_active || !context.service_account_enabled {
-        return Err(ScimError::bearer_invalid(
-            "SCIM service account is disabled",
-        ));
-    }
-    if !claims
-        .scope
-        .split_ascii_whitespace()
-        .any(|scope| scope == access.scope())
-    {
-        return Err(ScimError::insufficient_scope(access.scope()));
-    }
-    let application_context = context.application;
-    let application = application_context.application.clone();
-    // SCIM is an application directory capability, not a generic service
-    // account capability. The repository proves ownership and returns the
-    // active binding, but the protocol is still an independent boundary: a
-    // SAML/CAS/JWT client must not become a SCIM principal merely by receiving
-    // client-credentials and users.* permissions.
-    let binding = &context.binding;
-    if binding.application_id != application.id
-        || binding.is_active != 1
-        || binding.protocol != "oidc"
-    {
-        return Err(ScimError::bearer_invalid(
-            "SCIM client is not bound to the OIDC application protocol",
-        ));
-    }
-    let config = ensure_application_scim_enabled(&application_context)?;
-    let expected_audience = config
-        .get("scim_audience")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|audience| !audience.is_empty())
-        .ok_or_else(|| ScimError::bearer_invalid("application SCIM audience is not configured"))?
-        .to_string();
-    let audiences = [expected_audience];
-    // The application and its directory module are resolved before this
-    // check, so a website cannot borrow another website's configured
-    // audience. The JWT layer performs the actual `aud` validation.
-    let claims = state
-        .jwt
-        .verify_access_token_with_issuers_and_audiences(raw_token, issuers, &audiences)
-        .map_err(|_| {
-            ScimError::bearer_invalid(
-                "token audience is not valid for this application SCIM source",
-            )
-        })?;
-    if claims.sub != format!("service-account:{}", claims.client_id) {
-        return Err(ScimError::bearer_invalid(
-            "SCIM service account subject is invalid",
-        ));
-    }
-    let required_permission = match access {
-        ScimAccess::Read => Permission::UsersRead,
-        ScimAccess::Write => Permission::UsersManage,
-    };
-    if !util::from_json::<Vec<String>>(&context.service_account_permissions)
-        .map_err(ScimError::from)?
-        .iter()
-        .any(|permission| permission == required_permission.as_str())
-    {
-        return Err(ScimError::insufficient_scope(required_permission.as_str()));
-    }
-    let organization_id = application.organization_id.clone();
-    Ok(Some(ScimPrincipal {
-        user: None,
-        client_id: Some(context.client_id),
-        application: Some(application),
-        token_id: None,
-        groups_enabled: config
-            .get("sync_groups")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        organization_id: Some(organization_id),
-    }))
-}
-
-fn ensure_scim_groups_enabled(principal: &ScimPrincipal) -> Result<(), ScimError> {
-    if principal.groups_enabled {
-        Ok(())
-    } else {
-        Err(ScimError::new(
-            StatusCode::FORBIDDEN,
-            Some("mutability"),
-            "group synchronization is disabled for this application",
-        ))
-    }
-}
-
-fn ensure_application_scim_enabled(
-    context: &ScimApplicationContext,
-) -> Result<serde_json::Map<String, Value>, ScimError> {
-    if !context.runtime_active() {
-        return Err(ScimError::bearer_invalid("SCIM application is disabled"));
-    }
-    if context.module.is_enabled != 1 {
-        return Err(ScimError::bearer_invalid(
-            "SCIM is not enabled for application",
-        ));
-    };
-    let raw_config =
-        serde_json::from_str::<Value>(&context.module.config_json).map_err(|error| {
-            AppError::Internal(format!("application module config is invalid: {error}"))
-        })?;
-    let config = applications::normalize_module_config("directory_sync", raw_config)
-        .map_err(ScimError::from)?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| {
-            ScimError::from(AppError::Internal(
-                "application module config is not an object".to_string(),
-            ))
-        })?;
-    if config.get("scim_enabled").and_then(Value::as_bool) != Some(true) {
-        return Err(ScimError::bearer_invalid(
-            "SCIM is not enabled for application",
-        ));
-    }
-    Ok(config)
-}
-
-fn validate_scim_claims(
-    claims: &crate::jwt::TokenClaims,
-    expected_audience: &str,
-    access: ScimAccess,
-) -> Result<(), ScimError> {
-    if claims.gpt_sso_login_code_level.is_some() {
-        return Err(ScimError::bearer_invalid(
-            "authorization-code login tokens cannot access SCIM",
-        ));
-    }
-    if claims.aud != expected_audience {
-        return Err(ScimError::bearer_invalid(
-            "token audience is not valid for SCIM",
-        ));
-    }
-    if claims.sub == claims.client_id || claims.sub.starts_with("service-account:") {
-        return Err(ScimError::bearer_invalid(
-            "client credential subjects are not supported by SCIM",
-        ));
-    }
-    let required_scope = access.scope();
-    if !claims
-        .scope
-        .split_ascii_whitespace()
-        .any(|scope| scope == required_scope)
-    {
-        return Err(ScimError::insufficient_scope(required_scope));
-    }
-    Ok(())
-}
-
-async fn editable_user(state: &AppState, id: &str) -> Result<UserRecord, ScimError> {
-    let user = state
-        .db
-        .find_user_by_id(id)
-        .await?
-        .ok_or_else(|| ScimError::not_found("user not found"))?;
+    principal: &ScimPrincipal,
+    id: &str,
+) -> Result<UserRecord, ScimError> {
+    let user = scoped_scim_user(state, principal, id).await?;
     if user.archived_at.is_some() {
         Err(ScimError::bad_request(
             "mutability",
@@ -1582,25 +1103,6 @@ async fn scoped_scim_users_page(
         )
         .await
         .map_err(ScimError::from)
-}
-
-async fn ensure_scim_user_scope(
-    state: &AppState,
-    principal: &ScimPrincipal,
-    user: &UserRecord,
-) -> Result<(), ScimError> {
-    let Some(organization_id) = principal.organization_id.as_deref() else {
-        return Ok(());
-    };
-    if state
-        .db
-        .user_belongs_to_organization(organization_id, &user.id)
-        .await?
-    {
-        Ok(())
-    } else {
-        Err(ScimError::not_found("user not found"))
-    }
 }
 
 fn scim_user_mutation_scope(principal: &ScimPrincipal) -> Option<ScimUserMutationScope> {
@@ -1674,18 +1176,21 @@ async fn list_scim_group_members(
     }
 }
 
-async fn validate_password_for_subject(
+async fn scim_group_resource(
     state: &AppState,
-    password: &str,
-    email: &str,
-    username: &str,
-) -> Result<(), ScimError> {
-    state
-        .db
-        .security_policy()
-        .await?
-        .validate_password(password, PasswordSubject { email, username })
-        .map_err(ScimError::from)
+    headers: &HeaderMap,
+    principal: &ScimPrincipal,
+    group: &GroupRecord,
+) -> Result<ScimGroup, ScimError> {
+    let members = group_members_from_users(
+        &group.id,
+        list_scim_group_members(state, principal, &group.id).await?,
+    );
+    Ok(group_to_scim_with_members(
+        &scim_base_url(state, headers),
+        group,
+        members,
+    ))
 }
 
 async fn audit_scim(
@@ -1892,14 +1397,6 @@ fn patch_members_value(value: &Value) -> Result<Vec<ScimMember>, ScimError> {
     }])
 }
 
-fn member_ids(members: Vec<ScimMember>) -> Vec<String> {
-    members
-        .into_iter()
-        .map(|member| member.value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
 fn json_string(value: &Value, field: &str) -> Result<String, ScimError> {
     value
         .as_str()
@@ -1920,73 +1417,12 @@ fn normalize_required(value: &str, field: &str) -> Result<String, ScimError> {
     }
 }
 
-fn generated_scim_password() -> String {
-    format!("Scim-{}9!", util::random_token(24))
-}
-
-fn normalize_path(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches('"')
-        .split('[')
-        .next()
-        .unwrap_or(value)
-        .to_ascii_lowercase()
-}
-
-fn bearer_token(value: &str) -> Option<&str> {
-    let mut parts = value.split_ascii_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() {
-        return None;
-    }
-    Some(token)
-}
-
 fn scim_base_url(state: &AppState, headers: &HeaderMap) -> String {
     util::external_base_url(
         &state.settings,
         headers,
         &state.settings.server.public_base_url,
     )
-}
-
-fn iso_ts(value: i64) -> String {
-    DateTime::<Utc>::from_timestamp(value, 0)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .to_rfc3339()
-}
-
-fn etag_for_serializable<T: Serialize>(value: &T) -> String {
-    let body = serde_json::to_vec(value).unwrap_or_default();
-    format!(
-        "\"{}\"",
-        util::sha256_base64url(&String::from_utf8_lossy(&body))
-    )
-}
-
-/// SCIM writes use the representation ETag returned by the preceding GET.
-/// Missing If-Match remains compatible with older provisioning clients; the
-/// database CAS still protects the request-start snapshot in that case.
-fn ensure_if_match(headers: &HeaderMap, current_etag: &str) -> Result<(), ScimError> {
-    let Some(raw) = headers.get(header::IF_MATCH) else {
-        return Ok(());
-    };
-    let value = raw
-        .to_str()
-        .map_err(|_| ScimError::bad_request("invalidValue", "If-Match is not valid ASCII"))?;
-    if value
-        .split(',')
-        .map(str::trim)
-        .any(|candidate| candidate == "*" || candidate == current_etag)
-    {
-        Ok(())
-    } else {
-        Err(ScimError::conflict(
-            "the SCIM resource changed; refetch it and retry with its current ETag",
-        ))
-    }
 }
 
 fn scim_json<T: Serialize>(value: T) -> Response {

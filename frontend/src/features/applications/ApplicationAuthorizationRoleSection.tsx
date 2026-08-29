@@ -1,25 +1,21 @@
 import { ArrowRight, Pencil, Plus, Trash2 } from "lucide-react";
+import { useMemo } from "react";
 import type {
   ApplicationPermissionDefinition,
   ApplicationProfileRole,
 } from "../../lib/api/application-authorization";
-import type { ApplicationAuthorizationCopy } from "./ApplicationAuthorizationModule";
+import type { ApplicationAuthorizationCopy } from "./application-authorization-copy";
+import {
+  normalizedPermissionList,
+  type ApplicationRoleDraft,
+} from "./application-authorization-role-policy";
 import {
   PermissionDefinitionDetails,
   PermissionTree,
 } from "./ApplicationPermissionTree";
 import { Input, Toggle } from "./components/ApplicationModulePrimitives";
 
-export type ApplicationRoleDraft = {
-  id: string | null;
-  role_key: string;
-  name: string;
-  description: string;
-  permissions: string[];
-  is_default: boolean;
-  is_active: boolean;
-  source: string;
-};
+export type { ApplicationRoleDraft } from "./application-authorization-role-policy";
 
 type ApplicationAuthorizationRoleSectionProps = {
   canManage: boolean;
@@ -37,7 +33,6 @@ type ApplicationAuthorizationRoleSectionProps = {
   onTogglePermission: (permission: string) => void;
   onClearRole: () => void;
   onSaveRole: () => void;
-  normalizedPermissionList: (values: string[]) => string[];
 };
 
 export function ApplicationAuthorizationRoleSection({
@@ -56,8 +51,12 @@ export function ApplicationAuthorizationRoleSection({
   onTogglePermission,
   onClearRole,
   onSaveRole,
-  normalizedPermissionList,
 }: ApplicationAuthorizationRoleSectionProps) {
+  const knownPermissionKeys = useMemo(
+    () => new Set(applicationPermissionCatalog.map((item) => item.key)),
+    [applicationPermissionCatalog],
+  );
+
   return (
     <>
       <div className="subsection-heading">
@@ -224,9 +223,7 @@ export function ApplicationAuthorizationRoleSection({
               onUpdateRole({
                 permissions: normalizedPermissionList([
                   ...roleDraft.permissions.filter((permission) =>
-                    applicationPermissionCatalog.some(
-                      (item) => item.key === permission,
-                    ),
+                    knownPermissionKeys.has(permission),
                   ),
                   ...value.split(/\r?\n/),
                 ]),

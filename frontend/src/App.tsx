@@ -52,6 +52,7 @@ import {
   LoginMethodSwitcher
 } from "./components/LoginMethod";
 import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
+import { useBrowserAccountFlow } from "./features/auth/use-browser-account-flow";
 import {
   EnterpriseAuthWorkspace
 } from "./features/auth/EnterpriseAuthWorkspace";
@@ -150,7 +151,6 @@ import { initialNavigation, initialTheme } from "./lib/navigation";
 import {
   browserAccountShortName,
   formatDiagnosticValue,
-  inlineAccountLoginFlow,
   matchesHttpUrl
 } from "./app-helpers";
 import {
@@ -165,8 +165,6 @@ import type {
   ApplicationModule,
   AuditEvent,
   AuditWebhook,
-  BrowserAccount,
-  BrowserAccountsContext,
   AuthorizationCodeInspection,
   AuthMode,
   BulkUserImportResult,
@@ -218,7 +216,6 @@ const WalletWorkspace = lazy(() =>
 type UserRoleFilter = "all" | "admin" | "user";
 type UserLoginRegionFilter = "all" | "domestic" | "overseas";
 type UserLinkedIdentityFilter = "all" | "linked" | "unlinked";
-type BrowserAccountContinuation = () => Promise<void>;
 type EnterpriseFormState = {
   slug: string;
   name: string;
@@ -571,6 +568,11 @@ export function App() {
   );
   const effectiveAccountFlow = accountLoginFlow ?? initialAuth.accountFlow;
   const authFormsVisible = accountLoginExpanded || !selectedBrowserAccount;
+  const adminPermissions = deriveAdminPermissions({
+    permissions: userPermissions,
+    organization: organizationContext,
+    restrictedLoginCodeSession: isRestrictedLoginCodeSession
+  });
   const {
     hasGlobalConsolePermission,
     canAdmin,
@@ -585,11 +587,7 @@ export function App() {
     canManageProviders,
     canReadAudit,
     canManageSecurity
-  } = deriveAdminPermissions({
-    permissions: userPermissions,
-    organization: organizationContext,
-    restrictedLoginCodeSession: isRestrictedLoginCodeSession
-  });
+  } = adminPermissions;
 
   const {
     overview,
@@ -650,17 +648,7 @@ export function App() {
     session: session.controller,
     scopeKey: cacheScope,
     onLoginSettingsLoaded: setLoginSettingsDraft,
-    canAdmin,
-    canReadUsers,
-    canManageActiveOrganization,
-    canReadOrganizations,
-    canManageOrganizations,
-    canManageAuthorizationCodes,
-    canManageSettings,
-    canManagePlatformProviders,
-    canManageProviders,
-    canManageSecurity,
-    canReadAudit
+    permissions: adminPermissions
   });
 
   const userDirectoryFilterKey = useMemo(() => JSON.stringify({
@@ -764,91 +752,39 @@ export function App() {
 
   const adminViewLoading = adminLoading || userDirectory.loading;
 
-  function setSharedAuthEmail(value: string) {
-    setAuthEmail(value);
-  }
-
-  function selectBrowserAccount(
-    account: BrowserAccount,
-    continuation: BrowserAccountContinuation
-  ) {
-    if (accountLoginFlow) {
-      const currentUrl = new URL(window.location.href);
-      currentUrl.searchParams.delete("account_flow");
-      window.history.replaceState(
-        window.history.state,
-        "",
-        `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`
-      );
-      setAccountLoginFlow(null);
-    }
-    setSelectedBrowserAccount(account);
-    setContinueWithBrowserAccount(() => continuation);
-    setAccountLoginExpanded(false);
-    setError("");
-    setVerificationMessage("");
-  }
-
-  function handleBrowserAccountsLoaded(
-    accounts: BrowserAccount[],
-    context: BrowserAccountsContext,
-    continuationForAccount?: (accountRef: string) => Promise<void>
-  ) {
-    setBrowserAccountsContext(context);
-    if (accounts.length === 0) {
-      setSelectedBrowserAccount(null);
-      setContinueWithBrowserAccount(null);
-      return;
-    }
-    if (accountLoginExpanded) return;
-    const next = accounts.find((account) => account.account_ref === selectedBrowserAccount?.account_ref)
-      ?? accounts[0];
-    setSelectedBrowserAccount(next);
-    if (continuationForAccount) {
-      setContinueWithBrowserAccount(() => () => continuationForAccount(next.account_ref));
-    }
-  }
-
-  async function continueSelectedBrowserAccount() {
-    if (!continueWithBrowserAccount) return;
-    setBrowserAccountContinuing(true);
-    setError("");
-    try {
-      await continueWithBrowserAccount();
-    } finally {
-      setBrowserAccountContinuing(false);
-    }
-  }
-
-  function openAnotherAccountLogin(loginUrl: string) {
-    const accountFlow = inlineAccountLoginFlow(loginUrl, authReturnTo ?? "/");
-    if (!accountFlow) {
-      throw new Error(t("browserAccountAddFailed"));
-    }
-    const currentUrl = new URL(window.location.href);
-    currentUrl.searchParams.set("account_flow", accountFlow);
-    window.history.replaceState(
-      window.history.state,
-      "",
-      `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`
-    );
-    setAccountLoginFlow(accountFlow);
-    setAccountLoginExpanded(true);
-    setSelectedBrowserAccount(null);
-    setContinueWithBrowserAccount(null);
-    setAuthMode("login");
-    setLoginMethod("password");
-    setLoginPassword("");
-    setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
-    setLoginMfaChallengeId("");
-    setLoginMfaCode("");
-    setLoginRecoveryAvailable(false);
-    setLoginCaptchaChallengeId("");
-    setLoginCaptchaPrompt("");
-    setLoginCaptchaAnswer("");
-    setError("");
-    setVerificationMessage("");
-  }
+  const {
+    setSharedAuthEmail,
+    selectBrowserAccount,
+    handleBrowserAccountsLoaded,
+    continueSelectedBrowserAccount,
+    openAnotherAccountLogin,
+  } = useBrowserAccountFlow({
+    accountLoginFlow,
+    accountLoginExpanded,
+    authReturnTo,
+    selectedBrowserAccount,
+    continueWithBrowserAccount,
+    setAccountLoginFlow,
+    setAccountLoginExpanded,
+    setSelectedBrowserAccount,
+    setContinueWithBrowserAccount,
+    setBrowserAccountsContext,
+    setBrowserAccountContinuing,
+    setAuthMode,
+    setLoginMethod,
+    setLoginPassword,
+    setAuthorizationCodeLoginForm,
+    setLoginMfaChallengeId,
+    setLoginMfaCode,
+    setLoginRecoveryAvailable,
+    setLoginCaptchaChallengeId,
+    setLoginCaptchaPrompt,
+    setLoginCaptchaAnswer,
+    setAuthEmail,
+    setError,
+    setVerificationMessage,
+    t,
+  });
 
   function finishInteractiveAuth(nextUser: User): boolean {
     // Session ownership lives in the controller. Loading the organization

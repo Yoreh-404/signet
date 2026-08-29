@@ -5,17 +5,15 @@ use crate::{
     config::VerificationChannelSettings,
     db::{
         AdminLoginCodeRedemptionInput, ApplicationRecord, AuthorizationCodeType,
-        ExternalOidcProviderRecord, InvitationRecord, LoginCodeLevel, NewTrialEnrollmentUser,
-        NewUser, NewVerificationCode, PublicExternalOidcProvider, PublicLoginSettings,
+        ExternalOidcProviderRecord, InvitationRecord, LoginCodeLevel, NewRuntimeSettings,
+        NewTrialEnrollmentUser, NewUser, NewVerificationCode, PublicLoginSettings,
         PublicRegistrationSettings, VerificationCodeClaim,
     },
     domain_discovery::EmailDomainRoutable,
     error::{AppError, AppResult},
     identity_sources,
     network_policy::TrustedNetworkPolicy,
-    redirects,
-    security_policy::{PasswordPolicy, PasswordSubject},
-    util, verification,
+    redirects, security_policy, util, verification,
 };
 use axum::{
     Json, Router,
@@ -31,6 +29,14 @@ use serde_json::Value;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 use url::Url;
+
+use crate::registration_values::{
+    external_subject_email_local_part, first_nonempty_code,
+    normalize_authorization_code_login_email, normalize_email, normalize_external_issuer,
+    normalize_optional, optional_login_hint, optional_register_email,
+    register_username_or_email_local, required_register_email, required_register_password,
+    unique_username,
+};
 
 const REGISTRATION_VERIFICATION_PURPOSE: &str = "registration";
 const PASSWORD_RESET_VERIFICATION_PURPOSE: &str = "password_reset";
@@ -121,10 +127,7 @@ async fn bootstrap(
         {
             continue;
         }
-        if !external_oidc_provider_is_available_to_organization(
-            &provider,
-            target_organization_id.as_deref(),
-        ) {
+        if !external_oidc_provider_is_available_to_organization(&provider, target_organization_id) {
             continue;
         }
         let allow_login = external_oidc_login_available(has_users, provider.allow_login == 1);
@@ -354,13 +357,13 @@ async fn complete_password_reset(
             "password reset is not available for this account".to_string(),
         ));
     }
-    state.db.security_policy().await?.validate_password(
+    security_policy::validate_password_for_subject(
+        &state,
         &payload.password,
-        PasswordSubject {
-            email: &user.email,
-            username: &user.username,
-        },
-    )?;
+        &user.email,
+        &user.username,
+    )
+    .await?;
     let ip_address = state.request_ip(&headers, Some(remote_addr)).await?;
     state
         .db
@@ -714,13 +717,7 @@ async fn register(
     auth::assert_registration_allowed(&state, Some(&email), request_ip.as_deref()).await?;
     let username = register_username_or_email_local(&payload.username, &email);
     let password = required_register_password(&payload.password)?;
-    state.db.security_policy().await?.validate_password(
-        password,
-        PasswordSubject {
-            email: &email,
-            username: &username,
-        },
-    )?;
+    security_policy::validate_password_for_subject(&state, password, &email, &username).await?;
     let phone = normalize_optional(&payload.phone);
     let mut verification_claims = Vec::new();
     if registration.require_email_verification && !first_user {
@@ -772,6 +769,17 @@ async fn register(
             verification_claims,
         )
         .await?;
+    if first_user && let Some(origin) = crate::csrf::normalized_origin(&headers) {
+        let runtime = state.db.runtime_settings().await?;
+        state
+            .db
+            .upsert_runtime_settings(NewRuntimeSettings {
+                public_base_url: origin.clone(),
+                issuer: origin,
+                trust_proxy_headers: runtime.trust_proxy_headers == 1,
+            })
+            .await?;
+    }
     let jar = auth::issue_session_with_login_event(
         &state,
         jar,
@@ -853,13 +861,7 @@ async fn register_with_registration_authorization_code(
         None => register_username_or_email_local(&payload.username, &email),
     };
     let password = required_register_password(&payload.password)?;
-    state.db.security_policy().await?.validate_password(
-        password,
-        PasswordSubject {
-            email: &email,
-            username: &username,
-        },
-    )?;
+    security_policy::validate_password_for_subject(&state, password, &email, &username).await?;
     let password_hash = util::hash_password(password)?;
     let phone = normalize_optional(&payload.phone);
     let mut verification_claims = Vec::new();
@@ -1822,83 +1824,6 @@ fn verification_channel<'a>(
     }
 }
 
-fn normalize_email(value: &str) -> AppResult<String> {
-    let email = value.trim().to_ascii_lowercase();
-    if !email.contains('@') {
-        return Err(AppError::BadRequest("email is invalid".to_string()));
-    }
-    Ok(email)
-}
-
-fn required_register_email(value: &Option<String>) -> AppResult<String> {
-    optional_register_email(value)?
-        .ok_or_else(|| AppError::BadRequest("email is required".to_string()))
-}
-
-fn optional_register_email(value: &Option<String>) -> AppResult<Option<String>> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(normalize_email)
-        .transpose()
-}
-
-fn register_username_or_email_local(value: &Option<String>, email: &str) -> String {
-    normalize_optional(value).unwrap_or_else(|| {
-        email
-            .split('@')
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("user")
-            .to_string()
-    })
-}
-
-fn first_nonempty_code(left: &Option<String>, right: &Option<String>) -> Option<String> {
-    [left.as_deref(), right.as_deref()]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn required_register_password(value: &Option<String>) -> AppResult<&str> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest("password is required".to_string()))
-}
-
-fn normalize_authorization_code_login_email(value: &str) -> AppResult<String> {
-    let email = value.trim();
-    if email.is_empty() || email.len() > 320 || email.chars().any(|ch| ch.is_control()) {
-        return Err(AppError::Unauthorized);
-    }
-    normalize_email(email).map_err(|_| AppError::Unauthorized)
-}
-
-fn normalize_optional(value: &Option<String>) -> Option<String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn optional_login_hint(value: &Option<String>) -> AppResult<Option<String>> {
-    let Some(value) = normalize_optional(value) else {
-        return Ok(None);
-    };
-    if value.len() > 320 || value.contains(['\r', '\n']) {
-        return Err(AppError::BadRequest("login_hint is invalid".to_string()));
-    }
-    Ok(Some(value))
-}
-
 fn provider_scopes(provider: &ExternalOidcProviderRecord) -> AppResult<String> {
     Ok(util::from_json::<Vec<String>>(&provider.scopes)?.join(" "))
 }
@@ -2080,20 +2005,6 @@ async fn verify_external_id_token(
     Ok(ExternalIdTokenClaims { sub })
 }
 
-fn normalize_external_issuer(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
-}
-
-fn unique_username(preferred: &str, sub: &str) -> String {
-    let base = if preferred.trim().is_empty() {
-        "external-user".to_string()
-    } else {
-        preferred.trim().to_ascii_lowercase()
-    };
-    let suffix = util::token_hash(sub).chars().take(8).collect::<String>();
-    format!("{base}-{suffix}")
-}
-
 #[cfg(test)]
 fn external_oidc_email(
     claims: &serde_json::Value,
@@ -2143,31 +2054,6 @@ fn external_oidc_email_with_verification(
         ),
         false,
     ))
-}
-
-fn external_subject_email_local_part(external_subject: &str) -> String {
-    let base = external_subject
-        .trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '-' | '_' | '.'))
-        .map(|ch| ch.to_ascii_lowercase())
-        .take(32)
-        .collect::<String>();
-    let base = if base.is_empty() {
-        "external-user".to_string()
-    } else {
-        base
-    };
-    let suffix = util::token_hash(external_subject)
-        .chars()
-        .take(8)
-        .collect::<String>();
-    format!("{base}-{suffix}")
-}
-
-#[allow(dead_code)]
-fn public_provider(provider: ExternalOidcProviderRecord) -> AppResult<PublicExternalOidcProvider> {
-    provider.public()
 }
 
 #[cfg(test)]

@@ -118,15 +118,15 @@ pub async fn protocol(State(state): State<AppState>, request: Request, next: Nex
 
     let receipt = match state
         .db
-        .claim_mutation_receipt_with_owner(
-            &dedupe_hash,
-            &scope_key,
-            &method,
-            &uri,
-            &idempotency_key,
-            &request_hash,
-            &owner_token,
-        )
+        .claim_mutation_receipt_with_owner(crate::db::MutationReceiptClaim {
+            dedupe_hash: &dedupe_hash,
+            scope_key: &scope_key,
+            method: &method,
+            path: &uri,
+            idempotency_key: &idempotency_key,
+            request_hash: &request_hash,
+            owner_token: &owner_token,
+        })
         .await
     {
         Ok(receipt) => receipt,
@@ -160,15 +160,15 @@ pub async fn protocol(State(state): State<AppState>, request: Request, next: Nex
             tracing::error!(mutation_id = %mutation_id, error = %error, "failed to buffer mutation response");
             let _ = state
                 .db
-                .finalize_mutation_receipt(
-                    &mutation_id,
-                    &owner_token,
-                    STATUS_UNKNOWN,
-                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
-                    None,
-                    None,
-                    Some("response_buffer_failed"),
-                )
+                .finalize_mutation_receipt(crate::db::MutationReceiptFinalization {
+                    id: &mutation_id,
+                    owner_token: &owner_token,
+                    status: STATUS_UNKNOWN,
+                    response_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
+                    response_body: None,
+                    response_content_type: None,
+                    error_code: Some("response_buffer_failed"),
+                })
                 .await;
             return protocol_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -221,15 +221,15 @@ pub async fn protocol(State(state): State<AppState>, request: Request, next: Nex
 
     let finalize_result = state
         .db
-        .finalize_mutation_receipt(
-            &mutation_id,
-            &owner_token,
-            outcome,
-            status.as_u16() as i32,
-            stored_body,
-            content_type,
-            error_code.as_deref(),
-        )
+        .finalize_mutation_receipt(crate::db::MutationReceiptFinalization {
+            id: &mutation_id,
+            owner_token: &owner_token,
+            status: outcome,
+            response_status: status.as_u16() as i32,
+            response_body: stored_body,
+            response_content_type: content_type,
+            error_code: error_code.as_deref(),
+        })
         .await;
     match finalize_result {
         Ok(true) => {}
@@ -318,10 +318,10 @@ fn replay_or_status(receipt: MutationReceiptRecord) -> Response {
                 .and_then(|value| StatusCode::from_u16(value as u16).ok())
                 .unwrap_or(StatusCode::OK);
             let (mut parts, body) = (status, Body::from(body)).into_response().into_parts();
-            if let Some(content_type) = receipt.response_content_type {
-                if let Ok(value) = HeaderValue::from_str(&content_type) {
-                    parts.headers.insert(CONTENT_TYPE, value);
-                }
+            if let Some(content_type) = receipt.response_content_type
+                && let Ok(value) = HeaderValue::from_str(&content_type)
+            {
+                parts.headers.insert(CONTENT_TYPE, value);
             }
             response_with_protocol_headers(parts, body, &receipt.id, &receipt.status, true)
         }

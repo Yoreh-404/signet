@@ -184,32 +184,20 @@ impl Fixture {
             .await
             .unwrap();
         assert_ne!(app_default.id, app_user.id);
-        replace_profile_bindings(
-            &db,
-            &application.id,
-            &application_profile.id,
-            Some(&a_user.id),
-            Some(&group.id),
-            vec![app_user.id.clone()],
-            vec![("a.override".to_string(), "allow".to_string())],
-            vec![app_group.id.clone()],
-            BTreeMap::from([("admin".to_string(), vec![app_org.id.clone()])]),
-        )
-        .await;
-        replace_profile_bindings(
-            &db,
-            &application.id,
-            &application_profile.id,
-            Some(&b_user.id),
-            None,
-            vec![app_user.id.clone()],
-            vec![
-                ("b.override".to_string(), "allow".to_string()),
-                ("public.read".to_string(), "deny".to_string()),
-            ],
-            Vec::new(),
-            BTreeMap::new(),
-        )
+        replace_profile_bindings(ProfileBindingInput {
+            db: &db,
+            application_id: &application.id,
+            profile_id: &application_profile.id,
+            user_id: Some(&a_user.id),
+            group_id: Some(&group.id),
+            user_role_ids: vec![app_user.id.clone()],
+            user_permission_overrides: vec![("a.override".to_string(), "allow".to_string())],
+            group_role_ids: vec![app_group.id.clone()],
+            organization_role_bindings: BTreeMap::from([(
+                "admin".to_string(),
+                vec![app_org.id.clone()],
+            )]),
+        })
         .await;
 
         let profile = db
@@ -285,17 +273,20 @@ impl Fixture {
             .await
             .unwrap();
         assert_eq!(profile_default.role_key, "profile-default");
-        replace_profile_bindings(
-            &db,
-            &application.id,
-            &profile.id,
-            Some(&a_user.id),
-            Some(&group.id),
-            vec![profile_user.id.clone()],
-            vec![("profile.override".to_string(), "allow".to_string())],
-            vec![profile_group.id.clone()],
-            BTreeMap::from([("admin".to_string(), vec![profile_org.id.clone()])]),
-        )
+        replace_profile_bindings(ProfileBindingInput {
+            db: &db,
+            application_id: &application.id,
+            profile_id: &profile.id,
+            user_id: Some(&a_user.id),
+            group_id: Some(&group.id),
+            user_role_ids: vec![profile_user.id.clone()],
+            user_permission_overrides: vec![("profile.override".to_string(), "allow".to_string())],
+            group_role_ids: vec![profile_group.id.clone()],
+            organization_role_bindings: BTreeMap::from([(
+                "admin".to_string(),
+                vec![profile_org.id.clone()],
+            )]),
+        })
         .await;
 
         let legacy_application =
@@ -345,17 +336,20 @@ impl Fixture {
             })
             .await
             .unwrap();
-        replace_profile_bindings(
-            &db,
-            &legacy_application.id,
-            &legacy_profile.id,
-            None,
-            Some(&group.id),
-            Vec::new(),
-            Vec::new(),
-            vec![legacy_group_role.id],
-            BTreeMap::from([("admin".to_string(), vec![legacy_org_role.id])]),
-        )
+        replace_profile_bindings(ProfileBindingInput {
+            db: &db,
+            application_id: &legacy_application.id,
+            profile_id: &legacy_profile.id,
+            user_id: None,
+            group_id: Some(&group.id),
+            user_role_ids: Vec::new(),
+            user_permission_overrides: Vec::new(),
+            group_role_ids: vec![legacy_group_role.id],
+            organization_role_bindings: BTreeMap::from([(
+                "admin".to_string(),
+                vec![legacy_org_role.id],
+            )]),
+        })
         .await;
 
         let (_, session_token) = db
@@ -463,46 +457,51 @@ async fn insert_application(db: &Db, organization_id: &str, slug: &str) -> Appli
     .unwrap()
 }
 
-async fn replace_profile_bindings(
-    db: &Db,
-    application_id: &str,
-    profile_id: &str,
-    user_id: Option<&str>,
-    group_id: Option<&str>,
+struct ProfileBindingInput<'a> {
+    db: &'a Db,
+    application_id: &'a str,
+    profile_id: &'a str,
+    user_id: Option<&'a str>,
+    group_id: Option<&'a str>,
     user_role_ids: Vec<String>,
     user_permission_overrides: Vec<(String, String)>,
     group_role_ids: Vec<String>,
     organization_role_bindings: BTreeMap<String, Vec<String>>,
-) {
-    db.replace_application_authorization_bindings_with_audit(
-        application_id,
-        profile_id,
-        AuthorizationBindingsUpdate {
-            user_id: user_id.map(ToOwned::to_owned),
-            group_id: group_id.map(ToOwned::to_owned),
-            user_role_ids,
-            user_permission_overrides: user_permission_overrides
-                .into_iter()
-                .map(
-                    |(permission, effect)| AuthorizationBindingPermissionOverride {
-                        permission,
-                        effect,
-                    },
-                )
-                .collect(),
-            group_role_ids,
-            organization_role_bindings,
-        },
-        audit::management_event(
-            "authorization-entitlements-test",
-            "application.authorization_profile.bindings.update",
-            "application_authorization_profile",
-            Some(profile_id.to_string()),
-            serde_json::json!({}),
-        ),
-    )
-    .await
-    .unwrap();
+}
+
+async fn replace_profile_bindings(input: ProfileBindingInput<'_>) {
+    input
+        .db
+        .replace_application_authorization_bindings_with_audit(
+            input.application_id,
+            input.profile_id,
+            AuthorizationBindingsUpdate {
+                user_id: input.user_id.map(ToOwned::to_owned),
+                group_id: input.group_id.map(ToOwned::to_owned),
+                user_role_ids: input.user_role_ids,
+                user_permission_overrides: input
+                    .user_permission_overrides
+                    .into_iter()
+                    .map(
+                        |(permission, effect)| AuthorizationBindingPermissionOverride {
+                            permission,
+                            effect,
+                        },
+                    )
+                    .collect(),
+                group_role_ids: input.group_role_ids,
+                organization_role_bindings: input.organization_role_bindings,
+            },
+            audit::management_event(
+                "authorization-entitlements-test",
+                "application.authorization_profile.bindings.update",
+                "application_authorization_profile",
+                Some(input.profile_id.to_string()),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .unwrap();
 }
 
 fn assert_missing(values: &[String], forbidden: &[&str]) {
@@ -820,17 +819,20 @@ async fn profile_entitlements_keep_public_defaults_and_scope_assignments() {
     // Removing a profile group assignment deactivates its mapping row. The
     // batched resolver must not resurrect that historical row on the next
     // authorization calculation.
-    replace_profile_bindings(
-        &fixture.db,
-        &fixture.application.id,
-        &fixture.profile.id,
-        Some(&fixture.a_user.id),
-        Some(&fixture.group.id),
-        vec!["profile-user-role".to_string()],
-        vec![("profile.override".to_string(), "allow".to_string())],
-        Vec::new(),
-        BTreeMap::from([("admin".to_string(), vec!["profile-org-role".to_string()])]),
-    )
+    replace_profile_bindings(ProfileBindingInput {
+        db: &fixture.db,
+        application_id: &fixture.application.id,
+        profile_id: &fixture.profile.id,
+        user_id: Some(&fixture.a_user.id),
+        group_id: Some(&fixture.group.id),
+        user_role_ids: vec!["profile-user-role".to_string()],
+        user_permission_overrides: vec![("profile.override".to_string(), "allow".to_string())],
+        group_role_ids: Vec::new(),
+        organization_role_bindings: BTreeMap::from([(
+            "admin".to_string(),
+            vec!["profile-org-role".to_string()],
+        )]),
+    })
     .await;
     let after_group_removal = authorization::resolve_entitlements_for_profile(
         &fixture.state,

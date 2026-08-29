@@ -36,43 +36,13 @@ use url::{Host, Url};
 
 pub const FORMAT: &str = crate::application_contract::FORMAT;
 pub const DISCOVERY_PATH: &str = "/.well-known/signet-authorization.json";
-pub const MANAGEMENT_MODE_SIGNET: &str = "signet_managed";
-pub const MANAGEMENT_MODE_WEBSITE: &str = "website_managed";
-pub const SOURCE_WEBSITE: &str = "website_manifest";
-pub const SOURCE_MANUAL: &str = "manual";
-pub const SOURCE_MODE_MANUAL: &str = "manual";
-pub const SOURCE_MODE_DISCOVERY: &str = "application_discovery";
-pub const SYNC_STATUS_MANUAL: &str = "manual";
-pub const SYNC_STATUS_SYNCED: &str = "accepted";
-pub const SYNC_STATUS_NO_PROFILE: &str = "no_profile";
-pub const SYNC_STATUS_ERROR: &str = "unknown";
-pub const SYNC_UNCONFIGURED: &str = "unconfigured";
-pub const SYNC_PENDING: &str = "pending";
-pub const SYNC_ACCEPTED: &str = "accepted";
-pub const SYNC_REJECTED: &str = "rejected";
-pub const SYNC_UNKNOWN: &str = "unknown";
-pub const SYNC_SYNCED: &str = SYNC_ACCEPTED;
-pub const SYNC_ERROR: &str = SYNC_UNKNOWN;
-pub const SYNC_DISABLED: &str = "disabled";
-
-/// Returns whether the locally materialized discovery contract may be used by
-/// runtime authentication.  The management-mode comparison lives here rather
-/// than in each caller so the canonical `website_managed` value cannot drift
-/// into a legacy or UI-only spelling.
-pub fn website_discovery_runtime_active(
-    management_mode: &str,
-    operator_disabled: bool,
-    last_verified_revision: Option<i64>,
-    last_verified_expires_at: Option<i64>,
-    snapshot_available: bool,
-    now: i64,
-) -> bool {
-    management_mode != MANAGEMENT_MODE_WEBSITE
-        || (!operator_disabled
-            && last_verified_revision.is_some()
-            && snapshot_available
-            && last_verified_expires_at.is_none_or(|expires_at| expires_at > now))
-}
+pub use crate::application_discovery_contract::{
+    MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE, SOURCE_MANUAL, SOURCE_MODE_DISCOVERY,
+    SOURCE_MODE_MANUAL, SOURCE_WEBSITE, SYNC_ACCEPTED, SYNC_DISABLED, SYNC_ERROR, SYNC_PENDING,
+    SYNC_REJECTED, SYNC_STATUS_ERROR, SYNC_STATUS_MANUAL, SYNC_STATUS_NO_PROFILE,
+    SYNC_STATUS_SYNCED, SYNC_SYNCED, SYNC_UNCONFIGURED, SYNC_UNKNOWN,
+    website_discovery_runtime_active,
+};
 
 const MAX_CLIENT_ID_LENGTH: usize = 255;
 const MAX_SCOPE_LENGTH: usize = 256;
@@ -207,7 +177,7 @@ impl DiscoveryLease {
                 &self.application_id,
                 &self.owner_token,
                 self.lease_generation,
-                manifest,
+                manifest.into(),
             )
             .await
             .map(Some)
@@ -320,6 +290,101 @@ pub struct VerifiedApplicationManifest {
     /// A redacted JSON representation suitable for storing as the last
     /// verified snapshot. Client secrets are deliberately omitted.
     pub redacted_payload: Value,
+}
+
+impl From<VerifiedApplicationManifest> for crate::db::ApplicationDiscoveryManifest {
+    fn from(manifest: VerifiedApplicationManifest) -> Self {
+        Self {
+            revision: manifest.revision,
+            version: manifest.version,
+            digest: manifest.digest,
+            expires_at: manifest.expires_at,
+            revoke_removed_clients: manifest.revoke_removed_clients,
+            clients: manifest.clients,
+            client_protocols: manifest.client_protocols,
+            protocols: manifest.protocols,
+            login_adapters: manifest.login_adapters,
+            directory_sync: manifest.directory_sync,
+            authorization: manifest.authorization,
+            authorization_mappings: manifest.authorization_mappings.into(),
+            profiles: manifest
+                .profiles
+                .into_iter()
+                .map(|(key, profile)| (key, profile.into()))
+                .collect(),
+            redacted_payload: manifest.redacted_payload,
+        }
+    }
+}
+
+impl From<NormalizedAuthorizationMappings>
+    for crate::db::ApplicationDiscoveryAuthorizationMappings
+{
+    fn from(mappings: NormalizedAuthorizationMappings) -> Self {
+        Self {
+            group_mappings: mappings
+                .group_mappings
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            organization_role_mappings: mappings
+                .organization_role_mappings
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<NormalizedGroupMapping> for crate::db::ApplicationDiscoveryGroupMapping {
+    fn from(mapping: NormalizedGroupMapping) -> Self {
+        Self {
+            group: mapping.group,
+            role: mapping.role,
+        }
+    }
+}
+
+impl From<NormalizedOrganizationRoleMapping>
+    for crate::db::ApplicationDiscoveryOrganizationRoleMapping
+{
+    fn from(mapping: NormalizedOrganizationRoleMapping) -> Self {
+        Self {
+            organization_role: mapping.organization_role,
+            role: mapping.role,
+        }
+    }
+}
+
+impl From<NormalizedProfile> for crate::db::ApplicationDiscoveryProfile {
+    fn from(profile: NormalizedProfile) -> Self {
+        Self {
+            permissions: profile.permissions.into_iter().map(Into::into).collect(),
+            roles: profile.roles.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<NormalizedPermission> for crate::db::ApplicationDiscoveryPermission {
+    fn from(permission: NormalizedPermission) -> Self {
+        Self {
+            key: permission.key,
+            label: permission.label,
+            description: permission.description,
+        }
+    }
+}
+
+impl From<NormalizedRole> for crate::db::ApplicationDiscoveryRole {
+    fn from(role: NormalizedRole) -> Self {
+        Self {
+            key: role.key,
+            name: role.name,
+            description: role.description,
+            permissions: role.permissions,
+            is_default: role.is_default,
+        }
+    }
 }
 
 pub fn website_origin(website_url: &str) -> AppResult<String> {
@@ -526,21 +591,22 @@ pub async fn auto_register_application(
             return Ok(record);
         }
 
-        let (contract, signing_public_jwks) = fetch_and_verify_auto_registration(
-            &discovery_url,
-            &origin,
-            &expected_audience,
-            &application.organization_id,
-            &challenge,
-            &state.settings.discovery.challenge_secret,
-            state
-                .settings
-                .discovery
-                .auto_registration
-                .challenge_ttl_seconds,
-            state.settings.discovery.allow_private_networks,
-        )
-        .await?;
+        let (contract, signing_public_jwks) =
+            fetch_and_verify_auto_registration(DiscoveryAutoRegistrationRequest {
+                discovery_url: &discovery_url,
+                expected_issuer: &origin,
+                expected_audience: &expected_audience,
+                organization_id: &application.organization_id,
+                challenge: &challenge,
+                challenge_secret: &state.settings.discovery.challenge_secret,
+                max_contract_ttl_seconds: state
+                    .settings
+                    .discovery
+                    .auto_registration
+                    .challenge_ttl_seconds,
+                allow_private_networks: state.settings.discovery.allow_private_networks,
+            })
+            .await?;
         if contract.application_id != application.slug {
             return Err(AppError::BadRequest(
                 "allowlisted origin returned an unexpected application_id".to_string(),
@@ -585,21 +651,22 @@ pub async fn auto_register_application(
         return Ok(record);
     }
 
-    let (contract, signing_public_jwks) = fetch_and_verify_auto_registration(
-        &discovery_url,
-        &origin,
-        &expected_audience,
-        &entry.organization_id,
-        &challenge,
-        &state.settings.discovery.challenge_secret,
-        state
-            .settings
-            .discovery
-            .auto_registration
-            .challenge_ttl_seconds,
-        state.settings.discovery.allow_private_networks,
-    )
-    .await?;
+    let (contract, signing_public_jwks) =
+        fetch_and_verify_auto_registration(DiscoveryAutoRegistrationRequest {
+            discovery_url: &discovery_url,
+            expected_issuer: &origin,
+            expected_audience: &expected_audience,
+            organization_id: &entry.organization_id,
+            challenge: &challenge,
+            challenge_secret: &state.settings.discovery.challenge_secret,
+            max_contract_ttl_seconds: state
+                .settings
+                .discovery
+                .auto_registration
+                .challenge_ttl_seconds,
+            allow_private_networks: state.settings.discovery.allow_private_networks,
+        })
+        .await?;
     if !entry
         .application_ids
         .iter()
@@ -669,7 +736,7 @@ pub async fn auto_register_application(
         })
         .await
     {
-        return Err(cleanup_failed_auto_registration(&state, &application.id, error).await);
+        return Err(cleanup_failed_auto_registration(state, &application.id, error).await);
     }
     let record = match state
         .db
@@ -678,7 +745,7 @@ pub async fn auto_register_application(
     {
         Ok(record) => record,
         Err(error) => {
-            return Err(cleanup_failed_auto_registration(&state, &application.id, error).await);
+            return Err(cleanup_failed_auto_registration(state, &application.id, error).await);
         }
     };
     state
@@ -830,73 +897,101 @@ fn manifest_content_digest(payload: &[u8]) -> AppResult<String> {
     Ok(util::sha256_base64url(&canonical))
 }
 
+pub struct DiscoveryFetchRequest<'a> {
+    pub discovery_url: &'a str,
+    pub fetch_secret: &'a str,
+    pub signing_public_jwks: &'a str,
+    pub expected_issuer: &'a str,
+    pub expected_application_id: &'a str,
+    pub expected_audience: &'a str,
+    pub organization_id: &'a str,
+    pub allow_private_networks: bool,
+}
+
+pub struct DiscoveryChallengeRequest<'a> {
+    pub discovery_url: &'a str,
+    pub signing_public_jwks: &'a str,
+    pub expected_issuer: &'a str,
+    pub expected_application_id: &'a str,
+    pub expected_audience: &'a str,
+    pub organization_id: &'a str,
+    pub challenge: &'a str,
+    pub challenge_secret: &'a str,
+    pub max_contract_ttl_seconds: i64,
+    pub allow_private_networks: bool,
+}
+
+pub struct DiscoveryAutoRegistrationRequest<'a> {
+    pub discovery_url: &'a str,
+    pub expected_issuer: &'a str,
+    pub expected_audience: &'a str,
+    pub organization_id: &'a str,
+    pub challenge: &'a str,
+    pub challenge_secret: &'a str,
+    pub max_contract_ttl_seconds: i64,
+    pub allow_private_networks: bool,
+}
+
 pub async fn fetch_and_verify(
-    discovery_url: &str,
-    fetch_secret: &str,
-    signing_public_jwks: &str,
-    expected_issuer: &str,
-    expected_application_id: &str,
-    expected_audience: &str,
-    organization_id: &str,
-    allow_private_networks: bool,
+    request: DiscoveryFetchRequest<'_>,
 ) -> AppResult<VerifiedApplicationManifest> {
-    if fetch_secret.trim().is_empty() {
+    if request.fetch_secret.trim().is_empty() {
         return Err(AppError::Configuration(
             "website-managed application has no fetch secret".to_string(),
         ));
     }
     let body = fetch_discovery_body(
-        discovery_url,
-        Some(fetch_secret),
+        request.discovery_url,
+        Some(request.fetch_secret),
         None,
-        allow_private_networks,
+        request.allow_private_networks,
     )
     .await?;
     verify_and_normalize(
         &body,
-        signing_public_jwks,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        organization_id,
+        request.signing_public_jwks,
+        request.expected_issuer,
+        request.expected_application_id,
+        request.expected_audience,
+        request.organization_id,
     )
 }
 
 /// Fetches a known application without a long-lived transport secret. The
 /// signed v3 contract must echo the challenge in its registration proof.
 pub async fn fetch_and_verify_challenge(
-    discovery_url: &str,
-    signing_public_jwks: &str,
-    expected_issuer: &str,
-    expected_application_id: &str,
-    expected_audience: &str,
-    organization_id: &str,
-    challenge: &str,
-    challenge_secret: &str,
-    max_contract_ttl_seconds: i64,
-    allow_private_networks: bool,
+    request: DiscoveryChallengeRequest<'_>,
 ) -> AppResult<VerifiedApplicationManifest> {
-    verify_discovery_challenge(challenge_secret, expected_issuer, challenge)?;
-    let body =
-        fetch_discovery_body(discovery_url, None, Some(challenge), allow_private_networks).await?;
+    verify_discovery_challenge(
+        request.challenge_secret,
+        request.expected_issuer,
+        request.challenge,
+    )?;
+    let body = fetch_discovery_body(
+        request.discovery_url,
+        None,
+        Some(request.challenge),
+        request.allow_private_networks,
+    )
+    .await?;
     let token = extract_jws(&body)?;
-    let payload = verify_jws(&token, signing_public_jwks)?;
+    let payload = verify_jws(&token, request.signing_public_jwks)?;
     let contract = parse_contract(&payload)?;
     validate_registration_contract(
         &contract,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        challenge,
-        max_contract_ttl_seconds,
+        request.expected_issuer,
+        request.expected_application_id,
+        request.expected_audience,
+        request.challenge,
+        request.max_contract_ttl_seconds,
     )?;
     normalize_application_contract(
         &contract,
         &payload,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        organization_id,
+        request.expected_issuer,
+        request.expected_application_id,
+        request.expected_audience,
+        request.organization_id,
     )
 }
 
@@ -904,38 +999,40 @@ pub async fn fetch_and_verify_challenge(
 /// is bootstrapped only from the protected JWS `jwk` header, after the origin,
 /// audience, contract, and challenge proof have all been validated.
 pub async fn fetch_and_verify_auto_registration(
-    discovery_url: &str,
-    expected_issuer: &str,
-    expected_audience: &str,
-    organization_id: &str,
-    challenge: &str,
-    challenge_secret: &str,
-    max_contract_ttl_seconds: i64,
-    allow_private_networks: bool,
+    request: DiscoveryAutoRegistrationRequest<'_>,
 ) -> AppResult<(VerifiedApplicationManifest, String)> {
-    verify_discovery_challenge(challenge_secret, expected_issuer, challenge)?;
-    let body =
-        fetch_discovery_body(discovery_url, None, Some(challenge), allow_private_networks).await?;
+    verify_discovery_challenge(
+        request.challenge_secret,
+        request.expected_issuer,
+        request.challenge,
+    )?;
+    let body = fetch_discovery_body(
+        request.discovery_url,
+        None,
+        Some(request.challenge),
+        request.allow_private_networks,
+    )
+    .await?;
     let token = extract_jws(&body)?;
     let (payload, key) = verify_jws_with_embedded_key(&token)?;
     let contract = parse_contract(&payload)?;
     validate_registration_contract(
         &contract,
-        expected_issuer,
+        request.expected_issuer,
         &contract.application_id,
-        expected_audience,
-        challenge,
-        max_contract_ttl_seconds,
+        request.expected_audience,
+        request.challenge,
+        request.max_contract_ttl_seconds,
     )?;
     let pinned_jwks = serde_json::to_string(&PinnedJwks { keys: vec![key] })
         .map_err(|_| AppError::Internal("failed to encode discovery signing key".to_string()))?;
     let verified = normalize_application_contract(
         &contract,
         &payload,
-        expected_issuer,
+        request.expected_issuer,
         &contract.application_id,
-        expected_audience,
-        organization_id,
+        request.expected_audience,
+        request.organization_id,
     )?;
     Ok((verified, pinned_jwks))
 }
@@ -1960,72 +2057,25 @@ fn classify_apply_failure(error: &AppError) -> SyncFailureStatus {
 }
 
 async fn fetch_and_verify_for_sync(
-    discovery_url: &str,
-    fetch_secret: &str,
-    signing_public_jwks: &str,
-    expected_issuer: &str,
-    expected_application_id: &str,
-    expected_audience: &str,
-    organization_id: &str,
-    allow_private_networks: bool,
+    request: DiscoveryFetchRequest<'_>,
 ) -> Result<VerifiedApplicationManifest, SyncFailure> {
-    let body = fetch_discovery_body(
-        discovery_url,
-        Some(fetch_secret),
-        None,
-        allow_private_networks,
-    )
-    .await
-    .map_err(SyncFailure::unknown)?;
-    verify_and_normalize(
-        &body,
-        signing_public_jwks,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        organization_id,
-    )
-    .map_err(SyncFailure::rejected)
+    fetch_and_verify(request)
+        .await
+        .map_err(|error| match error {
+            AppError::Configuration(_) => SyncFailure::unknown(error),
+            error => SyncFailure::rejected(error),
+        })
 }
 
 async fn fetch_and_verify_challenge_for_sync(
-    discovery_url: &str,
-    signing_public_jwks: &str,
-    expected_issuer: &str,
-    expected_application_id: &str,
-    expected_audience: &str,
-    organization_id: &str,
-    challenge: &str,
-    challenge_secret: &str,
-    max_contract_ttl_seconds: i64,
-    allow_private_networks: bool,
+    request: DiscoveryChallengeRequest<'_>,
 ) -> Result<VerifiedApplicationManifest, SyncFailure> {
-    verify_discovery_challenge(challenge_secret, expected_issuer, challenge)
-        .map_err(SyncFailure::unknown)?;
-    let body = fetch_discovery_body(discovery_url, None, Some(challenge), allow_private_networks)
+    fetch_and_verify_challenge(request)
         .await
-        .map_err(SyncFailure::unknown)?;
-    let token = extract_jws(&body).map_err(SyncFailure::rejected)?;
-    let payload = verify_jws(&token, signing_public_jwks).map_err(SyncFailure::rejected)?;
-    let contract = parse_contract(&payload).map_err(SyncFailure::rejected)?;
-    validate_registration_contract(
-        &contract,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        challenge,
-        max_contract_ttl_seconds,
-    )
-    .map_err(SyncFailure::rejected)?;
-    normalize_application_contract(
-        &contract,
-        &payload,
-        expected_issuer,
-        expected_application_id,
-        expected_audience,
-        organization_id,
-    )
-    .map_err(SyncFailure::rejected)
+        .map_err(|error| match error {
+            AppError::Configuration(_) => SyncFailure::unknown(error),
+            error => SyncFailure::rejected(error),
+        })
 }
 
 /// Fetches and applies one website-owned authorization snapshot. The
@@ -2140,22 +2190,22 @@ async fn sync_application_once(
                 .challenge_ttl_seconds,
         )
         .map_err(SyncFailure::unknown)?;
-        fetch_and_verify_challenge_for_sync(
-            &discovery_url,
-            &discovery.signing_public_jwks,
-            &website_issuer,
-            &application.slug,
-            &expected_audience,
-            &application.organization_id,
-            &challenge,
-            &state.settings.discovery.challenge_secret,
-            state
+        fetch_and_verify_challenge_for_sync(DiscoveryChallengeRequest {
+            discovery_url: &discovery_url,
+            signing_public_jwks: &discovery.signing_public_jwks,
+            expected_issuer: &website_issuer,
+            expected_application_id: &application.slug,
+            expected_audience: &expected_audience,
+            organization_id: &application.organization_id,
+            challenge: &challenge,
+            challenge_secret: &state.settings.discovery.challenge_secret,
+            max_contract_ttl_seconds: state
                 .settings
                 .discovery
                 .auto_registration
                 .challenge_ttl_seconds,
-            state.settings.discovery.allow_private_networks,
-        )
+            allow_private_networks: state.settings.discovery.allow_private_networks,
+        })
         .await
     } else {
         if state.settings.discovery.encryption_key.trim().is_empty() {
@@ -2168,16 +2218,16 @@ async fn sync_application_once(
             &discovery.fetch_secret_ciphertext,
         )
         .map_err(SyncFailure::unknown)?;
-        fetch_and_verify_for_sync(
-            &discovery_url,
-            &fetch_secret,
-            &discovery.signing_public_jwks,
-            &website_issuer,
-            &application.slug,
-            &expected_audience,
-            &application.organization_id,
-            state.settings.discovery.allow_private_networks,
-        )
+        fetch_and_verify_for_sync(DiscoveryFetchRequest {
+            discovery_url: &discovery_url,
+            fetch_secret: &fetch_secret,
+            signing_public_jwks: &discovery.signing_public_jwks,
+            expected_issuer: &website_issuer,
+            expected_application_id: &application.slug,
+            expected_audience: &expected_audience,
+            organization_id: &application.organization_id,
+            allow_private_networks: state.settings.discovery.allow_private_networks,
+        })
         .await
     }
 }
@@ -2743,16 +2793,16 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let verified = fetch_and_verify(
-            &format!("http://127.0.0.1:{}{}", address.port(), DISCOVERY_PATH),
-            &fetch_secret,
-            &jwks,
-            "https://axon.example",
-            "axon",
-            "https://sso.example",
-            "org-1",
-            true,
-        )
+        let verified = fetch_and_verify(DiscoveryFetchRequest {
+            discovery_url: &format!("http://127.0.0.1:{}{}", address.port(), DISCOVERY_PATH),
+            fetch_secret: &fetch_secret,
+            signing_public_jwks: &jwks,
+            expected_issuer: "https://axon.example",
+            expected_application_id: "axon",
+            expected_audience: "https://sso.example",
+            organization_id: "org-1",
+            allow_private_networks: true,
+        })
         .await
         .unwrap();
         assert_eq!(verified.application_id, "axon");

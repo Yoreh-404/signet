@@ -15,7 +15,7 @@ use crate::{
     organizations::normalize_slug,
 };
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 pub const ACCESS_ASSIGNED_ACCOUNTS: &str = "assigned_accounts";
 pub const ACCESS_ORGANIZATION_MEMBERS: &str = "organization_members";
@@ -724,18 +724,26 @@ pub async fn validate_module_bindings(
                         bound_ids.insert(client.id.clone());
                     }
                 }
-                for client_id in client_ids.difference(&bound_ids) {
-                    let client = state
-                        .db
-                        .find_client_by_id(client_id)
-                        .await?
-                        .ok_or_else(|| {
+                let missing_client_ids = client_ids
+                    .difference(&bound_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing_client_ids.is_empty() {
+                    let existing_clients =
+                        state.db.list_clients_by_ids(&missing_client_ids).await?;
+                    let existing_clients = existing_clients
+                        .into_iter()
+                        .map(|client| (client.id.clone(), client))
+                        .collect::<HashMap<_, _>>();
+                    for client_id in missing_client_ids {
+                        let client = existing_clients.get(&client_id).ok_or_else(|| {
                             AppError::BadRequest("protocol client does not exist".to_string())
                         })?;
-                    if client.organization_id.as_deref()
-                        != Some(application.organization_id.as_str())
-                    {
-                        return Err(AppError::Forbidden);
+                        if client.organization_id.as_deref()
+                            != Some(application.organization_id.as_str())
+                        {
+                            return Err(AppError::Forbidden);
+                        }
                     }
                     return Err(AppError::Forbidden);
                 }
@@ -748,14 +756,20 @@ pub async fn validate_module_bindings(
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str);
+            let provider_ids = provider_ids.map(ToOwned::to_owned).collect::<BTreeSet<_>>();
+            let providers = state
+                .db
+                .list_external_oidc_providers_by_ids(
+                    &provider_ids.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await?
+                .into_iter()
+                .map(|provider| (provider.id.clone(), provider))
+                .collect::<HashMap<_, _>>();
             for provider_id in provider_ids {
-                let provider = state
-                    .db
-                    .find_external_oidc_provider_by_id(provider_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::BadRequest("external OIDC provider does not exist".to_string())
-                    })?;
+                let provider = providers.get(&provider_id).ok_or_else(|| {
+                    AppError::BadRequest("external OIDC provider does not exist".to_string())
+                })?;
                 if !organization_binding_is_allowed(
                     &application.organization_id,
                     provider.organization_id.as_deref(),
@@ -771,16 +785,20 @@ pub async fn validate_module_bindings(
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
                 .collect::<BTreeSet<_>>();
             if !provider_ids.is_empty() {
+                let providers = state
+                    .db
+                    .list_ldap_providers_by_ids(&provider_ids.iter().cloned().collect::<Vec<_>>())
+                    .await?
+                    .into_iter()
+                    .map(|provider| (provider.id.clone(), provider))
+                    .collect::<HashMap<_, _>>();
                 for provider_id in provider_ids {
-                    let provider = state
-                        .db
-                        .find_ldap_provider_by_id(provider_id)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::BadRequest("LDAP provider does not exist".to_string())
-                        })?;
+                    let provider = providers.get(&provider_id).ok_or_else(|| {
+                        AppError::BadRequest("LDAP provider does not exist".to_string())
+                    })?;
                     if !organization_binding_is_allowed(
                         &application.organization_id,
                         provider.organization_id.as_deref(),
@@ -962,6 +980,29 @@ pub async fn application_directory_provider_enabled(
                 .filter_map(Value::as_str)
                 .any(|id| id == provider_id)
         }))
+}
+
+pub async fn application_directory_provider_allowlist(
+    state: &AppState,
+    application_id: &str,
+) -> AppResult<Option<BTreeSet<String>>> {
+    let Some(module) = application_module(state, application_id, "directory_sync").await? else {
+        return Ok(None);
+    };
+    if module.is_enabled != 1 {
+        return Ok(Some(BTreeSet::new()));
+    }
+    let config = module_config(&module)?;
+    Ok(Some(
+        config
+            .get("ldap_provider_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+    ))
 }
 
 pub fn normalize_application_name(value: &str) -> AppResult<String> {

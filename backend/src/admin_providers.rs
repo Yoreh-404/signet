@@ -1,4 +1,4 @@
-use super::normalize_required_text;
+use super::{admin_client_policy::validate_absolute_http_url, normalize_required_text};
 use crate::{
     AppState,
     audit::{self, AuditSink},
@@ -7,7 +7,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     identity_sources::{self, OidcDiscoveryResult, OidcProviderTemplate},
-    organizations, security_policy,
+    security_policy,
 };
 use axum::{
     Json,
@@ -78,13 +78,9 @@ pub(super) struct ExternalOidcProviderInput {
     pub(super) scopes: Vec<String>,
     pub(super) email_domains: Vec<String>,
     pub(super) is_active: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "super::default_true")]
     pub(super) allow_login: bool,
     pub(super) allow_registration: bool,
-}
-
-pub(super) fn default_true() -> bool {
-    true
 }
 
 pub(super) async fn create_external_oidc_provider(
@@ -567,7 +563,7 @@ pub(super) fn normalize_optional_http_url(
     if value.is_empty() {
         return Ok(String::new());
     }
-    super::validate_absolute_http_url(&value, field)?;
+    validate_absolute_http_url(&value, field)?;
     if trim_trailing_slash {
         Ok(value.trim_end_matches('/').to_string())
     } else {

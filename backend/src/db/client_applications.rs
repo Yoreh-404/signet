@@ -1,9 +1,7 @@
-use super::*;
-
 use super::{
-    AppError, AppResult, ClientRecord, CountRow, Db, IapApplicationRecord, NewClient,
-    NewIapApplication, normalize_permission_keys, ph, select_client_sql,
-    select_iap_application_sql,
+    AppError, AppResult, ClientRecord, CountRow, DatabaseKind, Db, IapApplicationRecord, NewClient,
+    NewIapApplication, bind_text_list, blocking, dedupe_nonempty, normalize_permission_keys, ph,
+    select_client_sql, select_iap_application_sql,
 };
 use crate::util;
 use diesel::{
@@ -23,6 +21,47 @@ impl Db {
                 .bind::<Text, _>(client_id)
                 .get_result::<ClientRecord>(&mut conn)
                 .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_clients_by_client_ids(
+        &self,
+        client_ids: &[String],
+    ) -> AppResult<Vec<ClientRecord>> {
+        if client_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client_ids = client_ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=client_ids.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "{} WHERE client_id IN ({})",
+                select_client_sql(),
+                placeholders,
+            );
+            bind_text_list(&mut conn, sql_query(sql), &client_ids)
+                .load::<ClientRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_clients_by_ids(&self, ids: &[String]) -> AppResult<Vec<ClientRecord>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=ids.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("{} WHERE id IN ({})", select_client_sql(), placeholders);
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<ClientRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }

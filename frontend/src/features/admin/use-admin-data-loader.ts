@@ -26,6 +26,7 @@ export type {
   AdminReadModelUpdater
 } from "./admin-read-model";
 import type { SessionController } from "../session/useSessionController";
+import type { AdminPermissionState } from "./admin-permissions";
 import type {
   AuditEvent,
   AuditWebhook,
@@ -51,18 +52,23 @@ export type AdminDataLoaderOptions = {
   session: SessionController;
   scopeKey: string | null;
   onLoginSettingsLoaded: (draft: LoginSettingsDraft) => void;
-  canAdmin: boolean;
-  canReadUsers: boolean;
-  canManageActiveOrganization: boolean;
-  canReadOrganizations: boolean;
-  canManageOrganizations: boolean;
-  canManageAuthorizationCodes: boolean;
-  canManageSettings: boolean;
-  canManagePlatformProviders: boolean;
-  canManageProviders: boolean;
-  canManageSecurity: boolean;
-  canReadAudit: boolean;
+  permissions: AdminDataPermissions;
 };
+
+export type AdminDataPermissions = Pick<
+  AdminPermissionState,
+  | "canAdmin"
+  | "canReadUsers"
+  | "canManageActiveOrganization"
+  | "canReadOrganizations"
+  | "canManageOrganizations"
+  | "canManageAuthorizationCodes"
+  | "canManageSettings"
+  | "canManagePlatformProviders"
+  | "canManageProviders"
+  | "canManageSecurity"
+  | "canReadAudit"
+>;
 
 /**
  * Admin pages share a session-scoped read model, but they do not share a
@@ -91,6 +97,9 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
     session,
     scopeKey,
     onLoginSettingsLoaded,
+    permissions,
+  } = options;
+  const {
     canAdmin,
     canReadUsers,
     canManageActiveOrganization,
@@ -102,7 +111,7 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
     canManageProviders,
     canManageSecurity,
     canReadAudit
-  } = options;
+  } = permissions;
 
   const [readModel, setReadModel] = useState<AdminReadModel>(createEmptyAdminReadModel);
   const [adminLoading, setAdminLoading] = useState(false);

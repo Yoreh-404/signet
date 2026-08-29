@@ -1,14 +1,14 @@
 //! User account persistence operations.
 
-use super::*;
-
 use super::{
-    AppError, AppResult, CountRow, Db, NewBulkProvisionedUser, NewUser, OrganizationRecord,
-    UserIdentityCandidate, UserRecord, UserRegistrationSource, UserUpdate, bind_text_list,
-    count_all_users_sql, count_user_identity_conflicts_sql, insert_user_sql, ph,
-    select_organization_sql, select_user_sql,
+    AppError, AppResult, CountRow, DatabaseKind, Db, NewBulkProvisionedUser, NewUser,
+    OrganizationRecord, USER_AUTH_STATE_TABLES, UserIdentityCandidate, UserRecord,
+    UserRegistrationSource, UserUpdate, VerificationCodeClaim, VerificationCodeDecision,
+    VerificationCodeRecord, VerificationCodeVerifier, bind_text_list, blocking,
+    count_all_users_sql, count_user_identity_conflicts_sql, ensure_first_user_registration_state,
+    insert_user_sql, ph, select_organization_sql, select_user_sql,
 };
-use crate::util;
+use crate::{organizations::OrganizationEmailPolicy, util};
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text},

@@ -33,6 +33,7 @@ use saml_rs::{
 use saml_rs::{LogoutRequest, LogoutResponse};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use url::Url;
 
 const SAML_INTERACTION_TTL_SECONDS: i64 = 300;
@@ -43,6 +44,9 @@ const MAX_SAML_REQUEST_BYTES: usize = 512 * 1024;
 const NAME_ID_FORMAT_EMAIL: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
 const NAME_ID_FORMAT_PERSISTENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent";
 const ATTRIBUTE_NAME_FORMAT_BASIC: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:basic";
+
+type SamlAttributeOutput = (Vec<LoginResponseAttribute>, Vec<(String, String)>);
+type SamlResponseAttributes<'a> = Option<(&'a [LoginResponseAttribute], &'a [(String, String)])>;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -190,16 +194,16 @@ async fn sso_redirect(
         ));
     }
     let relay_state = validated_relay_state(query_value(raw_query, "RelayState"))?;
-    begin_saml_flow(
-        &state,
-        &jar,
-        &application,
-        &config,
-        &base_url,
-        None,
+    begin_saml_flow(SamlFlowRequest {
+        state: &state,
+        jar: &jar,
+        application: &application,
+        config: &config,
+        base_url: &base_url,
+        request_id: None,
         relay_state,
-        config.acs_url.clone(),
-    )
+        acs_url: config.acs_url.clone(),
+    })
     .await
 }
 
@@ -385,22 +389,30 @@ async fn process_slo_request(
     let requested_name_id = logout.name_id().map(|name_id| name_id.value().to_string());
     let mut sessions = Vec::new();
     if let Some(name_id) = requested_name_id.as_deref() {
+        let session_index_hashes = logout
+            .session_indexes()
+            .iter()
+            .map(|session_index| saml_session_index_hash(&application.id, session_index.as_str()))
+            .collect::<Vec<_>>();
+        let sessions_by_index = state
+            .db
+            .list_application_saml_sessions_by_indexes(&session_index_hashes, &application.id)
+            .await?
+            .into_iter()
+            .map(|record| (record.session_index_hash.clone(), record))
+            .collect::<HashMap<_, _>>();
         for session_index in logout.session_indexes() {
-            if let Some(record) = state
-                .db
-                .find_application_saml_session(
-                    &saml_session_index_hash(&application.id, session_index.as_str()),
-                    &application.id,
-                )
-                .await?
-                && record.name_id_hash == saml_name_id_hash(&application.id, name_id)
+            if let Some(record) = sessions_by_index.get(&saml_session_index_hash(
+                &application.id,
+                session_index.as_str(),
+            )) && record.name_id_hash == saml_name_id_hash(&application.id, name_id)
                 && !sessions
                     .iter()
                     .any(|item: &crate::db::ApplicationSamlSessionRecord| {
                         item.session_index_hash == record.session_index_hash
                     })
             {
-                sessions.push(record);
+                sessions.push(record.clone());
             }
         }
         if logout.session_indexes().is_empty() {
@@ -425,14 +437,13 @@ async fn process_slo_request(
     // A deployment may have issued an assertion before the SessionIndex
     // binding table was introduced. A browser cookie is a safe compatibility
     // fallback only when its user produces exactly the requested NameID.
-    if requested_name_id.is_some() && logout.session_indexes().is_empty() {
-        if let Some(current) = auth::current_user_from_cookie(state, jar).await?
-            && current.can_authorize_oauth_client()
-            && saml_name_id(&config, &current.user)
-                == requested_name_id.as_deref().unwrap_or_default()
-        {
-            state.db.delete_session(&current.session_id).await?;
-        }
+    if requested_name_id.is_some()
+        && logout.session_indexes().is_empty()
+        && let Some(current) = auth::current_user_from_cookie(state, jar).await?
+        && current.can_authorize_oauth_client()
+        && saml_name_id(&config, &current.user) == requested_name_id.as_deref().unwrap_or_default()
+    {
+        state.db.delete_session(&current.session_id).await?;
     }
 
     let context = saml_rs::logout::create_logout_response(
@@ -536,16 +547,16 @@ async fn process_sso_request(
     {
         return Err(AppError::Unauthorized);
     }
-    begin_saml_flow(
+    begin_saml_flow(SamlFlowRequest {
         state,
         jar,
-        &application,
-        &config,
-        &base_url,
-        Some(parsed.request_id),
+        application: &application,
+        config: &config,
+        base_url: &base_url,
+        request_id: Some(parsed.request_id),
         relay_state,
-        parsed.acs_url,
-    )
+        acs_url: parsed.acs_url,
+    })
     .await
 }
 
@@ -573,16 +584,16 @@ async fn continue_sso(
     {
         return Err(AppError::Unauthorized);
     }
-    issue_saml_response(
-        &state,
-        &application,
-        &config,
-        &base_url,
-        &current.user,
-        &current.session_id,
-        (!interaction.request_id.is_empty()).then_some(interaction.request_id.as_str()),
-        interaction.relay_state.as_deref(),
-    )
+    issue_saml_response(SamlResponseRequest {
+        state: &state,
+        application: &application,
+        config: &config,
+        base_url: &base_url,
+        user: &current.user,
+        signet_session_id: &current.session_id,
+        request_id: (!interaction.request_id.is_empty()).then_some(interaction.request_id.as_str()),
+        relay_state: interaction.relay_state.as_deref(),
+    })
     .await
 }
 
@@ -591,29 +602,52 @@ struct ContinueQuery {
     handle: String,
 }
 
-async fn begin_saml_flow(
-    state: &AppState,
-    jar: &axum_extra::extract::cookie::CookieJar,
-    application: &ApplicationRecord,
-    config: &SamlApplicationConfig,
-    base_url: &str,
+struct SamlFlowRequest<'a> {
+    state: &'a AppState,
+    jar: &'a axum_extra::extract::cookie::CookieJar,
+    application: &'a ApplicationRecord,
+    config: &'a SamlApplicationConfig,
+    base_url: &'a str,
     request_id: Option<String>,
     relay_state: Option<String>,
     acs_url: String,
-) -> AppResult<Response> {
+}
+
+struct SamlResponseRequest<'a> {
+    state: &'a AppState,
+    application: &'a ApplicationRecord,
+    config: &'a SamlApplicationConfig,
+    base_url: &'a str,
+    user: &'a crate::db::UserRecord,
+    signet_session_id: &'a str,
+    request_id: Option<&'a str>,
+    relay_state: Option<&'a str>,
+}
+
+async fn begin_saml_flow(request: SamlFlowRequest<'_>) -> AppResult<Response> {
+    let SamlFlowRequest {
+        state,
+        jar,
+        application,
+        config,
+        base_url,
+        request_id,
+        relay_state,
+        acs_url,
+    } = request;
     let current = auth::current_user_from_cookie(state, jar).await?;
     if let Some(current) = current {
         ensure_saml_account_capability(&current)?;
-        return issue_saml_response(
+        return issue_saml_response(SamlResponseRequest {
             state,
             application,
             config,
             base_url,
-            &current.user,
-            &current.session_id,
-            request_id.as_deref(),
-            relay_state.as_deref(),
-        )
+            user: &current.user,
+            signet_session_id: &current.session_id,
+            request_id: request_id.as_deref(),
+            relay_state: relay_state.as_deref(),
+        })
         .await;
     }
 
@@ -700,16 +734,17 @@ async fn parse_saml_request(
     })
 }
 
-async fn issue_saml_response(
-    state: &AppState,
-    application: &ApplicationRecord,
-    config: &SamlApplicationConfig,
-    base_url: &str,
-    user: &crate::db::UserRecord,
-    signet_session_id: &str,
-    request_id: Option<&str>,
-    relay_state: Option<&str>,
-) -> AppResult<Response> {
+async fn issue_saml_response(request: SamlResponseRequest<'_>) -> AppResult<Response> {
+    let SamlResponseRequest {
+        state,
+        application,
+        config,
+        base_url,
+        user,
+        signet_session_id,
+        request_id,
+        relay_state,
+    } = request;
     let entitlements = authorization::resolve_entitlements(state, application, user).await?;
     let claims = saml_claims(application, user, &entitlements);
     let (attributes, user_attributes) = saml_attributes(config, &claims)?;
@@ -801,7 +836,7 @@ fn saml_claims(
 fn saml_attributes(
     config: &SamlApplicationConfig,
     claims: &Map<String, Value>,
-) -> AppResult<(Vec<LoginResponseAttribute>, Vec<(String, String)>)> {
+) -> AppResult<SamlAttributeOutput> {
     let configured = if config.attributes.is_empty() {
         vec![
             SamlAttributeConfig::basic("email", "email"),
@@ -826,7 +861,6 @@ fn saml_attributes(
                 .iter()
                 .filter_map(value_to_string)
                 .enumerate()
-                .map(|(index, value)| (index, value))
                 .collect::<Vec<_>>(),
             other => value_to_string(other)
                 .map(|value| vec![(0, value)])
@@ -1096,7 +1130,7 @@ async fn build_idp(
     state: &AppState,
     config: &SamlApplicationConfig,
     base_url: &str,
-    response_attributes: Option<(&[LoginResponseAttribute], &[(String, String)])>,
+    response_attributes: SamlResponseAttributes<'_>,
 ) -> AppResult<IdentityProvider> {
     let private_key = if !state
         .settings

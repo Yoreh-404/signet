@@ -4,9 +4,7 @@
 //! consumption remains an atomic conditional update so a challenge can only
 //! be consumed once.
 
-use super::*;
-
-use super::{AppError, AppResult, Db, MfaChallengeRecord, ph};
+use super::{AppError, AppResult, DatabaseKind, Db, MfaChallengeRecord, blocking, ph};
 use crate::util;
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,

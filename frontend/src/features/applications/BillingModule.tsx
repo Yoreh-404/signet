@@ -4,9 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as applicationApi from "../../lib/api/applications";
 import * as billingApi from "../../lib/api/billing";
 import type { ApplicationBillingSettings, BillingWallet } from "../../types";
-import type { ApplicationRequestGuard } from "./application-request-guard";
 import { Input, ModuleHeader, ModuleSave, Toggle } from "./components/ApplicationModulePrimitives";
 import { stableDomainEqual } from "../admin/stable-domain-comparator";
+import { useApplicationRequestLifecycle } from "./use-application-request-lifecycle";
+import { useApplicationWorkspaceRequestContext } from "./use-application-workspace-request-context";
 
 type BillingCopy = {
   billing: string;
@@ -42,17 +43,16 @@ export function BillingModule({
   applicationId,
   canManage,
   copy,
-  requestGuard,
   onDirtyChange,
   onEnabledChange
 }: {
   applicationId: string;
   canManage: boolean;
   copy: BillingCopy;
-  requestGuard: ApplicationRequestGuard;
   onDirtyChange: (dirty: boolean) => void;
   onEnabledChange: (enabled: boolean) => void;
 }) {
+  const { requestGuard } = useApplicationWorkspaceRequestContext();
   const [settings, setSettings] = useState<ApplicationBillingSettings | null>(null);
   const [baseline, setBaseline] = useState<ApplicationBillingSettings | null>(null);
   const [wallets, setWallets] = useState<BillingWallet[]>([]);
@@ -68,6 +68,10 @@ export function BillingModule({
   const transferIdempotencyKey = useRef<string | null>(null);
   const transferRequestSignature = useRef<string | null>(null);
   const walletView = useMemo(() => billingApi.createBillingWalletViewModel(wallets), [wallets]);
+  const { beginRequest, isCurrent, finishRequest } = useApplicationRequestLifecycle({
+    applicationId,
+    requestGuard
+  });
 
   useEffect(() => {
     setSettings(null);
@@ -87,7 +91,7 @@ export function BillingModule({
   }, [applicationId, onDirtyChange, onEnabledChange]);
 
   useEffect(() => {
-    const request = requestGuard.begin(applicationId, { scope: "billing:load", kind: "read" });
+    const request = beginRequest("billing:load", { kind: "read" });
     if (!request) return;
     setLoading(true);
     setError("");
@@ -96,7 +100,7 @@ export function BillingModule({
       billingApi.listBillingWallets({ signal: request.signal }).catch(() => [] as BillingWallet[])
     ])
       .then(([nextSettings, nextWallets]) => {
-        if (!requestGuard.isCurrent(request)) return;
+        if (!isCurrent(request)) return;
         setSettings(nextSettings);
         setBaseline(nextSettings);
         setWallets(nextWallets);
@@ -104,7 +108,7 @@ export function BillingModule({
         onEnabledChange(nextSettings.accept_signet_balance);
       })
       .catch(() => {
-        if (!requestGuard.isCurrent(request)) return;
+        if (!isCurrent(request)) return;
         setSettings(null);
         setBaseline(null);
         setWallets([]);
@@ -112,11 +116,11 @@ export function BillingModule({
         onEnabledChange(false);
       })
       .finally(() => {
-        if (requestGuard.isCurrent(request)) setLoading(false);
-        requestGuard.finish(request, false);
+        if (isCurrent(request)) setLoading(false);
+        finishRequest(request, false);
       });
-    return () => requestGuard.finish(request, false);
-  }, [applicationId, copy.loadFailed, onEnabledChange, reloadToken, requestGuard]);
+    return () => finishRequest(request, false);
+  }, [applicationId, beginRequest, copy.loadFailed, finishRequest, isCurrent, onEnabledChange, reloadToken]);
 
   useEffect(() => {
     const dirty = Boolean(
@@ -131,8 +135,7 @@ export function BillingModule({
 
   async function saveSettings() {
     if (!settings || !canManage) return;
-    const request = requestGuard.begin(applicationId, {
-      scope: "billing:settings",
+    const request = beginRequest("billing:settings", {
       kind: "mutation",
       payloadFingerprint: JSON.stringify(settings)
     });
@@ -145,17 +148,17 @@ export function BillingModule({
         wallet_mode: settings.wallet_mode,
         supported_currencies: settings.supported_currencies
       }, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined });
-      if (!requestGuard.isCurrent(request)) return;
+      if (!isCurrent(request)) return;
       setSettings(nextSettings);
       setBaseline(nextSettings);
       onEnabledChange(nextSettings.accept_signet_balance);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
@@ -173,8 +176,7 @@ export function BillingModule({
       return;
     }
     const requestSignature = `${applicationId}:${amountMinor}:${currency}:${transferDirection}`;
-    const request = requestGuard.begin(applicationId, {
-      scope: "billing:transfer",
+    const request = beginRequest("billing:transfer", {
       kind: "mutation",
       payloadFingerprint: requestSignature
     });
@@ -197,19 +199,19 @@ export function BillingModule({
         direction: transferDirection,
         idempotency_key: idempotencyKey
       }, { signal: request.signal, idempotencyKey });
-      if (!requestGuard.isCurrent(request)) return;
+      if (!isCurrent(request)) return;
       const nextWallets = await billingApi.listBillingWallets({ signal: request.signal, force: true });
-      if (!requestGuard.isCurrent(request)) return;
+      if (!isCurrent(request)) return;
       transferIdempotencyKey.current = null;
       setTransferAmount("");
       setWallets(nextWallets);
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (requestGuard.isCurrent(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (requestGuard.isCurrent(request)) setTransferSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setTransferSaving(false);
+      finishRequest(request, committed);
     }
   }
 

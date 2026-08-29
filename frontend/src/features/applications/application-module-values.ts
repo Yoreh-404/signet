@@ -25,3 +25,17 @@ export function stringList(value: unknown): string[] {
     ? value.filter((item): item is string => typeof item === "string")
     : [];
 }
+
+export function uniqueTrimmed(values: readonly string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+export function splitUniqueTrimmed(value: string, separator = /\r?\n/): string[] {
+  return uniqueTrimmed(value.split(separator));
+}
+
+export function toggleString(values: readonly string[], value: string): string[] {
+  return values.includes(value)
+    ? values.filter((item) => item !== value)
+    : [...values, value];
+}

@@ -490,14 +490,7 @@ fn normalize_device_scope(
 ) -> AppResult<String> {
     let requested_scopes =
         util::normalize_scopes(requested, &state.settings.oidc.supported_scopes)?;
-    let allowed_scopes = client.scopes()?;
-    for scope in &requested_scopes {
-        if !allowed_scopes.iter().any(|allowed| allowed == scope) {
-            return Err(AppError::Oidc(format!(
-                "client is not allowed to request scope: {scope}"
-            )));
-        }
-    }
+    oidc::validate_requested_scopes(client, &requested_scopes)?;
     Ok(requested_scopes.join(" "))
 }
 

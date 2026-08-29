@@ -22,13 +22,14 @@ args@{
   lib,
   workspaceSrc,
   ignoreLockHash,
+  workspaceLockFile ? null,
   pkgs ? null,
   cargoConfig ? {},
 }:
 let
-  nixifiedLockHash = "d5a64b10ed6243f74021d36f2eae142357f23f6e6c4c013e5627c65c01dd211a";
+  nixifiedLockHash = "d589a5f280037320bf24c7fc5764aef2c0363dc9fa6a3cc13d1e71b829865ce4";
   workspaceSrc = if args.workspaceSrc == null then ./. else args.workspaceSrc;
-  currentLockHash = builtins.hashFile "sha256" (workspaceSrc + /Cargo.lock);
+  currentLockHash = builtins.hashFile "sha256" (if workspaceLockFile == null then workspaceSrc + /Cargo.lock else workspaceLockFile);
   lockHashIgnored = if ignoreLockHash
                   then builtins.trace "Ignoring lock hash" ignoreLockHash
                   else ignoreLockHash;

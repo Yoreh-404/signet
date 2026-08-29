@@ -466,10 +466,9 @@ fn parse_cas_config(config: &Map<String, Value>) -> AppResult<CasApplicationConf
     let mut service_urls = string_list(config, "service_urls")?;
     if service_urls.is_empty()
         && let Some(value) = config.get("service_validate_url").and_then(Value::as_str)
+        && !value.trim().is_empty()
     {
-        if !value.trim().is_empty() {
-            service_urls.push(value.trim().to_string());
-        }
+        service_urls.push(value.trim().to_string());
     }
     for service in &service_urls {
         validate_service_url(service)?;
@@ -665,7 +664,7 @@ fn cas_success(
             body.push_str(&xml_escape(&value));
             body.push_str("</cas:");
             body.push_str(&name);
-            body.push_str(">");
+            body.push('>');
         }
         body.push_str("</cas:attributes>");
     }

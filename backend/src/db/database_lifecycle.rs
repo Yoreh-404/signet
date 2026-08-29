@@ -4,168 +4,30 @@ use super::migrate_mysql_phone_uniqueness;
 use super::migrate_postgres_phone_uniqueness;
 #[cfg(feature = "sqlite")]
 use super::migrate_sqlite_phone_uniqueness;
-use super::*;
 use super::{
-    ApplicationRecord, AuthorizationCodeType, BootstrapClient, ClientRecord, CountRow,
-    DatabaseKind, Db, LoginCodeLevel, NewApplication, NewApplicationDiscovery, NewClient,
-    NewExternalOidcProvider, NewLoginSettings, NewRegistrationSettings, NewRuntimeSettings,
-    NewSecurityPolicy, NewUser, Settings, UserListScope, UserRegistrationSource,
-    application_slug_base, application_slug_collision_candidate,
-    authorization_code_registration_source_backfill_sql, blocking, connect_mysql, connect_postgres,
-    connect_sqlite, default_openai_quick_link, is_ignorable_migration_error, migration_sql, ph,
+    ApplicationRecord, BootstrapApplication, BootstrapClient, ClientRecord, CountRow, DatabaseKind,
+    Db, NewApplication, NewApplicationDiscovery, NewClient, NewExternalOidcProvider,
+    NewLoginSettings, NewRegistrationSettings, NewRuntimeSettings, NewSecurityPolicy, NewUser,
+    Settings, UserListScope, application_slug_base, application_slug_collision_candidate, blocking,
+    default_openai_quick_link, ph,
+};
+use crate::application_discovery_contract::{
+    MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE, SYNC_DISABLED, SYNC_PENDING, SYNC_UNCONFIGURED,
 };
 use crate::error::{AppError, AppResult};
+use crate::util;
 use diesel::{
     RunQueryDsl,
     connection::SimpleConnection,
     sql_query,
     sql_types::{BigInt, Text},
 };
-use std::time::Duration;
-use tracing::warn;
-
-pub(super) fn bootstrap_client_secret_hash(
-    client: &BootstrapClient,
-    existing: Option<&ClientRecord>,
-) -> AppResult<Option<String>> {
-    let auth_method = client.token_endpoint_auth_method.as_str();
-    let existing_hash = existing.and_then(|record| record.client_secret_hash.as_deref());
-    if !client.rotate_secret
-        && let Some(existing_hash) = existing_hash
-    {
-        if matches!(
-            auth_method,
-            "none" | crate::client_assertion::PRIVATE_KEY_JWT
-        ) || crate::client_assertion::stored_secret_supports_method(
-            auth_method,
-            Some(existing_hash),
-        ) {
-            return Ok(Some(existing_hash.to_string()));
-        }
-        return Err(AppError::Configuration(format!(
-            "bootstrap client {} has an existing client_secret incompatible with {}, set rotate_secret=true to replace it",
-            client.client_id, auth_method
-        )));
-    }
-    if matches!(
-        auth_method,
-        "none" | crate::client_assertion::PRIVATE_KEY_JWT
-    ) {
-        return Ok(None);
-    }
-
-    let configured_secret = client
-        .client_secret_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|env_name| {
-            std::env::var(env_name).map_err(|err| {
-                AppError::Configuration(format!(
-                    "bootstrap client {} references unusable client_secret_env {env_name}: {err}",
-                    client.client_id
-                ))
-            })
-        })
-        .transpose()?
-        .or_else(|| (!client.client_secret.is_empty()).then(|| client.client_secret.clone()));
-    let Some(configured_secret) = configured_secret.filter(|secret| !secret.is_empty()) else {
-        return Err(AppError::Configuration(format!(
-            "bootstrap client {} requires client_secret or client_secret_env",
-            client.client_id
-        )));
-    };
-    crate::client_assertion::store_client_secret(auth_method, &configured_secret)
-}
+use std::collections::BTreeSet;
 
 impl Db {
-    pub fn connect(settings: &Settings) -> AppResult<Self> {
-        match settings.database.kind {
-            DatabaseKind::Sqlite => connect_sqlite(&settings.database),
-            DatabaseKind::Postgres => connect_postgres(&settings.database),
-            DatabaseKind::Mysql => connect_mysql(&settings.database),
-        }
-    }
-
-    /// Connect and verify the selected database while the shared database
-    /// service may still be starting. The conductor intentionally leaves
-    /// Compose services unordered, so a transient database error must not
-    /// permanently terminate Signet during a normal bootstrap race.
-    pub async fn connect_with_retry(settings: &Settings) -> AppResult<Self> {
-        let mut retry_delay = Duration::from_secs(1);
-        loop {
-            match Self::connect(settings) {
-                Ok(db) => match db.ping().await {
-                    Ok(()) => return Ok(db),
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            retry_in_seconds = retry_delay.as_secs(),
-                            "Signet database is unavailable; retrying"
-                        );
-                    }
-                },
-                Err(error @ AppError::Configuration(_)) => return Err(error),
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        retry_in_seconds = retry_delay.as_secs(),
-                        "Signet database pool could not be created; retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(retry_delay).await;
-            retry_delay = std::cmp::min(retry_delay + retry_delay, Duration::from_secs(30));
-        }
-    }
-
-    pub async fn ping(&self) -> AppResult<()> {
-        with_conn!(self, |conn, _kind| {
-            conn.batch_execute("SELECT 1")
-                .map_err(|err| AppError::Database(err.to_string()))
-        })
-    }
-
-    /// Creates the complete Application/OIDC connection aggregate on one
-    /// database connection.  The profile is materialized before the binding
-    /// points at it, so a failed mapper, profile, or binding write rolls back
-    /// the client as well.
-
-    pub async fn migrate(&self) -> AppResult<()> {
-        with_conn!(self, |conn, kind| {
-            for statement in migration_sql(kind) {
-                if let Err(err) = conn.batch_execute(statement) {
-                    let message = err.to_string();
-                    if !is_ignorable_migration_error(statement, &message) {
-                        return Err(AppError::Database(message));
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        self.remove_legacy_phone_uniqueness().await?;
-        self.migrate_tenant_application_model().await?;
-        with_conn!(self, |conn, kind| {
-            // This data repair is deliberately outside the static migration
-            // arrays: those arrays run on every startup and MySQL keeps them
-            // schema-only. The statement is idempotent and only touches
-            // legacy rows which still carry the default source.
-            sql_query(authorization_code_registration_source_backfill_sql(kind))
-                .bind::<Text, _>(UserRegistrationSource::AuthorizationCode.as_str())
-                .bind::<Text, _>(UserRegistrationSource::Local.as_str())
-                .bind::<Text, _>(AuthorizationCodeType::Registration.as_str())
-                .bind::<Text, _>(AuthorizationCodeType::Login.as_str())
-                .bind::<Text, _>(LoginCodeLevel::TrialEnrollment.as_str())
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     /// Older installations treated phone as an identity key. Phone is now a
     /// verification contact and may legitimately be shared across accounts.
-    async fn remove_legacy_phone_uniqueness(&self) -> AppResult<()> {
+    pub(super) async fn remove_legacy_phone_uniqueness(&self) -> AppResult<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::Sqlite(pool) => {
@@ -209,7 +71,7 @@ impl Db {
     /// policies are normalized to the global Signet account boundary during
     /// startup so stale rows cannot continue to act as an authentication
     /// gate.
-    async fn migrate_tenant_application_model(&self) -> AppResult<()> {
+    pub(super) async fn migrate_tenant_application_model(&self) -> AppResult<()> {
         let system_organization = self.system_organization().await?;
         let system_organization_id = system_organization.id.clone();
         let system_organization_id_for_update = system_organization_id.clone();
@@ -267,7 +129,7 @@ impl Db {
                 .unwrap_or_default();
             self.upsert_application_discovery(NewApplicationDiscovery {
                 application_id: application.id,
-                management_mode: crate::application_discovery::MANAGEMENT_MODE_SIGNET.to_string(),
+                management_mode: MANAGEMENT_MODE_SIGNET.to_string(),
                 website_url,
                 fetch_secret_ciphertext: String::new(),
                 signing_public_jwks: String::new(),
@@ -275,7 +137,7 @@ impl Db {
                 last_verified_version: None,
                 last_verified_digest: None,
                 last_verified_expires_at: None,
-                sync_status: crate::application_discovery::SYNC_DISABLED.to_string(),
+                sync_status: SYNC_DISABLED.to_string(),
                 last_fetched_at: None,
                 last_success_at: None,
                 last_error: None,
@@ -585,10 +447,7 @@ impl Db {
             let is_website_managed = self
                 .find_application_discovery(&existing_application.id)
                 .await?
-                .is_some_and(|discovery| {
-                    discovery.management_mode
-                        == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
-                });
+                .is_some_and(|discovery| discovery.management_mode == MANAGEMENT_MODE_WEBSITE);
             if is_website_managed {
                 return self
                     .link_client_to_application(
@@ -751,7 +610,8 @@ impl Db {
         let permissions = crate::service_accounts::normalize_permissions(
             client.service_account_permissions.clone(),
         )?;
-        let client_secret_hash = bootstrap_client_secret_hash(client, existing.as_ref())?;
+        let client_secret_hash =
+            super::database_bootstrap::client_secret_hash(client, existing.as_ref())?;
         let organization_id = existing
             .as_ref()
             .and_then(|record| record.organization_id.clone())
@@ -809,7 +669,8 @@ impl Db {
                 let Some(existing) = self.find_client_by_client_id(&client.client_id).await? else {
                     return Err(insert_error);
                 };
-                let client_secret_hash = bootstrap_client_secret_hash(client, Some(&existing))?;
+                let client_secret_hash =
+                    super::database_bootstrap::client_secret_hash(client, Some(&existing))?;
                 self.update_client(
                     &existing.id,
                     NewClient {
@@ -913,21 +774,19 @@ impl Db {
                 || value.fetch_secret_ciphertext != fetch_secret_ciphertext
                 || value.signing_public_jwks != signing_public_jwks
         });
-        let sync_status = if application.management_mode
-            == crate::application_discovery::MANAGEMENT_MODE_WEBSITE
-        {
+        let sync_status = if application.management_mode == MANAGEMENT_MODE_WEBSITE {
             if signing_public_jwks.is_empty() {
-                crate::application_discovery::SYNC_UNCONFIGURED.to_string()
+                SYNC_UNCONFIGURED.to_string()
             } else if reset_snapshot {
-                crate::application_discovery::SYNC_PENDING.to_string()
+                SYNC_PENDING.to_string()
             } else {
                 existing_discovery
                     .as_ref()
                     .map(|value| value.sync_status.clone())
-                    .unwrap_or_else(|| crate::application_discovery::SYNC_PENDING.to_string())
+                    .unwrap_or_else(|| SYNC_PENDING.to_string())
             }
         } else {
-            crate::application_discovery::SYNC_DISABLED.to_string()
+            SYNC_DISABLED.to_string()
         };
         self.upsert_application_discovery(NewApplicationDiscovery {
             application_id: application_record.id.clone(),

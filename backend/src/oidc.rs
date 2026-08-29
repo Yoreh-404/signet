@@ -5,56 +5,89 @@ use crate::{
     auth::{self, AccountCapabilities},
     auth_domain::ApplicationAuthContext,
     auth_flow, authorization_details,
-    claim_mapper::ClaimOutputTarget,
-    client_assertion,
     client_policy::{
         AuthorizationRequestSecurityView, AuthorizationRequestSource, ClientSecurityPolicy,
         DefaultClientSecurityPolicy,
     },
     consent::{self, OidcConsentPolicy},
     db::{
-        ApplicationRecord, ClientRecord, LoginCodeLevel, NewApplicationAuthContext,
-        NewAuthorizationCode, RefreshTokenInput, SessionRecord, UserRecord,
+        ApplicationRecord, ClientRecord, NewApplicationAuthContext, NewAuthorizationCode,
+        SessionRecord, UserRecord,
     },
-    directory,
-    dpop::{self, DpopBinding},
+    directory, dpop,
     error::{AppError, AppResult},
     html::escape as html_escape,
-    jwt::{TokenClaims, TokenSubject},
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
     oauth_targets::{self, AudienceValidationError, ResourceValidationError},
-    oidc_authorization::{AuthorizationSnapshot, ClientClaimsSnapshot},
-    oidc_claims::{
-        self, DefaultEmailVerifiedClaimPolicy, EmailVerifiedClaimPolicy, RequestedClaims,
-    },
-    oidc_client_auth::{ClientAuthFields, ClientAuthForm, diagnostic_client_id},
+    oidc_authorization::AuthorizationSnapshot,
+    oidc_claims::RequestedClaims,
+    oidc_client_auth::ClientAuthFields,
     redirects, security_policy,
-    service_accounts::ServiceAccountProfile,
-    subject,
     util::{self, url_decode, url_encode},
 };
+#[cfg(test)]
+use axum::Json;
 use axum::{
-    Form, Json, Router,
+    Form, Router,
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+#[path = "oidc_browser_interaction.rs"]
+mod oidc_browser_interaction;
+#[path = "oidc_metadata.rs"]
+mod oidc_metadata;
+#[path = "oidc_request.rs"]
+mod oidc_request;
+#[path = "oidc_resource.rs"]
+mod oidc_resource;
+#[path = "oidc_token.rs"]
+mod oidc_token;
+#[path = "oidc_token_liveness.rs"]
+mod oidc_token_liveness;
+#[cfg(test)]
+use oidc_browser_interaction::prompt_without_login;
+use oidc_browser_interaction::{
+    account_selection_prompted_request, reauthentication_request, return_to_request,
+};
+use serde::Deserialize;
+use std::{collections::HashSet, net::SocketAddr};
 use time::Duration;
+#[cfg(test)]
 use url::Url;
 
-pub(crate) use crate::oidc_logout::{
-    LogoutRequest, complete_logout, logout_get, logout_hint_authorizes_current_session,
-    logout_post, logout_request_client, post_logout_redirect_url, validated_logout_hint,
-    validated_post_logout_redirect,
+#[cfg(test)]
+use crate::{
+    db::{LoginCodeLevel, RefreshTokenInput},
+    dpop::DpopBinding,
+    jwt::TokenSubject,
+    oidc_client_auth::ClientAuthForm,
+    subject,
 };
+use oidc_metadata::{discovery, jwks};
+pub(crate) use oidc_request::ResolvedAuthorizeRequest;
+use oidc_request::{AuthorizeRequest, ConsentForm, PromptBehavior};
+use oidc_resource::{introspect, revoke, userinfo};
+use oidc_token::token;
+#[cfg(test)]
+use oidc_token::{
+    TokenRequest, authorization_code_login_level, token_from_authorization_code,
+    token_from_refresh_token,
+};
+#[cfg(test)]
+use oidc_token_liveness::{is_machine_token_claims, service_account_claim_is_live};
+
+#[cfg(test)]
+pub(crate) use crate::oidc_logout::{
+    LogoutRequest, logout_hint_authorizes_current_session, post_logout_redirect_url,
+};
+pub(crate) use crate::oidc_logout::{logout_get, logout_post};
 
 #[cfg(test)]
 pub(crate) use crate::oidc_client_auth::service_client_endpoint_request;
@@ -128,172 +161,6 @@ pub fn routes() -> Router<AppState> {
         .route("/login", get(login_page).post(login_form))
 }
 
-#[derive(Debug, Serialize)]
-struct DiscoveryDocument {
-    issuer: String,
-    authorization_endpoint: String,
-    pushed_authorization_request_endpoint: String,
-    require_pushed_authorization_requests: bool,
-    device_authorization_endpoint: String,
-    token_endpoint: String,
-    introspection_endpoint: String,
-    revocation_endpoint: String,
-    resource_parameter_supported: bool,
-    authorization_details_parameter_supported: bool,
-    authorization_details_types_supported: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    registration_endpoint: Option<String>,
-    userinfo_endpoint: String,
-    jwks_uri: String,
-    end_session_endpoint: String,
-    backchannel_logout_supported: bool,
-    backchannel_logout_session_supported: bool,
-    frontchannel_logout_supported: bool,
-    frontchannel_logout_session_supported: bool,
-    response_types_supported: Vec<&'static str>,
-    response_modes_supported: Vec<&'static str>,
-    grant_types_supported: Vec<&'static str>,
-    subject_types_supported: Vec<&'static str>,
-    id_token_signing_alg_values_supported: Vec<&'static str>,
-    authorization_signing_alg_values_supported: Vec<&'static str>,
-    token_endpoint_auth_methods_supported: Vec<&'static str>,
-    token_endpoint_auth_signing_alg_values_supported: Vec<&'static str>,
-    dpop_signing_alg_values_supported: Vec<&'static str>,
-    request_parameter_supported: bool,
-    request_uri_parameter_supported: bool,
-    request_object_signing_alg_values_supported: Vec<&'static str>,
-    claims_parameter_supported: bool,
-    acr_values_supported: Vec<&'static str>,
-    scopes_supported: Vec<String>,
-    claims_supported: Vec<&'static str>,
-    code_challenge_methods_supported: Vec<&'static str>,
-}
-
-async fn discovery(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Json<DiscoveryDocument>> {
-    let issuer = state.effective_issuer(&headers).await?;
-    let authorization_details_types_supported =
-        authorization_details::supported_types_from_clients(&state.db.list_clients().await?)?;
-    Ok(Json(DiscoveryDocument {
-        issuer: issuer.clone(),
-        authorization_endpoint: absolute(&issuer, &state.settings.oidc.authorization_endpoint),
-        pushed_authorization_request_endpoint: absolute(&issuer, "/oauth2/par"),
-        require_pushed_authorization_requests: false,
-        device_authorization_endpoint: absolute(&issuer, "/oauth2/device_authorization"),
-        token_endpoint: absolute(&issuer, &state.settings.oidc.token_endpoint),
-        introspection_endpoint: absolute(&issuer, "/oauth2/introspect"),
-        revocation_endpoint: absolute(&issuer, "/oauth2/revoke"),
-        resource_parameter_supported: true,
-        authorization_details_parameter_supported: true,
-        authorization_details_types_supported,
-        registration_endpoint: state
-            .settings
-            .oidc
-            .allow_dynamic_client_registration
-            .then(|| absolute(&issuer, "/connect/register")),
-        userinfo_endpoint: absolute(&issuer, &state.settings.oidc.userinfo_endpoint),
-        jwks_uri: absolute(&issuer, &state.settings.oidc.jwks_uri),
-        end_session_endpoint: absolute(&issuer, &state.settings.oidc.end_session_endpoint),
-        backchannel_logout_supported: true,
-        backchannel_logout_session_supported: true,
-        frontchannel_logout_supported: true,
-        frontchannel_logout_session_supported: true,
-        response_types_supported: vec!["code"],
-        response_modes_supported: crate::jarm::SUPPORTED_RESPONSE_MODES.to_vec(),
-        grant_types_supported: vec![
-            "authorization_code",
-            "refresh_token",
-            "client_credentials",
-            crate::device::DEVICE_CODE_GRANT,
-            crate::token_exchange::TOKEN_EXCHANGE_GRANT,
-        ],
-        subject_types_supported: vec![subject::SUBJECT_TYPE_PUBLIC, subject::SUBJECT_TYPE_PAIRWISE],
-        id_token_signing_alg_values_supported: vec!["RS256"],
-        authorization_signing_alg_values_supported: crate::jarm::SUPPORTED_SIGNING_ALGS.to_vec(),
-        token_endpoint_auth_methods_supported: vec![
-            "client_secret_basic",
-            "client_secret_post",
-            client_assertion::CLIENT_SECRET_JWT,
-            client_assertion::PRIVATE_KEY_JWT,
-            "none",
-        ],
-        token_endpoint_auth_signing_alg_values_supported:
-            client_assertion::TOKEN_ENDPOINT_AUTH_SIGNING_ALGS.to_vec(),
-        dpop_signing_alg_values_supported: dpop::SUPPORTED_SIGNING_ALGS.to_vec(),
-        request_parameter_supported: true,
-        request_uri_parameter_supported: true,
-        request_object_signing_alg_values_supported: client_assertion::SUPPORTED_SIGNING_ALGS
-            .to_vec(),
-        claims_parameter_supported: true,
-        acr_values_supported: assurance::SUPPORTED_ACR_VALUES.to_vec(),
-        scopes_supported: state.settings.oidc.supported_scopes.clone(),
-        claims_supported: oidc_claims::SUPPORTED_CLAIMS.to_vec(),
-        code_challenge_methods_supported: vec!["plain", "S256"],
-    }))
-}
-
-async fn jwks(State(state): State<AppState>) -> Json<crate::jwt::Jwks> {
-    Json(state.jwt.jwks())
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AuthorizeRequest {
-    interaction_request: Option<String>,
-    request: Option<String>,
-    request_uri: Option<String>,
-    response_type: Option<String>,
-    client_id: Option<String>,
-    redirect_uri: Option<String>,
-    scope: Option<String>,
-    resource: Option<String>,
-    authorization_details: Option<String>,
-    login_hint: Option<String>,
-    prompt: Option<String>,
-    max_age: Option<String>,
-    acr_values: Option<String>,
-    claims: Option<String>,
-    state: Option<String>,
-    nonce: Option<String>,
-    code_challenge: Option<String>,
-    code_challenge_method: Option<String>,
-    response_mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConsentForm {
-    _csrf: Option<String>,
-    action: String,
-    remember: Option<String>,
-    response_type: String,
-    client_id: String,
-    redirect_uri: String,
-    scope: String,
-    resource: Option<String>,
-    authorization_details: Option<String>,
-    login_hint: Option<String>,
-    prompt: Option<String>,
-    max_age: Option<String>,
-    interaction_request: Option<String>,
-    request_uri: Option<String>,
-    acr_values: Option<String>,
-    claims: Option<String>,
-    state: Option<String>,
-    nonce: Option<String>,
-    code_challenge: Option<String>,
-    code_challenge_method: Option<String>,
-    response_mode: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PromptBehavior {
-    force_consent: bool,
-    force_login: bool,
-    select_account: bool,
-    none: bool,
-}
-
 struct AuthorizationHttpContext<'a> {
     state: &'a AppState,
     headers: &'a HeaderMap,
@@ -320,113 +187,6 @@ impl AuthorizationSessionFreshness for SessionRecord {
             || max_age.is_some_and(|max_age| {
                 max_age == 0 || now.saturating_sub(self.created_at) > max_age
             })
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct ResolvedAuthorizeRequest {
-    #[serde(default)]
-    pub source: AuthorizationRequestSource,
-    pub response_type: String,
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub scope: Option<String>,
-    pub resource: Option<String>,
-    pub authorization_details: Option<String>,
-    pub login_hint: Option<String>,
-    pub prompt: Option<String>,
-    pub max_age: Option<i64>,
-    pub acr_values: Option<String>,
-    pub claims: Option<RequestedClaims>,
-    pub state: Option<String>,
-    pub nonce: Option<String>,
-    pub code_challenge: Option<String>,
-    pub code_challenge_method: Option<String>,
-    pub response_mode: Option<String>,
-    #[serde(default)]
-    pub account_selection_prompted: bool,
-    #[serde(default)]
-    pub account_selection_required: bool,
-    #[serde(default)]
-    pub reauthentication_required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_user_id: Option<String>,
-}
-
-impl ResolvedAuthorizeRequest {
-    fn from_query(query: AuthorizeRequest) -> AppResult<Self> {
-        Ok(Self {
-            source: AuthorizationRequestSource::Query,
-            response_type: required_query_value(query.response_type, "response_type")?,
-            client_id: required_query_value(query.client_id, "client_id")?,
-            redirect_uri: required_query_value(query.redirect_uri, "redirect_uri")?,
-            scope: query.scope,
-            resource: normalize_resource(query.resource.as_deref())?,
-            authorization_details: optional_form_value(query.authorization_details),
-            login_hint: optional_form_value(query.login_hint),
-            prompt: query.prompt,
-            max_age: parse_max_age(query.max_age.as_deref())?,
-            acr_values: normalize_acr_values_param(query.acr_values.as_deref())?,
-            claims: RequestedClaims::from_authorization_parameter(query.claims.as_deref())?,
-            state: query.state,
-            nonce: query.nonce,
-            code_challenge: query.code_challenge,
-            code_challenge_method: query.code_challenge_method,
-            response_mode: query.response_mode,
-            account_selection_prompted: false,
-            account_selection_required: false,
-            reauthentication_required: false,
-            selected_session_id: None,
-            selected_user_id: None,
-        })
-    }
-
-    fn prompt_behavior(&self) -> AppResult<PromptBehavior> {
-        prompt_behavior(self.prompt.as_deref())
-    }
-
-    fn requested_assurance(&self) -> AppResult<assurance::RequestedAssurance> {
-        self.claims
-            .as_ref()
-            .map(|claims| claims.requested_assurance(self.acr_values.as_deref()))
-            .unwrap_or_else(|| {
-                assurance::RequestedAssurance::new(
-                    self.acr_values.as_deref(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-            })
-    }
-}
-
-impl ConsentForm {
-    fn resolved_request(&self) -> AppResult<ResolvedAuthorizeRequest> {
-        Ok(ResolvedAuthorizeRequest {
-            source: AuthorizationRequestSource::Query,
-            response_type: required_query_value(Some(self.response_type.clone()), "response_type")?,
-            client_id: required_query_value(Some(self.client_id.clone()), "client_id")?,
-            redirect_uri: required_query_value(Some(self.redirect_uri.clone()), "redirect_uri")?,
-            scope: Some(self.scope.clone()),
-            resource: normalize_resource(self.resource.as_deref())?,
-            authorization_details: optional_form_value(self.authorization_details.clone()),
-            login_hint: optional_form_value(self.login_hint.clone()),
-            prompt: optional_form_value(self.prompt.clone()),
-            max_age: parse_max_age(self.max_age.as_deref())?,
-            acr_values: normalize_acr_values_param(self.acr_values.as_deref())?,
-            claims: RequestedClaims::from_authorization_parameter(self.claims.as_deref())?,
-            state: optional_form_value(self.state.clone()),
-            nonce: optional_form_value(self.nonce.clone()),
-            code_challenge: optional_form_value(self.code_challenge.clone()),
-            code_challenge_method: optional_form_value(self.code_challenge_method.clone()),
-            response_mode: optional_form_value(self.response_mode.clone()),
-            account_selection_prompted: false,
-            account_selection_required: false,
-            reauthentication_required: false,
-            selected_session_id: None,
-            selected_user_id: None,
-        })
     }
 }
 
@@ -884,11 +644,7 @@ async fn authorize_with_admin_universal_login_grant(
     // code. The grant itself and authorization-code insert are then committed
     // together, so concurrent requests have exactly one winner.
     let request = crate::par::consume_interaction_request(state, interaction_request).await?;
-    if serde_json::to_string(&request).map_err(|err| AppError::Internal(err.to_string()))?
-        != serde_json::to_string(&preview).map_err(|err| AppError::Internal(err.to_string()))?
-    {
-        return Err(AppError::Unauthorized);
-    }
+    ensure_interaction_request_matches_preview(&request, &preview)?;
     if request.client_id != grant.client_id {
         return Err(AppError::Unauthorized);
     }
@@ -1128,15 +884,13 @@ async fn requires_authorization_consent(
         .requires_prompt(existing.as_ref(), requested_scopes))
 }
 
-async fn enforce_authorization_mfa(
+async fn authorization_mfa_decision(
     context: &AuthorizationHttpContext<'_>,
     current: &auth::CurrentUser,
     client: &ClientRecord,
     session: &SessionRecord,
     request: &ResolvedAuthorizeRequest,
-    return_to: &str,
-    prompt_none: bool,
-) -> AppResult<Option<Response>> {
+) -> AppResult<MfaDecision> {
     let user_has_totp = context
         .state
         .db
@@ -1153,13 +907,25 @@ async fn enforce_authorization_mfa(
             .as_deref(),
     )? || assurance::DefaultAssurancePolicy
         .requires_mfa(&requested_assurance);
-    match auth_flow::oidc_authorization_mfa_decision(
+    auth_flow::oidc_authorization_mfa_decision(
         &policy,
         client,
         session,
         user_has_totp,
         policy_requires_mfa,
-    )? {
+    )
+}
+
+async fn enforce_authorization_mfa(
+    context: &AuthorizationHttpContext<'_>,
+    current: &auth::CurrentUser,
+    client: &ClientRecord,
+    session: &SessionRecord,
+    request: &ResolvedAuthorizeRequest,
+    return_to: &str,
+    prompt_none: bool,
+) -> AppResult<Option<Response>> {
+    match authorization_mfa_decision(context, current, client, session, request).await? {
         MfaDecision::Satisfied => Ok(None),
         MfaDecision::Challenge if prompt_none => redirect_authorization_error(
             context.state,
@@ -1202,29 +968,7 @@ async fn assert_authorization_mfa_satisfied(
     session: &SessionRecord,
     request: &ResolvedAuthorizeRequest,
 ) -> AppResult<()> {
-    let user_has_totp = context
-        .state
-        .db
-        .find_totp_method(&current.user.id)
-        .await?
-        .is_some();
-    let policy = context.state.db.security_policy().await?;
-    let requested_assurance = request.requested_assurance()?;
-    let policy_requires_mfa = policy.requires_mfa_for_ip(
-        context
-            .state
-            .request_ip(context.headers, context.remote_addr)
-            .await?
-            .as_deref(),
-    )? || assurance::DefaultAssurancePolicy
-        .requires_mfa(&requested_assurance);
-    match auth_flow::oidc_authorization_mfa_decision(
-        &policy,
-        client,
-        session,
-        user_has_totp,
-        policy_requires_mfa,
-    )? {
+    match authorization_mfa_decision(context, current, client, session, request).await? {
         MfaDecision::Satisfied => Ok(()),
         MfaDecision::Challenge | MfaDecision::SetupRequired => Err(AppError::Forbidden),
     }
@@ -1543,6 +1287,20 @@ async fn validate_authorize_request_with_runtime(
     Ok((client, runtime))
 }
 
+fn ensure_interaction_request_matches_preview(
+    request: &ResolvedAuthorizeRequest,
+    preview: &ResolvedAuthorizeRequest,
+) -> AppResult<()> {
+    let request_json =
+        serde_json::to_string(request).map_err(|err| AppError::Internal(err.to_string()))?;
+    let preview_json =
+        serde_json::to_string(preview).map_err(|err| AppError::Internal(err.to_string()))?;
+    if request_json != preview_json {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_authorize_request_for_client(
     client: &ClientRecord,
     request: &ResolvedAuthorizeRequest,
@@ -1631,8 +1389,12 @@ pub(crate) fn validate_requested_scopes(
     requested_scopes: &[String],
 ) -> AppResult<()> {
     let allowed_scopes = client.scopes()?;
+    let allowed_scope_set = allowed_scopes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     for scope in requested_scopes {
-        if !allowed_scopes.iter().any(|allowed| allowed == scope) {
+        if !allowed_scope_set.contains(scope.as_str()) {
             return Err(AppError::Oidc(format!(
                 "client is not allowed to request scope: {scope}"
             )));
@@ -1672,1277 +1434,6 @@ async fn ensure_trial_enrollment_client_allowed_for_user(
         return Err(AppError::Forbidden);
     }
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenRequest {
-    grant_type: String,
-    code: Option<String>,
-    device_code: Option<String>,
-    redirect_uri: Option<String>,
-    #[serde(flatten)]
-    client_auth: ClientAuthForm,
-    code_verifier: Option<String>,
-    refresh_token: Option<String>,
-    scope: Option<String>,
-    resource: Option<String>,
-    authorization_details: Option<String>,
-    subject_token: Option<String>,
-    subject_token_type: Option<String>,
-    requested_token_type: Option<String>,
-    audience: Option<String>,
-    actor_token: Option<String>,
-}
-
-impl ClientAuthFields for TokenRequest {
-    fn client_auth(&self) -> &ClientAuthForm {
-        &self.client_auth
-    }
-
-    fn defers_application_runtime_gate(&self) -> bool {
-        matches!(
-            self.grant_type.as_str(),
-            "authorization_code"
-                | "refresh_token"
-                | "client_credentials"
-                | crate::device::DEVICE_CODE_GRANT
-                | crate::token_exchange::TOKEN_EXCHANGE_GRANT
-        )
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct TokenResponse {
-    access_token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    issued_token_type: Option<&'static str>,
-    token_type: &'static str,
-    expires_in: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refresh_token: Option<String>,
-    scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    authorization_details: Option<serde_json::Value>,
-}
-
-async fn token(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(payload): Form<TokenRequest>,
-) -> AppResult<Json<TokenResponse>> {
-    let issuer = state.effective_issuer(&headers).await?;
-    let grant_type = payload.grant_type.clone();
-    let presented_client_id = diagnostic_client_id(&headers, &payload);
-    let client = match authenticate_client_at(
-        &state,
-        &headers,
-        &payload,
-        &state.settings.oidc.token_endpoint,
-    )
-    .await
-    {
-        Ok(client) => client,
-        Err(err) => {
-            tracing::warn!(
-                client_id = presented_client_id.as_deref().unwrap_or_default(),
-                grant_type,
-                error = %err.oauth_error(),
-                message = %err,
-                "OIDC token client authentication failed"
-            );
-            return Err(err);
-        }
-    };
-    let dpop =
-        dpop::optional_token_endpoint_proof(&state, &headers, &state.settings.oidc.token_endpoint)
-            .await?;
-    DefaultClientSecurityPolicy.validate_token_binding(&client, dpop.is_some())?;
-    let client_id = client.client_id.clone();
-    let result = match payload.grant_type.as_str() {
-        "authorization_code" => {
-            token_from_authorization_code(state, client, payload, issuer, dpop).await
-        }
-        "refresh_token" => token_from_refresh_token(state, client, payload, issuer, dpop).await,
-        "client_credentials" => {
-            token_from_client_credentials(state, client, payload, issuer, dpop).await
-        }
-        crate::device::DEVICE_CODE_GRANT => {
-            token_from_device_code(state, client, payload, issuer, dpop).await
-        }
-        crate::token_exchange::TOKEN_EXCHANGE_GRANT => {
-            token_from_token_exchange(state, headers, client, payload, issuer, dpop).await
-        }
-        _ => Err(AppError::Oidc("unsupported grant_type".to_string())),
-    };
-    if let Err(err) = &result {
-        tracing::warn!(
-            client_id,
-            grant_type,
-            error = %err.oauth_error(),
-            message = %err,
-            "OIDC token request failed"
-        );
-    }
-    result
-}
-
-async fn token_from_client_credentials(
-    state: AppState,
-    client: ClientRecord,
-    payload: TokenRequest,
-    issuer: String,
-    dpop: Option<DpopBinding>,
-) -> AppResult<Json<TokenResponse>> {
-    // Client credentials are machine authorization. Load the application,
-    // client binding, organization, and discovery boundary once here and use
-    // that same value for both the gate and access-token claims. This path is
-    // intentionally separate from the user authorization snapshot.
-    if client.service_account_enabled != 1
-        || !client
-            .grant_types()
-            .map_err(|_| AppError::Unauthorized)?
-            .iter()
-            .any(|value| value == "client_credentials")
-    {
-        return Err(AppError::Unauthorized);
-    }
-    let runtime = applications::ApplicationRuntimeSnapshot::load(&state, &client, None)
-        .await
-        .map_err(|_| AppError::Unauthorized)?;
-    runtime
-        .require_service()
-        .map_err(|_| AppError::Unauthorized)?;
-    let scope = normalize_client_credentials_scope(&client, payload.scope.as_deref())?;
-    let resource = resolve_client_credentials_audience(
-        &client,
-        normalize_resource(payload.resource.as_deref())?,
-        payload.audience.as_deref(),
-    )?;
-    let authorization_details = authorization_details::normalize_authorization_details_for_client(
-        &client,
-        payload.authorization_details.as_deref(),
-    )?;
-    let mut access_claims = serde_json::Map::new();
-    access_claims.insert(
-        "application_id".to_string(),
-        serde_json::Value::String(runtime.application.id.clone()),
-    );
-    access_claims.insert(
-        "authorization_profile_id".to_string(),
-        serde_json::Value::String(runtime.binding.authorization_profile_id.clone()),
-    );
-    dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
-    authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
-    let service_account_permissions = if client.service_account_enabled() {
-        let service_claims = client.service_account_claims()?;
-        let permissions = client.service_account_permissions()?;
-        access_claims.extend(service_claims);
-        access_claims.insert(
-            "sub".to_string(),
-            serde_json::Value::String(client.service_account_subject()),
-        );
-        permissions
-    } else {
-        Vec::new()
-    };
-    let access_token = state.jwt.sign_client_access_token_with_issuer_and_claims(
-        &issuer,
-        &client,
-        &scope,
-        resource.as_deref(),
-        state.settings.oidc.access_token_ttl_seconds,
-        access_claims,
-    )?;
-    state
-        .db
-        .record_audit_event(audit::oauth_event(
-            client.client_id.clone(),
-            "token.client_credentials",
-            AuditOutcome::Success,
-            serde_json::json!({
-                "scope": scope,
-                "authorization_details_types": authorization_details::details_types_for_audit(authorization_details.as_deref())?,
-                "service_account_enabled": client.service_account_enabled(),
-                "service_account_permissions": service_account_permissions
-            }),
-        ))
-        .await?;
-    Ok(Json(TokenResponse {
-        access_token,
-        issued_token_type: None,
-        token_type: dpop::token_type(dpop.as_ref()),
-        expires_in: state.settings.oidc.access_token_ttl_seconds,
-        id_token: None,
-        refresh_token: None,
-        scope,
-        authorization_details: authorization_details::authorization_details_json(
-            authorization_details.as_deref(),
-        )?,
-    }))
-}
-
-async fn token_from_authorization_code(
-    state: AppState,
-    client: ClientRecord,
-    payload: TokenRequest,
-    issuer: String,
-    dpop: Option<DpopBinding>,
-) -> AppResult<Json<TokenResponse>> {
-    if !client
-        .grant_types()?
-        .iter()
-        .any(|value| value == "authorization_code")
-    {
-        return Err(AppError::Oidc(
-            "client cannot use authorization_code grant".to_string(),
-        ));
-    }
-    let code = payload
-        .code
-        .ok_or_else(|| AppError::Oidc("code is required".to_string()))?;
-    let redirect_uri = payload
-        .redirect_uri
-        .as_deref()
-        .ok_or_else(|| AppError::Oidc("redirect_uri is required".to_string()))?;
-    let record = state
-        .db
-        .consume_authorization_code_for_client(
-            &code,
-            &client.client_id,
-            Some(redirect_uri),
-            payload.code_verifier.as_deref(),
-            client.require_pkce == 1,
-            client.require_s256_pkce == 1,
-        )
-        .await?;
-    let amr = util::from_json::<Vec<String>>(&record.amr)?;
-    let login_code_level = authorization_code_login_level(record.session_id.as_deref(), &amr);
-    issue_tokens_for_user(
-        &state,
-        &client,
-        &issuer,
-        IssueUserTokensInput {
-            user_id: record.user_id,
-            scope: record.scope,
-            resource: merge_token_resource(record.resource, payload.resource)?,
-            authorization_details: authorization_details::merge_authorization_details(
-                record.authorization_details,
-                payload.authorization_details,
-                &client,
-            )?,
-            nonce: record.nonce,
-            auth_time: Some(record.auth_time),
-            assurance: Some(assurance::AuthenticationAssurance {
-                acr: record.acr,
-                amr,
-            }),
-            sid: record.session_id,
-            // All login-code levels are intentionally online, short-lived
-            // credentials. Never mint a refresh token even if an inconsistent
-            // stored request somehow contains offline_access.
-            allow_refresh_token: login_code_level.is_none(),
-            login_code_level,
-            application_id: record.application_id,
-            authorization_profile_id: record.authorization_profile_id,
-            auth_context_id: record.auth_context_id,
-            dpop,
-        },
-    )
-    .await
-}
-
-fn authorization_code_login_level(
-    session_id: Option<&str>,
-    amr: &[String],
-) -> Option<LoginCodeLevel> {
-    if amr.iter().any(|value| value == "trial_enrollment") {
-        Some(LoginCodeLevel::TrialEnrollment)
-    } else if session_id.is_none() && amr.iter().any(|value| value == "authorization_code") {
-        Some(LoginCodeLevel::AdminUniversal)
-    } else if amr.iter().any(|value| value == "temporary") {
-        Some(LoginCodeLevel::AccountRecovery)
-    } else {
-        None
-    }
-}
-
-async fn token_from_device_code(
-    state: AppState,
-    client: ClientRecord,
-    payload: TokenRequest,
-    issuer: String,
-    dpop: Option<DpopBinding>,
-) -> AppResult<Json<TokenResponse>> {
-    if !client
-        .grant_types()?
-        .iter()
-        .any(|value| value == crate::device::DEVICE_CODE_GRANT)
-    {
-        return Err(AppError::Oidc(
-            "client cannot use device authorization grant".to_string(),
-        ));
-    }
-    let device_code = payload
-        .device_code
-        .ok_or_else(|| AppError::Oidc("device_code is required".to_string()))?;
-    let record =
-        crate::device::consume_authorized_device_code(&state, &client, &device_code).await?;
-    let user_id = record
-        .authorized_user_id
-        .ok_or_else(|| AppError::Oidc("device authorization is not approved".to_string()))?;
-    issue_tokens_for_user(
-        &state,
-        &client,
-        &issuer,
-        IssueUserTokensInput {
-            user_id,
-            scope: record.scope,
-            resource: merge_token_resource(record.resource, payload.resource)?,
-            authorization_details: authorization_details::merge_authorization_details(
-                record.authorization_details,
-                payload.authorization_details,
-                &client,
-            )?,
-            nonce: None,
-            auth_time: record.authorized_at.or(Some(record.created_at)),
-            assurance: None,
-            sid: None,
-            allow_refresh_token: true,
-            login_code_level: None,
-            application_id: None,
-            authorization_profile_id: None,
-            auth_context_id: None,
-            dpop,
-        },
-    )
-    .await
-}
-
-async fn token_from_token_exchange(
-    state: AppState,
-    headers: HeaderMap,
-    client: ClientRecord,
-    payload: TokenRequest,
-    issuer: String,
-    dpop: Option<DpopBinding>,
-) -> AppResult<Json<TokenResponse>> {
-    let input = crate::token_exchange::TokenExchangeInput {
-        subject_token: payload
-            .subject_token
-            .ok_or_else(|| AppError::Oidc("subject_token is required".to_string()))?,
-        subject_token_type: payload
-            .subject_token_type
-            .ok_or_else(|| AppError::Oidc("subject_token_type is required".to_string()))?,
-        requested_token_type: payload.requested_token_type,
-        scope: payload.scope,
-        resource: payload.resource,
-        audience: payload.audience,
-        actor_token: payload.actor_token,
-        dpop,
-    };
-    let exchanged =
-        crate::token_exchange::exchange_token(&state, &headers, &issuer, &client, input).await?;
-    Ok(Json(TokenResponse {
-        access_token: exchanged.access_token,
-        issued_token_type: Some(exchanged.issued_token_type),
-        token_type: exchanged.token_type,
-        expires_in: exchanged.expires_in,
-        id_token: None,
-        refresh_token: None,
-        scope: exchanged.scope,
-        authorization_details: exchanged.authorization_details,
-    }))
-}
-
-async fn token_from_refresh_token(
-    state: AppState,
-    client: ClientRecord,
-    payload: TokenRequest,
-    issuer: String,
-    dpop: Option<DpopBinding>,
-) -> AppResult<Json<TokenResponse>> {
-    if !client
-        .grant_types()?
-        .iter()
-        .any(|value| value == "refresh_token")
-    {
-        return Err(AppError::Oidc(
-            "client cannot use refresh_token grant".to_string(),
-        ));
-    }
-    let refresh_token = payload
-        .refresh_token
-        .ok_or_else(|| AppError::Oidc("refresh_token is required".to_string()))?;
-    let hash = util::token_hash(&refresh_token);
-    let record = state
-        .db
-        .find_refresh_token(&hash)
-        .await?
-        .ok_or_else(invalid_refresh_token_grant)?;
-    if record.client_id != client.client_id
-        || record.revoked_at.is_some()
-        || record.expires_at < util::now_ts()
-    {
-        return Err(invalid_refresh_token_grant());
-    }
-    if let Some(expected_jkt) = record.dpop_jkt.as_deref() {
-        match dpop.as_ref() {
-            Some(binding) if binding.jkt == expected_jkt => {}
-            _ => {
-                return Err(AppError::oauth(
-                    "invalid_dpop_proof",
-                    "refresh token is bound to a different DPoP key",
-                    StatusCode::UNAUTHORIZED,
-                ));
-            }
-        }
-    }
-    let user = load_active_user(&state, &record.user_id).await?;
-    if !introspected_refresh_grant_is_live(&state, &user.id, &client.client_id).await? {
-        return Err(invalid_refresh_token_grant());
-    }
-    // The single AuthorizationSnapshot below is the live application/client /
-    // user gate for refresh issuance. Do not run an independent application
-    // lookup before it: that would let the claim projection and the gate see
-    // different policy revisions.
-    let authorization_snapshot = AuthorizationSnapshot::load(&state, &client, &user).await?;
-    let binding = authorization_snapshot.binding.clone();
-    if let Some(binding) = binding.as_ref() {
-        if record.application_id.as_deref() != Some(binding.application_id.as_str())
-            || record.authorization_profile_id.as_deref()
-                != Some(binding.authorization_profile_id.as_str())
-        {
-            return Err(invalid_refresh_token_grant());
-        }
-    }
-    let scope = record.scope;
-    let resource = merge_token_resource(record.resource, payload.resource)?;
-    let authorization_details = authorization_details::merge_authorization_details(
-        record.authorization_details,
-        payload.authorization_details,
-        &client,
-    )?;
-    let mut access_claims = authorization_snapshot.claims_for_user(
-        &client,
-        &user,
-        &scope,
-        ClaimOutputTarget::AccessToken,
-    )?;
-    if let Some(application_id) = record.application_id.as_deref() {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(application_id.to_string()),
-        );
-    }
-    if let Some(profile_id) = record.authorization_profile_id.as_deref() {
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(profile_id.to_string()),
-        );
-    }
-    dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
-    authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
-    let token_audience = resource
-        .as_deref()
-        .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
-    let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
-        &issuer,
-        TokenSubject {
-            user: &user,
-            client_id: &client.client_id,
-            audience: token_audience,
-            scope: &scope,
-            nonce: None,
-            auth_time: None,
-        },
-        state.settings.oidc.access_token_ttl_seconds,
-        access_claims,
-    )?;
-    let id_token = if scope.split_whitespace().any(|scope| scope == "openid") {
-        let id_claims = authorization_snapshot.claims_for_user(
-            &client,
-            &user,
-            &scope,
-            ClaimOutputTarget::IdToken,
-        )?;
-        let subject_identifier = subject::subject_for_client(&issuer, &user, &client)?;
-        Some(state.jwt.sign_id_token_with_subject_and_claims(
-            &issuer,
-            TokenSubject {
-                user: &user,
-                client_id: &client.client_id,
-                audience: None,
-                scope: &scope,
-                nonce: None,
-                auth_time: None,
-            },
-            &subject_identifier,
-            state.settings.oidc.id_token_ttl_seconds,
-            id_claims,
-        )?)
-    } else {
-        None
-    };
-    let response_authorization_details =
-        authorization_details::authorization_details_json(authorization_details.as_deref())?;
-    let new_refresh_token = util::random_token(48);
-    let rotated = state
-        .db
-        .rotate_refresh_token(
-            &hash,
-            &client.client_id,
-            RefreshTokenInput {
-                token_hash: util::token_hash(&new_refresh_token),
-                user_id: user.id,
-                scope: scope.clone(),
-                resource: resource.clone(),
-                authorization_details: authorization_details.clone(),
-                dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
-                auth_context_id: record.auth_context_id.clone(),
-                expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
-            },
-        )
-        .await?;
-    if !rotated {
-        return Err(invalid_refresh_token_grant());
-    }
-    Ok(Json(TokenResponse {
-        access_token,
-        issued_token_type: None,
-        token_type: dpop::token_type(dpop.as_ref()),
-        expires_in: state.settings.oidc.access_token_ttl_seconds,
-        id_token,
-        refresh_token: Some(new_refresh_token),
-        scope,
-        authorization_details: response_authorization_details,
-    }))
-}
-
-fn invalid_refresh_token_grant() -> AppError {
-    AppError::oauth(
-        "invalid_grant",
-        "refresh token is invalid",
-        StatusCode::BAD_REQUEST,
-    )
-}
-
-struct IssueUserTokensInput {
-    user_id: String,
-    scope: String,
-    resource: Option<String>,
-    authorization_details: Option<String>,
-    nonce: Option<String>,
-    auth_time: Option<i64>,
-    assurance: Option<assurance::AuthenticationAssurance>,
-    sid: Option<String>,
-    allow_refresh_token: bool,
-    login_code_level: Option<LoginCodeLevel>,
-    application_id: Option<String>,
-    authorization_profile_id: Option<String>,
-    auth_context_id: Option<String>,
-    dpop: Option<DpopBinding>,
-}
-
-async fn issue_tokens_for_user(
-    state: &AppState,
-    client: &ClientRecord,
-    issuer: &str,
-    input: IssueUserTokensInput,
-) -> AppResult<Json<TokenResponse>> {
-    let IssueUserTokensInput {
-        user_id,
-        scope,
-        resource,
-        authorization_details,
-        nonce,
-        auth_time,
-        assurance,
-        sid,
-        allow_refresh_token,
-        login_code_level,
-        application_id,
-        authorization_profile_id,
-        auth_context_id,
-        dpop,
-    } = input;
-    let user = load_oidc_user(state, &user_id).await?;
-    // An authorization code can outlive the browser session by a few minutes.
-    // Re-check immutable trial provenance here so disabling/expiring an
-    // enrollment code also blocks a previously issued OAuth code at token
-    // exchange time.
-    ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
-    let authorization_snapshot = if login_code_level.is_none() {
-        Some(AuthorizationSnapshot::load(state, client, &user).await?)
-    } else {
-        if application_id.is_some() || authorization_profile_id.is_some() {
-            return Err(invalid_refresh_token_grant());
-        }
-        None
-    };
-    let client_claims_snapshot = if authorization_snapshot.is_none() {
-        Some(ClientClaimsSnapshot::load(state, client).await?)
-    } else {
-        None
-    };
-    let binding = authorization_snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.binding.as_ref());
-    if let Some(binding) = binding {
-        if application_id
-            .as_deref()
-            .is_some_and(|value| value != binding.application_id)
-            || authorization_profile_id
-                .as_deref()
-                .is_some_and(|value| value != binding.authorization_profile_id)
-        {
-            return Err(invalid_refresh_token_grant());
-        }
-    }
-    tracing::info!(
-        client_id = %client.client_id,
-        user_id = %user.id,
-        email = %user.email,
-        scope,
-        issuer,
-        "issuing OIDC tokens"
-    );
-    let mut access_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
-        snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
-    } else {
-        client_claims_snapshot
-            .as_ref()
-            .ok_or(AppError::Forbidden)?
-            .claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
-    };
-    if let Some(application_id) = application_id.as_deref() {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(application_id.to_string()),
-        );
-    } else if let Some(binding) = binding {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(binding.application_id.clone()),
-        );
-    }
-    if let Some(profile_id) = authorization_profile_id.as_deref() {
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(profile_id.to_string()),
-        );
-    } else if let Some(binding) = binding {
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(binding.authorization_profile_id.clone()),
-        );
-    }
-    dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
-    authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
-    if let Some(level) = login_code_level {
-        access_claims.insert(
-            "gpt_sso_login_code_level".to_string(),
-            serde_json::Value::String(level.as_str().to_string()),
-        );
-    }
-    let token_audience = resource
-        .as_deref()
-        .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
-    let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
-        issuer,
-        TokenSubject {
-            user: &user,
-            client_id: &client.client_id,
-            audience: token_audience,
-            scope: &scope,
-            nonce: None,
-            auth_time,
-        },
-        state.settings.oidc.access_token_ttl_seconds,
-        access_claims,
-    )?;
-    let mut id_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
-        snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::IdToken)?
-    } else {
-        client_claims_snapshot
-            .as_ref()
-            .ok_or(AppError::Forbidden)?
-            .claims_for_user(client, &user, &scope, ClaimOutputTarget::IdToken)?
-    };
-    if let Some(binding) = binding {
-        id_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(binding.application_id.clone()),
-        );
-        id_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(binding.authorization_profile_id.clone()),
-        );
-    }
-    insert_sid_claim(&mut id_claims, sid.as_deref());
-    if let Some(level) = login_code_level {
-        id_claims.insert(
-            "gpt_sso_login_code_level".to_string(),
-            serde_json::Value::String(level.as_str().to_string()),
-        );
-    }
-    if let Some(assurance) = assurance.as_ref() {
-        assurance::insert_id_token_assurance_claims(
-            &mut id_claims,
-            assurance,
-            &assurance::RequestedAssurance::default(),
-        )?;
-    }
-    let subject_identifier = subject::subject_for_client(issuer, &user, client)?;
-    let id_token = state.jwt.sign_id_token_with_subject_and_claims(
-        issuer,
-        TokenSubject {
-            user: &user,
-            client_id: &client.client_id,
-            audience: None,
-            scope: &scope,
-            nonce: nonce.as_deref(),
-            auth_time,
-        },
-        &subject_identifier,
-        state.settings.oidc.id_token_ttl_seconds,
-        id_claims,
-    )?;
-    let refresh_token = if allow_refresh_token
-        && user.archived_at.is_none()
-        && scope
-            .split_whitespace()
-            .any(|scope| scope == "offline_access")
-        && client
-            .grant_types()?
-            .iter()
-            .any(|value| value == "refresh_token")
-    {
-        let refresh_token = util::random_token(48);
-        state
-            .db
-            .insert_refresh_token(
-                client.client_id.clone(),
-                RefreshTokenInput {
-                    token_hash: util::token_hash(&refresh_token),
-                    user_id: user.id.clone(),
-                    scope: scope.clone(),
-                    resource: resource.clone(),
-                    authorization_details: authorization_details.clone(),
-                    dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
-                    auth_context_id: auth_context_id.clone(),
-                    expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
-                },
-            )
-            .await?;
-        Some(refresh_token)
-    } else {
-        None
-    };
-    Ok(Json(TokenResponse {
-        access_token,
-        issued_token_type: None,
-        token_type: dpop::token_type(dpop.as_ref()),
-        expires_in: state.settings.oidc.access_token_ttl_seconds,
-        id_token: Some(id_token),
-        refresh_token,
-        scope,
-        authorization_details: authorization_details::authorization_details_json(
-            authorization_details.as_deref(),
-        )?,
-    }))
-}
-
-fn insert_sid_claim(claims: &mut serde_json::Map<String, serde_json::Value>, sid: Option<&str>) {
-    if let Some(sid) = sid.filter(|value| !value.trim().is_empty()) {
-        claims.insert(
-            "sid".to_string(),
-            serde_json::Value::String(sid.to_string()),
-        );
-    }
-}
-
-async fn userinfo(
-    State(state): State<AppState>,
-    method: Method,
-    headers: HeaderMap,
-) -> AppResult<Json<serde_json::Value>> {
-    let (auth_scheme, token) = authorization_token(&headers)?;
-    let issuers = state.accepted_issuers(&headers).await?;
-    let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    // The access token identifies the client connection first. UserInfo is a
-    // concrete OIDC resource endpoint, so the second verification must bind
-    // its audience to that client; a token minted for an RFC 8707 API must
-    // not be replayed against UserInfo merely because it carries the same
-    // user subject.
-    let bootstrap_claims = state
-        .jwt
-        .verify_access_token_for_generic_bearer(token, &issuer_refs)?;
-    let client = state
-        .db
-        .find_client_by_client_id(&bootstrap_claims.client_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    if client.is_active != 1 {
-        return Err(AppError::Unauthorized);
-    }
-    let audiences = [client.client_id.clone()];
-    let claims = state.jwt.verify_access_token_with_issuers_and_audiences(
-        token,
-        &issuer_refs,
-        &audiences,
-    )?;
-    if let Some(cnf) = claims.cnf.as_ref() {
-        if auth_scheme != dpop::TOKEN_TYPE {
-            return Err(AppError::Unauthorized);
-        }
-        dpop::validate_access_token_proof(
-            &state,
-            &headers,
-            &method,
-            &state.settings.oidc.userinfo_endpoint,
-            token,
-            &cnf.jkt,
-        )
-        .await?;
-    } else if auth_scheme != "Bearer" {
-        return Err(AppError::Unauthorized);
-    }
-    let user = load_oidc_user(&state, &claims.sub).await?;
-    ensure_trial_enrollment_client_allowed_for_user(&state, &user.id, &client.client_id).await?;
-    if !introspected_user_grant_is_live(
-        &state,
-        &user.id,
-        &claims.client_id,
-        &claims.scope,
-        claims.grant_id.as_deref(),
-    )
-    .await?
-    {
-        return Err(AppError::Unauthorized);
-    }
-    let authorization_snapshot = if claims.gpt_sso_login_code_level.is_none() {
-        Some(AuthorizationSnapshot::load(&state, &client, &user).await?)
-    } else {
-        None
-    };
-    let client_claims_snapshot = if authorization_snapshot.is_none() {
-        Some(ClientClaimsSnapshot::load(&state, &client).await?)
-    } else {
-        None
-    };
-    tracing::info!(
-        client_id = %client.client_id,
-        user_id = %user.id,
-        email = %user.email,
-        "served OIDC userinfo"
-    );
-    let userinfo_subject = subject::subject_for_client(&claims.iss, &user, &client)?;
-    let mut response = serde_json::Map::new();
-    response.insert(
-        "sub".to_string(),
-        serde_json::Value::String(userinfo_subject),
-    );
-    response.insert(
-        "email".to_string(),
-        serde_json::Value::String(user.email.clone()),
-    );
-    response.insert(
-        "email_verified".to_string(),
-        serde_json::Value::Bool(DefaultEmailVerifiedClaimPolicy.email_verified(&user, &client)),
-    );
-    response.insert(
-        "name".to_string(),
-        serde_json::Value::String(
-            user.display_name
-                .clone()
-                .unwrap_or_else(|| user.username.clone()),
-        ),
-    );
-    response.insert(
-        "preferred_username".to_string(),
-        serde_json::Value::String(user.username.clone()),
-    );
-    let mapped_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
-        snapshot.claims_for_user(&client, &user, &claims.scope, ClaimOutputTarget::UserInfo)?
-    } else {
-        client_claims_snapshot
-            .as_ref()
-            .ok_or(AppError::Unauthorized)?
-            .claims_for_user(&client, &user, &claims.scope, ClaimOutputTarget::UserInfo)?
-    };
-    response.extend(mapped_claims);
-    Ok(Json(serde_json::Value::Object(response)))
-}
-
-#[derive(Debug, Deserialize)]
-struct IntrospectionRequest {
-    token: String,
-    token_type_hint: Option<String>,
-    #[serde(flatten)]
-    client_auth: ClientAuthForm,
-}
-
-impl ClientAuthFields for IntrospectionRequest {
-    fn client_auth(&self) -> &ClientAuthForm {
-        &self.client_auth
-    }
-}
-
-async fn introspect(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(payload): Form<IntrospectionRequest>,
-) -> AppResult<Json<serde_json::Value>> {
-    let client = authenticate_client_at(&state, &headers, &payload, "/oauth2/introspect").await?;
-    if client.token_endpoint_auth_method == "none" {
-        return Err(AppError::Unauthorized);
-    }
-    let _hint = payload.token_type_hint.as_deref();
-    let issuers = state.accepted_issuers(&headers).await?;
-    let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
-    let expected_audience = introspection_audience(&client);
-    if let Ok(claims) = state
-        .jwt
-        .verify_access_token_for_introspection(&payload.token, &issuer_refs)
-    {
-        let source_client = state.db.find_client_by_client_id(&claims.client_id).await?;
-        let active = claims.exp > util::now_ts()
-            && claims.aud == expected_audience
-            && source_client
-                .as_ref()
-                .is_some_and(|source_client| source_client.is_active == 1)
-            && introspected_access_token_is_live(&state, source_client.as_ref(), &claims).await?;
-        if active {
-            let cnf = claims
-                .cnf
-                .clone()
-                .map(|claim| serde_json::json!({ "jkt": claim.jkt }));
-            let subject_type = if claims.sub.starts_with("service-account:") {
-                "service".to_string()
-            } else {
-                source_client
-                    .as_ref()
-                    .map(|source_client| source_client.subject_type.clone())
-                    .unwrap_or_else(|| subject::SUBJECT_TYPE_PUBLIC.to_string())
-            };
-            return Ok(Json(serde_json::json!({
-                "active": true,
-                "scope": claims.scope,
-                "client_id": claims.client_id,
-                "sub": claims.sub,
-                "subject_type": subject_type,
-                "token_type": "Bearer",
-                "exp": claims.exp,
-                "iat": claims.iat,
-                "iss": claims.iss,
-                "aud": claims.aud,
-                "jti": claims.jti,
-                "act": claims.act,
-                "grant_id": claims.grant_id,
-                "grant_reference": claims.grant_id,
-                "username": claims.preferred_username,
-                "cnf": cnf,
-                "authorization_details": claims.authorization_details,
-            })));
-        }
-    }
-    let hash = util::token_hash(&payload.token);
-    if let Some(record) = state.db.find_refresh_token(&hash).await?
-        && record.revoked_at.is_none()
-        && record.expires_at > util::now_ts()
-        && record
-            .resource
-            .as_deref()
-            .unwrap_or(record.client_id.as_str())
-            == expected_audience
-    {
-        let source_client = state.db.find_client_by_client_id(&record.client_id).await?;
-        let user = if source_client
-            .as_ref()
-            .is_some_and(|source_client| source_client.is_active == 1)
-        {
-            load_oidc_user(&state, &record.user_id).await.ok()
-        } else {
-            None
-        };
-        let runtime_active = if let (Some(source_client), Some(user)) =
-            (source_client.as_ref(), user.as_ref())
-        {
-            match state
-                .db
-                .load_client_policy_snapshot_for_protocol(
-                    &source_client.id,
-                    &user.id,
-                    "oauth2_oidc",
-                )
-                .await
-            {
-                Ok(policy) => match policy.binding.as_ref() {
-                    Some(binding) => {
-                        policy.is_authorizable
-                            && policy.is_interactive_client_runtime_active()
-                            && policy.client_id.as_deref() == Some(source_client.id.as_str())
-                            && policy.user_id == user.id
-                            && record.application_id.as_deref()
-                                == Some(binding.application_id.as_str())
-                            && record.authorization_profile_id.as_deref()
-                                == Some(binding.authorization_profile_id.as_str())
-                    }
-                    None => {
-                        // Legacy refresh tokens have no application boundary;
-                        // a token carrying one cannot survive an unbind.
-                        record.application_id.is_none() && record.authorization_profile_id.is_none()
-                    }
-                },
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-        let consent_active = if runtime_active {
-            introspected_refresh_grant_is_live(&state, &record.user_id, &record.client_id).await?
-        } else {
-            false
-        };
-        if !consent_active {
-            return Ok(Json(serde_json::json!({ "active": false })));
-        }
-        let subject_type = if record.user_id.starts_with("service-account:") {
-            "service".to_string()
-        } else {
-            source_client
-                .as_ref()
-                .map(|source_client| source_client.subject_type.clone())
-                .unwrap_or_else(|| subject::SUBJECT_TYPE_PUBLIC.to_string())
-        };
-        let audience = record
-            .resource
-            .clone()
-            .unwrap_or_else(|| record.client_id.clone());
-        let authorization_details = authorization_details::authorization_details_json(
-            record.authorization_details.as_deref(),
-        )?;
-        return Ok(Json(serde_json::json!({
-            "active": true,
-            "scope": record.scope,
-            "client_id": record.client_id,
-            "sub": record.user_id,
-            "subject_type": subject_type,
-            "token_type": "refresh_token",
-            "exp": record.expires_at,
-            "iat": record.created_at,
-            "aud": audience,
-            "jti": serde_json::Value::Null,
-            "act": serde_json::Value::Null,
-            "grant_id": serde_json::Value::Null,
-            "grant_reference": serde_json::Value::Null,
-            "authorization_details": authorization_details,
-        })));
-    }
-    Ok(Json(serde_json::json!({ "active": false })))
-}
-
-fn introspection_audience(client: &ClientRecord) -> String {
-    if client.audience.trim().is_empty() {
-        client.client_id.clone()
-    } else {
-        client.audience.trim().to_string()
-    }
-}
-
-async fn introspected_access_token_is_live(
-    state: &AppState,
-    source_client: Option<&ClientRecord>,
-    claims: &TokenClaims,
-) -> AppResult<bool> {
-    let Some(source_client) = source_client else {
-        return Ok(false);
-    };
-
-    // Machine tokens have no user policy graph, but they still carry the
-    // application/profile boundary.  Resolve the complete runtime snapshot
-    // before reporting active so disabling the application, organization,
-    // discovery revision, or binding invalidates an already signed token.
-    if is_machine_token_claims(claims) {
-        let runtime = match applications::ApplicationRuntimeSnapshot::load(
-            state,
-            source_client,
-            None,
-        )
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(_) => return Ok(false),
-        };
-        if !token_claims_match_application_binding(claims, Some(&runtime.binding)) {
-            return Ok(false);
-        }
-        if !service_account_claim_is_live(source_client, claims) {
-            return Ok(false);
-        }
-        return Ok(true);
-    }
-
-    let user = match load_oidc_user(state, &claims.sub).await {
-        Ok(user) => user,
-        Err(_) => return Ok(false),
-    };
-    // This is the only source binding read for the access-token path.  Keep
-    // the policy snapshot next to the grant check so a stale outer binding
-    // read cannot make the token appear active after an unbind or rebind.
-    let policy = match state
-        .db
-        .load_client_policy_snapshot_for_protocol(&source_client.id, &user.id, "oauth2_oidc")
-        .await
-    {
-        Ok(policy) => policy,
-        Err(_) => return Ok(false),
-    };
-    if let Some(binding) = policy.binding.as_ref() {
-        if !policy.is_authorizable
-            || !policy.is_interactive_client_runtime_active()
-            || policy.client_id.as_deref() != Some(source_client.id.as_str())
-            || policy.user_id != user.id
-            || !token_claims_match_application_binding(claims, Some(binding))
-        {
-            return Ok(false);
-        }
-    } else if !token_claims_match_application_binding(claims, None) {
-        // Preserve the historical unbound-client policy, but never treat a
-        // token with application claims as legacy after its binding vanished.
-        return Ok(false);
-    }
-    introspected_user_grant_is_live(
-        state,
-        &user.id,
-        &claims.client_id,
-        &claims.scope,
-        claims.grant_id.as_deref(),
-    )
-    .await
-}
-
-fn is_machine_token_claims(claims: &TokenClaims) -> bool {
-    claims.sub.starts_with("service-account:")
-        || (claims.sub == claims.client_id && claims.email.is_empty())
-}
-
-fn service_account_claim_is_live(client: &ClientRecord, claims: &TokenClaims) -> bool {
-    client.service_account_enabled()
-        && client
-            .grant_types()
-            .ok()
-            .is_some_and(|grants| grants.iter().any(|grant| grant == "client_credentials"))
-        && (claims.sub == client.service_account_subject()
-            // Tokens issued before explicit service-account subjects were
-            // introduced used the client_id as their subject. Keep that
-            // compatibility shape, but apply the same live service-account
-            // gate so disabling/revoking the client invalidates both forms.
-            || (claims.sub == client.client_id && claims.email.is_empty()))
-}
-
-fn token_claims_match_application_binding(
-    claims: &TokenClaims,
-    binding: Option<&crate::db::ApplicationClientBindingRecord>,
-) -> bool {
-    match binding {
-        Some(binding) => {
-            claims.application_id.as_deref() == Some(binding.application_id.as_str())
-                && claims.authorization_profile_id.as_deref()
-                    == Some(binding.authorization_profile_id.as_str())
-        }
-        None => claims.application_id.is_none() && claims.authorization_profile_id.is_none(),
-    }
-}
-
-async fn introspected_user_grant_is_live(
-    state: &AppState,
-    user_id: &str,
-    client_id: &str,
-    scope: &str,
-    grant_id: Option<&str>,
-) -> AppResult<bool> {
-    if let Some(grant_id) = grant_id
-        && let Some(reference) = grant_id.strip_prefix("consent:")
-        && let Some((grant_client_id, version)) = reference.rsplit_once(':')
-    {
-        let Ok(version) = version.parse::<i64>() else {
-            return Ok(false);
-        };
-        let Some(consent) = state.db.find_client_grant(user_id, grant_client_id).await? else {
-            return Ok(false);
-        };
-        return Ok(consent.revoked_at.is_none()
-            && consent.updated_at == version
-            && grants_all_scopes(&consent.granted_scopes, scope));
-    }
-    let Some(consent) = state.db.find_client_grant(user_id, client_id).await? else {
-        // `skip_consent` creates an implicit authorization grant for ordinary
-        // browser flows. Delegated exchanges never take this branch because
-        // they always carry a consent:* grant reference.
-        return Ok(true);
-    };
-    Ok(consent.revoked_at.is_none() && grants_all_scopes(&consent.granted_scopes, scope))
-}
-
-async fn introspected_refresh_grant_is_live(
-    state: &AppState,
-    user_id: &str,
-    client_id: &str,
-) -> AppResult<bool> {
-    let Some(consent) = state.db.find_client_grant(user_id, client_id).await? else {
-        return Ok(true);
-    };
-    Ok(consent.revoked_at.is_none())
-}
-
-fn grants_all_scopes(granted_scopes: &str, requested_scope: &str) -> bool {
-    let granted = granted_scopes
-        .split_whitespace()
-        .collect::<std::collections::BTreeSet<_>>();
-    requested_scope
-        .split_whitespace()
-        .all(|scope| granted.contains(scope))
-}
-
-#[derive(Debug, Deserialize)]
-struct RevocationRequest {
-    token: String,
-    token_type_hint: Option<String>,
-    #[serde(flatten)]
-    client_auth: ClientAuthForm,
-}
-
-impl ClientAuthFields for RevocationRequest {
-    fn client_auth(&self) -> &ClientAuthForm {
-        &self.client_auth
-    }
-}
-
-async fn revoke(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(payload): Form<RevocationRequest>,
-) -> AppResult<StatusCode> {
-    let client = authenticate_client_at(&state, &headers, &payload, "/oauth2/revoke").await?;
-    let hash = util::token_hash(&payload.token);
-    if let Some(record) = state.db.find_refresh_token(&hash).await?
-        && record.client_id == client.client_id
-    {
-        state.db.revoke_refresh_token(&hash).await?;
-        state
-            .db
-            .record_audit_event(audit::oauth_event(
-                client.client_id,
-                "token.revoke",
-                AuditOutcome::Success,
-                serde_json::json!({ "token_type": payload.token_type_hint.unwrap_or_else(|| "refresh_token".to_string()) }),
-            ))
-            .await?;
-    }
-    Ok(StatusCode::OK)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3297,18 +1788,12 @@ fn normalize_client_credentials_scope(
     let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(String::new());
     };
-    let allowed = client.scopes()?;
     let scopes = requested
         .split_whitespace()
         .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
         .collect::<Vec<_>>();
-    for scope in &scopes {
-        if !allowed.iter().any(|allowed| allowed == scope) {
-            return Err(AppError::Oidc(format!(
-                "client is not allowed to request scope: {scope}"
-            )));
-        }
-    }
+    validate_requested_scopes(client, &scopes)?;
     Ok(scopes.join(" "))
 }
 
@@ -3548,13 +2033,7 @@ async fn authorize_return_to_for_interaction(
     strip_login_prompt: bool,
 ) -> AppResult<String> {
     let request = return_to_request(request, strip_login_prompt);
-    let request_uri = store
-        .store_interaction_request(&request.client_id, &request)
-        .await?;
-    Ok(format!(
-        "/oauth2/authorize?interaction_request={}",
-        url_encode(&request_uri)
-    ))
+    authorization_interaction_return_to(store, &request).await
 }
 
 async fn authorize_return_to_for_account_selection(
@@ -3562,8 +2041,15 @@ async fn authorize_return_to_for_account_selection(
     request: &ResolvedAuthorizeRequest,
 ) -> AppResult<String> {
     let request = account_selection_prompted_request(request);
+    authorization_interaction_return_to(store, &request).await
+}
+
+async fn authorization_interaction_return_to(
+    store: &impl AuthorizationInteractionRequestStore,
+    request: &ResolvedAuthorizeRequest,
+) -> AppResult<String> {
     let request_uri = store
-        .store_interaction_request(&request.client_id, &request)
+        .store_interaction_request(&request.client_id, request)
         .await?;
     Ok(format!(
         "/oauth2/authorize?interaction_request={}",
@@ -3576,39 +2062,6 @@ async fn consent_interaction_request(
     request: &ResolvedAuthorizeRequest,
 ) -> AppResult<String> {
     crate::par::store_interaction_authorization_request(state, &request.client_id, request).await
-}
-
-fn return_to_request(
-    request: &ResolvedAuthorizeRequest,
-    strip_login_prompt: bool,
-) -> ResolvedAuthorizeRequest {
-    let mut request = request.clone();
-    if strip_login_prompt {
-        request.prompt = prompt_without_login(request.prompt.as_deref());
-    }
-    request
-}
-
-fn reauthentication_request(request: &ResolvedAuthorizeRequest) -> ResolvedAuthorizeRequest {
-    let mut request = request.clone();
-    request.reauthentication_required = true;
-    request.selected_session_id = None;
-    request
-}
-
-fn account_selection_prompted_request(
-    request: &ResolvedAuthorizeRequest,
-) -> ResolvedAuthorizeRequest {
-    let mut request = request.clone();
-    // This handle is exposed to the browser before a selection is made. Keep
-    // the request incomplete so navigating to it directly cannot bypass the
-    // chooser. Only `complete_browser_account_selection` marks it completed.
-    request.account_selection_prompted = false;
-    request.account_selection_required = true;
-    request.reauthentication_required = false;
-    request.selected_session_id = None;
-    request.selected_user_id = None;
-    request
 }
 
 fn client_requires_account_selection(
@@ -3643,9 +2096,6 @@ async fn has_selectable_browser_accounts(
     let Some(context_id) = auth::browser_context_id_from_jar(state, jar) else {
         return Ok(false);
     };
-    if state.db.find_browser_context(&context_id).await?.is_none() {
-        return Ok(false);
-    }
     for option in state
         .db
         .list_browser_context_account_options(&context_id)
@@ -3716,47 +2166,43 @@ fn decode_authorize_return_to(return_to: &str) -> String {
     }
 }
 
+async fn authorization_request_from_return_to(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: AuthorizeRequest,
+) -> AppResult<Option<ResolvedAuthorizeRequest>> {
+    if let Some(interaction_request) = query.interaction_request.as_deref() {
+        return crate::par::peek_interaction_request(state, interaction_request).await;
+    }
+    if let Some(request_uri) = query.request_uri.as_deref() {
+        return crate::par::peek_request_uri(state, request_uri).await;
+    }
+    resolve_authorize_request(state, headers, query)
+        .await
+        .map(Some)
+}
+
+fn empty_authorization_login_context() -> AuthorizationLoginContext {
+    AuthorizationLoginContext {
+        client: None,
+        application: None,
+        request_requires_mfa: false,
+    }
+}
+
 pub(crate) async fn authorization_login_context_from_return_to(
     state: &AppState,
     headers: &HeaderMap,
     return_to: Option<&str>,
 ) -> AppResult<AuthorizationLoginContext> {
     let Some(return_to) = return_to else {
-        return Ok(AuthorizationLoginContext {
-            client: None,
-            application: None,
-            request_requires_mfa: false,
-        });
+        return Ok(empty_authorization_login_context());
     };
     let Some(query) = authorize_request_from_return_to(return_to)? else {
-        return Ok(AuthorizationLoginContext {
-            client: None,
-            application: None,
-            request_requires_mfa: false,
-        });
+        return Ok(empty_authorization_login_context());
     };
-    let request = if let Some(interaction_request) = query.interaction_request.as_deref() {
-        let Some(request) =
-            crate::par::peek_interaction_request(state, interaction_request).await?
-        else {
-            return Ok(AuthorizationLoginContext {
-                client: None,
-                application: None,
-                request_requires_mfa: false,
-            });
-        };
-        request
-    } else if let Some(request_uri) = query.request_uri.as_deref() {
-        let Some(request) = crate::par::peek_request_uri(state, request_uri).await? else {
-            return Ok(AuthorizationLoginContext {
-                client: None,
-                application: None,
-                request_requires_mfa: false,
-            });
-        };
-        request
-    } else {
-        resolve_authorize_request(state, headers, query).await?
+    let Some(request) = authorization_request_from_return_to(state, headers, query).await? else {
+        return Ok(empty_authorization_login_context());
     };
     let (client, runtime) = validate_authorize_request_with_runtime(state, &request).await?;
     let application = Some(runtime.application.clone());
@@ -3901,11 +2347,7 @@ pub(crate) async fn complete_browser_account_selection(
     )
     .ok_or(AppError::Unauthorized)?;
     let request = crate::par::consume_interaction_request(state, &interaction_request).await?;
-    if serde_json::to_string(&request).map_err(|err| AppError::Internal(err.to_string()))?
-        != serde_json::to_string(&preview).map_err(|err| AppError::Internal(err.to_string()))?
-    {
-        return Err(AppError::Unauthorized);
-    }
+    ensure_interaction_request_matches_preview(&request, &preview)?;
     let prompt = prompt_behavior_for_client(&client, &request)?;
     let reauthentication_required =
         session.needs_reauthentication(prompt, request.max_age, util::now_ts());
@@ -4039,15 +2481,6 @@ pub(crate) fn normalize_acr_values_param(value: Option<&str>) -> AppResult<Optio
     Ok((!values.is_empty()).then(|| values.join(" ")))
 }
 
-fn prompt_without_login(prompt: Option<&str>) -> Option<String> {
-    let prompt = prompt?
-        .split_whitespace()
-        .filter(|value| *value != "login")
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!prompt.is_empty()).then_some(prompt)
-}
-
 fn prompt_without_select_account(prompt: Option<&str>) -> Option<String> {
     let prompt = prompt?
         .split_whitespace()
@@ -4096,18 +2529,6 @@ fn serde_urlencode(pairs: &[(&'static str, String)]) -> String {
         serializer.append_pair(key, value);
     }
     serializer.finish()
-}
-
-#[allow(dead_code)]
-fn oauth_json_error(error: &str, description: &str, status: StatusCode) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": error,
-            "error_description": description,
-        })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::{sync::OnceLock, time::Duration};
+use std::{collections::HashMap, sync::OnceLock, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -124,10 +124,10 @@ pub fn spawn_audit_webhook_delivery(_db: Db, _event: AuditEventRecord) {
         // example during seed), so leave it in the durable outbox.
         return;
     };
-    if let Err(error) = notify.try_send(()) {
-        if !matches!(error, mpsc::error::TrySendError::Full(_)) {
-            tracing::debug!(error = %error, "audit webhook worker is no longer available");
-        }
+    if let Err(error) = notify.try_send(())
+        && !matches!(error, mpsc::error::TrySendError::Full(_))
+    {
+        tracing::debug!(error = %error, "audit webhook worker is no longer available");
     }
 }
 
@@ -176,9 +176,19 @@ async fn drain_audit_webhook_outbox(db: &Db, client: &reqwest::Client) -> AppRes
         // event path while still allowing webhook changes to take effect on
         // the next batch.
         let webhooks = db.list_audit_webhooks().await?;
+        let event_ids = claimed
+            .iter()
+            .map(|work| work.event_id.clone())
+            .collect::<Vec<_>>();
+        let events = db
+            .find_audit_events_by_ids(&event_ids)
+            .await?
+            .into_iter()
+            .map(|event| (event.id.clone(), event))
+            .collect::<HashMap<_, _>>();
         for work in claimed {
-            let result = match db.find_audit_event(&work.event_id).await? {
-                Some(event) => deliver_audit_event(db, client, &event, &webhooks).await,
+            let result = match events.get(&work.event_id) {
+                Some(event) => deliver_audit_event(db, client, event, &webhooks).await,
                 None => {
                     tracing::error!(
                         outbox_id = %work.id,

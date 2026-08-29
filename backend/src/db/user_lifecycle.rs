@@ -5,12 +5,7 @@
 //! state snapshot, dependent authentication rows are cleared in one
 //! transaction, and one audit event is committed with the state change.
 
-use super::*;
-
-use super::{
-    AuditEventRecord, AuthorizationCodeType, Db, LoginCodeLevel, USER_PERMANENT_DEPENDENT_TABLES,
-    UserRecord, bind_text_list, ph, select_user_sql,
-};
+use super::{AuditEventRecord, Db, UserRecord, bind_text_list, blocking, ph, select_user_sql};
 use crate::config::DatabaseKind;
 use crate::{
     error::{AppError, AppResult},

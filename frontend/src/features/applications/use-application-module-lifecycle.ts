@@ -1,14 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
 
-import type {
-  DirtyNavigationController,
-  DirtyNavigationSourceHandle
-} from "../navigation/useDirtyNavigation";
-import type {
-  ApplicationRequestBeginOptions,
-  ApplicationRequestGuard,
-  ApplicationRequestToken
-} from "./application-request-guard";
+import type { DirtyNavigationController } from "../navigation/useDirtyNavigation";
+import type { ApplicationRequestGuard } from "./application-request-guard";
+import { useApplicationDirtySource } from "./use-application-dirty-source";
+import { useApplicationRequestLifecycle } from "./use-application-request-lifecycle";
 
 export type ApplicationModuleLifecycleOptions = {
   applicationId: string;
@@ -29,39 +24,12 @@ export function useApplicationModuleLifecycle({
 }: ApplicationModuleLifecycleOptions) {
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState("");
-  const dirtySourceRef = useRef<DirtyNavigationSourceHandle | null>(null);
-  const registerSource = dirtyNavigation?.registerSource;
+  useApplicationDirtySource({ dirtyNavigation, dirtySource, dirty, onDirtyChange });
 
-  useEffect(() => {
-    if (!registerSource || !dirtySource) return;
-    const source = registerSource(dirtySource);
-    dirtySourceRef.current = source;
-    return () => {
-      source.unregister();
-      if (dirtySourceRef.current === source) dirtySourceRef.current = null;
-    };
-  }, [dirtySource, registerSource]);
-
-  useEffect(() => {
-    dirtySourceRef.current?.setDirty(dirty);
-    onDirtyChange?.(dirty);
-  }, [dirty, onDirtyChange]);
-
-  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-
-  const beginRequest = useCallback(
-    (scope: string, options: Omit<ApplicationRequestBeginOptions, "scope"> = {}) =>
-      requestGuard.begin(applicationId, { ...options, scope }),
-    [applicationId, requestGuard]
-  );
-  const isCurrent = useCallback(
-    (request: ApplicationRequestToken) => requestGuard.isCurrent(request),
-    [requestGuard]
-  );
-  const finishRequest = useCallback(
-    (request: ApplicationRequestToken, committed = true) => requestGuard.finish(request, committed),
-    [requestGuard]
-  );
+  const { beginRequest, isCurrent, finishRequest } = useApplicationRequestLifecycle({
+    applicationId,
+    requestGuard
+  });
 
   return {
     saving,

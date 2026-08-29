@@ -3,77 +3,101 @@ use crate::{
     access::{Authorizer, Permission, PermissionInfo, permission_catalog},
     application_discovery, applications, archived_accounts,
     audit::{self, AuditSink},
-    auth::{self, AccountCapabilities},
-    auth_flow, authorization, backchannel_logout, billing, claim_mapper, client_assertion,
-    client_policy, config, csrf,
+    auth, auth_flow, authorization, backchannel_logout, billing, client_assertion, csrf,
     db::{
         ApplicationAuthorizationProfileRecord, ApplicationDiscoveryRecord,
         ApplicationJwtClientRecord, ApplicationModuleRecord, ApplicationPermissionDefinitionRecord,
         ApplicationProfileRoleRecord, ApplicationRecord, ApplicationScimTokenRecord,
         AuditEventRecord, AuthorizationBindingPermissionOverride, AuthorizationBindingsSnapshot,
         AuthorizationBindingsUpdate, AuthorizationCodeType, ClientGrantWithClientRecord,
-        GroupRecord, InvitationRecord, InvitationUpdate, LinkedIdentityRecord, LoginCodeLevel,
-        LoginEventRecord, NewApplication, NewApplicationBillingSettings, NewApplicationDiscovery,
-        NewApplicationJwtClient, NewApplicationProfileRole, NewApplicationScimToken,
-        NewBulkProvisionedUser, NewClient, NewClientClaimMapper, NewExternalOidcProvider, NewGroup,
-        NewIapApplication, NewInvitation, NewLdapProvider, NewLoginSettings, NewOrganization,
-        NewRegistrationSettings, NewRole, NewRuntimeSettings, NewSecurityPolicy, NewUser,
-        OrganizationMemberInput, OrganizationMemberWithUserRecord, OrganizationRecord,
-        PublicAuditWebhook, PublicClient, PublicClientClaimMapper, PublicExternalOidcProvider,
-        PublicIapApplication, PublicInvitation, PublicInvitationRedemption, PublicLdapProvider,
-        PublicLoginSettings, PublicRegistrationSettings, PublicSecurityPolicy, PublicUser,
-        QuickLink, RoleRecord, SecurityPolicyRecord, SessionRecord, SigningKeyRecord,
-        UserListFilters, UserListLinkedIdentityFilter, UserListLoginRegion, UserListRoleFilter,
-        UserListScope, UserOptionRecord, UserOrganizationRecord, UserUpdate,
+        GroupRecord, InvitationRecord, InvitationUpdate, LoginCodeLevel, NewApplication,
+        NewApplicationBillingSettings, NewApplicationDiscovery, NewApplicationJwtClient,
+        NewApplicationProfileRole, NewApplicationScimToken, NewGroup, NewIapApplication,
+        NewInvitation, NewOrganization, NewRole, NewUser, OrganizationMemberInput,
+        OrganizationMemberWithUserRecord, OrganizationRecord, PublicAuditWebhook, PublicClient,
+        PublicClientClaimMapper, PublicIapApplication, PublicInvitation,
+        PublicInvitationRedemption, PublicUser, RoleRecord, SessionRecord, UserListScope,
+        UserOrganizationRecord, UserUpdate,
     },
     directory, directory_sync,
     error::{AppError, AppResult},
     frontchannel_logout, iap,
-    identity_sources::{self, OidcDiscoveryResult, OidcProviderTemplate},
     mfa::{self, RecoveryCodeIssuer},
     mfa_policy::MfaDecision,
     mutations,
-    network_policy::{self, TrustedNetworkPolicy},
+    network_policy::TrustedNetworkPolicy,
     organizations::{self, OrganizationEmailPolicy},
-    security_policy::{self, PasswordPolicy, PasswordSubject},
-    service_accounts, subject, util, webhooks,
+    security_policy, util, webhooks,
 };
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::HeaderMap,
     routing::{delete, get, post, put},
 };
 use axum_extra::extract::cookie::CookieJar;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, NaiveDate};
-use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
 };
-use url::Url;
 
 #[path = "admin_settings.rs"]
 mod admin_settings;
-use admin_settings::{
-    normalize_brand_logo_url, normalize_email_domains, normalize_optional_email,
-    normalize_optional_text, normalize_quick_links,
-};
+use admin_settings::{normalize_optional_email, normalize_optional_text};
 #[path = "admin_user_import.rs"]
 mod admin_user_import;
-use admin_user_import::{
-    BulkImportQuery, NormalizedUserInput, normalize_user_input, parse_bulk_import_csv,
-};
+use admin_user_import::normalize_user_input;
+#[path = "admin_client_policy.rs"]
+mod admin_client_policy;
+#[path = "admin_guards.rs"]
+mod admin_guards;
 #[path = "admin_providers.rs"]
 mod admin_providers;
-use admin_providers::{
-    ExternalOidcProviderInput, LdapProviderInput, OidcDiscoveryInput,
-    apply_external_provider_secret_update, default_true, normalize_external_provider_input,
-    normalize_ldap_provider_input, normalize_optional_http_url,
+use admin_client_policy::{
+    client_input_to_claim_mappers, client_input_to_new, validate_client_input,
 };
+use admin_guards::{require_any_permission, require_permission};
+#[path = "admin_organization_scope.rs"]
+mod admin_organization_scope;
+use admin_organization_scope::{client_organization_from_context, current_organization_context};
+#[path = "admin_authorization_code_policy.rs"]
+mod admin_authorization_code_policy;
+use admin_authorization_code_policy::{
+    AuthorizationCodeValidationInput, ensure_admin_universal_manager, immutable_allowed_client_ids,
+    immutable_optional_text, immutable_recovery_username, normalized_client_ids,
+    recovery_target_user_id, validate_active_allowed_clients, validate_login_code_binding_metadata,
+};
+#[path = "admin_user_directory.rs"]
+mod admin_user_directory;
+#[path = "admin_user_query.rs"]
+mod admin_user_query;
+#[cfg(test)]
+use crate::db::{UserListLinkedIdentityFilter, UserListRoleFilter};
+#[cfg(test)]
+use admin_user_query::USER_DIRECTORY_DEFAULT_PAGE_SIZE;
+#[cfg(test)]
+use admin_user_query::{UserListQuery, parse_user_list_query, user_list_scope};
+
+fn default_true() -> bool {
+    true
+}
+
+#[cfg(test)]
+use crate::db::QuickLink;
+#[cfg(test)]
+use crate::subject;
+#[cfg(test)]
+use admin_providers::{
+    ExternalOidcProviderInput, LdapProviderInput, apply_external_provider_secret_update,
+    normalize_external_provider_input, normalize_ldap_provider_input,
+};
+#[cfg(test)]
+use admin_settings::{normalize_brand_logo_url, normalize_email_domains, normalize_quick_links};
+#[cfg(test)]
+use admin_user_import::{BulkImportQuery, parse_bulk_import_csv};
+#[cfg(test)]
+use axum::{http::StatusCode, response::Response};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -126,10 +150,22 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/signing-keys",
             get(admin_settings::list_signing_keys).post(admin_settings::rotate_signing_key),
         )
-        .route("/api/admin/users", get(list_users).post(create_user))
-        .route("/api/admin/users/page", get(list_users))
-        .route("/api/admin/users/cursor", get(list_users_cursor))
-        .route("/api/admin/user-options", get(list_user_options))
+        .route(
+            "/api/admin/users",
+            get(admin_user_directory::list_users).post(create_user),
+        )
+        .route(
+            "/api/admin/users/page",
+            get(admin_user_directory::list_users),
+        )
+        .route(
+            "/api/admin/users/cursor",
+            get(admin_user_directory::list_users_cursor),
+        )
+        .route(
+            "/api/admin/user-options",
+            get(admin_user_directory::list_user_options),
+        )
         .route(
             "/api/admin/users/import-csv",
             post(admin_user_import::import_users_csv),
@@ -137,13 +173,21 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/users/bulk-lifecycle", post(bulk_user_lifecycle))
         .route(
             "/api/admin/users/{id}",
-            get(user_detail).put(update_user).delete(delete_user),
+            get(admin_user_directory::user_detail)
+                .put(update_user)
+                .delete(delete_user),
         )
         .route("/api/admin/users/{id}/enable", post(enable_user))
         .route("/api/admin/users/{id}/password", post(set_user_password))
         .route("/api/admin/users/{id}/mfa/reset", post(reset_user_mfa))
-        .route("/api/admin/users/{id}/login-events", get(user_login_events))
-        .route("/api/admin/users/{id}/permissions", get(user_permissions))
+        .route(
+            "/api/admin/users/{id}/login-events",
+            get(admin_user_directory::user_login_events),
+        )
+        .route(
+            "/api/admin/users/{id}/permissions",
+            get(admin_user_directory::user_permissions),
+        )
         .route("/api/admin/clients", get(list_clients))
         .route(
             "/api/admin/applications",
@@ -1185,454 +1229,6 @@ async fn overview(
     }))
 }
 
-const USER_DIRECTORY_DEFAULT_PAGE_SIZE: usize = 25;
-const USER_DIRECTORY_MAX_PAGE_SIZE: usize = 200;
-const USER_OPTION_DEFAULT_LIMIT: usize = 100;
-const USER_OPTION_MAX_LIMIT: usize = 200;
-
-#[derive(Debug, Deserialize, Default)]
-struct UserListQuery {
-    status: Option<String>,
-    page: Option<String>,
-    page_size: Option<String>,
-    cursor: Option<String>,
-    // Offset/limit remain accepted for non-UI callers during migration. The
-    // response contract is the one-based page envelope below.
-    offset: Option<String>,
-    limit: Option<String>,
-    #[serde(alias = "q")]
-    search: Option<String>,
-    organization_id: Option<String>,
-    linked_identity: Option<String>,
-    email: Option<String>,
-    phone: Option<String>,
-    role: Option<String>,
-    #[serde(alias = "registration_from", alias = "date_from")]
-    created_from: Option<String>,
-    #[serde(alias = "registration_to", alias = "date_to")]
-    created_to: Option<String>,
-    last_login_from: Option<String>,
-    last_login_to: Option<String>,
-    #[serde(alias = "region")]
-    login_region: Option<String>,
-}
-
-#[derive(Debug)]
-struct ParsedUserListQuery {
-    scope: UserListScope,
-    filters: UserListFilters,
-    page: usize,
-    page_size: usize,
-    offset: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct UserListPageResponse {
-    items: Vec<PublicUser>,
-    page: usize,
-    page_size: usize,
-    total: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct UserDirectoryCursorResponse {
-    items: Vec<PublicUser>,
-    page_size: usize,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct UserOptionQuery {
-    status: Option<String>,
-    organization_id: Option<String>,
-    #[serde(alias = "q")]
-    search: Option<String>,
-    limit: Option<String>,
-}
-
-fn encode_user_directory_cursor(cursor: &crate::db::UserDirectoryCursor) -> AppResult<String> {
-    let bytes = serde_json::to_vec(cursor)
-        .map_err(|error| AppError::Internal(format!("failed to encode user cursor: {error}")))?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn decode_user_directory_cursor(
-    value: Option<String>,
-) -> AppResult<Option<crate::db::UserDirectoryCursor>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    if value.is_empty() || value.len() > 2048 {
-        return Err(AppError::BadRequest("cursor is invalid".to_string()));
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| AppError::BadRequest("cursor is invalid".to_string()))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| AppError::BadRequest("cursor is invalid".to_string()))
-}
-
-fn normalize_user_list_text(
-    value: Option<String>,
-    field: &str,
-    max_chars: usize,
-) -> AppResult<Option<String>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if value.chars().count() > max_chars || value.chars().any(char::is_control) {
-        return Err(AppError::BadRequest(format!("{field} is invalid")));
-    }
-    Ok(Some(value))
-}
-
-fn parse_user_list_number(
-    value: Option<String>,
-    field: &str,
-    default: usize,
-    max: Option<usize>,
-    allow_zero: bool,
-) -> AppResult<usize> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    let value = value.trim();
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|_| AppError::BadRequest(format!("{field} must be a positive integer")))?;
-    let parsed = usize::try_from(parsed)
-        .map_err(|_| AppError::BadRequest(format!("{field} is too large")))?;
-    if (!allow_zero && parsed == 0) || max.is_some_and(|max| parsed > max) {
-        let message = max.map_or_else(
-            || {
-                if allow_zero {
-                    format!("{field} must be a non-negative integer")
-                } else {
-                    format!("{field} must be a positive integer")
-                }
-            },
-            |max| format!("{field} must be between 1 and {max}"),
-        );
-        return Err(AppError::BadRequest(message));
-    }
-    Ok(parsed)
-}
-
-fn parse_user_list_date(
-    value: Option<String>,
-    field: &str,
-    upper_bound: bool,
-) -> AppResult<Option<i64>> {
-    let Some(value) = normalize_user_list_text(value, field, 64)? else {
-        return Ok(None);
-    };
-    let (timestamp, date_only) = if let Ok(timestamp) = value.parse::<i64>() {
-        (timestamp, false)
-    } else if let Ok(date) = NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
-        (
-            date.and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid")
-                .and_utc()
-                .timestamp(),
-            true,
-        )
-    } else if let Ok(datetime) = DateTime::parse_from_rfc3339(&value) {
-        (datetime.timestamp(), false)
-    } else {
-        return Err(AppError::BadRequest(format!(
-            "{field} must be an RFC3339 timestamp, Unix timestamp, or YYYY-MM-DD"
-        )));
-    };
-    if timestamp < 0 {
-        return Err(AppError::BadRequest(format!("{field} is invalid")));
-    }
-    let timestamp = if upper_bound && date_only {
-        timestamp
-            .checked_add(86_400)
-            .ok_or_else(|| AppError::BadRequest(format!("{field} is out of range")))?
-    } else {
-        timestamp
-    };
-    Ok(Some(timestamp))
-}
-
-fn parse_user_list_query(query: UserListQuery) -> AppResult<ParsedUserListQuery> {
-    let scope = user_list_scope(query.status.as_deref())?;
-    let page_size = if query.page_size.is_some() {
-        parse_user_list_number(
-            query.page_size,
-            "page_size",
-            USER_DIRECTORY_DEFAULT_PAGE_SIZE,
-            Some(USER_DIRECTORY_MAX_PAGE_SIZE),
-            false,
-        )?
-    } else if query.limit.is_some() {
-        parse_user_list_number(
-            query.limit,
-            "limit",
-            USER_DIRECTORY_DEFAULT_PAGE_SIZE,
-            Some(USER_DIRECTORY_MAX_PAGE_SIZE),
-            false,
-        )?
-    } else {
-        USER_DIRECTORY_DEFAULT_PAGE_SIZE
-    };
-    let page = if query.page.is_some() {
-        parse_user_list_number(query.page, "page", 1, None, false)?
-    } else if query.offset.is_some() {
-        let offset = parse_user_list_number(query.offset, "offset", 0, None, true)?;
-        offset
-            .checked_div(page_size)
-            .and_then(|page| page.checked_add(1))
-            .ok_or_else(|| AppError::BadRequest("offset is too large".to_string()))?
-    } else {
-        1
-    };
-    let offset = page
-        .checked_sub(1)
-        .and_then(|page| page.checked_mul(page_size))
-        .ok_or_else(|| AppError::BadRequest("page is too large".to_string()))?;
-
-    let linked_identity = match query
-        .linked_identity
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("all")
-    {
-        "all" => UserListLinkedIdentityFilter::All,
-        "linked" => UserListLinkedIdentityFilter::Linked,
-        "unlinked" => UserListLinkedIdentityFilter::Unlinked,
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unsupported linked identity filter: {other}"
-            )));
-        }
-    };
-    let role = match query
-        .role
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("all")
-    {
-        "all" => UserListRoleFilter::Any,
-        "admin" => UserListRoleFilter::Admin,
-        "user" => UserListRoleFilter::User,
-        value => UserListRoleFilter::Named(
-            normalize_user_list_text(Some(value.to_string()), "role", 128)?
-                .expect("non-empty role was checked above"),
-        ),
-    };
-    let login_region = match query
-        .login_region
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("all")
-    {
-        "all" => UserListLoginRegion::All,
-        "domestic" => UserListLoginRegion::Domestic,
-        "overseas" => UserListLoginRegion::Overseas,
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unsupported login region filter: {other}"
-            )));
-        }
-    };
-    let created_from = parse_user_list_date(query.created_from, "registration_from", false)?;
-    let created_to = parse_user_list_date(query.created_to, "registration_to", true)?;
-    let last_login_from = parse_user_list_date(query.last_login_from, "last_login_from", false)?;
-    let last_login_to = parse_user_list_date(query.last_login_to, "last_login_to", true)?;
-    if created_from
-        .zip(created_to)
-        .is_some_and(|(from, to)| from >= to)
-    {
-        return Err(AppError::BadRequest(
-            "registration_from must be before registration_to".to_string(),
-        ));
-    }
-    if last_login_from
-        .zip(last_login_to)
-        .is_some_and(|(from, to)| from >= to)
-    {
-        return Err(AppError::BadRequest(
-            "last_login_from must be before last_login_to".to_string(),
-        ));
-    }
-
-    Ok(ParsedUserListQuery {
-        scope,
-        filters: UserListFilters {
-            organization_id: normalize_user_list_text(
-                query.organization_id,
-                "organization_id",
-                128,
-            )?,
-            linked_identity,
-            search: normalize_user_list_text(query.search, "search", 256)?,
-            email: normalize_user_list_text(query.email, "email", 320)?,
-            phone: normalize_user_list_text(query.phone, "phone", 128)?,
-            role,
-            created_from,
-            created_to,
-            last_login_from,
-            last_login_to,
-            login_region,
-        },
-        page,
-        page_size,
-        offset,
-    })
-}
-
-async fn list_users(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<UserListQuery>,
-) -> AppResult<Json<UserListPageResponse>> {
-    let parsed = parse_user_list_query(query)?;
-    require_user_list_reader(&state, &jar, parsed.filters.organization_id.as_deref()).await?;
-    let page = state
-        .db
-        .list_admin_users_page(
-            parsed.scope,
-            parsed.filters,
-            parsed.offset,
-            parsed.page_size,
-        )
-        .await?;
-    Ok(Json(UserListPageResponse {
-        items: page.users.into_iter().map(|user| user.public()).collect(),
-        page: parsed.page,
-        page_size: page.limit,
-        total: page.total,
-    }))
-}
-
-/// Cursor-based directory endpoint for deep paging. The legacy page endpoint
-/// remains available for compatibility, while new clients avoid COUNT/OFFSET
-/// scans and receive an opaque position token tied to the stable SQL order.
-async fn list_users_cursor(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<UserListQuery>,
-) -> AppResult<Json<UserDirectoryCursorResponse>> {
-    let cursor = decode_user_directory_cursor(query.cursor.clone())?;
-    let parsed = parse_user_list_query(query)?;
-    require_user_list_reader(&state, &jar, parsed.filters.organization_id.as_deref()).await?;
-    let page = state
-        .db
-        .list_admin_users_page_after(parsed.scope, parsed.filters, cursor, parsed.page_size)
-        .await?;
-    Ok(Json(UserDirectoryCursorResponse {
-        items: page.users.into_iter().map(|user| user.public()).collect(),
-        page_size: page.limit,
-        next_cursor: page
-            .next_cursor
-            .as_ref()
-            .map(encode_user_directory_cursor)
-            .transpose()?,
-    }))
-}
-
-async fn list_user_options(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<UserOptionQuery>,
-) -> AppResult<Json<Vec<UserOptionRecord>>> {
-    let scope = user_list_scope(query.status.as_deref())?;
-    let organization_id = normalize_user_list_text(query.organization_id, "organization_id", 128)?;
-    let search = normalize_user_list_text(query.search, "search", 256)?;
-    let limit = parse_user_list_number(
-        query.limit,
-        "limit",
-        USER_OPTION_DEFAULT_LIMIT,
-        Some(USER_OPTION_MAX_LIMIT),
-        false,
-    )?;
-    require_user_list_reader(&state, &jar, organization_id.as_deref()).await?;
-    Ok(Json(
-        state
-            .db
-            .list_user_options(scope, organization_id.as_deref(), search.as_deref(), limit)
-            .await?,
-    ))
-}
-
-fn user_list_scope(status: Option<&str>) -> AppResult<UserListScope> {
-    match status.unwrap_or("live") {
-        "live" => Ok(UserListScope::Live),
-        "active" => Ok(UserListScope::Active),
-        "disabled" => Ok(UserListScope::Disabled),
-        "archived" => Ok(UserListScope::Archived),
-        "authorization_code" => Ok(UserListScope::AuthorizationCode),
-        "all" => Ok(UserListScope::All),
-        other => Err(AppError::BadRequest(format!(
-            "unsupported user status filter: {other}"
-        ))),
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct UserDetailResponse {
-    user: PublicUser,
-    login_events: Vec<LoginEventRecord>,
-    linked_identities: Vec<LinkedIdentityRecord>,
-    organizations: Vec<UserOrganizationRecord>,
-}
-
-async fn user_detail(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<UserDetailResponse>> {
-    require_user_reader(&state, &jar).await?;
-    let user = state
-        .db
-        .find_user_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let login_events = state.db.list_login_events(&id, 20).await?;
-    let linked_identities = state.db.list_linked_identities(&id).await?;
-    let organizations = state.db.list_user_organizations(&id).await?;
-    Ok(Json(UserDetailResponse {
-        user: user.public(),
-        login_events,
-        linked_identities,
-        organizations,
-    }))
-}
-
-async fn user_login_events(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<Vec<LoginEventRecord>>> {
-    require_user_reader(&state, &jar).await?;
-    Ok(Json(state.db.list_login_events(&id, 100).await?))
-}
-
-async fn user_permissions(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<Vec<String>>> {
-    require_user_reader(&state, &jar).await?;
-    state
-        .db
-        .find_user_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok(Json(state.db.list_effective_permissions(&id).await?))
-}
-
 async fn list_audit_events(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -2034,38 +1630,6 @@ async fn require_organization_manager(
     require_permission(state, jar, Permission::OrganizationsManage).await
 }
 
-async fn require_permission(
-    state: &AppState,
-    jar: &CookieJar,
-    permission: Permission,
-) -> AppResult<auth::CurrentUser> {
-    let current = auth::require_current_user(state, jar).await?;
-    if !current.can_mutate_account() {
-        return Err(AppError::Forbidden);
-    }
-    state
-        .db
-        .require_permission(&current.user, permission)
-        .await?;
-    Ok(current)
-}
-
-async fn require_any_permission(
-    state: &AppState,
-    jar: &CookieJar,
-    permissions: &[Permission],
-) -> AppResult<auth::CurrentUser> {
-    let current = auth::require_current_user(state, jar).await?;
-    if !current.can_mutate_account() {
-        return Err(AppError::Forbidden);
-    }
-    state
-        .db
-        .require_any_permission(&current.user, permissions)
-        .await?;
-    Ok(current)
-}
-
 async fn role_response(state: &AppState, role: RoleRecord) -> AppResult<RoleAccessResponse> {
     let permissions = state.db.list_role_permissions(&role.id).await?;
     Ok(RoleAccessResponse {
@@ -2174,15 +1738,13 @@ async fn organization_members_input(
             .unwrap_or_default()
             .trim()
             .is_empty()
-        {
-            if let Some(email) = member
+            && let Some(email) = member
                 .email
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            {
-                email_selectors.push(email.to_string());
-            }
+        {
+            email_selectors.push(email.to_string());
         }
     }
     let user_ids_by_email = state.db.find_user_ids_by_emails(&email_selectors).await?;
@@ -2222,8 +1784,10 @@ async fn list_roles(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<RoleAccessResponse>>> {
     require_security_manager(&state, &jar).await?;
-    let roles = state.db.list_roles().await?;
-    let permissions_by_role = state.db.list_role_permissions_by_role().await?;
+    let (roles, permissions_by_role) = tokio::try_join!(
+        state.db.list_roles(),
+        state.db.list_role_permissions_by_role(),
+    )?;
     let mut response = Vec::with_capacity(roles.len());
     for role in roles {
         response.push(RoleAccessResponse {
@@ -2332,9 +1896,11 @@ async fn list_groups(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<GroupAccessResponse>>> {
     require_security_manager(&state, &jar).await?;
-    let groups = state.db.list_groups().await?;
-    let roles_by_group = state.db.list_group_roles_by_group().await?;
-    let members_by_group = state.db.list_group_members_public_by_group().await?;
+    let (groups, roles_by_group, members_by_group) = tokio::try_join!(
+        state.db.list_groups(),
+        state.db.list_group_roles_by_group(),
+        state.db.list_group_members_public_by_group(),
+    )?;
     let mut response = Vec::with_capacity(groups.len());
     for group in groups {
         response.push(GroupAccessResponse {
@@ -2498,9 +2064,12 @@ async fn list_organizations(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<OrganizationResponse>>> {
     require_organization_reader(&state, &jar).await?;
-    let member_counts = state.db.list_organization_member_counts().await?;
+    let (member_counts, organizations) = tokio::try_join!(
+        state.db.list_organization_member_counts(),
+        state.db.list_organizations(),
+    )?;
     let mut response = Vec::new();
-    for organization in state.db.list_organizations().await? {
+    for organization in organizations {
         let member_count = member_counts
             .get(&organization.id)
             .copied()
@@ -2944,11 +2513,23 @@ async fn user_access(
         .find_user_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(UserAccessResponse {
-        direct_roles: state.db.list_user_roles(&id).await?,
-        groups: state.db.list_user_groups(&id).await?,
-        effective_permissions: state.db.list_effective_permissions(&id).await?,
-    }))
+    Ok(Json(load_user_access_response(&state, &id).await?))
+}
+
+async fn load_user_access_response(
+    state: &AppState,
+    user_id: &str,
+) -> AppResult<UserAccessResponse> {
+    let (direct_roles, groups, effective_permissions) = tokio::try_join!(
+        state.db.list_user_roles(user_id),
+        state.db.list_user_groups(user_id),
+        state.db.list_effective_permissions(user_id),
+    )?;
+    Ok(UserAccessResponse {
+        direct_roles,
+        groups,
+        effective_permissions,
+    })
 }
 
 async fn update_user_roles(
@@ -2973,11 +2554,7 @@ async fn update_user_roles(
             serde_json::json!({ "role_ids": payload.role_ids }),
         ))
         .await?;
-    Ok(Json(UserAccessResponse {
-        direct_roles: state.db.list_user_roles(&id).await?,
-        groups: state.db.list_user_groups(&id).await?,
-        effective_permissions: state.db.list_effective_permissions(&id).await?,
-    }))
+    Ok(Json(load_user_access_response(&state, &id).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2999,19 +2576,6 @@ pub(super) fn normalize_required_text(value: String, field: &str) -> AppResult<S
     Ok(value)
 }
 
-async fn validate_password_for_subject(
-    state: &AppState,
-    password: &str,
-    email: &str,
-    username: &str,
-) -> AppResult<()> {
-    state
-        .db
-        .security_policy()
-        .await?
-        .validate_password(password, PasswordSubject { email, username })
-}
-
 async fn create_user(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -3023,7 +2587,13 @@ async fn create_user(
         .password
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("password is required".to_string()))?;
-    validate_password_for_subject(&state, password, &payload.email, &payload.username).await?;
+    security_policy::validate_password_for_subject(
+        &state,
+        password,
+        &payload.email,
+        &payload.username,
+    )
+    .await?;
     let user = state
         .db
         .insert_user(NewUser {
@@ -3068,7 +2638,13 @@ async fn update_user(
         payload.is_active,
     )?;
     if let Some(password) = payload.password.as_deref() {
-        validate_password_for_subject(&state, password, &payload.email, &payload.username).await?;
+        security_policy::validate_password_for_subject(
+            &state,
+            password,
+            &payload.email,
+            &payload.username,
+        )
+        .await?;
     }
     let password_hash = payload
         .password
@@ -3222,7 +2798,13 @@ async fn set_user_password(
         .find_user_by_id(&id)
         .await?
         .ok_or(AppError::NotFound)?;
-    validate_password_for_subject(&state, &payload.password, &user.email, &user.username).await?;
+    security_policy::validate_password_for_subject(
+        &state,
+        &payload.password,
+        &user.email,
+        &user.username,
+    )
+    .await?;
     state
         .db
         .replace_user_password_with_audit(
@@ -3431,19 +3013,6 @@ async fn current_organization_client_manager(
     }
     require_organization_manager_for(state, &current, &organization.id).await?;
     Ok((current, organization))
-}
-
-fn client_organization_from_context(
-    submitted_organization_id: Option<String>,
-    organization: &UserOrganizationRecord,
-) -> AppResult<Option<String>> {
-    if let Some(submitted) = submitted_organization_id {
-        let submitted = submitted.trim();
-        if !submitted.is_empty() && submitted != organization.id {
-            return Err(AppError::Forbidden);
-        }
-    }
-    Ok(Some(organization.id.clone()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4084,26 +3653,6 @@ fn application_response_from_graph(
     })
 }
 
-async fn current_organization_context(
-    state: &AppState,
-    jar: &CookieJar,
-) -> AppResult<(auth::CurrentUser, UserOrganizationRecord)> {
-    let current = auth::require_current_user(state, jar).await?;
-    if !current.can_mutate_account() {
-        return Err(AppError::Forbidden);
-    }
-    let organization = state
-        .db
-        .active_user_organization(&current.user.id)
-        .await?
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "join or create an organization before using the management console".to_string(),
-            )
-        })?;
-    Ok((current, organization))
-}
-
 pub(crate) async fn require_organization_manager_for(
     state: &AppState,
     current: &auth::CurrentUser,
@@ -4125,17 +3674,16 @@ pub(crate) async fn require_organization_manager_for(
             .await?;
         return Ok(());
     }
-    if state
-        .db
-        .has_permission(&current.user, Permission::OrganizationsManage)
-        .await?
-    {
+    let (platform_manager, memberships) = tokio::try_join!(
+        state
+            .db
+            .has_permission(&current.user, Permission::OrganizationsManage),
+        state.db.list_user_organizations(&current.user.id),
+    )?;
+    if platform_manager {
         return Ok(());
     }
-    let membership = state
-        .db
-        .list_user_organizations(&current.user.id)
-        .await?
+    let membership = memberships
         .into_iter()
         .find(|organization| organization.id == organization_id && organization.is_active == 1);
     match membership
@@ -4201,13 +3749,7 @@ async fn list_application_modules(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<ApplicationModuleResponse>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
     let modules = state
         .db
         .list_application_modules(&id)
@@ -4223,13 +3765,7 @@ async fn get_application_billing_settings(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
     let settings = state.db.ensure_application_billing_settings(&id).await?;
     Ok(Json(billing::application_billing_settings_response(
         settings,
@@ -4242,13 +3778,7 @@ async fn update_application_billing_settings(
     Path(id): Path<String>,
     Json(payload): Json<billing::ApplicationBillingSettingsInput>,
 ) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     let (accept_signet_balance, wallet_mode, supported_currencies) =
         billing::normalize_application_billing_input(&state.settings, payload)?;
     let settings = state
@@ -4347,13 +3877,7 @@ async fn update_application_module(
     Path((id, module_key)): Path<(String, String)>,
     Json(payload): Json<ApplicationModuleInput>,
 ) -> AppResult<Json<ApplicationModuleResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
     let config = applications::normalize_module_config(&module_key, payload.config)?;
@@ -4402,13 +3926,7 @@ async fn get_application_jwt_client(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Option<ApplicationJwtClientResponse>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, application) = managed_application(&state, &jar, &id).await?;
     let Some(module) = applications::enabled_protocol_config(&state, &id, "jwt").await? else {
         return Ok(Json(None));
     };
@@ -4433,13 +3951,7 @@ async fn update_application_jwt_client(
     Path(id): Path<String>,
     Json(payload): Json<ApplicationJwtClientInput>,
 ) -> AppResult<Json<ApplicationJwtClientResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     let client_type = payload.client_type.trim().to_ascii_lowercase();
     if !matches!(client_type.as_str(), "public" | "confidential") {
         return Err(AppError::BadRequest(
@@ -4481,13 +3993,7 @@ async fn rotate_application_jwt_secret(
     Path(id): Path<String>,
     Json(payload): Json<ApplicationJwtSecretRotationInput>,
 ) -> AppResult<Json<ApplicationJwtSecretRotationResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     if !(0..=86_400).contains(&payload.grace_seconds) {
         return Err(AppError::BadRequest(
             "JWT secret grace_seconds must be between 0 and 86400".to_string(),
@@ -4551,13 +4057,7 @@ async fn revoke_application_jwt_secrets(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     let module = applications::enabled_protocol_config(&state, &id, "jwt")
         .await?
         .ok_or_else(|| AppError::BadRequest("JWT protocol is not enabled".to_string()))?;
@@ -4735,13 +4235,7 @@ async fn delete_application_module(
     jar: CookieJar,
     Path((id, module_key)): Path<(String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
     state.db.delete_application_module(&id, &module_key).await?;
@@ -4780,20 +4274,26 @@ async fn ensure_website_application_modules_editable(
     state: &AppState,
     application: &ApplicationRecord,
 ) -> AppResult<()> {
-    if state
-        .db
-        .find_application_discovery(&application.id)
-        .await?
-        .is_some_and(|record| {
-            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-        })
-    {
+    if application_is_website_managed(state, application).await? {
         return Err(AppError::BadRequest(
             "website-managed application modules are read-only; update the website manifest"
                 .to_string(),
         ));
     }
     Ok(())
+}
+
+async fn application_is_website_managed(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<bool> {
+    Ok(state
+        .db
+        .find_application_discovery(&application.id)
+        .await?
+        .is_some_and(|record| {
+            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
+        }))
 }
 
 async fn get_application_discovery(
@@ -5154,13 +4654,7 @@ async fn list_application_oidc_clients(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<PublicClient>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
     let graph = state.db.read_application_graph(&id).await?;
     let clients = application_client_binding_responses_from_graph(
         &graph,
@@ -5390,13 +4884,7 @@ async fn managed_authorization_profile(
     ApplicationRecord,
     ApplicationAuthorizationProfileRecord,
 )> {
-    let current = auth::require_current_user(state, jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(application_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(state, jar, application_id).await?;
     let profile = state
         .db
         .find_application_authorization_profile_by_id(profile_id)
@@ -5413,14 +4901,7 @@ async fn ensure_local_profile_catalog_editable(
     application: &ApplicationRecord,
     _profile: &ApplicationAuthorizationProfileRecord,
 ) -> AppResult<()> {
-    if state
-        .db
-        .find_application_discovery(&application.id)
-        .await?
-        .is_some_and(|record| {
-            record.management_mode == application_discovery::MANAGEMENT_MODE_WEBSITE
-        })
-    {
+    if application_is_website_managed(state, application).await? {
         return Err(AppError::BadRequest(
             "website-managed role catalogs are read-only; update the website manifest".to_string(),
         ));
@@ -5859,13 +5340,7 @@ async fn update_application(
     Path(id): Path<String>,
     Json(payload): Json<ApplicationInput>,
 ) -> AppResult<Json<ApplicationResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let existing = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &existing.organization_id).await?;
+    let (current, existing) = managed_application(&state, &jar, &id).await?;
     let organization_id = existing.organization_id.clone();
     let application = state
         .db
@@ -5889,13 +5364,7 @@ async fn delete_application(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let existing = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &existing.organization_id).await?;
+    let (current, existing) = managed_application(&state, &jar, &id).await?;
     state
         .db
         .delete_application_with_expected_organization_and_audit(
@@ -5918,13 +5387,7 @@ async fn list_application_client_bindings(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<ApplicationClientBindingResponse>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
     let graph = state.db.read_application_graph(&id).await?;
     Ok(Json(application_client_binding_responses_from_graph(
         &graph,
@@ -6010,13 +5473,7 @@ async fn list_application_enrollment_codes(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<PublicInvitation>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (_current, _application) = managed_application(&state, &jar, &id).await?;
     Ok(Json(
         state
             .db
@@ -6034,13 +5491,7 @@ async fn create_application_enrollment_code(
     Path(id): Path<String>,
     Json(payload): Json<ApplicationEnrollmentCodeInput>,
 ) -> AppResult<Json<ApplicationEnrollmentCodeCreateResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, application) = managed_application(&state, &jar, &id).await?;
     if application.is_active != 1 {
         return Err(AppError::BadRequest(
             "application enrollment is unavailable while the application is disabled".to_string(),
@@ -6152,13 +5603,7 @@ async fn delete_application_enrollment_code(
     jar: CookieJar,
     Path((id, code_id)): Path<(String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &application.organization_id).await?;
+    let (current, _application) = managed_application(&state, &jar, &id).await?;
     if !state
         .db
         .application_enrollment_code_belongs_to(&id, &code_id)
@@ -6495,99 +5940,6 @@ struct InvitationInput {
     is_active: bool,
 }
 
-fn normalized_client_ids(values: Option<Vec<String>>) -> Vec<String> {
-    values
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn immutable_allowed_client_ids(
-    existing: Vec<String>,
-    requested: Option<Vec<String>>,
-) -> AppResult<Vec<String>> {
-    let existing = normalized_client_ids(Some(existing));
-    let Some(requested) = requested else {
-        return Ok(existing);
-    };
-    if normalized_client_ids(Some(requested)) != existing {
-        return Err(AppError::BadRequest(
-            "allowed_client_ids cannot be changed after creation".to_string(),
-        ));
-    }
-    Ok(existing)
-}
-
-fn immutable_optional_text(
-    field: &str,
-    existing: Option<&str>,
-    requested: Option<String>,
-) -> AppResult<Option<String>> {
-    let existing = existing
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let Some(requested) = requested else {
-        return Ok(existing);
-    };
-    let requested = normalize_optional_text(Some(requested));
-    if requested != existing {
-        return Err(AppError::BadRequest(format!(
-            "{field} cannot be changed after trial enrollment code creation"
-        )));
-    }
-    Ok(existing)
-}
-
-fn immutable_recovery_username(
-    existing: Option<&str>,
-    requested: Option<String>,
-) -> AppResult<Option<String>> {
-    let existing = existing
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AppError::Configuration(
-                "account recovery authorization code is missing its bound username".to_string(),
-            )
-        })?
-        .to_string();
-    let Some(requested) = requested else {
-        return Ok(Some(existing));
-    };
-    let requested = normalize_optional_text(Some(requested)).ok_or_else(|| {
-        AppError::BadRequest(
-            "authorized_username cannot be cleared after account recovery code creation"
-                .to_string(),
-        )
-    })?;
-    if requested != existing {
-        return Err(AppError::BadRequest(
-            "authorized_username cannot be changed after account recovery code creation"
-                .to_string(),
-        ));
-    }
-    Ok(Some(existing))
-}
-
-fn ensure_admin_universal_manager(
-    user: &crate::db::UserRecord,
-    code_type: AuthorizationCodeType,
-    login_code_level: LoginCodeLevel,
-) -> AppResult<()> {
-    if code_type == AuthorizationCodeType::Login
-        && login_code_level == LoginCodeLevel::AdminUniversal
-        && user.is_admin != 1
-    {
-        return Err(AppError::Forbidden);
-    }
-    Ok(())
-}
-
 async fn ensure_trial_enrollment_role_manager(
     state: &AppState,
     user: &crate::db::UserRecord,
@@ -6607,62 +5959,6 @@ async fn ensure_trial_enrollment_role_manager(
             .await?;
     }
     Ok(())
-}
-
-fn recovery_target_user_id(
-    username: &str,
-    user: Option<crate::db::UserRecord>,
-) -> AppResult<String> {
-    let user = user.ok_or_else(|| {
-        AppError::BadRequest(
-            "account recovery authorization codes require an existing account".to_string(),
-        )
-    })?;
-    if user.username != username {
-        return Err(AppError::BadRequest(
-            "authorized_username must exactly match the existing account username".to_string(),
-        ));
-    }
-    if user.is_active != 1 || user.archived_at.is_some() {
-        return Err(AppError::BadRequest(
-            "account recovery authorization codes require an active account".to_string(),
-        ));
-    }
-    Ok(user.id)
-}
-
-fn validate_login_code_binding_metadata(
-    login_code_level: LoginCodeLevel,
-    authorized_email: Option<&str>,
-    authorized_username: Option<&str>,
-    authorized_display_name: Option<&str>,
-) -> AppResult<()> {
-    if authorized_email.is_some() || authorized_display_name.is_some() {
-        return Err(AppError::BadRequest(
-            "login authorization codes cannot set email or display-name metadata".to_string(),
-        ));
-    }
-    if matches!(
-        login_code_level,
-        LoginCodeLevel::AdminUniversal | LoginCodeLevel::TrialEnrollment
-    ) && authorized_username.is_some()
-    {
-        return Err(AppError::BadRequest(
-            "this login authorization code cannot set account binding metadata".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-struct AuthorizationCodeValidationInput<'a> {
-    code_type: AuthorizationCodeType,
-    login_code_level: LoginCodeLevel,
-    authorized_email: Option<&'a str>,
-    authorized_username: Option<&'a str>,
-    authorized_display_name: Option<&'a str>,
-    allowed_client_ids: &'a [String],
-    organization_id: Option<&'a str>,
-    organization_role: Option<&'a str>,
 }
 
 async fn validate_authorization_code_input(
@@ -6738,22 +6034,7 @@ async fn validate_authorization_code_input(
                                 .to_string(),
                         ));
                     }
-                    for client_id in allowed_client_ids {
-                        let client = state
-                            .db
-                            .find_client_by_client_id(client_id)
-                            .await?
-                            .ok_or_else(|| {
-                                AppError::BadRequest(format!(
-                                    "allowed OIDC client does not exist: {client_id}"
-                                ))
-                            })?;
-                        if client.is_active != 1 {
-                            return Err(AppError::BadRequest(format!(
-                                "allowed OIDC client is disabled: {client_id}"
-                            )));
-                        }
-                    }
+                    validate_active_allowed_clients(state, allowed_client_ids).await?;
                 }
                 LoginCodeLevel::TrialEnrollment => {
                     let organization_id = organization_id
@@ -6795,22 +6076,7 @@ async fn validate_authorization_code_input(
                             "trial enrollment organization is disabled".to_string(),
                         ));
                     }
-                    for client_id in allowed_client_ids {
-                        let client = state
-                            .db
-                            .find_client_by_client_id(client_id)
-                            .await?
-                            .ok_or_else(|| {
-                                AppError::BadRequest(format!(
-                                    "allowed OIDC client does not exist: {client_id}"
-                                ))
-                            })?;
-                        if client.is_active != 1 {
-                            return Err(AppError::BadRequest(format!(
-                                "allowed OIDC client is disabled: {client_id}"
-                            )));
-                        }
-                    }
+                    validate_active_allowed_clients(state, allowed_client_ids).await?;
                 }
             }
         }
@@ -7124,151 +6390,6 @@ async fn delete_invitation(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-fn validate_client_input(payload: &ClientInput) -> AppResult<()> {
-    if payload.client_id.trim().is_empty() {
-        return Err(AppError::BadRequest("client_id is required".to_string()));
-    }
-    normalize_client_logo_uri(&payload.logo_uri)?;
-    let redirect_uris = normalize_redirect_uri_list(&payload.redirect_uris, "redirect_uri")?;
-    let post_logout_redirect_uris = normalize_redirect_uri_list(
-        &payload.post_logout_redirect_uris,
-        "post_logout_redirect_uri",
-    )?;
-    if let Some(audience) = payload.audience.as_deref()
-        && !audience.trim().is_empty()
-        && audience.len() > 2048
-    {
-        return Err(AppError::BadRequest(
-            "audience must be between 1 and 2048 characters".to_string(),
-        ));
-    }
-    let uses_authorization_code = payload
-        .grant_types
-        .iter()
-        .any(|value| value == "authorization_code");
-    if uses_authorization_code && redirect_uris.is_empty() {
-        return Err(AppError::BadRequest(
-            "at least one redirect_uri is required".to_string(),
-        ));
-    }
-    if !payload.scopes.iter().any(|scope| scope == "openid") {
-        return Err(AppError::BadRequest(
-            "scopes must include openid".to_string(),
-        ));
-    }
-    if uses_authorization_code && !payload.response_types.iter().any(|value| value == "code") {
-        return Err(AppError::BadRequest(
-            "response_types must include code".to_string(),
-        ));
-    }
-    if payload.service_account_enabled
-        && !payload
-            .grant_types
-            .iter()
-            .any(|value| value == "client_credentials")
-    {
-        return Err(AppError::BadRequest(
-            "service accounts require client_credentials grant".to_string(),
-        ));
-    }
-    service_accounts::normalize_permissions(payload.service_account_permissions.clone())?;
-    crate::authorization_details::normalize_public_types(
-        payload.authorization_details_types.clone(),
-    )?;
-    if !matches!(
-        payload.token_endpoint_auth_method.as_str(),
-        "client_secret_basic"
-            | "client_secret_post"
-            | client_assertion::CLIENT_SECRET_JWT
-            | client_assertion::PRIVATE_KEY_JWT
-            | "none"
-    ) {
-        return Err(AppError::BadRequest(
-            "unsupported token_endpoint_auth_method".to_string(),
-        ));
-    }
-    client_assertion::validate_key_source(
-        &payload.token_endpoint_auth_method,
-        &payload.jwks_uri,
-        &payload.jwks,
-    )?;
-    client_policy::validate_client_security_configuration(client_policy::ClientSecurityConfig {
-        token_endpoint_auth_method: &payload.token_endpoint_auth_method,
-        require_pkce: payload.require_pkce,
-        require_s256_pkce: payload.require_s256_pkce,
-        require_confidential_client: payload.require_confidential_client,
-        require_pushed_authorization_requests: payload.require_pushed_authorization_requests,
-        require_dpop: payload.require_dpop,
-    })?;
-    backchannel_logout::validate_backchannel_logout_config(
-        &payload.backchannel_logout_uri,
-        payload.backchannel_logout_session_required,
-    )?;
-    frontchannel_logout::validate_frontchannel_logout_config(
-        &payload.frontchannel_logout_uri,
-        payload.frontchannel_logout_session_required,
-        &redirect_uris,
-    )?;
-    for uri in post_logout_redirect_uris {
-        validate_absolute_http_url(&uri, "post_logout_redirect_uri")?;
-    }
-    subject::validate_subject_config(&payload.subject_type, &payload.sector_identifier_uri)?;
-    Ok(())
-}
-
-fn normalize_redirect_uri_list(values: &[String], field: &str) -> AppResult<Vec<String>> {
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for value in values {
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            continue;
-        }
-        validate_absolute_http_url(&value, field)?;
-        if seen.insert(value.clone()) {
-            normalized.push(value);
-        }
-    }
-    Ok(normalized)
-}
-
-fn validate_absolute_http_url(value: &str, field: &str) -> AppResult<()> {
-    let parsed = Url::parse(value)
-        .map_err(|err| AppError::BadRequest(format!("{field} is invalid: {err}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err(AppError::BadRequest(format!(
-            "{field} must be an absolute http(s) URL"
-        )));
-    }
-    if parsed.fragment().is_some() {
-        return Err(AppError::BadRequest(format!(
-            "{field} cannot contain a fragment"
-        )));
-    }
-    Ok(())
-}
-
-fn normalize_client_logo_uri(value: &str) -> AppResult<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(String::new());
-    }
-    if value.len() > 2048 {
-        return Err(AppError::BadRequest(
-            "logo_uri must not exceed 2048 characters".to_string(),
-        ));
-    }
-    validate_absolute_http_url(value, "logo_uri")?;
-    let parsed = Url::parse(value)
-        .map_err(|err| AppError::BadRequest(format!("logo_uri is invalid: {err}")))?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(AppError::BadRequest(
-            "logo_uri cannot include user info".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
 async fn public_client_with_claim_mappers(
     state: &AppState,
     client: crate::db::ClientRecord,
@@ -7342,130 +6463,6 @@ async fn iap_application_input_to_new(
         required_organization_id,
         required_organization_roles: payload.required_organization_roles,
         required_permissions: payload.required_permissions,
-        is_active: payload.is_active,
-    })
-}
-
-fn client_input_to_claim_mappers(payload: &ClientInput) -> AppResult<Vec<NewClientClaimMapper>> {
-    payload
-        .claim_mappers
-        .iter()
-        .enumerate()
-        .map(|(index, mapper)| {
-            let sort_order = if mapper.sort_order == 0 {
-                index as i32
-            } else {
-                mapper.sort_order
-            };
-            let record = crate::db::ClientClaimMapperRecord {
-                id: String::new(),
-                client_db_id: String::new(),
-                claim_name: mapper.claim_name.trim().to_string(),
-                source: mapper.source.trim().to_string(),
-                source_value: mapper.source_value.trim().to_string(),
-                value_type: mapper.value_type.trim().to_string(),
-                include_in_id_token: i32::from(mapper.include_in_id_token),
-                include_in_access_token: i32::from(mapper.include_in_access_token),
-                include_in_userinfo: i32::from(mapper.include_in_userinfo),
-                is_active: i32::from(mapper.is_active),
-                sort_order,
-                created_at: 0,
-                updated_at: 0,
-            };
-            claim_mapper::validate_mapper_record(&record)?;
-            Ok(NewClientClaimMapper {
-                claim_name: record.claim_name,
-                source: record.source,
-                source_value: record.source_value,
-                value_type: record.value_type,
-                include_in_id_token: mapper.include_in_id_token,
-                include_in_access_token: mapper.include_in_access_token,
-                include_in_userinfo: mapper.include_in_userinfo,
-                is_active: mapper.is_active,
-                sort_order,
-            })
-        })
-        .collect()
-}
-
-fn client_input_to_new(
-    payload: ClientInput,
-    existing_hash: Option<String>,
-    organization_id: Option<String>,
-    existing_audience: Option<String>,
-) -> AppResult<NewClient> {
-    let secret = payload.client_secret.unwrap_or_default();
-    let token_auth = payload.token_endpoint_auth_method.as_str();
-    let can_reuse_secret =
-        client_assertion::stored_secret_supports_method(token_auth, existing_hash.as_deref());
-    let client_secret_hash = match token_auth {
-        "none" | client_assertion::PRIVATE_KEY_JWT => None,
-        _ if !secret.is_empty() => client_assertion::store_client_secret(token_auth, &secret)?,
-        _ if can_reuse_secret => existing_hash,
-        _ => {
-            return Err(AppError::BadRequest(
-                "client_secret is required for secret-based client authentication".to_string(),
-            ));
-        }
-    };
-    let jwks_uri = client_assertion::validate_jwks_uri(&payload.jwks_uri)?;
-    let jwks = client_assertion::normalize_jwks_json(&payload.jwks)?;
-    let logo_uri = normalize_client_logo_uri(&payload.logo_uri)?;
-    let service_account_permissions =
-        service_accounts::normalize_permissions(payload.service_account_permissions)?;
-    let backchannel_logout_uri = backchannel_logout::validate_backchannel_logout_config(
-        &payload.backchannel_logout_uri,
-        payload.backchannel_logout_session_required,
-    )?;
-    let redirect_uris = normalize_redirect_uri_list(&payload.redirect_uris, "redirect_uri")?;
-    let post_logout_redirect_uris = normalize_redirect_uri_list(
-        &payload.post_logout_redirect_uris,
-        "post_logout_redirect_uri",
-    )?;
-    let frontchannel_logout_uri = frontchannel_logout::validate_frontchannel_logout_config(
-        &payload.frontchannel_logout_uri,
-        payload.frontchannel_logout_session_required,
-        &redirect_uris,
-    )?;
-    Ok(NewClient {
-        client_id: payload.client_id,
-        client_secret_hash,
-        client_name: payload.client_name,
-        logo_uri,
-        organization_id,
-        redirect_uris,
-        post_logout_redirect_uris,
-        scopes: payload.scopes,
-        audience: payload
-            .audience
-            .or(existing_audience)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        grant_types: payload.grant_types,
-        response_types: payload.response_types,
-        token_endpoint_auth_method: payload.token_endpoint_auth_method,
-        require_pkce: payload.require_pkce,
-        require_mfa: payload.require_mfa,
-        require_pushed_authorization_requests: payload.require_pushed_authorization_requests,
-        require_s256_pkce: payload.require_s256_pkce,
-        require_confidential_client: payload.require_confidential_client,
-        require_dpop: payload.require_dpop,
-        require_account_selection: payload.require_account_selection,
-        trust_email_verified: payload.trust_email_verified,
-        authorization_details_types: crate::authorization_details::normalize_public_types(
-            payload.authorization_details_types,
-        )?,
-        subject_type: payload.subject_type,
-        sector_identifier_uri: payload.sector_identifier_uri,
-        jwks_uri,
-        jwks,
-        backchannel_logout_uri,
-        backchannel_logout_session_required: payload.backchannel_logout_session_required,
-        frontchannel_logout_uri,
-        frontchannel_logout_session_required: payload.frontchannel_logout_session_required,
-        service_account_enabled: payload.service_account_enabled,
-        service_account_permissions,
         is_active: payload.is_active,
     })
 }

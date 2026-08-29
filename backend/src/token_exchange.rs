@@ -14,7 +14,7 @@ use crate::{
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -564,12 +564,17 @@ async fn find_delegation_consent(
     if actor_client_id != subject_client_id {
         client_ids.push(actor_client_id.to_string());
     }
+    let grants = state.db.list_client_grants(user_id, &client_ids).await?;
+    let grants = grants
+        .into_iter()
+        .map(|grant| (grant.client_id.clone(), grant))
+        .collect::<BTreeMap<_, _>>();
     for client_id in client_ids {
-        if let Some(consent) = state.db.find_client_grant(user_id, &client_id).await?
+        if let Some(consent) = grants.get(&client_id)
             && consent.revoked_at.is_none()
             && grants_all(&consent.granted_scopes, requested_scope)
         {
-            return Ok(consent);
+            return Ok(consent.clone());
         }
     }
     Err(oauth_error(
@@ -609,15 +614,14 @@ async fn load_active_user(
     if user.is_active != 1 || user.archived_at.is_some() {
         return Err(oauth_error("invalid_grant", "subject user is not active"));
     }
-    if let Some(enrollment) = state.db.find_trial_enrollment_for_user(&user.id).await? {
-        if !enrollment.is_active_at(crate::util::now_ts())
-            || !enrollment.allows_client(target_client_id)?
-        {
-            return Err(oauth_error(
-                "invalid_grant",
-                "subject user is not eligible for this client",
-            ));
-        }
+    if let Some(enrollment) = state.db.find_trial_enrollment_for_user(&user.id).await?
+        && (!enrollment.is_active_at(crate::util::now_ts())
+            || !enrollment.allows_client(target_client_id)?)
+    {
+        return Err(oauth_error(
+            "invalid_grant",
+            "subject user is not eligible for this client",
+        ));
     }
     Ok(user)
 }

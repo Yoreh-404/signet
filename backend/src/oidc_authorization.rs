@@ -58,12 +58,13 @@ impl AuthorizationSnapshot {
         let entitlements = Some(authorization::resolve_entitlements_from_snapshot(
             &policy, user,
         )?);
+        let mappers = policy.claim_mappers.clone();
         Ok(Self {
-            policy: policy.clone(),
+            policy,
             application,
             binding,
             profile,
-            mappers: policy.claim_mappers.clone(),
+            mappers,
             entitlements,
         })
     }

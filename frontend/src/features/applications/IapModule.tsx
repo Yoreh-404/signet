@@ -3,9 +3,9 @@ import type { FormEvent } from "react";
 import { useEffect, useState } from "react";
 import * as applicationApi from "../../lib/api/applications";
 import type { IapApplication, OrganizationOption } from "../../types";
-import type { ApplicationRequestGuard } from "./application-request-guard";
 import { Input, ModuleFeedback, ModuleHeader, Toggle } from "./components/ApplicationModulePrimitives";
 import { useApplicationModuleLifecycle } from "./use-application-module-lifecycle";
+import { useApplicationWorkspaceRequestContext } from "./use-application-workspace-request-context";
 
 export type IapRuleDraft = {
   id: string;
@@ -83,7 +83,6 @@ export function IapModule({
   organizationOptions,
   canManage,
   copy,
-  requestGuard,
   onDirtyChange,
   onRulesCountChange,
   onRequestConfirmation
@@ -93,7 +92,6 @@ export function IapModule({
   organizationOptions: OrganizationOption[];
   canManage: boolean;
   copy: IapCopy;
-  requestGuard: ApplicationRequestGuard;
   onDirtyChange: (dirty: boolean) => void;
   onRulesCountChange: (count: number) => void;
   onRequestConfirmation?: (
@@ -104,6 +102,7 @@ export function IapModule({
 }) {
   const [rules, setRules] = useState<IapApplication[]>([]);
   const [draft, setDraft] = useState<IapRuleDraft | null>(null);
+  const { requestGuard } = useApplicationWorkspaceRequestContext();
   const {
     saving,
     setSaving,

@@ -5,10 +5,8 @@
 //! makes catalog mutations and edge mutations share a domain boundary without
 //! making every database operation depend on the monolithic db module.
 
-use super::*;
-
 use super::{
-    ApplicationProfileRoleRecord, DatabaseKind, Db, NewApplicationProfileRole,
+    ApplicationProfileRoleRecord, DatabaseKind, Db, NewApplicationProfileRole, blocking,
     normalize_application_entitlement_keys, ph, select_application_profile_role_sql,
 };
 use crate::error::{AppError, AppResult};

@@ -443,6 +443,8 @@ export type BrowserAccount = {
   last_selected_at: number | null;
 };
 
+export type BrowserAccountContinuation = () => Promise<void>;
+
 export type BrowserAccountsContext = {
   accounts: BrowserAccount[];
   client_name?: string | null;

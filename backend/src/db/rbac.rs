@@ -1,10 +1,9 @@
-use super::*;
-
 use super::{
     AuditEventRecord, CountRow, Db, GroupListFilter, GroupMemberLifecycleRow, GroupMemberPublicRow,
     GroupPatchPlan, GroupRecord, GroupRoleJoinRow, NewGroup, NewRole, PermissionRow, PublicUser,
     RoleIdRow, RolePermissionJoinRow, RoleRecord, ScimGroupMemberRecord, UserRecord,
-    bind_text_list, normalize_application_entitlement_keys, optimistic_concurrency_conflict, ph,
+    bind_text_list, blocking, dedupe_nonempty, normalize_application_entitlement_keys,
+    optimistic_concurrency_conflict, ph, select_group_sql,
 };
 use crate::{
     config::DatabaseKind,
@@ -581,7 +580,6 @@ impl Db {
     /// The organization boundary is evaluated in SQL and the result is a
     /// narrow group projection, avoiding the old `list_groups` plus one
     /// `list_group_members` query per group pattern.
-
     pub async fn find_group_by_id(&self, id: &str) -> AppResult<Option<GroupRecord>> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
@@ -837,12 +835,12 @@ impl Db {
                 let Some(existing_group) = existing_group else {
                     return Err(AppError::NotFound);
                 };
-                if let Some(expected_version) = expected_version {
-                    if existing_group.version != expected_version {
-                        return Err(optimistic_concurrency_conflict(
-                            "SCIM group changed while the request was in flight",
-                        ));
-                    }
+                if let Some(expected_version) = expected_version
+                    && existing_group.version != expected_version
+                {
+                    return Err(optimistic_concurrency_conflict(
+                        "SCIM group changed while the request was in flight",
+                    ));
                 }
                 let metadata_changed = existing_group.name != name
                     || existing_group.description != description;

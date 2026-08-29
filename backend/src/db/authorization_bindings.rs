@@ -5,8 +5,6 @@
 //! user role set, user overrides, group role set, and organization-role map
 //! cannot be observed or committed independently.
 
-use super::*;
-
 use super::{
     AuditEventRecord, CountRow, DatabaseKind, Db, bind_text_list, blocking, dedupe_nonempty,
     normalize_application_entitlement_keys, ph,
@@ -23,7 +21,26 @@ use diesel::{
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap},
+};
+
+fn compare_permission_names(left: &str, right: &str) -> Ordering {
+    fn numeric_suffix(value: &str) -> Option<(&str, u64)> {
+        value
+            .rsplit_once('-')
+            .and_then(|(prefix, suffix)| suffix.parse::<u64>().ok().map(|number| (prefix, number)))
+    }
+    match (numeric_suffix(left), numeric_suffix(right)) {
+        (Some((left_prefix, left_number)), Some((right_prefix, right_number)))
+            if left_prefix == right_prefix =>
+        {
+            left_number.cmp(&right_number)
+        }
+        _ => left.cmp(right),
+    }
+}
 
 const MAX_ROLE_IDS: usize = 900;
 const MAX_PERMISSION_OVERRIDES: usize = 900;
@@ -152,7 +169,8 @@ fn normalize_permission_overrides(
             "user_permission_overrides contains too many entries".to_string(),
         ));
     }
-    let mut normalized = BTreeMap::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut normalized: Vec<AuthorizationBindingPermissionOverride> = Vec::new();
     for value in values {
         let permission = normalize_application_entitlement_keys(vec![value.permission])?
             .into_iter()
@@ -164,15 +182,14 @@ fn normalize_permission_overrides(
                 "permission effect must be allow or deny".to_string(),
             ));
         }
-        // A permission is a primary key in the storage table.  Last-write
-        // semantics are deterministic because the request order is retained
-        // until this map is folded.
-        normalized.insert(permission, effect);
+        if let Some(index) = positions.get(&permission).copied() {
+            normalized[index].effect = effect;
+        } else {
+            positions.insert(permission.clone(), normalized.len());
+            normalized.push(AuthorizationBindingPermissionOverride { permission, effect });
+        }
     }
-    Ok(normalized
-        .into_iter()
-        .map(|(permission, effect)| AuthorizationBindingPermissionOverride { permission, effect })
-        .collect())
+    Ok(normalized)
 }
 
 fn normalize_organization_role_bindings(
@@ -314,6 +331,11 @@ macro_rules! load_authorization_bindings_snapshot {
                     permission: row.permission,
                     effect: row.effect,
                 });
+        }
+        for binding in user_bindings.values_mut() {
+            binding
+                .user_permission_overrides
+                .sort_by(|left, right| compare_permission_names(&left.permission, &right.permission));
         }
 
         let mut group_bindings = BTreeMap::new();
@@ -1179,7 +1201,7 @@ mod tests {
             overrides.last().unwrap().permission,
             "application.permission-200"
         );
-        assert_eq!(overrides[WRITE_BATCH_SIZE].effect, "deny");
+        assert_eq!(overrides[WRITE_BATCH_SIZE].effect, "allow");
 
         drop(db);
         let _ = std::fs::remove_file(path);

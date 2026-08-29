@@ -1,26 +1,27 @@
-use super::*;
-
 use super::{
-    AppError, AppResult, ClientClaimMapperRecord, ClientRecord, CountRow, Db, NewClientClaimMapper,
-    SessionMetadata, SessionRecord, bind_text_list, ph,
+    AppError, AppResult, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
+    NewClientClaimMapper, SessionMetadata, SessionRecord, bind_text_list, blocking, ph,
+    select_client_claim_mapper_sql,
 };
 use crate::util;
 use diesel::{
-    OptionalExtension, RunQueryDsl, sql_query,
-    sql_types::{BigInt, Nullable, Text},
+    Connection, OptionalExtension, RunQueryDsl, sql_query,
+    sql_types::{BigInt, Integer, Nullable, Text},
 };
 use std::collections::BTreeMap;
 
 impl Db {
-    pub async fn list_backchannel_logout_clients_for_user(
+    async fn list_logout_clients_for_user(
         &self,
         user_id: &str,
+        logout_uri_column: &'static str,
     ) -> AppResult<Vec<ClientRecord>> {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "{} WHERE is_active = 1 AND COALESCE(backchannel_logout_uri, '') <> '' AND client_id IN (SELECT DISTINCT oidc_client_id FROM login_events WHERE user_id = {} AND oidc_client_id IS NOT NULL) ORDER BY updated_at DESC",
+                "{} WHERE is_active = 1 AND COALESCE({}, '') <> '' AND client_id IN (SELECT DISTINCT oidc_client_id FROM login_events WHERE user_id = {} AND oidc_client_id IS NOT NULL) ORDER BY updated_at DESC",
                 super::select_client_sql(),
+                logout_uri_column,
                 ph(kind, 1)
             );
             sql_query(sql)
@@ -30,22 +31,20 @@ impl Db {
         })
     }
 
+    pub async fn list_backchannel_logout_clients_for_user(
+        &self,
+        user_id: &str,
+    ) -> AppResult<Vec<ClientRecord>> {
+        self.list_logout_clients_for_user(user_id, "backchannel_logout_uri")
+            .await
+    }
+
     pub async fn list_frontchannel_logout_clients_for_user(
         &self,
         user_id: &str,
     ) -> AppResult<Vec<ClientRecord>> {
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE is_active = 1 AND COALESCE(frontchannel_logout_uri, '') <> '' AND client_id IN (SELECT DISTINCT oidc_client_id FROM login_events WHERE user_id = {} AND oidc_client_id IS NOT NULL) ORDER BY updated_at DESC",
-                super::select_client_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .load::<ClientRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
+        self.list_logout_clients_for_user(user_id, "frontchannel_logout_uri")
+            .await
     }
 
     pub async fn insert_client_assertion_jti(

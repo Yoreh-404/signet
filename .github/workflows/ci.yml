@@ -13,6 +13,8 @@ jobs:
     runs-on: [self-hosted, linux-arm64]
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize shared Cargo cache
+        run: source scripts/opensponge-cargo-cache.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -93,6 +95,8 @@ jobs:
     runs-on: [self-hosted, linux-arm64]
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize shared Cargo cache
+        run: source scripts/opensponge-cargo-cache.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 22

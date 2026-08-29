@@ -5,17 +5,18 @@
 //! that aggregate: every row which can affect one application/profile + user
 //! decision is copied while one connection is inside one read transaction.
 
-use super::*;
-
 use super::{
     ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord, ApplicationModuleRecord,
     ApplicationProfilePermissionOverrideRecord, ApplicationProfileRoleRecord, ApplicationRecord,
     ClientClaimMapperRecord, CountRow, Db, GroupRecord, RoleRecord, UserOrganizationRecord,
     bind_text_list, blocking, ph, select_application_authorization_profile_sql,
-    select_application_profile_permission_override_sql, select_application_profile_role_sql,
-    select_application_sql, select_client_claim_mapper_sql,
+    select_application_client_binding_sql, select_application_profile_permission_override_sql,
+    select_application_profile_role_sql, select_application_sql, select_client_claim_mapper_sql,
 };
 use super::{normalize_application_entitlement_keys, select_application_module_sql};
+use crate::application_discovery_contract::{
+    SOURCE_MODE_MANUAL, SYNC_STATUS_MANUAL, website_discovery_runtime_active,
+};
 use crate::config::DatabaseKind;
 use crate::error::{AppError, AppResult};
 use crate::util;
@@ -107,6 +108,30 @@ struct DiscoveryRuntimeRow {
     snapshot_json: Option<String>,
     #[diesel(sql_type = Integer)]
     operator_disabled: i32,
+}
+
+fn discovery_runtime_is_active(discovery: Option<DiscoveryRuntimeRow>, now: i64) -> bool {
+    discovery.is_none_or(|discovery| {
+        website_discovery_runtime_active(
+            &discovery.management_mode,
+            discovery.operator_disabled != 0,
+            discovery.last_verified_revision,
+            discovery.last_verified_expires_at,
+            discovery.snapshot_json.is_some(),
+            now,
+        )
+    })
+}
+
+fn initialize_consistent_read<C: SimpleConnection>(
+    conn: &mut C,
+    kind: DatabaseKind,
+) -> AppResult<()> {
+    if matches!(kind, DatabaseKind::Postgres) {
+        conn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .map_err(AppError::from)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -452,7 +477,7 @@ macro_rules! materialize_migrated_profile_role {
                     .map_err(AppError::from)?;
             } else if !is_active
                 && existing.is_default == 1
-                && existing.source == source.to_string()
+                && existing.source == source
             {
                 let update_sql = format!(
                     "UPDATE application_profile_roles SET is_default = 0, updated_at = {} WHERE profile_id = {} AND id = {}",
@@ -588,10 +613,7 @@ impl Db {
                 // those reads on one PostgreSQL MVCC revision as well; a
                 // policy snapshot that is consistent only after login is
                 // still enough to admit a stale or disabled boundary.
-                if matches!(kind, DatabaseKind::Postgres) {
-                    conn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                        .map_err(AppError::from)?;
-                }
+                initialize_consistent_read(conn, kind)?;
                 let application = sql_query(format!(
                     "{} WHERE id = {}",
                     select_application_sql(),
@@ -633,16 +655,7 @@ impl Db {
                         .optional()
                         .map_err(AppError::from)?;
                         let now = crate::util::now_ts();
-                        let discovery_runtime_active = discovery.is_none_or(|discovery| {
-                            crate::application_discovery::website_discovery_runtime_active(
-                                &discovery.management_mode,
-                                discovery.operator_disabled != 0,
-                                discovery.last_verified_revision,
-                                discovery.last_verified_expires_at,
-                                discovery.snapshot_json.is_some(),
-                                now,
-                            )
-                        });
+                        let discovery_runtime_active = discovery_runtime_is_active(discovery, now);
                         let module = sql_query(format!(
                             "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key = {}",
                             ph(kind, 1),
@@ -762,8 +775,8 @@ impl Db {
                             .bind::<Text, _>("default")
                             .bind::<Text, _>("application")
                             .bind::<Nullable<Text>, _>(None::<String>)
-                            .bind::<Text, _>(crate::application_discovery::SOURCE_MODE_MANUAL)
-                            .bind::<Text, _>(crate::application_discovery::SYNC_STATUS_MANUAL)
+                            .bind::<Text, _>(SOURCE_MODE_MANUAL)
+                            .bind::<Text, _>(SYNC_STATUS_MANUAL)
                             .bind::<BigInt, _>(now)
                             .bind::<BigInt, _>(now)
                             .execute(conn)
@@ -1270,10 +1283,7 @@ impl Db {
                 // SELECT. Authorization is a graph decision, so role,
                 // membership, and assignment reads must observe one MVCC
                 // point rather than a mixture of revisions.
-                if matches!(kind, DatabaseKind::Postgres) {
-                    conn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                        .map_err(AppError::from)?;
-                }
+                initialize_consistent_read(conn, kind)?;
                 let (client_id, requested_application_id, requested_profile_id) =
                     match &boundary {
                         PolicyBoundary::Application { application_id } => {
@@ -1312,7 +1322,8 @@ impl Db {
 
                 let binding = if let Some(client_id) = client_id.as_ref() {
                     let sql = format!(
-                        "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE client_db_id = {}",
+                        "{} WHERE client_db_id = {}",
+                        select_application_client_binding_sql(),
                         ph(kind, 1)
                     );
                     sql_query(sql)
@@ -1427,16 +1438,7 @@ impl Db {
                             .optional()
                             .map_err(AppError::from)?;
                         let now = crate::util::now_ts();
-                        let runtime_active = discovery.is_none_or(|discovery| {
-                            crate::application_discovery::website_discovery_runtime_active(
-                                &discovery.management_mode,
-                                discovery.operator_disabled != 0,
-                                discovery.last_verified_revision,
-                                discovery.last_verified_expires_at,
-                                discovery.snapshot_json.is_some(),
-                                now,
-                            )
-                        });
+                        let runtime_active = discovery_runtime_is_active(discovery, now);
                         (organization_active, membership, runtime_active)
                     } else {
                         (false, None, false)
@@ -1485,7 +1487,7 @@ impl Db {
                             .as_ref()
                             .map(|value| value.protocol.as_str())
                     });
-                    if let Some(application) = application.as_ref() {
+                    if let Some(_application) = application.as_ref() {
                         protocol_module_enabled(
                             application_modules.get("protocols").cloned(),
                             protocol,

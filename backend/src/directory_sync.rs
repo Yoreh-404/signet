@@ -9,7 +9,7 @@
 
 use crate::{
     AppState, applications,
-    db::{ApplicationRecord, DirectorySyncRunRecord, LdapProviderRecord},
+    db::{ApplicationRecord, DirectorySyncRunRecord, DirectorySyncRunUpdate, LdapProviderRecord},
     error::{AppError, AppResult},
     organizations::OrganizationEmailPolicy,
     util,
@@ -23,6 +23,17 @@ const PAGE_SIZE: i32 = 500;
 const MAX_RETRIES: usize = 3;
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 const DIRECTORY_SYNC_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+struct SnapshotHeartbeatRequest<'a, P> {
+    state: &'a AppState,
+    application_id: &'a str,
+    provider_id: &'a str,
+    run_id: &'a str,
+    connector: &'a P,
+    provider: &'a LdapProviderRecord,
+    config: &'a DirectorySyncConfig,
+    heartbeat_interval: Duration,
+}
 
 #[derive(Debug, Clone)]
 pub struct DirectorySyncConfig {
@@ -321,16 +332,16 @@ pub async fn run_application_ldap_sync_with_provider<P: DirectorySyncProvider>(
         .start_directory_sync_run(application_id, provider_id)
         .await?;
 
-    let snapshot = match snapshot_with_lease_heartbeat(
+    let snapshot = match snapshot_with_lease_heartbeat(SnapshotHeartbeatRequest {
         state,
         application_id,
         provider_id,
-        &run.id,
+        run_id: &run.id,
         connector,
-        &provider,
-        &config,
-        DIRECTORY_SYNC_HEARTBEAT_INTERVAL,
-    )
+        provider: &provider,
+        config: &config,
+        heartbeat_interval: DIRECTORY_SYNC_HEARTBEAT_INTERVAL,
+    })
     .await
     {
         Ok(snapshot) => snapshot,
@@ -364,14 +375,16 @@ pub async fn run_application_ldap_sync_with_provider<P: DirectorySyncProvider>(
                 .finalize_directory_sync_run(
                     application_id,
                     provider_id,
-                    &run.id,
-                    "succeeded",
-                    stats.total_seen,
-                    stats.created_count,
-                    stats.updated_count,
-                    stats.disabled_count,
-                    None,
-                    cursor,
+                    DirectorySyncRunUpdate {
+                        run_id: &run.id,
+                        status: "succeeded",
+                        total_seen: stats.total_seen,
+                        created_count: stats.created_count,
+                        updated_count: stats.updated_count,
+                        disabled_count: stats.disabled_count,
+                        error: None,
+                        cursor,
+                    },
                 )
                 .await;
             match finalized {
@@ -449,15 +462,18 @@ async fn snapshot_with_retries<P: DirectorySyncProvider>(
 /// request is cancelled.  If a renewal fails, the provider future is dropped
 /// and no snapshot can reach reconciliation.
 async fn snapshot_with_lease_heartbeat<P: DirectorySyncProvider>(
-    state: &AppState,
-    application_id: &str,
-    provider_id: &str,
-    run_id: &str,
-    connector: &P,
-    provider: &LdapProviderRecord,
-    config: &DirectorySyncConfig,
-    heartbeat_interval: Duration,
+    request: SnapshotHeartbeatRequest<'_, P>,
 ) -> AppResult<DirectorySnapshot> {
+    let SnapshotHeartbeatRequest {
+        state,
+        application_id,
+        provider_id,
+        run_id,
+        connector,
+        provider,
+        config,
+        heartbeat_interval,
+    } = request;
     let snapshot = snapshot_with_retries(connector, provider, config);
     let heartbeat = renew_lease_until_failure(
         state.db.clone(),
@@ -569,19 +585,18 @@ async fn reconcile_snapshot(
                 })
             })
             .collect::<AppResult<Vec<_>>>()?,
-        groups: config
-            .sync_groups
-            .then(|| {
-                groups
-                    .iter()
-                    .map(|directory_group| crate::db::DirectorySyncGroupPlan {
-                        external_id: directory_group.external_id.clone(),
-                        display_name: directory_group.display_name.clone(),
-                        member_subjects: directory_group.member_subjects.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        groups: if config.sync_groups {
+            groups
+                .iter()
+                .map(|directory_group| crate::db::DirectorySyncGroupPlan {
+                    external_id: directory_group.external_id.clone(),
+                    display_name: directory_group.display_name.clone(),
+                    member_subjects: directory_group.member_subjects.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     let applied = state
         .db
@@ -621,14 +636,16 @@ async fn finalize_failed_run(
         .finalize_directory_sync_run(
             application_id,
             provider_id,
-            &run.id,
-            "failed",
-            0,
-            0,
-            0,
-            0,
-            Some(detail),
-            None,
+            DirectorySyncRunUpdate {
+                run_id: &run.id,
+                status: "failed",
+                total_seen: 0,
+                created_count: 0,
+                updated_count: 0,
+                disabled_count: 0,
+                error: Some(detail),
+                cursor: None,
+            },
         )
         .await
 }
@@ -938,16 +955,16 @@ mod tests {
         let started = fake.started.clone();
         let dropped = fake.dropped.clone();
         let result = {
-            let snapshot = snapshot_with_lease_heartbeat(
-                &state,
-                "heartbeat-app",
-                "heartbeat-provider",
-                &run.id,
-                &fake,
-                &provider,
-                &config,
-                Duration::from_millis(5),
-            );
+            let snapshot = snapshot_with_lease_heartbeat(SnapshotHeartbeatRequest {
+                state: &state,
+                application_id: "heartbeat-app",
+                provider_id: "heartbeat-provider",
+                run_id: &run.id,
+                connector: &fake,
+                provider: &provider,
+                config: &config,
+                heartbeat_interval: Duration::from_millis(5),
+            });
             tokio::pin!(snapshot);
             let started_wait = started.notified();
             tokio::pin!(started_wait);
@@ -957,7 +974,16 @@ mod tests {
             }
             state
                 .db
-                .finish_directory_sync_run(&run.id, "failed", 0, 0, 0, 0, None, None)
+                .finish_directory_sync_run(DirectorySyncRunUpdate {
+                    run_id: &run.id,
+                    status: "failed",
+                    total_seen: 0,
+                    created_count: 0,
+                    updated_count: 0,
+                    disabled_count: 0,
+                    error: None,
+                    cursor: None,
+                })
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(2), &mut snapshot)

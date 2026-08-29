@@ -6,7 +6,7 @@ import type {
   ApplicationPermissionOverride,
   ApplicationProfileRole,
 } from "../../lib/api/application-authorization";
-import type { ApplicationAuthorizationCopy } from "./ApplicationAuthorizationModule";
+import type { ApplicationAuthorizationCopy } from "./application-authorization-copy";
 import {
   PermissionDefinitionDetails,
   PermissionTree,

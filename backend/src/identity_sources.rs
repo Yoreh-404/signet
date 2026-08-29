@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use jsonwebtoken::jwk::JwkSet;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use url::Url;
 
 const DISCOVERY_TIMEOUT_SECONDS: u64 = 8;
@@ -255,14 +255,15 @@ fn normalize_discovered_scopes(scopes: Option<Vec<String>>) -> AppResult<Vec<Str
         .map(|scope| scope.trim().to_string())
         .filter(|scope| !scope.is_empty())
         .collect::<Vec<_>>();
-    if !supported.iter().any(|scope| scope == "openid") {
+    let supported_set = supported.iter().map(String::as_str).collect::<HashSet<_>>();
+    if !supported_set.contains("openid") {
         return Err(AppError::BadRequest(
             "OIDC discovery scopes_supported must include openid".to_string(),
         ));
     }
     let mut selected = Vec::new();
     for scope in ["openid", "profile", "email"] {
-        if supported.iter().any(|item| item == scope) {
+        if supported_set.contains(scope) {
             selected.push(scope.to_string());
         }
     }

@@ -5,8 +5,6 @@
 //! installs a fresh value and a stale worker can therefore never finalize the
 //! replacement owner's result.
 
-use super::*;
-
 use super::{Db, blocking, ph};
 use crate::{
     config::DatabaseKind,
@@ -19,6 +17,26 @@ use diesel::{
 };
 
 const MUTATION_RECEIPT_LEASE_TTL_SECONDS: i64 = 5 * 60;
+
+pub struct MutationReceiptClaim<'a> {
+    pub dedupe_hash: &'a str,
+    pub scope_key: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub idempotency_key: &'a str,
+    pub request_hash: &'a str,
+    pub owner_token: &'a str,
+}
+
+pub struct MutationReceiptFinalization<'a> {
+    pub id: &'a str,
+    pub owner_token: &'a str,
+    pub status: &'a str,
+    pub response_status: i32,
+    pub response_body: Option<String>,
+    pub response_content_type: Option<String>,
+    pub error_code: Option<&'a str>,
+}
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
 pub struct MutationReceiptRecord {
@@ -78,15 +96,15 @@ impl Db {
         request_hash: &str,
     ) -> AppResult<MutationReceiptRecord> {
         let owner_token = util::random_token(32);
-        self.claim_mutation_receipt_with_owner(
+        self.claim_mutation_receipt_with_owner(MutationReceiptClaim {
             dedupe_hash,
             scope_key,
             method,
             path,
             idempotency_key,
             request_hash,
-            &owner_token,
-        )
+            owner_token: &owner_token,
+        })
         .await
     }
 
@@ -96,26 +114,20 @@ impl Db {
     /// it can never receive an expired owner's token after losing that CAS.
     pub async fn claim_mutation_receipt_with_owner(
         &self,
-        dedupe_hash: &str,
-        scope_key: &str,
-        method: &str,
-        path: &str,
-        idempotency_key: &str,
-        request_hash: &str,
-        owner_token: &str,
+        claim: MutationReceiptClaim<'_>,
     ) -> AppResult<MutationReceiptRecord> {
-        if owner_token.trim().is_empty() {
+        if claim.owner_token.trim().is_empty() {
             return Err(AppError::BadRequest(
                 "mutation owner token is required".to_string(),
             ));
         }
-        let dedupe_hash = dedupe_hash.to_string();
-        let scope_key = scope_key.to_string();
-        let method = method.to_string();
-        let path = path.to_string();
-        let idempotency_key = idempotency_key.to_string();
-        let request_hash = request_hash.to_string();
-        let owner_token = owner_token.to_string();
+        let dedupe_hash = claim.dedupe_hash.to_string();
+        let scope_key = claim.scope_key.to_string();
+        let method = claim.method.to_string();
+        let path = claim.path.to_string();
+        let idempotency_key = claim.idempotency_key.to_string();
+        let request_hash = claim.request_hash.to_string();
+        let owner_token = claim.owner_token.to_string();
         let id = uuid::Uuid::new_v4().to_string();
         let now = util::now_ts();
         let lease_expires_at = now + MUTATION_RECEIPT_LEASE_TTL_SECONDS;
@@ -260,18 +272,15 @@ impl Db {
     /// receipt; callers must not publish the stale worker's response then.
     pub async fn finalize_mutation_receipt(
         &self,
-        id: &str,
-        owner_token: &str,
-        status: &str,
-        response_status: i32,
-        response_body: Option<String>,
-        response_content_type: Option<String>,
-        error_code: Option<&str>,
+        finalization: MutationReceiptFinalization<'_>,
     ) -> AppResult<bool> {
-        let id = id.to_string();
-        let owner_token = owner_token.to_string();
-        let status = status.to_string();
-        let error_code = error_code.map(ToOwned::to_owned);
+        let id = finalization.id.to_string();
+        let owner_token = finalization.owner_token.to_string();
+        let status = finalization.status.to_string();
+        let response_status = finalization.response_status;
+        let response_body = finalization.response_body;
+        let response_content_type = finalization.response_content_type;
+        let error_code = finalization.error_code.map(ToOwned::to_owned);
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             let sql = format!(

@@ -5,17 +5,16 @@
 //! these methods, but the final setup ownership/expiry check and the audit
 //! write must share the same database transaction as the state transition.
 
-use super::*;
-
 use super::{
-    AppError, AuditEventRecord, CountRow, Db, MfaRecoveryCodeRecord, MfaTotpMethodRecord,
-    MfaTotpSetupRecord, blocking, ph,
+    AppError, AuditEventRecord, CountRow, DatabaseKind, Db, MfaRecoveryCodeRecord,
+    MfaTotpMethodRecord, MfaTotpSetupRecord, blocking, ph,
 };
 use crate::audit::AuditEvent;
+use crate::error::AppResult;
 use crate::util;
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,
-    sql_types::{BigInt, Nullable, Text},
+    sql_types::{BigInt, Integer, Nullable, Text},
 };
 
 impl Db {

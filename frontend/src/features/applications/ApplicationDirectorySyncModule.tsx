@@ -8,10 +8,7 @@ import { useEffect, useRef, useState } from "react";
 
 import * as applicationApi from "../../lib/api/applications";
 import { stableDomainEqual } from "../admin/stable-domain-comparator";
-import type {
-  DirtyNavigationController,
-  DirtyNavigationSourceHandle
-} from "../navigation/useDirtyNavigation";
+import type { DirtyNavigationController } from "../navigation/useDirtyNavigation";
 import type {
   ApplicationDirectorySyncRun,
   ApplicationModule,
@@ -20,16 +17,16 @@ import type {
   Locale,
   TenantApplication
 } from "../../types";
-import type {
-  ApplicationRequestGuard,
-  ApplicationRequestToken
-} from "./application-request-guard";
+import { persistApplicationModule } from "./application-module-persistence";
 import {
   booleanValue,
   record,
   stringList,
-  stringValue
+  stringValue,
+  toggleString
 } from "./application-module-values";
+import { useApplicationWorkspaceRequestContext } from "./use-application-workspace-request-context";
+import { useApplicationDirtySource } from "./use-application-dirty-source";
 import {
   Input,
   ModuleHeader,
@@ -37,7 +34,11 @@ import {
   Toggle
 } from "./components/ApplicationModulePrimitives";
 
-export const APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE = "applications.directory-sync";
+import {
+  APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE,
+  applicationDirectorySyncConfig,
+} from "./application-workspace-module-contracts";
+export { APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE } from "./application-workspace-module-contracts";
 
 export type ApplicationDirectorySyncCopy = {
   directorySync: string;
@@ -107,7 +108,6 @@ export type ApplicationDirectorySyncModuleProps = {
   locale: Locale;
   canManage: boolean;
   copy: ApplicationDirectorySyncCopy;
-  requestGuard: ApplicationRequestGuard;
   dirtyNavigation: Pick<DirtyNavigationController, "registerSource">;
   onDirtyChange?: () => void;
   onReadModelChange?: (applicationId: string, config: Record<string, unknown> | null) => void;
@@ -119,33 +119,7 @@ export type ApplicationDirectorySyncModuleProps = {
   ) => void;
 };
 
-export function applicationDirectorySyncConfig(application: TenantApplication): Record<string, unknown> {
-  const module = (application.modules ?? []).find((item) => item.module_key === "directory_sync");
-  return {
-    enabled: false,
-    ldap_provider_ids: [],
-    user_sync_filter: "",
-    group_base_dn: "",
-    group_filter: "(objectClass=group)",
-    group_id_attribute: "dn",
-    group_name_attribute: "cn",
-    group_member_attribute: "member",
-    reactivate_users: true,
-    max_entries: 100000,
-    deprovision_action: "remove_membership",
-    scim_enabled: false,
-    scim_audience: "",
-    sync_groups: true,
-    ...record(module?.config)
-  };
-}
-
-function requestOptions(token: ApplicationRequestToken) {
-  return {
-    signal: token.signal,
-    ...(token.idempotencyKey ? { idempotencyKey: token.idempotencyKey } : {})
-  };
-}
+export { applicationDirectorySyncConfig } from "./application-workspace-module-contracts";
 
 function formatScimTokenTime(value: number | null, locale: Locale): string {
   if (value === null) return "";
@@ -158,7 +132,6 @@ export function ApplicationDirectorySyncModule({
   locale,
   canManage,
   copy,
-  requestGuard,
   dirtyNavigation,
   onDirtyChange,
   onReadModelChange,
@@ -175,37 +148,28 @@ export function ApplicationDirectorySyncModule({
   const [createdScimToken, setCreatedScimToken] = useState("");
   const [syncRuns, setSyncRuns] = useState<ApplicationDirectorySyncRun[]>([]);
   const [runningProviderId, setRunningProviderId] = useState<string | null>(null);
-  const dirtySourceRef = useRef<DirtyNavigationSourceHandle | null>(null);
-  const onDirtyChangeRef = useRef(onDirtyChange);
-  onDirtyChangeRef.current = onDirtyChange;
   const onReadModelChangeRef = useRef(onReadModelChange);
   onReadModelChangeRef.current = onReadModelChange;
+  const { beginRequest, isCurrent, finishRequest, requestOptions } = useApplicationWorkspaceRequestContext();
 
   const config = draftConfig ?? applicationDirectorySyncConfig(application);
-
-  function isCurrentApplicationRequest(token: ApplicationRequestToken): boolean {
-    return requestGuard.isCurrent(token);
-  }
 
   function hasUnsavedChanges(): boolean {
     return draftConfig !== null && !stableDomainEqual(draftConfig, applicationDirectorySyncConfig(application));
   }
 
-  useEffect(() => {
-    const source = dirtyNavigation.registerSource(APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE);
-    dirtySourceRef.current = source;
-    return () => {
-      source.unregister();
-      onDirtyChangeRef.current?.();
-      onReadModelChangeRef.current?.(application.id, null);
-      if (dirtySourceRef.current === source) dirtySourceRef.current = null;
-    };
-  }, [dirtyNavigation.registerSource]);
+  useApplicationDirtySource({
+    dirtyNavigation,
+    dirtySource: APPLICATION_DIRECTORY_SYNC_DIRTY_SOURCE,
+    dirty: hasUnsavedChanges(),
+    onDirtyChange
+  });
 
   useEffect(() => {
-    dirtySourceRef.current?.setDirty(hasUnsavedChanges());
-    onDirtyChangeRef.current?.();
-  }, [application, draftConfig]);
+    return () => {
+      onReadModelChangeRef.current?.(application.id, null);
+    };
+  }, [application.id]);
 
   useEffect(() => {
     onReadModelChangeRef.current?.(application.id, draftConfig ?? applicationDirectorySyncConfig(application));
@@ -225,36 +189,30 @@ export function ApplicationDirectorySyncModule({
   }, [application.id]);
 
   useEffect(() => {
-    const request = requestGuard.begin(application.id, {
-      scope: "directory-sync:runs",
-      kind: "read"
-    });
+    const request = beginRequest("directory-sync:runs", { kind: "read" });
     if (!request) return;
     void applicationApi.listApplicationDirectorySyncRuns(application.id, requestOptions(request))
       .then((runs) => {
-        if (isCurrentApplicationRequest(request)) setSyncRuns(runs);
+        if (isCurrent(request)) setSyncRuns(runs);
       })
       .catch(() => {
-        if (isCurrentApplicationRequest(request)) setSyncRuns([]);
+        if (isCurrent(request)) setSyncRuns([]);
       });
-    return () => requestGuard.finish(request, false);
-  }, [application, requestGuard]);
+    return () => finishRequest(request, false);
+  }, [application.id, beginRequest, finishRequest, isCurrent]);
 
   useEffect(() => {
-    const request = requestGuard.begin(application.id, {
-      scope: "directory-sync:scim-tokens",
-      kind: "read"
-    });
+    const request = beginRequest("directory-sync:scim-tokens", { kind: "read" });
     if (!request) return;
     void applicationApi.listApplicationScimTokens(application.id, requestOptions(request))
       .then((tokens) => {
-        if (isCurrentApplicationRequest(request)) setScimTokens(tokens);
+        if (isCurrent(request)) setScimTokens(tokens);
       })
       .catch(() => {
-        if (isCurrentApplicationRequest(request)) setScimTokens([]);
+        if (isCurrent(request)) setScimTokens([]);
       });
-    return () => requestGuard.finish(request, false);
-  }, [application, requestGuard]);
+    return () => finishRequest(request, false);
+  }, [application.id, beginRequest, finishRequest, isCurrent]);
 
   function updateDraft(next: Record<string, unknown>) {
     setDraftConfig(next);
@@ -262,59 +220,33 @@ export function ApplicationDirectorySyncModule({
 
   function toggleId(id: string) {
     const values = stringList(config.ldap_provider_ids);
-    const next = values.includes(id) ? values.filter((item) => item !== id) : [...values, id];
+    const next = toggleString(values, id);
     updateDraft({ ...config, ldap_provider_ids: next });
-  }
-
-  async function reloadModuleAfterSaveFailure(request: ApplicationRequestToken): Promise<boolean> {
-    const modules = await applicationApi.listApplicationModules(application.id, {
-      force: true,
-      ...requestOptions(request)
-    });
-    if (!isCurrentApplicationRequest(request)) return false;
-    const module = modules.find((item) => item.module_key === "directory_sync");
-    if (!module) return false;
-    onApplicationModuleChanged(application.id, module);
-    return true;
   }
 
   async function saveModule() {
     const nextConfig = draftConfig ?? applicationDirectorySyncConfig(application);
-    const request = requestGuard.begin(application.id, {
-      scope: "module:directory_sync",
+    const request = beginRequest("module:directory_sync", {
       kind: "mutation",
       payloadFingerprint: JSON.stringify(nextConfig)
     });
     if (!request) return;
     setSaving(true);
     setFeedback("");
-    let moduleWritten = false;
     let committed = false;
     try {
-      const module = await applicationApi.updateApplicationModule(application.id, "directory_sync", {
+      const result = await persistApplicationModule(application.id, "directory_sync", {
         config: nextConfig,
         is_enabled: booleanValue(nextConfig.enabled)
-      }, requestOptions(request));
-      moduleWritten = true;
-      if (!isCurrentApplicationRequest(request)) return;
-      onApplicationModuleChanged(application.id, module);
-      setDraftConfig(null);
-      setFeedback(copy.saved);
-      committed = true;
-    } catch {
-      if (isCurrentApplicationRequest(request)) {
-        try {
-          const reloaded = await reloadModuleAfterSaveFailure(request);
-          if (reloaded && moduleWritten) setDraftConfig(null);
-        } catch {
-          // Keep the draft when the reconciliation read also fails. The dirty
-          // source then gives the user a safe retry path.
-        }
-        if (isCurrentApplicationRequest(request)) setFeedback(copy.saveFailed);
-      }
+      }, request, isCurrent);
+      if (result.stale) return;
+      if (result.module) onApplicationModuleChanged(application.id, result.module);
+      if (result.committed || (result.module && result.moduleWritten)) setDraftConfig(null);
+      setFeedback(result.committed ? copy.saved : copy.saveFailed);
+      committed = result.committed;
     } finally {
-      if (isCurrentApplicationRequest(request)) setSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setSaving(false);
+      finishRequest(request, committed);
     }
   }
 
@@ -326,17 +258,14 @@ export function ApplicationDirectorySyncModule({
 
   async function createScimToken() {
     if (scimTokenScopes.length === 0) return;
-    const request = requestGuard.begin(application.id, {
-      scope: "directory-sync:scim-token:create",
-      kind: "mutation"
-    });
+    const request = beginRequest("directory-sync:scim-token:create", { kind: "mutation" });
     if (!request) return;
     let expiresAt: number | null = null;
     if (scimTokenExpiry) {
       const parsed = Date.parse(scimTokenExpiry);
       if (!Number.isFinite(parsed) || parsed <= Date.now()) {
         setFeedback(copy.saveFailed);
-        requestGuard.finish(request, false);
+        finishRequest(request, false);
         return;
       }
       expiresAt = Math.floor(parsed / 1000);
@@ -349,7 +278,7 @@ export function ApplicationDirectorySyncModule({
         scopes: scimTokenScopes,
         expires_at: expiresAt
       }, requestOptions(request));
-      if (!isCurrentApplicationRequest(request)) return;
+      if (!isCurrent(request)) return;
       const { token, ...metadata } = response;
       setScimTokens((current) => [metadata, ...current]);
       setCreatedScimToken(token ?? "");
@@ -357,67 +286,61 @@ export function ApplicationDirectorySyncModule({
       setFeedback(copy.saved);
       committed = true;
     } catch {
-      if (isCurrentApplicationRequest(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (isCurrentApplicationRequest(request)) setScimTokenSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setScimTokenSaving(false);
+      finishRequest(request, committed);
     }
   }
 
   async function revokeScimToken(tokenId: string) {
-    const request = requestGuard.begin(application.id, {
-      scope: `directory-sync:scim-token:${tokenId}:revoke`,
-      kind: "mutation"
-    });
+    const request = beginRequest(`directory-sync:scim-token:${tokenId}:revoke`, { kind: "mutation" });
     if (!request) return;
     setScimTokenSaving(true);
     setFeedback("");
     let committed = false;
     try {
       await applicationApi.revokeApplicationScimToken(application.id, tokenId, requestOptions(request));
-      if (!isCurrentApplicationRequest(request)) return;
+      if (!isCurrent(request)) return;
       setScimTokens((current) => current.map((token) => token.id === tokenId
         ? { ...token, revoked_at: Math.floor(Date.now() / 1000) }
         : token));
       if (createdScimToken) setCreatedScimToken("");
       committed = true;
     } catch {
-      if (isCurrentApplicationRequest(request)) setFeedback(copy.saveFailed);
+      if (isCurrent(request)) setFeedback(copy.saveFailed);
     } finally {
-      if (isCurrentApplicationRequest(request)) setScimTokenSaving(false);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setScimTokenSaving(false);
+      finishRequest(request, committed);
     }
   }
 
   async function runDirectorySync(providerId: string) {
     if (!canManage) return;
-    const request = requestGuard.begin(application.id, {
-      scope: `directory-sync:${providerId}:run`,
-      kind: "mutation"
-    });
+    const request = beginRequest(`directory-sync:${providerId}:run`, { kind: "mutation" });
     if (!request) return;
     setRunningProviderId(providerId);
     setFeedback("");
     let committed = false;
     try {
       const run = await applicationApi.runApplicationDirectorySync(application.id, providerId, requestOptions(request));
-      if (!isCurrentApplicationRequest(request)) return;
+      if (!isCurrent(request)) return;
       setSyncRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
       setFeedback(copy.syncCompleted);
       committed = true;
     } catch {
-      if (!isCurrentApplicationRequest(request)) return;
+      if (!isCurrent(request)) return;
       setFeedback(copy.saveFailed);
       try {
         const runs = await applicationApi.listApplicationDirectorySyncRuns(application.id, requestOptions(request));
-        if (!isCurrentApplicationRequest(request)) return;
+        if (!isCurrent(request)) return;
         setSyncRuns(runs);
       } catch {
         // Preserve the original action error when refreshing history fails.
       }
     } finally {
-      if (isCurrentApplicationRequest(request)) setRunningProviderId(null);
-      requestGuard.finish(request, committed);
+      if (isCurrent(request)) setRunningProviderId(null);
+      finishRequest(request, committed);
     }
   }
 

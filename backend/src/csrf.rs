@@ -36,6 +36,11 @@ pub async fn protect_browser_writes(
     if is_public_browser_write(path) {
         return match has_trusted_request_origin(&state, request.headers()).await {
             Ok(true) => next.run(request).await,
+            Ok(false) if path == "/api/register" => match state.db.user_count().await {
+                Ok(0) if origin_matches_request_host(request.headers()) => next.run(request).await,
+                Ok(_) => csrf_failed("request origin is not trusted"),
+                Err(error) => error.into_response(),
+            },
             Ok(false) => csrf_failed("request origin is not trusted"),
             Err(error) => error.into_response(),
         };
@@ -191,7 +196,7 @@ async fn has_trusted_request_origin(
     is_trusted_origin(state, &origin).await
 }
 
-fn request_origin(headers: &HeaderMap) -> Option<String> {
+pub fn request_origin(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -201,6 +206,39 @@ fn request_origin(headers: &HeaderMap) -> Option<String> {
                 .and_then(|value| value.to_str().ok())
         })
         .map(str::to_string)
+}
+
+pub fn normalized_origin(headers: &HeaderMap) -> Option<String> {
+    let origin = request_origin(headers)?;
+    let parsed = Url::parse(origin.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+fn origin_matches_request_host(headers: &HeaderMap) -> bool {
+    let Some(origin) = normalized_origin(headers) else {
+        return false;
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(origin_url) = Url::parse(&origin) else {
+        return false;
+    };
+    let Ok(host_url) = Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
+    if origin_url.host_str().map(str::to_ascii_lowercase)
+        != host_url.host_str().map(str::to_ascii_lowercase)
+    {
+        return false;
+    }
+    host_url.port().is_none() || origin_url.port() == host_url.port()
 }
 
 async fn is_trusted_origin(state: &AppState, candidate: &str) -> Result<bool, AppError> {
@@ -296,6 +334,38 @@ mod tests {
             origin_tuple("https://sso.example")
         );
         assert!(origin_tuple("null").is_none());
+    }
+
+    #[test]
+    fn normalized_origin_discards_referer_path_and_query() {
+        let headers = HeaderMap::from_iter([(
+            header::REFERER,
+            "https://SSO.example.com:443/register?step=1"
+                .parse()
+                .unwrap(),
+        )]);
+        assert_eq!(
+            normalized_origin(&headers).as_deref(),
+            Some("https://sso.example.com")
+        );
+    }
+
+    #[test]
+    fn first_registration_origin_must_match_request_host() {
+        let matching = HeaderMap::from_iter([
+            (
+                header::ORIGIN,
+                "https://sso.example.com:8443".parse().unwrap(),
+            ),
+            (header::HOST, "sso.example.com:8443".parse().unwrap()),
+        ]);
+        assert!(origin_matches_request_host(&matching));
+
+        let cross_site = HeaderMap::from_iter([
+            (header::ORIGIN, "https://evil.example.com".parse().unwrap()),
+            (header::HOST, "sso.example.com".parse().unwrap()),
+        ]);
+        assert!(!origin_matches_request_host(&cross_site));
     }
 
     #[test]

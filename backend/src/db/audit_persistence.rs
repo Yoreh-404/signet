@@ -1,8 +1,6 @@
-use super::*;
-
 use super::{
     AUDIT_WEBHOOK_OUTBOX_LEASE_TTL_SECONDS, AuditEventRecord, AuditWebhookOutboxRecord,
-    AuditWebhookRecord, Db, NewAuditWebhook, UpdateAuditWebhook,
+    AuditWebhookRecord, DatabaseKind, Db, NewAuditWebhook, UpdateAuditWebhook, blocking, ph,
 };
 use crate::{
     error::{AppError, AppResult},
@@ -13,14 +11,7 @@ use diesel::{
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 
-fn audit_event_select(kind: crate::config::DatabaseKind) -> String {
-    format!(
-        "SELECT id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at FROM audit_events WHERE id = {}",
-        super::ph(kind, 1)
-    )
-}
-
-fn audit_webhook_select(kind: crate::config::DatabaseKind, suffix: &str) -> String {
+fn audit_webhook_select(_kind: crate::config::DatabaseKind, suffix: &str) -> String {
     format!(
         "SELECT id, name, url, secret, actions, is_active, timeout_seconds, last_delivered_at, last_status_code, last_error, created_at, updated_at FROM audit_webhooks {suffix}",
     )
@@ -176,13 +167,25 @@ impl Db {
         })
     }
 
-    pub(crate) async fn find_audit_event(&self, id: &str) -> AppResult<Option<AuditEventRecord>> {
-        let id = id.to_string();
-        with_conn!(self, |conn, kind| {
-            sql_query(audit_event_select(kind))
-                .bind::<Text, _>(id)
-                .get_result::<AuditEventRecord>(&mut conn)
-                .optional()
+    pub(crate) async fn find_audit_events_by_ids(
+        &self,
+        ids: &[String],
+    ) -> AppResult<Vec<AuditEventRecord>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        with_conn!(self, |conn, _kind| {
+            let literals = ids
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, actor_user_id, actor_client_id, action, target_kind, target_id, outcome, ip_address, user_agent, details, created_at FROM audit_events WHERE id IN ({literals})"
+            );
+            sql_query(sql)
+                .load::<AuditEventRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }

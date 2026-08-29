@@ -1,8 +1,22 @@
 use crate::{
+    AppState,
     db::{LoginFailureSummary, SecurityPolicyRecord},
     error::{AppError, AppResult},
     network_policy, util,
 };
+
+pub async fn validate_password_for_subject(
+    state: &AppState,
+    password: &str,
+    email: &str,
+    username: &str,
+) -> AppResult<()> {
+    state
+        .db
+        .security_policy()
+        .await?
+        .validate_password(password, PasswordSubject { email, username })
+}
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

@@ -3,13 +3,12 @@
 //! The public methods remain inherent on `Db`; this module owns their query
 //! implementations and directory-specific SQL helpers.
 
-use super::*;
-
 use super::{
-    Db, UserAssignmentStateRecord, UserDirectoryCursor, UserDirectoryCursorPage, UserListFilter,
-    UserListFilters, UserListLinkedIdentityFilter, UserListLoginRegion, UserListPage,
-    UserListRoleFilter, UserListScope, UserOptionRecord, UserRecord, bind_text_list,
-    dedupe_nonempty, ph, select_user_sql,
+    CountRow, Db, UserAssignmentStateRecord, UserDirectoryCursor, UserDirectoryCursorPage,
+    UserEmailIdRow, UserIdentityConflictRow, UserListFilter, UserListFilters,
+    UserListLinkedIdentityFilter, UserListLoginRegion, UserListPage, UserListRoleFilter,
+    UserListScope, UserOptionRecord, UserRecord, bind_text_list, blocking, dedupe_nonempty, ph,
+    select_user_sql,
 };
 use crate::{
     config::DatabaseKind,
@@ -363,6 +362,29 @@ impl Db {
         })
     }
 
+    pub async fn find_scim_user_in_scope(
+        &self,
+        user_id: &str,
+        organization_id: &str,
+    ) -> AppResult<Option<UserRecord>> {
+        let user_id = user_id.to_string();
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE users.id = {} AND EXISTS (SELECT 1 FROM organization_members WHERE organization_members.organization_id = {} AND organization_members.user_id = users.id)",
+                select_user_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<Text, _>(organization_id)
+                .get_result::<UserRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
     /// Resolves a bounded set of account ids with a non-sensitive selector.
     /// Password hashes, login IPs, and authentication metadata are not read
     /// from the database, which makes this suitable for admin assignment
@@ -508,8 +530,10 @@ impl Db {
         offset: usize,
         limit: usize,
     ) -> AppResult<(i64, Vec<UserRecord>)> {
-        let mut filters = UserListFilters::default();
-        filters.organization_id = organization_id.map(str::to_string);
+        let filters = UserListFilters {
+            organization_id: organization_id.map(str::to_string),
+            ..Default::default()
+        };
         let page = self
             .fetch_user_list_page(
                 scope,

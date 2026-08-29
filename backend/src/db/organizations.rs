@@ -5,8 +5,6 @@
 //! same transaction as the aggregate write so a partially-created tenant can
 //! never be observed as successfully provisioned.
 
-use super::*;
-
 use super::{
     AppError, AuditEventRecord, CountRow, DatabaseKind, Db, GroupMemberIdRow, NewOrganization,
     OrganizationMemberInput, OrganizationMemberRecord, OrganizationRecord, bind_text_list,

@@ -304,10 +304,10 @@ impl DelegatedAllowlistEntry {
                 .filter(|scope| !scope.trim().is_empty())
                 .map(|scope| scope.trim().to_string()),
         );
-        if let Some(scope) = self.scope.as_deref().map(str::trim) {
-            if !scope.is_empty() {
-                scopes.insert(scope.to_string());
-            }
+        if let Some(scope) = self.scope.as_deref().map(str::trim)
+            && !scope.is_empty()
+        {
+            scopes.insert(scope.to_string());
         }
         scopes.into_iter().collect()
     }
@@ -975,10 +975,10 @@ impl Settings {
                     );
                 }
                 if client.client_secret.is_empty()
-                    && !client
+                    && client
                         .client_secret_env
                         .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty())
+                        .is_none_or(|value| value.trim().is_empty())
                 {
                     anyhow::bail!(
                         "bootstrap client {} rotate_secret requires client_secret or client_secret_env",

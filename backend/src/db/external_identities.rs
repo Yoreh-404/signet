@@ -1,15 +1,15 @@
 //! Persistence for external authentication providers and linked identities.
 
-use super::*;
-
 use super::{
     CountRow, Db, ExternalOidcProviderRecord, ExternalOidcStateRecord, LdapProviderRecord,
     LinkedIdentityRecord, NewExternalOidcProvider, NewLdapProvider, NewUser, OrganizationRecord,
-    UserIdentityCandidate, UserRecord, UserRegistrationSource, insert_user_sql, ph,
-    select_organization_sql, select_user_sql,
+    UserIdentityCandidate, UserRecord, UserRegistrationSource, bind_text_list, blocking,
+    count_all_users_sql, count_user_identity_conflicts_sql, ensure_first_user_registration_state,
+    insert_user_sql, ldap_provider_key, ph, select_organization_sql, select_user_sql,
 };
 use crate::config::DatabaseKind;
 use crate::error::{AppError, AppResult};
+use crate::organizations::OrganizationEmailPolicy;
 use crate::util;
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,
@@ -155,6 +155,30 @@ impl Db {
                 .bind::<Text, _>(id)
                 .get_result::<ExternalOidcProviderRecord>(&mut conn)
                 .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_external_oidc_providers_by_ids(
+        &self,
+        ids: &[String],
+    ) -> AppResult<Vec<ExternalOidcProviderRecord>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=ids.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "{} WHERE id IN ({})",
+                select_external_oidc_provider_sql(),
+                placeholders,
+            );
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<ExternalOidcProviderRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }
@@ -386,6 +410,30 @@ impl Db {
                 .bind::<Text, _>(id)
                 .get_result::<LdapProviderRecord>(&mut conn)
                 .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_ldap_providers_by_ids(
+        &self,
+        ids: &[String],
+    ) -> AppResult<Vec<LdapProviderRecord>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let placeholders = (1..=ids.len())
+                .map(|index| ph(kind, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "{} WHERE id IN ({})",
+                select_ldap_provider_sql(),
+                placeholders,
+            );
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<LdapProviderRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }

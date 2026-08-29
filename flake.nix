@@ -125,11 +125,11 @@
             "sso-backend/postgres"
             "sso-backend/mysql"
           ];
-          packageFun = args: import ./Cargo.nix (args // { inherit pkgs; });
-          workspaceSrc = "${signetSource}";
+          packageFun = args: import ./Cargo.nix (args // { inherit pkgs; workspaceLockFile = ./Cargo.lock; });
+          workspaceSrc = signetSource;
           # The source tree is augmented with the built frontend before Cargo
           # runs, so Cargo.nix cannot hash it during pure evaluation.
-          ignoreLockHash = true;
+          ignoreLockHash = false;
           packageOverrides = pkgs:
             let
               inherit (pkgs.rustBuilder) overrides rustLib;

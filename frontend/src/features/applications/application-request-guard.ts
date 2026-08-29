@@ -24,6 +24,20 @@ export type ApplicationRequestToken = {
   idempotencyKey: string | null;
 };
 
+export type ApplicationRequestOptions = {
+  signal: AbortSignal;
+  idempotencyKey?: string;
+};
+
+export function applicationRequestOptions(
+  request: ApplicationRequestToken
+): ApplicationRequestOptions {
+  return {
+    signal: request.signal,
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {})
+  };
+}
+
 export type ApplicationRequestCurrentScope = {
   applicationId: string | null;
   generation: number;
