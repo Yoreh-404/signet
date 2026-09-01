@@ -51,6 +51,8 @@ export type AdminDataLoaderOptions = {
   tab: Tab;
   session: SessionController;
   scopeKey: string | null;
+  enabled?: boolean;
+  onError?: (error: unknown) => void;
   onLoginSettingsLoaded: (draft: LoginSettingsDraft) => void;
   permissions: AdminDataPermissions;
 };
@@ -96,6 +98,8 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
     tab,
     session,
     scopeKey,
+    enabled = true,
+    onError,
     onLoginSettingsLoaded,
     permissions,
   } = options;
@@ -318,6 +322,18 @@ export function useAdminDataLoader(options: AdminDataLoaderOptions): AdminDataLo
     tab,
     updateReadModel
   ]);
+
+  useEffect(() => {
+    if (!enabled) {
+      invalidateAdminLoad();
+      return;
+    }
+    const loadScope = scopeKey;
+    void loadAdminData(tab).catch((error) => {
+      if (scopeKey === loadScope) onError?.(error);
+    });
+    return () => invalidateAdminLoad();
+  }, [enabled, invalidateAdminLoad, loadAdminData, onError, scopeKey, tab]);
 
   return {
     ...visibleReadModel,

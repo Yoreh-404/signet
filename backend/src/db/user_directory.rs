@@ -8,7 +8,7 @@ use super::{
     UserEmailIdRow, UserIdentityConflictRow, UserListFilter, UserListFilters,
     UserListLinkedIdentityFilter, UserListLoginRegion, UserListPage, UserListRoleFilter,
     UserListScope, UserOptionRecord, UserRecord, bind_text_list, blocking, dedupe_nonempty, ph,
-    select_user_sql,
+    placeholders, select_user_sql,
 };
 use crate::{
     config::DatabaseKind,
@@ -276,10 +276,7 @@ impl Db {
             return Ok(BTreeMap::new());
         }
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=emails.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, emails.len());
             let sql = format!("SELECT id, email FROM users WHERE email IN ({placeholders})");
             let rows = bind_text_list(&mut conn, sql_query(sql), &emails)
                 .load::<UserEmailIdRow>(&mut conn)
@@ -304,18 +301,12 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let mut predicates = Vec::new();
             if !emails.is_empty() {
-                let placeholders = (1..=emails.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = placeholders(kind, 1, emails.len());
                 predicates.push(format!("email IN ({placeholders})"));
             }
             if !usernames.is_empty() {
                 let start = emails.len() + 1;
-                let placeholders = (start..start + usernames.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = placeholders(kind, start, usernames.len());
                 predicates.push(format!("username IN ({placeholders})"));
             }
             let sql = format!(
@@ -412,10 +403,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT id, email, username, display_name FROM users WHERE id IN ({}) ORDER BY id ASC",
-                (1..=ids.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders(kind, 1, ids.len())
             );
             bind_text_list(&mut conn, sql_query(sql), &ids)
                 .load::<UserOptionRecord>(&mut conn)
@@ -450,10 +438,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT id, archived_at FROM users WHERE id IN ({}) ORDER BY id ASC",
-                (1..=ids.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders(kind, 1, ids.len())
             );
             bind_text_list(&mut conn, sql_query(sql), &ids)
                 .load::<UserAssignmentStateRecord>(&mut conn)
@@ -797,11 +782,6 @@ impl Db {
     }
 
     pub async fn count_users(&self, scope: UserListScope) -> AppResult<i64> {
-        #[derive(diesel::QueryableByName)]
-        struct CountRow {
-            #[diesel(sql_type = BigInt)]
-            count: i64,
-        }
         with_conn!(self, |conn, _kind| {
             let sql = if scope.where_sql().is_empty() {
                 "SELECT COUNT(*) AS count FROM users".to_string()

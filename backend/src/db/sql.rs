@@ -23,6 +23,34 @@ pub(super) fn ph(kind: DatabaseKind, index: usize) -> String {
     }
 }
 
+pub(super) fn placeholders(kind: DatabaseKind, start: usize, count: usize) -> String {
+    let mut result = String::new();
+    for index in start..start + count {
+        if index > start {
+            result.push_str(", ");
+        }
+        result.push_str(&ph(kind, index));
+    }
+    result
+}
+
+pub(super) fn placeholder_rows(
+    kind: DatabaseKind,
+    start: usize,
+    row_count: usize,
+    column_count: usize,
+) -> String {
+    (0..row_count)
+        .map(|row| {
+            format!(
+                "({})",
+                placeholders(kind, start + row * column_count, column_count)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(super) fn bind_text_list<Conn>(
     _connection: &mut Conn,
     query: SqlQuery,

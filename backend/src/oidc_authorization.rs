@@ -10,8 +10,8 @@ use crate::{
     AppState, applications, authorization,
     claim_mapper::{self, ClaimContext, ClaimOutputTarget},
     db::{
-        ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord, ApplicationRecord,
-        ClientClaimMapperRecord, ClientRecord, UserRecord,
+        ApplicationClientBindingRecord, ApplicationRecord, ClientClaimMapperRecord, ClientRecord,
+        UserRecord,
     },
     error::AppResult,
     oidc_claims::{DefaultEmailVerifiedClaimPolicy, EmailVerifiedClaimPolicy},
@@ -23,7 +23,6 @@ pub(crate) struct AuthorizationSnapshot {
     pub(crate) policy: authorization::AuthorizationPolicySnapshot,
     pub(crate) application: Option<ApplicationRecord>,
     pub(crate) binding: Option<ApplicationClientBindingRecord>,
-    pub(crate) profile: Option<ApplicationAuthorizationProfileRecord>,
     pub(crate) mappers: Vec<ClientClaimMapperRecord>,
     pub(crate) entitlements: Option<authorization::ApplicationEntitlements>,
 }
@@ -48,13 +47,12 @@ impl AuthorizationSnapshot {
             .await?;
         if !policy.is_authorizable
             || !policy.is_interactive_client_runtime_active()
-            || policy.client_id.as_deref() != Some(client.id.as_str())
+            || !policy.has_client_application_boundary(&client.id)
         {
             return Err(crate::error::AppError::Forbidden);
         }
         let application = policy.application.clone();
         let binding = policy.binding.clone();
-        let profile = policy.profile.clone();
         let entitlements = Some(authorization::resolve_entitlements_from_snapshot(
             &policy, user,
         )?);
@@ -63,7 +61,6 @@ impl AuthorizationSnapshot {
             policy,
             application,
             binding,
-            profile,
             mappers,
             entitlements,
         })
@@ -73,7 +70,8 @@ impl AuthorizationSnapshot {
         state: &AppState,
         client: &ClientRecord,
     ) -> AppResult<applications::ApplicationRuntimeSnapshot> {
-        applications::ApplicationRuntimeSnapshot::load(state, client, Some("oauth2_oidc")).await
+        applications::ApplicationRuntimeSnapshot::load_interactive(state, client, "oauth2_oidc")
+            .await
     }
 
     pub(crate) fn claims_for_user(
@@ -83,18 +81,10 @@ impl AuthorizationSnapshot {
         scope: &str,
         target: ClaimOutputTarget,
     ) -> AppResult<Map<String, Value>> {
-        if let (Some(application), Some(binding)) =
-            (self.application.as_ref(), self.binding.as_ref())
-            && (binding.application_id != application.id || binding.client_db_id != client.id)
-        {
+        if !self.policy.has_client_application_boundary(&client.id) {
             return Err(crate::error::AppError::Forbidden);
         }
-        if let Some(profile) = self.profile.as_ref()
-            && self
-                .application
-                .as_ref()
-                .is_none_or(|application| profile.application_id != application.id)
-        {
+        if !self.policy.has_profile_application_boundary() {
             return Err(crate::error::AppError::Forbidden);
         }
         if !self.policy.is_authorizable || self.policy.user_id != user.id {

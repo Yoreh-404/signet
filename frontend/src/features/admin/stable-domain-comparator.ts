@@ -16,13 +16,13 @@ export function stableDomainEqual(left: unknown, right: unknown): boolean {
   if (typeof left !== "object" || typeof right !== "object") return false;
   const leftRecord = left as Record<string, unknown>;
   const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord).sort();
-  const rightKeys = Object.keys(rightRecord).sort();
-  if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) return false;
-  return leftKeys.every((key) => stableDomainEqual(leftRecord[key], rightRecord[key]));
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+    && stableDomainEqual(leftRecord[key], rightRecord[key]));
 }
 
 export function isDirtyDomain<T>(value: T, baseline: T | null | undefined): boolean {
   return baseline !== null && baseline !== undefined && !stableDomainEqual(value, baseline);
 }
-

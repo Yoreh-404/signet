@@ -691,6 +691,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_lookup ON application_auth_contexts(auth_domain_id, user_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_active_lookup ON application_auth_contexts(auth_domain_id, user_id, revoked_at, authenticated_at DESC)",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id TEXT NOT NULL,
         invitation_id TEXT NOT NULL UNIQUE,
@@ -1967,6 +1968,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_lookup ON application_auth_contexts(auth_domain_id, user_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_application_auth_contexts_active_lookup ON application_auth_contexts(auth_domain_id, user_id, revoked_at, authenticated_at DESC)",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id TEXT NOT NULL,
         invitation_id TEXT NOT NULL UNIQUE,
@@ -3244,6 +3246,7 @@ pub(crate) const MYSQL_MIGRATIONS: &[&str] = &[
         updated_at BIGINT NOT NULL,
         INDEX idx_application_auth_contexts_lookup (auth_domain_id, user_id, expires_at)
     )",
+    "CREATE INDEX idx_application_auth_contexts_active_lookup ON application_auth_contexts(auth_domain_id, user_id, revoked_at, authenticated_at)",
     "CREATE TABLE IF NOT EXISTS application_enrollment_codes (
         application_id VARCHAR(64) NOT NULL,
         invitation_id VARCHAR(64) NOT NULL,

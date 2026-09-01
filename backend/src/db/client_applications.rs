@@ -1,7 +1,7 @@
 use super::{
     AppError, AppResult, ClientRecord, CountRow, DatabaseKind, Db, IapApplicationRecord, NewClient,
     NewIapApplication, bind_text_list, blocking, dedupe_nonempty, normalize_permission_keys, ph,
-    select_client_sql, select_iap_application_sql,
+    placeholders, select_client_sql, select_iap_application_sql,
 };
 use crate::util;
 use diesel::{
@@ -34,10 +34,7 @@ impl Db {
         }
         let client_ids = client_ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=client_ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, client_ids.len());
             let sql = format!(
                 "{} WHERE client_id IN ({})",
                 select_client_sql(),
@@ -55,10 +52,7 @@ impl Db {
         }
         let ids = ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, ids.len());
             let sql = format!("{} WHERE id IN ({})", select_client_sql(), placeholders);
             bind_text_list(&mut conn, sql_query(sql), &ids)
                 .load::<ClientRecord>(&mut conn)

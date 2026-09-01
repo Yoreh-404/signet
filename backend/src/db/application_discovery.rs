@@ -5,18 +5,18 @@ use super::{
     APPLICATION_DISCOVERY_LEASE_TTL_SECONDS, AppError, AppResult,
     ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
     ApplicationDiscoveryIdempotencyClaim, ApplicationDiscoveryIdempotencyRecord,
-    ApplicationDiscoveryJoinRecord, ApplicationDiscoveryLease, ApplicationDiscoveryRecord,
-    ApplicationRecord, ClientRecord, CountRow, DatabaseKind, Db, NewApplicationDiscovery,
-    WebsiteDiscoveryConnection, WebsiteDiscoveryProfileInput, bind_text_list, blocking, ph,
-    select_application_authorization_profile_sql, select_application_client_binding_sql,
-    select_application_discovery_sql, select_client_sql,
+    ApplicationDiscoveryJoinRecord, ApplicationDiscoveryLease, ApplicationDiscoveryMigrationRow,
+    ApplicationDiscoveryRecord, ApplicationRecord, ClientRecord, CountRow, DatabaseKind, Db,
+    NewApplicationDiscovery, WebsiteDiscoveryConnection, WebsiteDiscoveryProfileInput,
+    bind_text_list, blocking, ph, placeholders, select_application_authorization_profile_sql,
+    select_application_client_binding_sql, select_application_discovery_sql, select_client_sql,
 };
 use crate::application_discovery_contract::{MANAGEMENT_MODE_WEBSITE, SYNC_SYNCED};
 use crate::util;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct ApplicationDiscoveryManifest {
@@ -77,6 +77,27 @@ pub struct ApplicationDiscoveryRole {
 }
 
 impl Db {
+    pub(super) async fn list_applications_without_discovery(
+        &self,
+    ) -> AppResult<Vec<ApplicationDiscoveryMigrationRow>> {
+        with_conn!(self, |conn, _kind| {
+            sql_query(
+                "SELECT applications.id AS application_id,
+                        application_modules.config_json AS protocols_config_json
+                 FROM applications
+                 LEFT JOIN application_discovery
+                   ON application_discovery.application_id = applications.id
+                 LEFT JOIN application_modules
+                   ON application_modules.application_id = applications.id
+                  AND application_modules.module_key = 'protocols'
+                 WHERE application_discovery.application_id IS NULL
+                 ORDER BY applications.id ASC",
+            )
+            .load::<ApplicationDiscoveryMigrationRow>(&mut conn)
+            .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_application_discovery(
         &self,
         application_id: &str,
@@ -894,7 +915,7 @@ impl Db {
                     .clients
                     .iter()
                     .map(|client| client.client_id.clone())
-                    .collect::<BTreeSet<_>>();
+                    .collect::<HashSet<_>>();
                 let mut client_db_ids = BTreeMap::new();
                 let mut profile_db_ids = BTreeMap::new();
                 for client in &manifest.clients {
@@ -1000,10 +1021,7 @@ impl Db {
                     if !removed_client_db_ids.is_empty() {
                         let now = util::now_ts();
                         if matches!(kind, DatabaseKind::Postgres) {
-                            let placeholders = (1..=removed_client_db_ids.len())
-                                .map(|index| ph(kind, index))
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                            let placeholders = placeholders(kind, 1, removed_client_db_ids.len());
                             let deactivate_sql = format!(
                                 "UPDATE clients SET is_active = {}, updated_at = {} WHERE id IN ({placeholders})",
                                 ph(kind, removed_client_db_ids.len() + 1),
@@ -1015,10 +1033,7 @@ impl Db {
                                 .execute(conn)
                                 .map_err(AppError::from)?;
                         } else {
-                            let placeholders = (0..removed_client_db_ids.len())
-                                .map(|_| "?")
-                                .collect::<Vec<_>>()
-                                .join(", ");
+                            let placeholders = placeholders(kind, 1, removed_client_db_ids.len());
                             let deactivate_sql = format!(
                                 "UPDATE clients SET is_active = ?, updated_at = ? WHERE id IN ({placeholders})"
                             );
@@ -1032,10 +1047,7 @@ impl Db {
                             query.execute(conn).map_err(AppError::from)?;
                         }
 
-                        let placeholders = (2..=removed_client_db_ids.len() + 1)
-                            .map(|index| ph(kind, index))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let placeholders = placeholders(kind, 2, removed_client_db_ids.len());
                         let unlink_sql = format!(
                             "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id IN ({placeholders})",
                             ph(kind, 1)

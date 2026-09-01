@@ -1,6 +1,6 @@
 use super::{
     AppError, AppResult, ClientGrantRecord, ClientGrantWithClientRecord, Db, RefreshTokenInput,
-    RefreshTokenRecord, bind_text_list, blocking, ph,
+    RefreshTokenRecord, bind_text_list, blocking, ph, placeholders,
 };
 use crate::{config::DatabaseKind, util};
 use diesel::Connection;
@@ -215,10 +215,7 @@ impl Db {
         let user_id = user_id.to_string();
         let client_ids = client_ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (2..=client_ids.len() + 1)
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 2, client_ids.len());
             let sql = format!(
                 "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE client_id IN ({}) AND user_id = {} AND authorization_profile_id = 'default'",
                 placeholders.as_str(),

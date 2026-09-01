@@ -1,11 +1,12 @@
-import { AtSign, Copy, Globe2, KeyRound, Link2, Mail, Moon, Phone, Shield, Shuffle, Sun, Users } from "lucide-react";
-import type { FormEvent, ReactNode, Ref } from "react";
+import { Copy, Globe2, KeyRound, Link2, Mail, Moon, Phone, Shield, Shuffle, Sun, Users } from "lucide-react";
+import type { FormEvent, Ref } from "react";
 import { AuthorizationCodeLoginForm, LoginMethodSwitcher } from "../../components/LoginMethod";
 import { AccountChooser } from "./AccountChooser";
 import type { BrowserAccountSelectedHandler, BrowserAccountsLoadedHandler } from "./AccountChooser";
+import { EmailField, InlineCode } from "./AuthFields";
 import { Field, StatusBadge } from "../../components/ui";
 import { formatTime } from "../../lib/formatters";
-import { applyEmailDomain, oidcStartUrl, usableEmailDomain } from "../../lib/auth-flow";
+import { oidcStartUrl } from "../../lib/auth-flow";
 import type { BrowserAccount, BrowserAccountsContext, Bootstrap, ExternalProviderSummary, LoginMethod, Locale, QuickLink, Theme, AuthMode } from "../../types";
 import type { TranslationKey } from "../../i18n";
 
@@ -226,15 +227,6 @@ export function EnterpriseAuthWorkspace({
 
 function TopLanguage({ locale, supportedLocales, switchLocale, label }: { locale: Locale; supportedLocales: string[]; switchLocale: (locale: Locale) => void; label: string }) {
   return <label className="language-control"><span>{label}</span><select value={locale} onChange={(event) => switchLocale(event.target.value as Locale)}>{supportedLocales.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>;
-}
-
-function EmailField({ label, value, onChange, domains, customDomain, onCustomDomainChange, customLabel, applyLabel }: { label: string; value: string; onChange: (value: string) => void; domains: string[]; customDomain: string; onCustomDomainChange: (value: string) => void; customLabel: string; applyLabel: string }) {
-  const customSuffix = usableEmailDomain(customDomain);
-  return <div className="email-field"><Field label={label} value={value} onChange={onChange} type="email" autoComplete="email" required />{domains.length > 0 && <div className="domain-pills" role="group" aria-label={label}>{domains.map((domain) => <button type="button" key={domain} onClick={() => onChange(applyEmailDomain(value, domain))}>@{domain}</button>)}</div>}<div className="custom-domain"><input aria-label={customLabel} autoComplete="off" value={customDomain} placeholder={customLabel} onChange={(event) => onCustomDomainChange(event.target.value)} /><button type="button" disabled={!customSuffix} onClick={() => onChange(applyEmailDomain(value, customSuffix))}><AtSign size={14} />{applyLabel}</button></div></div>;
-}
-
-function InlineCode({ icon, label, button, value, onChange, onSend, disabled = false }: { icon: ReactNode; label: string; button: string; value: string; onChange: (value: string) => void; onSend: () => void; disabled?: boolean }) {
-  return <div className="inline-code"><Field label={label} value={value} onChange={onChange} autoComplete="one-time-code" /><button type="button" onClick={onSend} disabled={disabled}>{icon}{button}</button></div>;
 }
 
 function QuickJump({ links }: { links: QuickLink[] }) {

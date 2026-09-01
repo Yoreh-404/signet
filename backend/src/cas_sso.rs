@@ -11,6 +11,7 @@ use crate::{
     authorization,
     db::{ApplicationRecord, NewApplicationCasTicket},
     error::{AppError, AppResult},
+    http_urls::parse_safe_http_endpoint,
     redirects, util,
 };
 use axum::{
@@ -437,15 +438,8 @@ async fn load_application(
     state: &AppState,
     app_slug: &str,
 ) -> AppResult<(ApplicationRecord, CasApplicationConfig)> {
-    let application = state
-        .db
-        .find_active_application_by_slug(app_slug)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    applications::ensure_application_runtime_active(state, &application).await?;
-    let protocol = applications::enabled_protocol_config(state, &application.id, "cas")
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (application, protocol) =
+        applications::load_active_application_protocol_config(state, app_slug, "cas").await?;
     let mut config = parse_cas_config(&protocol)?;
     if config.service_urls.is_empty()
         && let Some(website_url) =
@@ -549,21 +543,12 @@ fn validate_service_url(value: &str) -> AppResult<()> {
             "CAS service URL is invalid".to_string(),
         ));
     }
-    let url = Url::parse(value)
-        .map_err(|_| AppError::BadRequest("CAS service URL is invalid".to_string()))?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    if !matches!(url.scheme(), "https" | "http")
-        || url.host_str().is_none()
-        || (url.scheme() == "http" && !loopback)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.query_pairs().any(|(key, _)| {
-            key.eq_ignore_ascii_case("ticket")
-                || key.eq_ignore_ascii_case("pgtIou")
-                || key.eq_ignore_ascii_case("pgtId")
-        })
-    {
+    let url = parse_safe_http_endpoint(value, "CAS service URL")?;
+    if url.query_pairs().any(|(key, _)| {
+        key.eq_ignore_ascii_case("ticket")
+            || key.eq_ignore_ascii_case("pgtIou")
+            || key.eq_ignore_ascii_case("pgtId")
+    }) {
         return Err(AppError::BadRequest(
             "CAS service URL is invalid".to_string(),
         ));

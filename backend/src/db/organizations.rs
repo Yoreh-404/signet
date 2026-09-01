@@ -8,7 +8,7 @@
 use super::{
     AppError, AuditEventRecord, CountRow, DatabaseKind, Db, GroupMemberIdRow, NewOrganization,
     OrganizationMemberInput, OrganizationMemberRecord, OrganizationRecord, bind_text_list,
-    blocking, dedupe_organization_members, ph, select_organization_sql,
+    blocking, dedupe_organization_members, ph, placeholders, select_organization_sql,
 };
 use crate::{audit::AuditEvent, util};
 use diesel::{
@@ -282,10 +282,7 @@ impl Db {
                     .map(|member| member.user_id.clone())
                     .collect::<Vec<_>>();
                 if !requested_user_ids.is_empty() {
-                    let placeholders = (1..=requested_user_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, requested_user_ids.len());
                     let user_sql = format!("SELECT id AS user_id FROM users WHERE id IN ({placeholders})");
                     let valid_ids = bind_text_list(conn, sql_query(user_sql), &requested_user_ids)
                         .load::<GroupMemberIdRow>(conn)
@@ -321,10 +318,7 @@ impl Db {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !removed_ids.is_empty() {
-                    let placeholders = (1..=removed_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, removed_ids.len());
                     let binding_sql = format!(
                         "DELETE FROM application_identity_bindings WHERE user_id IN ({placeholders}) AND application_id IN (SELECT id FROM applications WHERE organization_id = {})",
                         ph(kind, removed_ids.len() + 1)

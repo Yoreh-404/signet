@@ -546,14 +546,10 @@ async fn registration_target_application(
     let Some(client) = context.client else {
         return Ok(None);
     };
-    let application = state
-        .db
-        .find_application_for_client(&client.id)
-        .await?
-        // An OIDC client must be governed by an application before its login
-        // page can admit a new identity. This is deliberately fail-closed.
-        .ok_or(AppError::Forbidden)?;
-    crate::applications::ensure_application_runtime_active(state, &application).await?;
+    // An OIDC client must be governed by an active application before its
+    // login page can admit a new identity. This is deliberately fail-closed.
+    let application =
+        crate::applications::load_active_application_for_client(state, &client.id).await?;
     Ok(Some(application))
 }
 

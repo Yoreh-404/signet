@@ -4,7 +4,7 @@ use super::{
     OrganizationMemberCountRecord, OrganizationMemberInput, OrganizationMemberRecord,
     OrganizationMemberWithUserRecord, OrganizationRecord, SIGNET_ORGANIZATION_ID,
     SIGNET_ORGANIZATION_SLUG, UserOrganizationRecord, bind_text_list, blocking,
-    dedupe_organization_members, ph, select_organization_sql,
+    dedupe_organization_members, ph, placeholders, select_organization_sql,
 };
 use crate::util;
 use diesel::{
@@ -568,10 +568,7 @@ impl Db {
                     .map(|member| member.user_id.clone())
                     .collect::<Vec<_>>();
                 if !requested_user_ids.is_empty() {
-                    let placeholders = (1..=requested_user_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, requested_user_ids.len());
                     let sql = format!(
                         "SELECT id AS user_id FROM users WHERE id IN ({placeholders})"
                     );
@@ -616,10 +613,7 @@ impl Db {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !removed_user_ids.is_empty() {
-                    let placeholders = (1..=removed_user_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, removed_user_ids.len());
                     let bindings_sql = format!(
                         "DELETE FROM application_identity_bindings WHERE user_id IN ({placeholders}) AND application_id IN (SELECT id FROM applications WHERE organization_id = {})",
                         ph(kind, removed_user_ids.len() + 1)

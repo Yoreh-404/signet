@@ -2,7 +2,6 @@ import { useRef, useState } from "react";
 import { initialAuthContext } from "../../lib/auth-flow";
 import { emptyAuthorizationCodeLoginForm, emptyPasswordResetForm, emptyRegisterForm } from "../../lib/form-defaults";
 import type {
-  AuthorizationCodeInspection,
   BrowserAccount,
   BrowserAccountContinuation,
   BrowserAccountsContext,
@@ -42,12 +41,7 @@ export function useAccountController({ initialAuth, initialError = "" }: Account
   const [myConsents, setMyConsents] = useState<MyConsent[]>([]);
   const [mySessions, setMySessions] = useState<MySession[]>([]);
   const [signingKeyKid, setSigningKeyKid] = useState("");
-  const accountLoadId = useRef(0);
-  const accountAbortController = useRef<AbortController | null>(null);
-
   const [registerForm, setRegisterForm] = useState(emptyRegisterForm);
-  const [registrationCodeInspection, setRegistrationCodeInspection] = useState<AuthorizationCodeInspection | null>(null);
-  const [registrationCodeInspecting, setRegistrationCodeInspecting] = useState(false);
   const [passwordResetForm, setPasswordResetForm] = useState(emptyPasswordResetForm);
   const [authEmail, setAuthEmail] = useState(initialAuth.loginHint || "");
   const [loginMethod, setLoginMethod] = useState<LoginMethod>("password");
@@ -96,14 +90,8 @@ export function useAccountController({ initialAuth, initialError = "" }: Account
     setMySessions,
     signingKeyKid,
     setSigningKeyKid,
-    accountLoadId,
-    accountAbortController,
     registerForm,
     setRegisterForm,
-    registrationCodeInspection,
-    setRegistrationCodeInspection,
-    registrationCodeInspecting,
-    setRegistrationCodeInspecting,
     passwordResetForm,
     setPasswordResetForm,
     authEmail,

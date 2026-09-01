@@ -101,34 +101,22 @@ impl Db {
         // migration default is Signet-managed, so existing installations keep
         // their current behavior until an operator opts a website into the
         // website-managed mode through bootstrap or the admin API.
-        for application in self.list_applications(None).await? {
-            if self
-                .find_application_discovery(&application.id)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            let website_url = self
-                .list_application_modules(&application.id)
-                .await?
-                .into_iter()
-                .find(|module| module.module_key == "protocols")
-                .and_then(|module| {
-                    serde_json::from_str::<serde_json::Value>(&module.config_json)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("website_url")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .map(ToOwned::to_owned)
-                        })
+        for application in self.list_applications_without_discovery().await? {
+            let website_url = application
+                .protocols_config_json
+                .as_deref()
+                .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
+                .and_then(|value| {
+                    value
+                        .get("website_url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
                 })
                 .unwrap_or_default();
             self.upsert_application_discovery(NewApplicationDiscovery {
-                application_id: application.id,
+                application_id: application.application_id,
                 management_mode: MANAGEMENT_MODE_SIGNET.to_string(),
                 website_url,
                 fetch_secret_ciphertext: String::new(),

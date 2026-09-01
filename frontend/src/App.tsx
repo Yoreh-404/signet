@@ -1,22 +1,15 @@
 import {
-  Activity,
   Archive,
   AtSign,
   Ban,
   Building2,
-  ChevronDown,
-  ChevronUp,
-  Clock3,
   Coins,
-  ExternalLink,
   FileUp,
-  Filter,
   Globe2,
   KeyRound,
   Link2,
   LogOut,
   Mail,
-  Monitor,
   Moon,
   Phone,
   Plus,
@@ -32,7 +25,7 @@ import {
   UserRound,
   Users
 } from "lucide-react";
-import { ChangeEvent, FormEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Check,
@@ -53,6 +46,14 @@ import {
 } from "./components/LoginMethod";
 import { AccountChooser, startBrowserAccountLogin } from "./features/auth/AccountChooser";
 import { useBrowserAccountFlow } from "./features/auth/use-browser-account-flow";
+import { usePasskeyLogin } from "./features/auth/use-passkey-login";
+import { useAuthVerificationActions } from "./features/auth/use-auth-verification-actions";
+import { useAuthorizationCodeLogin } from "./features/auth/use-authorization-code-login";
+import { usePasswordLogin } from "./features/auth/use-password-login";
+import { useRegistrationSubmit } from "./features/auth/use-registration-submit";
+import { useRegistrationCodeInspection } from "./features/auth/use-registration-code-inspection";
+import { useAuthBootstrapActions } from "./features/auth/use-auth-bootstrap-actions";
+import { clearLoginChallengeState } from "./features/auth/login-challenge-state";
 import {
   EnterpriseAuthWorkspace
 } from "./features/auth/EnterpriseAuthWorkspace";
@@ -60,45 +61,77 @@ import { InvitationsWorkspace } from "./features/invitations/InvitationsWorkspac
 import { useInvitationRedemptions } from "./features/invitations/useInvitationRedemptions";
 import { useAccountController } from "./features/admin/use-account-controller";
 import { useApplicationController } from "./features/admin/use-application-controller";
+import { useApplicationAdminStateActions } from "./features/admin/use-application-admin-state-actions";
+import { useAdminUserActions } from "./features/admin/use-admin-user-actions";
+import { useAdminAccessActions } from "./features/admin/use-admin-access-actions";
 import { useAdminDataLoader } from "./features/admin/use-admin-data-loader";
+import { useAdminSearchProjections } from "./features/admin/use-admin-search-projections";
+import { useAdminDirtyState } from "./features/admin/use-admin-dirty-state";
+import { useAdminRefresh } from "./features/admin/use-admin-refresh";
+import { useAdminSettingsActions } from "./features/admin/use-admin-settings-actions";
+import { useApplicationActions } from "./features/admin/use-application-actions";
+import { useBulkUserImportActions } from "./features/admin/use-bulk-user-import-actions";
+import { useUserAccessLoader } from "./features/admin/use-user-access-loader";
+import { useInvitationActions } from "./features/admin/use-invitation-actions";
+import { useEnterpriseActions } from "./features/admin/use-enterprise-actions";
+import { useAccountSecurityActions } from "./features/account/use-account-security-actions";
+import { useUiAction } from "./features/admin/use-ui-action";
 import { useLatestRequest } from "./features/admin/use-latest-request";
 import { useInvitationController } from "./features/admin/use-invitation-controller";
+import { useOrganizationMemberActions } from "./features/admin/use-organization-member-actions";
+import { useOrganizationEditorActions } from "./features/admin/use-organization-editor-actions";
+import { useOrganizationAdminActions } from "./features/admin/use-organization-admin-actions";
+import { useEditorLifecycle } from "./features/admin/use-editor-lifecycle";
+import { useConfirmationActions } from "./features/admin/use-confirmation-actions";
+import { useProviderAdminActions } from "./features/admin/use-provider-admin-actions";
+import { useLoginSettingsActions } from "./features/admin/use-login-settings-actions";
 import { deriveAdminPermissions } from "./features/admin/admin-permissions";
 import { useAdminNavigation } from "./features/navigation/useAdminNavigation";
 import { AdminSidebar } from "./features/navigation/AdminSidebar";
 import type { AdminSidebarNavigationGroup } from "./features/navigation/AdminSidebar";
 import { AdminHeader } from "./features/navigation/AdminHeader";
 import type { AdminHeaderTab } from "./features/navigation/AdminHeader";
+import { AdminFeedbackStack } from "./features/navigation/AdminFeedbackStack";
+import { useAdminTabModel } from "./features/navigation/use-admin-tab-model";
+import { useMobileSidebarFocusTrap } from "./features/navigation/use-mobile-sidebar-focus-trap";
+import { QuickJump } from "./features/navigation/QuickJump";
+import { TopLanguage } from "./features/navigation/TopLanguage";
+import { EmailField, InlineCode } from "./features/auth/AuthFields";
+import { AdminOverview } from "./features/overview/AdminOverview";
 import { useOrganizationController } from "./features/admin/use-organization-controller";
 import { useRoleController } from "./features/admin/use-role-controller";
 import { useSettingsController } from "./features/admin/use-settings-controller";
 import { useSessionController } from "./features/session/useSessionController";
+import { useDocumentPreferences } from "./features/preferences/use-document-preferences";
 import { PortalWorkspace } from "./features/settings/PortalWorkspace";
 import { RegistrationSettingsPanel } from "./features/settings/RegistrationSettingsPanel";
 import { SettingsWorkspace } from "./features/settings/SettingsWorkspace";
 import { AccountWorkspace } from "./features/account/AccountWorkspace";
+import { useAccountDataLoader } from "./features/account/use-account-data-loader";
 import { SecurityWorkspace } from "./features/security/SecurityWorkspace";
 import { ProvidersWorkspace } from "./features/providers/ProvidersWorkspace";
 import { useUserDirectoryCursor } from "./features/users/use-user-directory";
 import { useUserSelection } from "./features/users/use-user-selection";
+import { useUserDirectoryQuery } from "./features/users/use-user-directory-query";
+import { useUserBulkActions } from "./features/users/use-user-bulk-actions";
+import { UserDirectoryFilterPanel } from "./features/users/UserDirectoryFilterPanel";
+import type {
+  UserLinkedIdentityFilter,
+  UserLoginRegionFilter,
+  UserRoleFilter,
+} from "./features/users/user-directory-filter-types";
 import { UserEditorModal } from "./features/users/UserEditorModal";
+import { UserDetailPanel } from "./features/users/UserDetailPanel";
 import { BulkUserImportModal } from "./features/users/BulkUserImportModal";
 import { UserTable } from "./features/users/UserTable";
 import { OrganizationsWorkspace } from "./features/organizations/OrganizationsWorkspace";
 import type { OrganizationFormState } from "./features/organizations/OrganizationWorkspace";
 import type { BulkUserImportFormState } from "./features/users/BulkUserImportModal";
-import {
-  availableUserActions,
-  BULK_USER_IMPORT_TEMPLATE,
-  isBulkUserImportResult,
-  lifecycleStateForUser
-} from "./features/users/user-lifecycle";
+import { BULK_USER_IMPORT_TEMPLATE } from "./features/users/user-lifecycle";
 import type { BulkUserAction, UserLifecycleState } from "./features/users/user-lifecycle";
-import { isDirtyDomain } from "./features/admin/stable-domain-comparator";
 import { confirmDiscardChanges } from "./features/admin/confirm-discard-changes";
 import { useUserController } from "./features/admin/use-user-controller";
 import * as adminApi from "./lib/api/admin";
-import * as accountApi from "./lib/api/account";
 import type { WalletWorkspaceHandle } from "./features/billing/WalletWorkspace";
 import { translations } from "./i18n";
 import type { TranslationKey } from "./i18n";
@@ -106,7 +139,6 @@ import {
   api,
   ApiError
 } from "./lib/api";
-import * as applicationApi from "./lib/api/applications";
 import {
   applyEmailDomain,
   authContextError,
@@ -120,11 +152,9 @@ import {
   usableEmailDomain
 } from "./lib/auth-flow";
 import {
-  matchesSearch,
   toggleValue
 } from "./lib/collection-utils";
 import {
-  formatTime,
   joinList,
   shortSessionId,
   splitList,
@@ -132,17 +162,16 @@ import {
   toTimestamp
 } from "./lib/formatters";
 import {
-  createQuickLinkId,
   emptyAuditWebhookForm,
   emptyAuthorizationCodeLoginForm,
   emptyApplicationForm,
   emptyGroupForm,
+  emptyEnterpriseForm,
   emptyInvitationForm,
   emptyLdapProviderForm,
   emptyOrganizationForm,
   emptyPasswordResetForm,
   emptyProviderForm,
-  emptyQuickLinkForm,
   emptyRegisterForm,
   emptyRoleForm,
   emptyUserForm
@@ -153,48 +182,25 @@ import {
   formatDiagnosticValue,
   matchesHttpUrl
 } from "./app-helpers";
-import {
-  authenticationCredentialJson,
-  passkeyCreationOptions,
-  passkeyRequestOptions,
-  registrationCredentialJson
-} from "./lib/webauthn";
 import type {
-  AccessGroup,
-  ApplicationClientBinding,
-  ApplicationModule,
   AuditEvent,
-  AuditWebhook,
-  AuthorizationCodeInspection,
   AuthMode,
-  BulkUserImportResult,
   Client,
-  ExternalProvider,
-  ExternalProviderDiscovery,
-  ExternalProviderTemplate,
   Invitation,
-  LdapProvider,
   Locale,
   LoginMethod,
   LoginResponse,
   LoginSettings,
-  LoginSettingsDraft,
   LogoutResponse,
   Organization,
-  OrganizationMember,
   OrganizationOption,
   OidcContinuationLoginResponse,
   Overview,
   PendingConfirmation,
   PermissionInfo,
-  QuickLink,
-  RegistrationSettings,
-  Role,
-  SecurityPolicy,
   SigningKey,
   Tab,
   Theme,
-  TenantApplication,
   User,
   UserAccess,
   UserDetail,
@@ -213,23 +219,6 @@ const WalletWorkspace = lazy(() =>
   }))
 );
 
-type UserRoleFilter = "all" | "admin" | "user";
-type UserLoginRegionFilter = "all" | "domestic" | "overseas";
-type UserLinkedIdentityFilter = "all" | "linked" | "unlinked";
-type EnterpriseFormState = {
-  slug: string;
-  name: string;
-  description: string;
-  allowed_email_domains: string;
-};
-
-const emptyEnterpriseForm: EnterpriseFormState = {
-  slug: "",
-  name: "",
-  description: "",
-  allowed_email_domains: ""
-};
-
 export function App() {
   const initialAuth = useMemo(initialAuthContext, []);
   const initialNavigationState = useMemo(() => initialNavigation(), []);
@@ -238,13 +227,13 @@ export function App() {
     return saved === "en-US" ? "en-US" : "zh-CN";
   });
   const t = (key: TranslationKey) => translations[locale][key];
-  const messageOr = (err: unknown, fallback: TranslationKey) => {
+  const messageOr = useMemo(() => (err: unknown, fallback: TranslationKey) => {
     if (err instanceof ApiError && err.code === "network_error") return t("networkError");
     if (err instanceof ApiError && err.code === "csrf_failed") return t("sessionExpired");
     if (err instanceof ApiError && err.status >= 500) return t("serverError");
     if (err instanceof ApiError && (err.status === 401 || err.status === 403)) return t(fallback);
     return err instanceof Error ? err.message : t(fallback);
-  };
+  }, [locale]);
 
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -292,14 +281,8 @@ export function App() {
     setMySessions,
     signingKeyKid,
     setSigningKeyKid,
-    accountLoadId,
-    accountAbortController,
     registerForm,
     setRegisterForm,
-    registrationCodeInspection,
-    setRegistrationCodeInspection,
-    registrationCodeInspecting,
-    setRegistrationCodeInspecting,
     passwordResetForm,
     setPasswordResetForm,
     authEmail,
@@ -355,7 +338,6 @@ export function App() {
     pendingConfirmation,
     setPendingConfirmation
   } = accountController;
-
   const {
     selectedUser,
     setSelectedUser,
@@ -447,6 +429,20 @@ export function App() {
     organizationMembersLoadId
   } = organizationController;
   const {
+    editOrganization,
+    setOrganizationMemberRole
+  } = useOrganizationEditorActions({
+    organizationMembersLoadId,
+    setOrganizationForm,
+    setOrganizationFormBaseline,
+    setOrganizationMemberRoles,
+    setOrganizationMemberRolesBaseline,
+    setOrganizationMembersLoading,
+    openOrganizationEditor: () => setEditor("organization"),
+    setError,
+    messageOr
+  });
+  const {
     invitationForm,
     setInvitationForm,
     invitationFormBaseline,
@@ -509,7 +505,6 @@ export function App() {
   } = useSettingsController();
 
   const userDetailsRequest = useLatestRequest();
-  const userAccessRequest = useLatestRequest();
 
   const session = useSessionController({ returnTo: authReturnTo });
   const {
@@ -526,10 +521,62 @@ export function App() {
     transitionToAuthenticated,
     transitionToAnonymous
   } = session;
+  const { initialize, loadBootstrap } = useAuthBootstrapActions({
+    returnTo: authReturnTo,
+    autoInitialize: true,
+    loadSessionBootstrap,
+    initializeSession,
+    transitionToAnonymous,
+    setLocale,
+    setAuthMode,
+    setInitialLoadError,
+    formatError: messageOr
+  });
+  const { inspection: registrationCodeInspection, inspecting: registrationCodeInspecting } =
+    useRegistrationCodeInspection({
+      hasUsers: bootstrap?.has_users ?? false,
+      authMode,
+      authorizationCode: registerForm.authorization_code
+    });
+  const { load: loadAccountData } = useAccountDataLoader({
+    controller: session.controller,
+    scopeKey: cacheScope,
+    enabled: !initialAuth.isAuthPage,
+    onError: useMemo(
+      () => (error: unknown) => setError(messageOr(error, "loadFailed")),
+      [messageOr]
+    ),
+    setMfaStatus,
+    setPasskeys,
+    setMyConsents,
+    setMySessions
+  });
   const invitationRedemptions = useInvitationRedemptions();
   const invitationRedemptionsError = invitationRedemptions.error
     ? messageOr(invitationRedemptions.error, "loadAuthorizationCodeRedemptionsFailed")
     : "";
+  const {
+    addEnterpriseMember,
+    createOrganizationMemberInvitation,
+    deleteOrganizationMemberInvitation
+  } = useOrganizationMemberActions({
+    organizationContext,
+    enterpriseMemberEmail,
+    enterpriseMemberRole,
+    setEnterpriseMemberEmail,
+    setEnterpriseMemberRole,
+    setOrganizationMembers,
+    organizationMemberInvitationForm,
+    setOrganizationMemberInvitationForm,
+    setOrganizationMemberInvitations,
+    setRevealedOrganizationMemberInvitation,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    messageOr,
+    translate: t,
+    toTimestamp
+  });
 
   const {
     tab,
@@ -641,21 +688,440 @@ export function App() {
     securityPolicyBaseline,
     setSecurityPolicyBaseline,
     adminLoading,
-    loadAdminData,
-    invalidateAdminLoad
+    loadAdminData
   } = useAdminDataLoader({
     tab,
     session: session.controller,
     scopeKey: cacheScope,
+    enabled: canAdmin
+      && !initialAuth.isAuthPage
+      && tab !== "account"
+      && tab !== "billing"
+      && !(tab === "overview" && !hasGlobalConsolePermission),
+    onError: useMemo(
+      () => (error: unknown) => setError(messageOr(error, "loadFailed")),
+      [messageOr]
+    ),
     onLoginSettingsLoaded: setLoginSettingsDraft,
     permissions: adminPermissions
   });
+  const {
+    updateApplicationModuleInState,
+    updateApplicationOidcClientsInState
+  } = useApplicationAdminStateActions({ applications, setApplications, setClients });
 
-  const userDirectoryFilterKey = useMemo(() => JSON.stringify({
+  const {
+    userForm: userFormDirty,
+    enterpriseForm: enterpriseFormDirty,
+    organizationForm: organizationFormDirty,
+    providerForm: providerFormDirty,
+    ldapProviderForm: ldapProviderFormDirty,
+    applicationForm: applicationFormDirty,
+    invitationForm: invitationFormDirty,
+    roleForm: roleFormDirty,
+    groupForm: groupFormDirty,
+    auditWebhookForm: auditWebhookFormDirty,
+    registrationSettings: registrationSettingsDirty,
+    runtimeSettings: runtimeSettingsDirty,
+    loginSettings: loginSettingsDirty,
+    quickLinkForm: quickLinkFormDirty,
+    securityPolicy: securityPolicyDirty,
+    configurationFormsDirty,
+    editorDirty
+  } = useAdminDirtyState({
+    editor,
+    userForm,
+    userFormBaseline,
+    enterpriseForm,
+    enterpriseFormBaseline,
+    organizationForm,
+    organizationFormBaseline,
+    organizationMemberRoles,
+    organizationMemberRolesBaseline,
+    providerForm,
+    providerFormBaseline,
+    ldapProviderForm,
+    ldapProviderFormBaseline,
+    applicationForm,
+    applicationFormBaseline,
+    invitationForm,
+    invitationFormBaseline,
+    roleForm,
+    roleFormBaseline,
+    groupForm,
+    groupFormBaseline,
+    auditWebhookForm,
+    auditWebhookFormBaseline,
+    registrationSettings,
+    registrationSettingsBaseline,
+    runtimeSettings,
+    runtimeSettingsBaseline,
+    loginSettingsDraft,
+    loginSettingsBaseline,
+    quickLinkForm,
+    quickLinkFormBaseline,
+    securityPolicy,
+    securityPolicyBaseline
+  });
+  const runUiAction = useUiAction({ setBusy, setError, formatError: messageOr });
+  const {
+    saveSecurityPolicy,
+    rotateSigningKey,
+    saveRegistrationSettings,
+    saveRuntimeSettings,
+    saveAuditWebhook,
+    editAuditWebhook,
+    deleteAuditWebhook
+  } = useAdminSettingsActions({
+    securityPolicy,
+    setSecurityPolicy,
+    setSecurityPolicyBaseline,
+    signingKeyKid,
+    setSigningKeyKid,
+    registrationSettings,
+    setRegistrationSettings,
+    setRegistrationSettingsBaseline,
+    runtimeSettings,
+    setRuntimeSettings,
+    setRuntimeSettingsBaseline,
+    auditWebhookForm,
+    setAuditWebhookForm,
+    setAuditWebhookFormBaseline,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    loadAdminData,
+    loadBootstrap,
+    translate: t,
+    formatError: messageOr
+  });
+  const { saveOrganization, deleteOrganization } = useOrganizationAdminActions({
+    organizationForm,
+    organizationMemberRoles,
+    organizationMembersLoading,
+    organizationMembersLoadId,
+    setOrganizationForm,
+    setOrganizationFormBaseline,
+    setOrganizationMemberRoles,
+    setOrganizationMemberRolesBaseline,
+    setOrganizationMembersLoading,
+    setEditor,
+    runUiAction,
+    loadAdminData,
+    setVerificationMessage,
+    changesSavedMessage: t("changesSaved")
+  });
+  const closeEditor = useEditorLifecycle({
+    editor,
+    editorDirty,
+    confirmDiscard: () => confirmDiscardChanges(t),
+    setEditor,
+    setError,
+    organizationMembersLoadId,
+    setOrganizationMembersLoading,
+    setUserForm,
+    setUserFormBaseline,
+    setEnterpriseForm,
+    setEnterpriseFormBaseline,
+    setOrganizationForm,
+    setOrganizationFormBaseline,
+    setOrganizationMemberRoles,
+    setOrganizationMemberRolesBaseline,
+    applicationCreateMutationRef,
+    applicationDeleteMutationRef,
+    setApplicationForm,
+    setApplicationFormBaseline,
+    setProviderForm,
+    setProviderFormBaseline,
+    setProviderTemplateId,
+    providerDiscoveryRequest,
+    setLdapProviderForm,
+    setLdapProviderFormBaseline,
+    setInvitationForm,
+    setInvitationFormBaseline,
+    setLastInvitationCode,
+    setRoleForm,
+    setRoleFormBaseline,
+    setGroupForm,
+    setGroupFormBaseline
+  });
+  const {
+    editApplication,
+    saveApplication,
+    deleteApplication
+  } = useApplicationActions({
+    applicationForm,
+    setApplicationForm,
+    setApplicationFormBaseline,
+    applications,
+    setApplications,
+    applicationCreateMutationRef,
+    applicationDeleteMutationRef,
+    organizationId: organizationContext?.id ?? null,
+    scopeKey: cacheScope,
+    applicationNavigationId,
+    openEditor: () => setEditor("application"),
+    closeEditor: () => setEditor(null),
+    navigateToTab,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    loadAdminData,
+    translate: t,
+    formatError: messageOr
+  });
+  const {
+    saveInvitation,
+    deleteInvitation,
+    copyLastInvitationCode: copyInvitationCode,
+    revealInvitationCode,
+    closeInvitationReveal
+  } = useInvitationActions({
+    invitationForm,
+    setInvitationForm,
+    setInvitationFormBaseline,
+    setLastInvitationCode,
+    setEditor: (nextEditor) => setEditor(nextEditor),
+    setRevealedInvitation,
+    setRevealedInvitationCode,
+    setRevealingInvitationId,
+    setInvitationRevealError,
+    canManageOrganizations,
+    user: user ?? null,
+    setBusy,
+    setError,
+    loadAdminData,
+    copyText: copyTextToClipboard,
+    translate: t,
+    formatError: messageOr
+  });
+  const { switchEnterprise, saveEnterprise } = useEnterpriseActions({
+    enterpriseForm,
+    setEnterpriseForm,
+    setEnterpriseFormBaseline,
+    currentOrganizationId: organizationContext?.id ?? null,
+    currentUserId: user?.id ?? null,
+    formsDirty: configurationFormsDirty,
+    confirmDiscard: () => confirmDiscardChanges(t),
+    switchOrganization: switchSessionOrganization,
+    clearScopedData: () => {
+      setApplications([]);
+      setClients([]);
+      setOrganizationMembers([]);
+    },
+    loadOrganizationContext: loadSessionOrganizationContext,
+    navigateToTab,
+    setEditor: (nextEditor) => setEditor(nextEditor),
+    setBusy,
+    setError,
+    setVerificationMessage,
+    translate: t,
+    formatError: messageOr
+  });
+  const { requestConfirmation, runPendingConfirmation } = useConfirmationActions({
+    pendingConfirmation,
+    setPendingConfirmation,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    formatError: messageOr,
+    confirmActionTitle: t("confirmAction"),
+    confirmActionDescription: t("confirmActionDescription"),
+    operationCompletedMessage: t("operationCompleted")
+  });
+  const {
+    providerRedirectPath,
+    applyProviderTemplate,
+    discoverProviderEndpoints,
+    saveProvider,
+    deleteProvider,
+    saveLdapProvider,
+    deleteLdapProvider,
+    editLdapProvider
+  } = useProviderAdminActions({
+    providerForm,
+    providerTemplates,
+    providerTemplateId,
+    setProviderForm,
+    setProviderFormBaseline,
+    providerDiscoveryRequest,
+    ldapProviderForm,
+    setLdapProviderForm,
+    setLdapProviderFormBaseline,
+    setEditor,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    loadAdminData,
+    loadBootstrap,
+    messageOr,
+    changesSavedMessage: t("changesSaved")
+  });
+  const {
+    persistLoginSettings,
+    resetQuickLinkForm,
+    saveQuickLinkDraft,
+    editQuickLink,
+    removeQuickLink
+  } = useLoginSettingsActions({
+    loginSettingsDraft,
+    quickLinkForm,
+    setLoginSettings,
+    setLoginSettingsDraft,
+    setLoginSettingsBaseline,
+    setQuickLinkForm,
+    setQuickLinkFormBaseline,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    loadBootstrap,
+    messageOr,
+    changesSavedMessage: t("changesSaved"),
+    saveLoginSettingsFailedMessage: t("saveLoginSettingsFailed")
+  });
+  const {
+    sendVerification,
+    sendPasswordResetCode,
+    handlePasswordReset
+  } = useAuthVerificationActions({
+    authEmail,
+    registerPhone: registerForm.phone,
+    passwordResetForm,
+    setRegisterForm,
+    setPasswordResetForm,
+    setAuthMode,
+    setVerificationMessage,
+    runUiAction,
+    setBusy,
+    setError,
+    formatError: messageOr,
+    translate: t,
+    request: api
+  });
+  const handlePasskeyLogin = usePasskeyLogin({
+    email: authEmail,
+    accountFlow: effectiveAccountFlow,
+    setBusy,
+    setError,
+    setLoginMfaChallengeId,
+    setLoginMfaCode,
+    setLoginRecoveryAvailable,
+    setLoginCaptchaChallengeId,
+    setLoginCaptchaPrompt,
+    setLoginCaptchaAnswer,
+    translate: t,
+    formatError: messageOr,
+    finishInteractiveAuth,
+    loadBootstrap
+  });
+  const handleAuthorizationCodeLogin = useAuthorizationCodeLogin({
+    form: authorizationCodeLoginForm,
+    returnTo: authReturnTo,
+    accountFlow: effectiveAccountFlow,
+    setForm: setAuthorizationCodeLoginForm,
+    setBusy,
+    setError,
+    translate: t,
+    formatError: messageOr,
+    finishInteractiveAuth,
+    loadBootstrap,
+    request: api
+  });
+  const handleLogin = usePasswordLogin({
+    email: authEmail,
+    password: loginPassword,
+    mfaChallengeId: loginMfaChallengeId,
+    mfaCode: loginMfaCode,
+    captchaChallengeId: loginCaptchaChallengeId,
+    captchaAnswer: loginCaptchaAnswer,
+    returnTo: authReturnTo,
+    accountFlow: effectiveAccountFlow,
+    setBusy,
+    setError,
+    setMfaChallengeId: setLoginMfaChallengeId,
+    setMfaCode: setLoginMfaCode,
+    setRecoveryAvailable: setLoginRecoveryAvailable,
+    setCaptchaChallengeId: setLoginCaptchaChallengeId,
+    setCaptchaPrompt: setLoginCaptchaPrompt,
+    setCaptchaAnswer: setLoginCaptchaAnswer,
+    translate: t,
+    formatError: messageOr,
+    finishInteractiveAuth,
+    loadBootstrap,
+    request: api
+  });
+  const handleRegister = useRegistrationSubmit({
+    bootstrap,
+    form: registerForm,
+    email: authEmail,
+    returnTo: authReturnTo,
+    accountFlow: effectiveAccountFlow,
+    trialEnrollment: registrationCodeInspection?.mode === "trial_enrollment",
+    setForm: setRegisterForm,
+    setAuthMode,
+    setBusy,
+    setError,
+    translate: t,
+    formatError: messageOr,
+    finishInteractiveAuth,
+    loadBootstrap,
+    request: api
+  });
+  const {
+    registerPasskey,
+    deletePasskey,
+    revokeMyConsent,
+    revokeMySession,
+    startTotpSetup,
+    confirmTotpSetup,
+    rotateRecoveryCodes,
+    disableMfa
+  } = useAccountSecurityActions({
+    passkeyName,
+    setPasskeyName,
+    setPasskeys,
+    totpSetup,
+    totpSetupCode,
+    setTotpSetup,
+    setTotpSetupCode,
+    setMfaStatus,
+    setNewRecoveryCodes,
+    setError,
+    loadAccountData,
+    runUiAction,
+    formatError: messageOr
+  });
+
+  const userDirectoryQueryModel = useUserDirectoryQuery(
+    {
+      searchQuery,
+      userFilter,
+      userOrganizationFilter,
+      userEmailFilter,
+      userRoleFilter,
+      userRegistrationFrom,
+      userRegistrationTo,
+      userLastLoginFrom,
+      userLastLoginTo,
+      userPhoneFilter,
+      userLoginRegionFilter,
+      userLinkedIdentityFilter,
+    },
+    {
+      userDirectoryPage,
+      userDirectoryPageSize,
+      userDirectoryCursorHistory,
+      setUserDirectoryPage,
+      setUserDirectoryCursorHistory,
+      setSelectedUserIds,
+    },
+  );
+  const userDirectoryQuery = userDirectoryQueryModel.query;
+  const resetUserDirectoryQueryState = userDirectoryQueryModel.resetQueryState;
+  const userDirectoryFilters = {
     searchQuery,
     userFilter,
     userOrganizationFilter,
-    userLinkedIdentityFilter,
     userEmailFilter,
     userRoleFilter,
     userRegistrationFrom,
@@ -663,71 +1129,85 @@ export function App() {
     userLastLoginFrom,
     userLastLoginTo,
     userPhoneFilter,
-    userLoginRegionFilter
-  }), [
-    searchQuery,
-    userEmailFilter,
-    userFilter,
-    userLastLoginFrom,
-    userLastLoginTo,
-    userLinkedIdentityFilter,
     userLoginRegionFilter,
-    userOrganizationFilter,
-    userPhoneFilter,
-    userRegistrationFrom,
-    userRegistrationTo,
-    userRoleFilter
-  ]);
-  const previousUserDirectoryFilterKey = useRef(userDirectoryFilterKey);
-  const userDirectoryFilterTransition = previousUserDirectoryFilterKey.current !== userDirectoryFilterKey;
-  useEffect(() => {
-    previousUserDirectoryFilterKey.current = userDirectoryFilterKey;
-  }, [userDirectoryFilterKey]);
-
-  const userDirectoryQuery = useMemo(() => ({
-    // Filter changes are reconciled by the following effect, but the query
-    // must switch to the first keyset page during the same render. Otherwise
-    // the cursor from the previous filter set can issue one stale request.
-    page: userDirectoryFilterTransition ? 1 : userDirectoryPage,
-    page_size: userDirectoryPageSize,
-    cursor: userDirectoryFilterTransition
-      ? undefined
-      : userDirectoryCursorHistory[userDirectoryPage - 1] ?? undefined,
-    status: userFilter,
-    search: searchQuery,
-    organization_id: userOrganizationFilter,
-    linked_identity: userLinkedIdentityFilter === "all" ? undefined : userLinkedIdentityFilter,
-    email: userEmailFilter,
-    phone: userPhoneFilter,
-    role: userRoleFilter === "all" ? undefined : userRoleFilter,
-    registration_from: userRegistrationFrom,
-    registration_to: userRegistrationTo,
-    last_login_from: userLastLoginFrom,
-    last_login_to: userLastLoginTo,
-    login_region: userLoginRegionFilter === "all" ? undefined : userLoginRegionFilter
-  }), [
-    searchQuery,
-    userDirectoryCursorHistory,
-    userDirectoryFilterKey,
-    userDirectoryFilterTransition,
-    userDirectoryPage,
-    userEmailFilter,
-    userFilter,
-    userLastLoginFrom,
-    userLastLoginTo,
     userLinkedIdentityFilter,
-    userLoginRegionFilter,
-    userOrganizationFilter,
-    userPhoneFilter,
-    userRegistrationFrom,
-    userRegistrationTo,
-    userRoleFilter
-  ]);
+  };
   const userDirectory = useUserDirectoryCursor({
     endpoint: "/api/admin/users/cursor",
     query: userDirectoryQuery,
     enabled: canAdmin && canReadUsers && !initialAuth.isAuthPage && tab === "users",
     scopeKey: cacheScope
+  });
+  const {
+    openBulkUserImport,
+    closeBulkUserImport,
+    resetBulkUserImport,
+    readBulkUserImportFile,
+    submitBulkUserImport
+  } = useBulkUserImportActions({
+    busy,
+    csv: bulkImportCsv,
+    dryRun: bulkImportDryRun,
+    commitConfirmed: bulkImportCommitConfirmed,
+    setOpen: setBulkImportOpen,
+    setCsv: setBulkImportCsv,
+    setFileName: setBulkImportFileName,
+    setDryRun: setBulkImportDryRun,
+    setCommitConfirmed: setBulkImportCommitConfirmed,
+    setResult: setBulkImportResult,
+    setImportError: setBulkImportError,
+    setBusy,
+    setError,
+    setVerificationMessage,
+    reloadUsers: userDirectory.reload,
+    translate: t,
+    formatError: messageOr
+  });
+  const loadUserAccess = useUserAccessLoader({
+    setSelectedAccessUserId,
+    setUserAccess
+  });
+  const {
+    saveUser,
+    enableUser,
+    advanceUserLifecycle
+  } = useAdminUserActions({
+    userForm,
+    setUserForm,
+    setUserFormBaseline,
+    selectedUser,
+    setSelectedUser,
+    setSelectedUserIds,
+    reloadUsers: userDirectory.reload,
+    runUiAction,
+    clearEditor: () => setEditor(null),
+    setVerificationMessage,
+    translate: t
+  });
+  const {
+    saveRole,
+    deleteRole,
+    saveGroup,
+    deleteGroup,
+    saveUserRoles,
+    editRole,
+    editGroup
+  } = useAdminAccessActions({
+    roleForm,
+    setRoleForm,
+    setRoleFormBaseline,
+    groupForm,
+    setGroupForm,
+    setGroupFormBaseline,
+    selectedAccessUserId,
+    userAccess,
+    setUserAccess,
+    loadAdminData,
+    loadUserAccess,
+    runUiAction,
+    clearEditor: () => setEditor(null),
+    setVerificationMessage,
+    translate: t
   });
 
   // The cursor query is the sole owner of the visible page. Keeping a second
@@ -833,121 +1313,13 @@ export function App() {
     localStorage.setItem("gpt-sso-locale", next);
   }
 
-  async function loadBootstrap() {
-    const next = await loadSessionBootstrap(authReturnTo);
-    if (!localStorage.getItem("gpt-sso-locale") && next.default_locale === "en-US") {
-      setLocale("en-US");
-    }
-    if (!next.has_users) {
-      setAuthMode("register");
-    }
-  }
-
-  async function loadEnterpriseContext(userId?: string) {
-    return loadSessionOrganizationContext(userId);
-  }
-
-  function invalidateAccountLoad() {
-    accountLoadId.current += 1;
-    accountAbortController.current?.abort();
-    accountAbortController.current = null;
-  }
-
-  async function loadAccountData() {
-    const requestId = ++accountLoadId.current;
-    accountAbortController.current?.abort();
-    const controller = new AbortController();
-    accountAbortController.current = controller;
-    const started = session.controller.getSnapshot();
-    const startedUserId = started.user?.id ?? null;
-    const startedOrganizationId = started.organizationContext?.id ?? null;
-    const startedScope = started.cacheScope;
-    const startedSessionGeneration = session.controller.getGeneration();
-    const isCurrent = () => {
-      const current = session.controller.getSnapshot();
-      return accountLoadId.current === requestId
-        && !controller.signal.aborted
-        && session.controller.getGeneration() === startedSessionGeneration
-        && current.cacheScope === startedScope
-        && (current.user?.id ?? null) === startedUserId
-        && (current.organizationContext?.id ?? null) === startedOrganizationId;
-    };
-
-    try {
-      if (!started.user) {
-        if (!isCurrent()) return;
-        setMfaStatus(null);
-        setPasskeys([]);
-        setMyConsents([]);
-        setMySessions([]);
-        return;
-      }
-      const [nextMfaStatus, nextPasskeys, nextConsents, nextSessions] = await Promise.all([
-        accountApi.getMfaStatus({ signal: controller.signal }),
-        accountApi.listPasskeys({ signal: controller.signal }),
-        accountApi.listConsents({ signal: controller.signal }),
-        accountApi.listSessions({ signal: controller.signal })
-      ]);
-      if (!isCurrent()) return;
-      setMfaStatus(nextMfaStatus);
-      setPasskeys(nextPasskeys);
-      setMyConsents(nextConsents);
-      setMySessions(nextSessions);
-    } catch (error) {
-      // A request that belongs to an older account, organization, or session
-      // is expected to lose the race; it must not surface as a new-page error.
-      if (!isCurrent()) return;
-      throw error;
-    } finally {
-      if (accountAbortController.current === controller) accountAbortController.current = null;
-    }
-  }
-
-  // Admin read lifecycle is owned by useAdminDataLoader. App only composes
-  // the read model with form state and mutation commands.
-  async function initialize() {
-    setInitialLoadError("");
-    try {
-      const next = await initializeSession({ returnTo: authReturnTo });
-      if (!localStorage.getItem("gpt-sso-locale") && next.bootstrap?.default_locale === "en-US") {
-        setLocale("en-US");
-      }
-      if (!next.bootstrap?.has_users) setAuthMode("register");
-    } catch (err) {
-      transitionToAnonymous();
-      setInitialLoadError(messageOr(err, "loadFailed"));
-    }
-  }
-
-  useEffect(() => {
-    void initialize();
-  }, []);
-
-  useEffect(() => {
-    document.documentElement.lang = locale;
-  }, [locale]);
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("gpt-sso-theme", theme);
-  }, [theme]);
+  useDocumentPreferences(locale, theme);
 
   useEffect(() => {
     if (authCanCompleteWithCurrentUser && authReturnTo) {
       window.location.assign(authReturnTo);
     }
   }, [authCanCompleteWithCurrentUser, authReturnTo]);
-
-  useEffect(() => {
-    if (initialAuth.isAuthPage) {
-      invalidateAccountLoad();
-      return;
-    }
-    void loadAccountData().catch((err) => setError(messageOr(err, "loadFailed")));
-    return () => {
-      invalidateAccountLoad();
-    };
-  }, [initialAuth.isAuthPage, user?.id, cacheScope]);
 
   useEffect(() => {
     // Clear data immediately when the scope changes. The render-time guard
@@ -960,99 +1332,8 @@ export function App() {
   }, [cacheScope, setOrganizationMemberInvitations, setOrganizationMembers]);
 
   useEffect(() => {
-    if (!canAdmin || initialAuth.isAuthPage || tab === "account" || tab === "billing" || (tab === "overview" && !hasGlobalConsolePermission)) {
-      invalidateAdminLoad();
-      return;
-    }
-    const loadScope = cacheScope;
-    loadAdminData(tab).catch((err) => {
-      if (cacheScope === loadScope) setError(messageOr(err, "loadFailed"));
-    });
-    return () => invalidateAdminLoad();
-  }, [
-    canAdmin,
-    canManageActiveOrganization,
-    hasGlobalConsolePermission,
-    initialAuth.isAuthPage,
-    tab,
-    organizationContext?.id,
-    cacheScope,
-    loadAdminData,
-    invalidateAdminLoad
-  ]);
-
-  useEffect(() => {
-    const authorizationCode = registerForm.authorization_code.trim();
-    if (!bootstrap?.has_users || authMode !== "register" || !authorizationCode) {
-      setRegistrationCodeInspection(null);
-      setRegistrationCodeInspecting(false);
-      return;
-    }
-    let current = true;
-    setRegistrationCodeInspection(null);
-    setRegistrationCodeInspecting(true);
-    const timer = window.setTimeout(() => {
-      void api<AuthorizationCodeInspection>("/api/public/authorization-code/inspect", {
-        method: "POST",
-        body: JSON.stringify({ authorization_code: authorizationCode })
-      }).then((inspection) => {
-        if (current) setRegistrationCodeInspection(inspection);
-      }).catch(() => {
-        // The final registration request always re-checks the code.  Keep a
-        // transient inspection failure separate from an unavailable code so a
-        // network hiccup never becomes a client-side authorization decision.
-        if (current) setRegistrationCodeInspection(null);
-      }).finally(() => {
-        if (current) setRegistrationCodeInspecting(false);
-      });
-    }, 350);
-    return () => {
-      current = false;
-      window.clearTimeout(timer);
-    };
-  }, [authMode, bootstrap?.has_users, registerForm.authorization_code]);
-
-  useEffect(() => {
     if (userOrganizationFilter) setUserFiltersExpanded(true);
   }, [userOrganizationFilter]);
-
-  useEffect(() => {
-    setSelectedUserIds([]);
-  }, [
-    userDirectoryPage,
-    searchQuery,
-    userFilter,
-    userOrganizationFilter,
-    userLinkedIdentityFilter,
-    userEmailFilter,
-    userRoleFilter,
-    userRegistrationFrom,
-    userRegistrationTo,
-    userLastLoginFrom,
-    userLastLoginTo,
-    userPhoneFilter,
-    userLoginRegionFilter
-  ]);
-
-  // Cursor positions belong to one exact filter set. A filter change starts a
-  // fresh keyset walk instead of reusing a position from another result set.
-  useEffect(() => {
-    setUserDirectoryPage(1);
-    setUserDirectoryCursorHistory([null]);
-  }, [
-    searchQuery,
-    userEmailFilter,
-    userFilter,
-    userLastLoginFrom,
-    userLastLoginTo,
-    userLinkedIdentityFilter,
-    userLoginRegionFilter,
-    userOrganizationFilter,
-    userPhoneFilter,
-    userRegistrationFrom,
-    userRegistrationTo,
-    userRoleFilter
-  ]);
 
   useEffect(() => {
     setUserDirectoryPage(1);
@@ -1060,45 +1341,12 @@ export function App() {
     setSelectedUserIds([]);
   }, [cacheScope]);
 
-  useEffect(() => {
-    if (!sidebarOpen || !sidebarRef.current) return;
-    const sidebar = sidebarRef.current;
-    const previousOverflow = document.body.style.overflow;
-    const focusableElements = () => [...sidebar.querySelectorAll<HTMLElement>(
-      "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
-    )].filter((element) => element.getClientRects().length > 0);
-    const focusFrame = window.requestAnimationFrame(() => focusableElements()[0]?.focus());
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setSidebarOpen(false);
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const focusable = focusableElements();
-      if (focusable.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last?.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.body.style.overflow = "hidden";
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.cancelAnimationFrame(focusFrame);
-      document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      window.requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
-    };
-  }, [sidebarOpen]);
+  useMobileSidebarFocusTrap({
+    open: sidebarOpen,
+    sidebarRef,
+    mobileMenuButtonRef,
+    setOpen: setSidebarOpen
+  });
 
   useEffect(() => {
     if (!user || !verificationMessage) return;
@@ -1119,253 +1367,14 @@ export function App() {
   function changeLoginMethod(next: LoginMethod) {
     setLoginMethod(next);
     setError("");
-    setLoginMfaChallengeId("");
-    setLoginMfaCode("");
-    setLoginRecoveryAvailable(false);
-    setLoginCaptchaChallengeId("");
-    setLoginCaptchaPrompt("");
-    setLoginCaptchaAnswer("");
-  }
-
-  async function handleLogin(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const result = await api<LoginResponse>("/api/login", {
-        method: "POST",
-        body: JSON.stringify({
-          email: authEmail,
-          password: loginPassword,
-          mfa_challenge_id: loginMfaChallengeId || null,
-          mfa_code: loginMfaCode || null,
-          captcha_challenge_id: loginCaptchaChallengeId || null,
-          captcha_answer: loginCaptchaAnswer || null,
-          return_to: authReturnTo,
-          account_flow: effectiveAccountFlow
-        })
-      });
-      if ("continue_to" in result) {
-        window.location.assign(result.continue_to);
-        return;
-      }
-      if (result.captcha_required) {
-        setLoginCaptchaChallengeId(result.captcha_challenge_id ?? "");
-        setLoginCaptchaPrompt(result.captcha_prompt ?? "");
-        setLoginCaptchaAnswer("");
-        return;
-      }
-      if (result.mfa_required) {
-        setLoginMfaChallengeId(result.mfa_challenge_id ?? "");
-        setLoginRecoveryAvailable(result.recovery_available);
-        setLoginMfaCode("");
-        setLoginCaptchaChallengeId("");
-        setLoginCaptchaPrompt("");
-        setLoginCaptchaAnswer("");
-        return;
-      }
-      if (!result.user) throw new Error(t("loginFailed"));
-      setLoginMfaChallengeId("");
-      setLoginMfaCode("");
-      setLoginRecoveryAvailable(false);
-      setLoginCaptchaChallengeId("");
-      setLoginCaptchaPrompt("");
-      setLoginCaptchaAnswer("");
-      if (finishInteractiveAuth(result.user)) return;
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "loginFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleAuthorizationCodeLogin(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const result = await api<LoginResponse>("/api/login/authorization-code", {
-        method: "POST",
-        body: JSON.stringify({
-          email: authorizationCodeLoginForm.email.trim(),
-          authorization_code: authorizationCodeLoginForm.authorization_code.trim(),
-          return_to: authReturnTo,
-          account_flow: effectiveAccountFlow
-        })
-      });
-      if (result.mode === "oidc_continuation") {
-        setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
-        window.location.assign(result.continue_to);
-        return;
-      }
-      if (!result.user) throw new Error(t("authorizationCodeLoginFailed"));
-      setAuthorizationCodeLoginForm(emptyAuthorizationCodeLoginForm);
-      if (finishInteractiveAuth(result.user)) return;
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "authorizationCodeLoginFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handlePasskeyLogin() {
-    const email = authEmail.trim();
-    if (!email) {
-      setError(t("passkeyEmailRequired"));
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      if (!navigator.credentials?.get || !window.PublicKeyCredential) {
-        throw new Error(t("passkeyLoginFailed"));
-      }
-      const start = await accountApi.startPasskeyAuthentication(email, effectiveAccountFlow);
-      const credential = await navigator.credentials.get(passkeyRequestOptions(start.public_key));
-      if (!credential || credential.type !== "public-key") {
-        throw new Error(t("passkeyLoginFailed"));
-      }
-      const result = await accountApi.finishPasskeyAuthentication<
-        { user: User } | OidcContinuationLoginResponse
-      >({
-        challengeId: start.challenge_id,
-        credential: authenticationCredentialJson(credential as PublicKeyCredential),
-        accountFlow: effectiveAccountFlow
-      });
-      if ("continue_to" in result) {
-        window.location.assign(result.continue_to);
-        return;
-      }
-      setLoginMfaChallengeId("");
-      setLoginMfaCode("");
-      setLoginRecoveryAvailable(false);
-      setLoginCaptchaChallengeId("");
-      setLoginCaptchaPrompt("");
-      setLoginCaptchaAnswer("");
-      if (finishInteractiveAuth(result.user)) return;
-      await loadBootstrap();
-    } catch (err) {
-      setError(err instanceof ApiError && err.status === 401
-        ? t("passkeyLoginFailed")
-        : messageOr(err, "passkeyLoginFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleRegister(event: FormEvent) {
-    event.preventDefault();
-    if (
-      bootstrap?.has_users
-      && !bootstrap.registration.allow_password_registration
-      && !bootstrap.registration.require_invitation
-      && !registerForm.authorization_code.trim()
-    ) {
-      setError(t("passwordRegistrationUnavailable"));
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      const body: Record<string, string | null> = isTrialEnrollmentRegistration
-        ? {
-            // The server has classified this as an enrollment code.  Do not
-            // manufacture usernames, passwords or code rules in the browser.
-            email: authEmail,
-            authorization_code: registerForm.authorization_code.trim() || null,
-            return_to: authReturnTo,
-            account_flow: effectiveAccountFlow
-          }
-        : {
-            email: authEmail,
-            username: registerForm.username,
-            display_name: null,
-            phone: registerForm.phone || null,
-            password: registerForm.password,
-            email_code: registerForm.email_code || null,
-            phone_code: registerForm.phone_code || null,
-            authorization_code: registerForm.authorization_code.trim() || null,
-            return_to: authReturnTo,
-            account_flow: effectiveAccountFlow
-          };
-      const result = await api<{ user: User; first_admin: boolean } | OidcContinuationLoginResponse>("/api/register", {
-        method: "POST",
-        body: JSON.stringify(body)
-      });
-      if ("continue_to" in result) {
-        setRegisterForm(emptyRegisterForm);
-        window.location.assign(result.continue_to);
-        return;
-      }
-      if (finishInteractiveAuth(result.user)) return;
-      setRegisterForm(emptyRegisterForm);
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "registrationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function sendVerification(channel: "email" | "phone") {
-    const target = channel === "email" ? authEmail : registerForm.phone;
-    await runUiAction(async () => {
-      const result = await api<{ dev_code: string | null; expires_at: number }>("/api/register/verification/start", {
-        method: "POST",
-        body: JSON.stringify({ channel, target })
-      });
-      setVerificationMessage(
-        `${t("codeSent")}${result.dev_code ? `: ${result.dev_code}. ${t("copiedCodeHint")}` : ""}`
-      );
-      const devCode = result.dev_code;
-      if (channel === "email" && devCode) {
-        setRegisterForm((current) => ({ ...current, email_code: devCode }));
-      }
-      if (channel === "phone" && devCode) {
-        setRegisterForm((current) => ({ ...current, phone_code: devCode }));
-      }
-    }, "sendVerificationFailed");
-  }
-
-  async function sendPasswordResetCode() {
-    await runUiAction(async () => {
-      const result = await api<{ dev_code: string | null; expires_at: number }>("/api/password-reset/start", {
-        method: "POST",
-        body: JSON.stringify({ email: authEmail })
-      });
-      setVerificationMessage(
-        `${t("codeSent")}${result.dev_code ? `: ${result.dev_code}. ${t("copiedCodeHint")}` : ""}`
-      );
-      const devCode = result.dev_code;
-      if (devCode) {
-        setPasswordResetForm((current) => ({ ...current, code: devCode }));
-      }
-    }, "sendResetCodeFailed");
-  }
-
-  async function handlePasswordReset(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      await api("/api/password-reset/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          email: authEmail,
-          code: passwordResetForm.code,
-          password: passwordResetForm.password
-        })
-      });
-      setPasswordResetForm(emptyPasswordResetForm);
-      setAuthMode("login");
-      setVerificationMessage(t("passwordResetComplete"));
-    } catch (err) {
-      setError(messageOr(err, "resetPasswordFailed"));
-    } finally {
-      setBusy(false);
-    }
+    clearLoginChallengeState({
+      setMfaChallengeId: setLoginMfaChallengeId,
+      setMfaCode: setLoginMfaCode,
+      setRecoveryAvailable: setLoginRecoveryAvailable,
+      setCaptchaChallengeId: setLoginCaptchaChallengeId,
+      setCaptchaPrompt: setLoginCaptchaPrompt,
+      setCaptchaAnswer: setLoginCaptchaAnswer
+    });
   }
 
   function nextRegisterEmail() {
@@ -1400,23 +1409,6 @@ export function App() {
     await copyTextToClipboard(email, "copiedEmail", "copyEmailUnavailable");
   }
 
-  async function runUiAction(
-    action: () => Promise<void>,
-    fallback: TranslationKey = "operationFailed"
-  ): Promise<boolean> {
-    setBusy(true);
-    setError("");
-    try {
-      await action();
-      return true;
-    } catch (err) {
-      setError(messageOr(err, fallback));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function handleLogout() {
     await runUiAction(async () => {
       const result = await api<LogoutResponse>("/api/logout", { method: "POST" });
@@ -1438,105 +1430,6 @@ export function App() {
     }
   }
 
-  async function saveUser(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        email: userForm.email,
-        username: userForm.username,
-        display_name: userForm.display_name || null,
-        phone: userForm.phone || null,
-        password: userForm.password || null,
-        is_admin: userForm.is_admin,
-        is_active: userForm.is_active
-      };
-      if (userForm.id) {
-        await adminApi.updateAdminUser(userForm.id, body);
-      } else {
-        await adminApi.createAdminUser(body);
-      }
-      setUserForm(emptyUserForm);
-      setUserFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await userDirectory.reload();
-    } catch (err) {
-      setError(messageOr(err, "saveUserFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function openBulkUserImport() {
-    setBulkImportOpen(true);
-    setBulkImportError("");
-  }
-
-  function closeBulkUserImport() {
-    if (busy) return;
-    setBulkImportOpen(false);
-    setBulkImportError("");
-  }
-
-  function resetBulkUserImport() {
-    setBulkImportCsv("");
-    setBulkImportFileName("");
-    setBulkImportDryRun(true);
-    setBulkImportCommitConfirmed(false);
-    setBulkImportResult(null);
-    setBulkImportError("");
-  }
-
-  async function readBulkUserImportFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.currentTarget.files?.[0];
-    // Let the same file be selected again after an accidental choice.
-    event.currentTarget.value = "";
-    if (!file) return;
-    try {
-      const csv = await file.text();
-      setBulkImportCsv(csv);
-      setBulkImportFileName(file.name);
-      setBulkImportResult(null);
-      setBulkImportError("");
-    } catch {
-      setBulkImportError(t("bulkImportFileReadFailed"));
-    }
-  }
-
-  async function submitBulkUserImport(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!bulkImportCsv.trim()) {
-      setBulkImportError(t("bulkImportCsvRequired"));
-      return;
-    }
-    if (!bulkImportDryRun && !bulkImportCommitConfirmed) {
-      setBulkImportError(t("bulkImportCommitConfirmationRequired"));
-      return;
-    }
-    setBusy(true);
-    setBulkImportError("");
-    try {
-      const result = await adminApi.importAdminUsersCsv(bulkImportCsv, bulkImportDryRun);
-      setBulkImportResult(result);
-      if (result.committed) {
-        setVerificationMessage(t("bulkImportCompleted"));
-        await userDirectory.reload();
-      } else {
-        setVerificationMessage(t("bulkImportDryRunComplete"));
-      }
-    } catch (err) {
-      if (err instanceof ApiError && isBulkUserImportResult(err.body)) {
-        setBulkImportResult(err.body);
-        setBulkImportError(t("bulkImportValidationFailed"));
-      } else {
-        setBulkImportError(messageOr(err, "bulkImportFailed"));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function showUserDetails(id: string) {
     await runUiAction(async () => {
@@ -1555,1498 +1448,42 @@ export function App() {
     });
   }
 
-  async function enableUser(id: string) {
-    const completed = await runUiAction(async () => {
-      await adminApi.enableAdminUser(id);
-      await userDirectory.reload();
-      if (selectedUser?.user.id === id) setSelectedUser(null);
-    });
-    if (completed) setVerificationMessage(t("operationCompleted"));
-  }
-
-  async function advanceUserLifecycle(id: string) {
-    await adminApi.advanceAdminUserLifecycle(id);
-    setSelectedUserIds((current) => current.filter((selectedId) => selectedId !== id));
-    await userDirectory.reload();
-    if (selectedUser?.user.id === id) setSelectedUser(null);
-    if (userForm.id === id) {
-      setUserForm(emptyUserForm);
-      setUserFormBaseline(null);
-    }
-  }
-
-  async function editApplication(application: TenantApplication) {
-    const protocolModule = application.modules?.find((module) => module.module_key === "protocols");
-    const protocolConfig = protocolModule?.config && typeof protocolModule.config === "object"
-      ? protocolModule.config
-      : {};
-    const websiteUrl = typeof protocolConfig.website_url === "string" ? protocolConfig.website_url : "";
-    const nextForm = {
-      id: application.id,
-      slug: application.slug,
-      name: application.name,
-      website_url: websiteUrl,
-      description: application.description ?? "",
-      account_selection_mode: application.account_selection_mode,
-      unique_identity_factors: application.unique_identity_factors,
-      is_active: application.is_active,
-    };
-    setApplicationForm(nextForm);
-    setApplicationFormBaseline(nextForm);
-    setEditor("application");
-  }
-
-  async function saveApplication(event: FormEvent) {
-    event.preventDefault();
-    const creatingApplication = !applicationForm.id;
-    setBusy(true);
-    setError("");
-    try {
-      const input = {
-        slug: applicationForm.slug,
-        name: applicationForm.name,
-        website_url: applicationForm.website_url.trim() || null,
-        description: applicationForm.description || null,
-        account_selection_mode: applicationForm.account_selection_mode,
-        unique_identity_factors: applicationForm.unique_identity_factors,
-        is_active: applicationForm.is_active
-      };
-      let application: TenantApplication;
-      if (applicationForm.id) {
-        application = await applicationApi.updateApplication(applicationForm.id, input);
-        const currentProtocolModule = application.modules?.find((module) => module.module_key === "protocols");
-        const currentProtocolConfig = currentProtocolModule?.config ?? {};
-        await applicationApi.updateApplicationModule(application.id, "protocols", {
-          config: {
-            ...(currentProtocolConfig && typeof currentProtocolConfig === "object" ? currentProtocolConfig : {}),
-            website_url: applicationForm.website_url
-          },
-          is_enabled: currentProtocolModule?.is_enabled ?? Boolean(application.client_bindings.length)
-        });
-      } else {
-        const fingerprint = JSON.stringify(input);
-        const existingMutation = applicationCreateMutationRef.current;
-        const idempotencyKey = existingMutation?.fingerprint === fingerprint
-          ? existingMutation.key
-          : `ui-application-create-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
-        applicationCreateMutationRef.current = { fingerprint, key: idempotencyKey };
-        application = await applicationApi.createApplication(input, { idempotencyKey });
-        applicationCreateMutationRef.current = null;
-        // Creation and the initial protocols module commit atomically on the
-        // server. There is no second module request to partially fail.
-        setApplicationForm((current) => ({ ...current, id: application.id }));
-      }
-      setApplicationForm(emptyApplicationForm);
-      setApplicationFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData("applications", { force: true });
-    } catch (err) {
-      // The first write may already have committed even when a later phase or
-      // the response failed. Reconcile the collection before exposing the
-      // error so a newly created application is visible and can be retried.
-      if (
-        creatingApplication
-        && err instanceof ApiError
-        && (err.code === "network_error" || err.status >= 500)
-      ) {
-        try {
-          const recoveredApplications = await applicationApi.listApplications({ force: true });
-          const recovered = recoveredApplications.find((candidate) => (
-            candidate.organization_id === organizationContext?.id
-            && candidate.slug === applicationForm.slug.trim()
-            && candidate.name === applicationForm.name.trim()
-          ));
-          if (recovered) {
-            setApplicationForm((current) => ({ ...current, id: recovered.id }));
-          }
-        } catch {
-          // The normal collection reconciliation below remains the fallback.
-        }
-      }
-      try {
-        await loadAdminData("applications", { force: true });
-      } catch {
-        // Preserve the original mutation error when reconciliation is also
-        // unavailable.
-      }
-      setError(messageOr(err, "saveApplicationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteApplication(id: string) {
-    const organizationId = organizationContext?.id ?? null;
-    const scopeKey = cacheScope;
-    const target = applications.find((application) => application.id === id);
-    if (target && organizationId && target.organization_id !== organizationId) {
-      throw new Error("application does not belong to the active organization");
-    }
-    const existingMutation = applicationDeleteMutationRef.current;
-    const idempotencyKey = existingMutation
-      && existingMutation.applicationId === id
-      && existingMutation.organizationId === organizationId
-      && existingMutation.scopeKey === scopeKey
-      ? existingMutation.key
-      : `ui-application-delete-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
-    applicationDeleteMutationRef.current = {
-      applicationId: id,
-      organizationId,
-      scopeKey,
-      key: idempotencyKey
-    };
-
-    const clearDeletedApplication = () => {
-      setApplications((current) => current.filter((application) => application.id !== id));
-      if (applicationForm.id === id) {
-        setApplicationForm(emptyApplicationForm);
-        setApplicationFormBaseline(null);
-        setEditor(null);
-      }
-      if (applicationNavigationId === id) {
-        navigateToTab("applications", { applicationId: null, applicationSection: null });
-      }
-    };
-
-    try {
-      await applicationApi.deleteApplication(id, { idempotencyKey });
-      clearDeletedApplication();
-      await loadAdminData("applications", { force: true });
-      applicationDeleteMutationRef.current = null;
-    } catch (error) {
-      // A lost response must not make the operator repeat a destructive
-      // command with a new key. Reconcile the scoped collection first; if the
-      // target is gone, the original delete committed and is safe to treat as
-      // success even when the refresh endpoint itself failed afterward.
-      try {
-        const recovered = await applicationApi.listApplications({ force: true });
-        setApplications(recovered);
-        if (!recovered.some((application) => application.id === id)) {
-          clearDeletedApplication();
-          applicationDeleteMutationRef.current = null;
-          return;
-        }
-      } catch {
-        // Keep the original error and the stable idempotency key for retry.
-      }
-      throw error;
-    }
-  }
-
-  function updateApplicationModuleInState(
-    applicationId: string,
-    module: ApplicationModule,
-    clientBindings?: ApplicationClientBinding[]
-  ) {
-    setApplications((current) => current.map((application) => {
-      if (application.id !== applicationId) return application;
-      const modules = [...(application.modules ?? [])];
-      const index = modules.findIndex((item) => item.module_key === module.module_key);
-      if (index >= 0) modules[index] = module;
-      else modules.push(module);
-      return {
-        ...application,
-        modules,
-        ...(clientBindings ? { client_bindings: clientBindings } : {})
-      };
-    }));
-  }
-
-  function updateApplicationOidcClientsInState(applicationId: string, nextClients: Client[]) {
-    const previousApplicationClientIds = new Set(
-      applications
-        .find((application) => application.id === applicationId)
-        ?.client_bindings
-        .filter((binding) => binding.protocol === "oidc")
-        .map((binding) => binding.id) ?? []
-    );
-    setClients((current) => {
-      // `nextClients` is the complete application projection. Remove the
-      // previous projection first so a deleted client cannot remain in the
-      // global read model and reappear in invitation selectors.
-      const retained = current.filter((client) => !previousApplicationClientIds.has(client.id));
-      return [...retained, ...nextClients];
-    });
-    setApplications((current) => current.map((application) => {
-      if (application.id !== applicationId) return application;
-      const previousOidcBindings = application.client_bindings.filter((binding) => binding.protocol === "oidc");
-      const oidcBindings = nextClients.map((client) => {
-        const previous = previousOidcBindings.find((binding) => binding.id === client.id);
-        return {
-          ...client,
-          protocol: "oidc",
-          authorization_profile_id: previous?.authorization_profile_id ?? "default",
-          auth_domain_id: previous?.auth_domain_id ?? `auth-domain:${applicationId}`
-        };
-      });
-      return {
-        ...application,
-        client_bindings: [
-          ...application.client_bindings.filter((binding) => binding.protocol !== "oidc"),
-          ...oidcBindings
-        ]
-      };
-    }));
-  }
-
-  async function addEnterpriseMember() {
-    if (!organizationContext || !enterpriseMemberEmail.trim()) return;
-    setBusy(true);
-    setError("");
-    try {
-      await adminApi.addAdminOrganizationMember(organizationContext.id, {
-        email: enterpriseMemberEmail.trim(),
-        role: enterpriseMemberRole
-      });
-      setOrganizationMembers(await adminApi.listAdminOrganizationMembers(organizationContext.id));
-      setEnterpriseMemberEmail("");
-      setEnterpriseMemberRole("member");
-      setVerificationMessage(t("operationCompleted"));
-    } catch (err) {
-      setError(messageOr(err, "operationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function createOrganizationMemberInvitation() {
-    if (!organizationContext) return;
-    const expiresAt = toTimestamp(organizationMemberInvitationForm.expires_at);
-    if (!organizationMemberInvitationForm.email.trim() || expiresAt === null) {
-      setError(t("organizationMemberInvitationValidation"));
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      const created = await adminApi.createAdminOrganizationInvitation(organizationContext.id, {
-        email: organizationMemberInvitationForm.email.trim(),
-        display_name: organizationMemberInvitationForm.display_name || null,
-        description: organizationMemberInvitationForm.description || null,
-        expires_at: expiresAt,
-        organization_role: organizationMemberInvitationForm.organization_role,
-        is_active: organizationMemberInvitationForm.is_active
-      });
-      setOrganizationMemberInvitations((current) => [created.invitation, ...current]);
-      setRevealedOrganizationMemberInvitation(created);
-      setOrganizationMemberInvitationForm({
-        email: "",
-        display_name: "",
-        description: "",
-        expires_at: "",
-        organization_role: "member",
-        is_active: true
-      });
-      setVerificationMessage(t("organizationMemberInvitationCreated"));
-    } catch (err) {
-      setError(messageOr(err, "operationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteOrganizationMemberInvitation(invitationId: string) {
-    if (!organizationContext) return;
-    await adminApi.deleteAdminOrganizationInvitation(organizationContext.id, invitationId);
-    setOrganizationMemberInvitations((current) => current.filter((invitation) => invitation.id !== invitationId));
-    setRevealedOrganizationMemberInvitation((current) =>
-      current?.invitation.id === invitationId ? null : current
-    );
-  }
-
-  async function saveInvitation(event: FormEvent) {
-    event.preventDefault();
-    const editingInvitation = Boolean(invitationForm.id);
-    const isAccountRecoveryCode = invitationForm.code_type === "login"
-      && invitationForm.login_code_level === "account_recovery";
-    const isTrialEnrollmentCode = invitationForm.code_type === "login"
-      && invitationForm.login_code_level === "trial_enrollment";
-    const isAdminUniversalCode = invitationForm.code_type === "login"
-      && invitationForm.login_code_level === "admin_universal";
-    const isApplicationBoundLoginCode = isTrialEnrollmentCode || isAdminUniversalCode;
-    if (isAccountRecoveryCode && !invitationForm.authorized_username.trim()) {
-      setError(t("loginCodeUsernameRequired"));
-      return;
-    }
-    if (isAdminUniversalCode && !user?.is_admin) {
-      setError(t("adminUniversalCodeAdminOnly"));
-      return;
-    }
-    if (isApplicationBoundLoginCode && invitationForm.allowed_client_ids.length === 0) {
-      setError(t(isTrialEnrollmentCode ? "trialEnrollmentApplicationsRequired" : "allowedApplicationsRequired"));
-      return;
-    }
-    if (isTrialEnrollmentCode && !canManageOrganizations) {
-      setError(t("trialEnrollmentOrganizationManageRequired"));
-      return;
-    }
-    if (isTrialEnrollmentCode && !invitationForm.organization_id) {
-      setError(t("trialEnrollmentOrganizationRequired"));
-      return;
-    }
-    if (isTrialEnrollmentCode && !invitationForm.organization_role) {
-      setError(t("trialEnrollmentRoleRequired"));
-      return;
-    }
-    if (isTrialEnrollmentCode && (!invitationForm.expires_at || !invitationForm.max_uses)) {
-      setError(t("trialEnrollmentLimitsRequired"));
-      return;
-    }
-    setBusy(true);
-    setError("");
-    setLastInvitationCode("");
-    try {
-      const body = {
-        code_type: invitationForm.code_type,
-        login_code_level: invitationForm.code_type === "login" ? invitationForm.login_code_level : null,
-        allowed_client_ids: isApplicationBoundLoginCode ? invitationForm.allowed_client_ids : [],
-        organization_id: isTrialEnrollmentCode ? invitationForm.organization_id : null,
-        organization_role: isTrialEnrollmentCode ? invitationForm.organization_role : null,
-        description: invitationForm.description || null,
-        authorized_email: invitationForm.code_type === "login" ? null : invitationForm.authorized_email || null,
-        authorized_username: isApplicationBoundLoginCode ? null : invitationForm.authorized_username || null,
-        authorized_display_name: invitationForm.code_type === "registration"
-          ? invitationForm.authorized_display_name || null
-          : null,
-        expires_at: toTimestamp(invitationForm.expires_at),
-        max_uses: invitationForm.max_uses ? Number(invitationForm.max_uses) : null,
-        is_active: invitationForm.is_active
-      };
-      if (invitationForm.id) {
-        await adminApi.updateAdminAuthorizationCode(invitationForm.id, body);
-      } else {
-        const result = await adminApi.createAdminAuthorizationCode(body);
-        setLastInvitationCode(result.code);
-      }
-      setInvitationForm(emptyInvitationForm);
-      setInvitationFormBaseline(null);
-      // Keep a newly-created code visible so it can be copied once; edits can
-      // return straight to the list.
-      setEditor(editingInvitation ? null : "invitation");
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveInvitationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteInvitation(id: string) {
-    await adminApi.deleteAdminAuthorizationCode(id);
-    await loadAdminData();
-  }
-
-  async function copyLastInvitationCode() {
-    await copyTextToClipboard(
-      lastInvitationCode,
-      "authorizationCodeCopied",
-      "copyAuthorizationCodeUnavailable"
-    );
-  }
-
-  async function revealInvitationCode(invitation: Invitation) {
-    if (!invitation.can_reveal) return;
-    setRevealedInvitation(invitation);
-    setRevealedInvitationCode("");
-    setInvitationRevealError("");
-    setRevealingInvitationId(invitation.id);
-    try {
-      const result = await adminApi.revealAdminAuthorizationCode(invitation.id);
-      setRevealedInvitationCode(result.code);
-    } catch (err) {
-      setInvitationRevealError(messageOr(err, "revealAuthorizationCodeFailed"));
-    } finally {
-      setRevealingInvitationId("");
-    }
-  }
-
-  function closeInvitationReveal() {
-    setRevealedInvitation(null);
-    setRevealedInvitationCode("");
-    setInvitationRevealError("");
-    setRevealingInvitationId("");
-  }
-
-  async function saveRole(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        name: roleForm.name,
-        description: roleForm.description || null,
-        permissions: roleForm.permissions
-      };
-      if (roleForm.id) {
-        await adminApi.updateAdminRole(roleForm.id, body);
-      } else {
-        await adminApi.createAdminRole(body);
-      }
-      setRoleForm(emptyRoleForm);
-      setRoleFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-      if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
-    } catch (err) {
-      setError(messageOr(err, "saveRoleFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function editRole(role: Role) {
-    if (role.is_system) return;
-    setRoleForm({
-      id: role.id,
-      name: role.name,
-      description: role.description ?? "",
-      permissions: role.permissions
-    });
-    setRoleFormBaseline({
-      id: role.id,
-      name: role.name,
-      description: role.description ?? "",
-      permissions: role.permissions
-    });
-  }
-
-  async function deleteRole(id: string) {
-    await adminApi.deleteAdminRole(id);
-    if (roleForm.id === id) {
-      setRoleForm(emptyRoleForm);
-      setRoleFormBaseline(null);
-    }
-    await loadAdminData();
-    if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
-  }
-
-  async function saveGroup(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        name: groupForm.name,
-        description: groupForm.description || null
-      };
-      const group = groupForm.id
-        ? await adminApi.updateAdminGroup(groupForm.id, body)
-        : await adminApi.createAdminGroup(body);
-      await adminApi.updateAdminGroupRoles(group.id, groupForm.role_ids);
-      await adminApi.updateAdminGroupMembers(group.id, groupForm.user_ids);
-      setGroupForm(emptyGroupForm);
-      setGroupFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-      if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
-    } catch (err) {
-      setError(messageOr(err, "saveGroupFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function editGroup(group: AccessGroup) {
-    setGroupForm({
-      id: group.id,
-      name: group.name,
-      description: group.description ?? "",
-      role_ids: (group.roles ?? []).map((role) => role.id),
-      user_ids: (group.members ?? []).map((member) => member.id)
-    });
-    setGroupFormBaseline({
-      id: group.id,
-      name: group.name,
-      description: group.description ?? "",
-      role_ids: (group.roles ?? []).map((role) => role.id),
-      user_ids: (group.members ?? []).map((member) => member.id)
-    });
-  }
-
-  async function deleteGroup(id: string) {
-    await adminApi.deleteAdminGroup(id);
-    if (groupForm.id === id) {
-      setGroupForm(emptyGroupForm);
-      setGroupFormBaseline(null);
-    }
-    await loadAdminData();
-    if (selectedAccessUserId) await loadUserAccess(selectedAccessUserId);
-  }
-
-  async function saveOrganization(event: FormEvent) {
-    event.preventDefault();
-    if (organizationMembersLoading) return;
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        slug: organizationForm.slug,
-        name: organizationForm.name,
-        description: organizationForm.description || null,
-        allowed_email_domains: splitList(organizationForm.allowed_email_domains).map(normalizeDomain),
-        is_active: organizationForm.is_active
-      };
-      const organization = organizationForm.id
-        ? await adminApi.updateAdminOrganization(organizationForm.id, body)
-        : await adminApi.createAdminOrganization(body);
-      await adminApi.replaceAdminOrganizationMembers(organization.id, {
-        members: Object.entries(organizationMemberRoles).map(([user_id, role]) => ({ user_id, role }))
-      });
-      organizationMembersLoadId.current += 1;
-      setOrganizationForm(emptyOrganizationForm);
-      setOrganizationFormBaseline(null);
-      setOrganizationMemberRolesBaseline(null);
-      setOrganizationMemberRoles({});
-      setOrganizationMembersLoading(false);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveOrganizationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function editOrganization(organization: Organization) {
-    const loadId = ++organizationMembersLoadId.current;
-    const nextForm = {
-      id: organization.id,
-      slug: organization.slug,
-      name: organization.name,
-      description: organization.description ?? "",
-      allowed_email_domains: organization.allowed_email_domains.join("\n"),
-      is_active: organization.is_active
-    };
-    setOrganizationForm(nextForm);
-    setOrganizationFormBaseline(nextForm);
-    setOrganizationMemberRoles({});
-    setOrganizationMemberRolesBaseline(null);
-    setOrganizationMembersLoading(true);
-    setEditor("organization");
-    try {
-      const members = await adminApi.listAdminOrganizationMembers(organization.id);
-      if (loadId !== organizationMembersLoadId.current) return;
-      const nextRoles = Object.fromEntries(members.map((member) => [member.user_id, member.role]));
-      setOrganizationMemberRoles(nextRoles);
-      setOrganizationMemberRolesBaseline(nextRoles);
-    } catch (err) {
-      if (loadId === organizationMembersLoadId.current) {
-        setError(messageOr(err, "loadFailed"));
-      }
-    } finally {
-      if (loadId === organizationMembersLoadId.current) {
-        setOrganizationMembersLoading(false);
-      }
-    }
-  }
-
-  function setOrganizationMemberRole(userId: string, role: string | null) {
-    setOrganizationMemberRoles((current) => {
-      const next = { ...current };
-      if (role) {
-        next[userId] = role;
-      } else {
-        delete next[userId];
-      }
-      return next;
-    });
-  }
-
-  async function deleteOrganization(id: string) {
-    await adminApi.deleteAdminOrganization(id);
-    if (organizationForm.id === id) {
-      organizationMembersLoadId.current += 1;
-      setOrganizationForm(emptyOrganizationForm);
-      setOrganizationFormBaseline(null);
-      setOrganizationMemberRoles({});
-      setOrganizationMemberRolesBaseline(null);
-      setOrganizationMembersLoading(false);
-    }
-    await loadAdminData();
-  }
-
-  async function loadUserAccess(id: string) {
-    const request = userAccessRequest.begin();
-    setSelectedAccessUserId(id);
-    setUserAccess(null);
-    if (!id) {
-      return;
-    }
-    try {
-      const access = await adminApi.getAdminUserAccess(id, {
-        signal: request.signal,
-        force: true
-      });
-      if (request.isCurrent()) setUserAccess(access);
-    } catch (error) {
-      if (request.isCurrent()) throw error;
-    }
-  }
-
-  async function saveUserRoles() {
-    if (!selectedAccessUserId || !userAccess) return;
-    const completed = await runUiAction(async () => {
-      const updated = await adminApi.updateAdminUserRoles(
-        selectedAccessUserId,
-        userAccess.direct_roles.map((role) => role.id)
-      );
-      setUserAccess(updated);
-      await loadAdminData();
-    });
-    if (completed) setVerificationMessage(t("changesSaved"));
-  }
-
-  async function startTotpSetup() {
-    setNewRecoveryCodes([]);
-    setTotpSetupCode("");
-    await runUiAction(async () => {
-      setTotpSetup(await accountApi.startTotpSetup());
-    }, "startMfaSetupFailed");
-  }
-
-  async function confirmTotpSetup() {
-    if (!totpSetup) return;
-    await runUiAction(async () => {
-      const result = await accountApi.confirmTotpSetup(totpSetup.setup_id, totpSetupCode);
-      setMfaStatus(result.status);
-      setNewRecoveryCodes(result.recovery_codes);
-      setTotpSetup(null);
-      setTotpSetupCode("");
-      await loadAccountData();
-    }, "confirmMfaSetupFailed");
-  }
-
-  async function rotateRecoveryCodes() {
-    await runUiAction(async () => {
-      const result = await accountApi.rotateRecoveryCodes();
-      setMfaStatus(result.status);
-      setNewRecoveryCodes(result.recovery_codes);
-      await loadAccountData();
-    }, "rotateRecoveryCodesFailed");
-  }
-
-  async function disableMfa() {
-    setError("");
-    try {
-      const result = await accountApi.disableMfa();
-      setMfaStatus(result);
-      setTotpSetup(null);
-      setNewRecoveryCodes([]);
-      await loadAccountData();
-    } catch (err) {
-      const message = messageOr(err, "disableMfaFailed");
-      setError(message);
-      throw new Error(message);
-    }
-  }
-
-  async function registerPasskey() {
-    setBusy(true);
-    setError("");
-    try {
-      if (!navigator.credentials?.create || !window.PublicKeyCredential) {
-        throw new Error(t("registerPasskeyFailed"));
-      }
-      const start = await accountApi.startPasskeyRegistration(passkeyName || null);
-      const credential = await navigator.credentials.create(passkeyCreationOptions(start.public_key));
-      if (!credential || credential.type !== "public-key") {
-        throw new Error(t("registerPasskeyFailed"));
-      }
-      const created = await accountApi.finishPasskeyRegistration({
-        challengeId: start.challenge_id,
-        name: passkeyName || null,
-        credential: registrationCredentialJson(credential as PublicKeyCredential)
-      });
-      setPasskeys((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-      setPasskeyName("");
-    } catch (err) {
-      setError(messageOr(err, "registerPasskeyFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deletePasskey(id: string) {
-    setBusy(true);
-    setError("");
-    try {
-      await accountApi.deletePasskey(id);
-      setPasskeys((current) => current.filter((item) => item.id !== id));
-    } catch (err) {
-      const message = messageOr(err, "deletePasskeyFailed");
-      setError(message);
-      throw new Error(message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function revokeMyConsent(clientId: string) {
-    setBusy(true);
-    setError("");
-    try {
-      await accountApi.revokeConsent(clientId);
-      await loadAccountData();
-    } catch (err) {
-      const message = messageOr(err, "revokeAuthorizationFailed");
-      setError(message);
-      throw new Error(message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function revokeMySession(sessionId: string) {
-    setBusy(true);
-    setError("");
-    try {
-      await accountApi.revokeSession(sessionId);
-      await loadAccountData();
-    } catch (err) {
-      const message = messageOr(err, "revokeSessionFailed");
-      setError(message);
-      throw new Error(message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function resetUserMfa(id: string) {
     await adminApi.resetAdminUserMfa(id);
     await loadAdminData();
   }
 
-  async function saveSecurityPolicy(event: FormEvent) {
-    event.preventDefault();
-    if (!securityPolicy) return;
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await adminApi.updateAdminSecurityPolicy({
-          password_min_length: Number(securityPolicy.password_min_length),
-          password_require_uppercase: Number(Boolean(securityPolicy.password_require_uppercase)),
-          password_require_lowercase: Number(Boolean(securityPolicy.password_require_lowercase)),
-          password_require_digit: Number(Boolean(securityPolicy.password_require_digit)),
-          password_require_symbol: Number(Boolean(securityPolicy.password_require_symbol)),
-          password_reject_user_info: Number(Boolean(securityPolicy.password_reject_user_info)),
-          login_lockout_enabled: Number(Boolean(securityPolicy.login_lockout_enabled)),
-          max_failed_login_attempts: Number(securityPolicy.max_failed_login_attempts),
-          failure_window_seconds: Number(securityPolicy.failure_window_seconds),
-          lockout_seconds: Number(securityPolicy.lockout_seconds),
-          trusted_ip_cidrs: securityPolicy.trusted_ip_cidrs,
-          require_mfa_outside_trusted_networks: securityPolicy.require_mfa_outside_trusted_networks,
-          allowed_ip_cidrs: securityPolicy.allowed_ip_cidrs,
-          blocked_ip_cidrs: securityPolicy.blocked_ip_cidrs,
-          allowed_email_domains: securityPolicy.allowed_email_domains,
-          blocked_email_domains: securityPolicy.blocked_email_domains,
-          captcha_enabled: securityPolicy.captcha_enabled,
-          captcha_after_failed_attempts: Number(securityPolicy.captcha_after_failed_attempts),
-          captcha_ttl_seconds: Number(securityPolicy.captcha_ttl_seconds)
-        });
-      setSecurityPolicy(updated);
-      setSecurityPolicyBaseline(updated);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveSecurityPolicyFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function rotateSigningKey() {
-    setBusy(true);
-    setError("");
-    try {
-      await adminApi.rotateAdminSigningKey(signingKeyKid.trim() || null);
-      setSigningKeyKid("");
-      await loadAdminData();
-    } catch (err) {
-      const message = messageOr(err, "rotateSigningKeyFailed");
-      setError(message);
-      throw new Error(message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveRegistrationSettings(event: FormEvent) {
-    event.preventDefault();
-    if (!registrationSettings) return;
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await adminApi.updateAdminRegistrationSettings(registrationSettings);
-      setRegistrationSettings(updated);
-      setRegistrationSettingsBaseline(updated);
-      setVerificationMessage(t("changesSaved"));
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "saveRegistrationSettingsFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveRuntimeSettings(event: FormEvent) {
-    event.preventDefault();
-    if (!runtimeSettings) return;
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await adminApi.updateAdminRuntimeSettings({
-        public_base_url: runtimeSettings.public_base_url,
-        issuer: runtimeSettings.issuer || runtimeSettings.public_base_url,
-        trust_proxy_headers: runtimeSettings.trust_proxy_headers
-      });
-      setRuntimeSettings(updated);
-      setRuntimeSettingsBaseline(updated);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveRuntimeSettingsFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function persistLoginSettings(draft: LoginSettingsDraft): Promise<boolean> {
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await adminApi.updateAdminLoginSettings({
-        brand_logo_url: draft.brand_logo_url,
-        email_domains: splitList(draft.email_domains).map(normalizeDomain),
-        quick_links: draft.quick_links
-      });
-      setLoginSettings(updated);
-      setLoginSettingsDraft({
-        brand_logo_url: updated.brand_logo_url,
-        email_domains: updated.email_domains.join("\n"),
-        quick_links: updated.quick_links
-      });
-      setLoginSettingsBaseline({
-        brand_logo_url: updated.brand_logo_url,
-        email_domains: updated.email_domains.join("\n"),
-        quick_links: updated.quick_links
-      });
-      setVerificationMessage(t("changesSaved"));
-      await loadBootstrap();
-      return true;
-    } catch (err) {
-      setError(messageOr(err, "saveLoginSettingsFailed"));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function resetQuickLinkForm() {
-    const empty = { ...emptyQuickLinkForm };
-    setQuickLinkForm(empty);
-    setQuickLinkFormBaseline(empty);
-  }
-
-  async function saveQuickLinkDraft() {
-    if (!quickLinkForm.label.trim() || !quickLinkForm.url.trim()) return;
-    const link: QuickLink = {
-      id: quickLinkForm.id || createQuickLinkId(),
-      label: quickLinkForm.label.trim(),
-      url: quickLinkForm.url.trim(),
-      // Kept for API compatibility. Quick links derive their visual icon from
-      // the destination instead of relying on an application-side icon list.
-      icon: "",
-      is_active: quickLinkForm.is_active
-    };
-    const nextLinks = quickLinkForm.id
-      ? loginSettingsDraft.quick_links.map((item) => (item.id === quickLinkForm.id ? link : item))
-      : [...loginSettingsDraft.quick_links, link];
-    const saved = await persistLoginSettings({ ...loginSettingsDraft, quick_links: nextLinks });
-    if (saved) resetQuickLinkForm();
-  }
-
-  function editQuickLink(link: QuickLink) {
-    const nextForm = {
-      id: link.id,
-      label: link.label,
-      url: link.url,
-      is_active: link.is_active
-    };
-    setQuickLinkForm(nextForm);
-    setQuickLinkFormBaseline(nextForm);
-  }
-
-  async function removeQuickLink(id: string) {
-    const saved = await persistLoginSettings({
-      ...loginSettingsDraft,
-      quick_links: loginSettingsDraft.quick_links.filter((item) => item.id !== id)
-    });
-    if (!saved) throw new Error(t("saveLoginSettingsFailed"));
-    if (quickLinkForm.id === id) resetQuickLinkForm();
-  }
-
-  function providerRedirectPath(slug: string): string {
-    return `/api/register/oidc/${slug.trim() || "provider"}/callback`;
-  }
-
-  function applyProviderTemplate() {
-    const template = providerTemplates.find((item) => item.id === providerTemplateId);
-    if (!template) return;
-    providerDiscoveryRequest.cancel();
-    setProviderForm({
-      ...providerForm,
-      slug: template.slug,
-      display_name: template.display_name,
-      issuer: template.issuer,
-      redirect_path: providerRedirectPath(template.slug),
-      scopes: joinList(template.scopes)
-    });
-  }
-
-  async function discoverProviderEndpoints() {
-    const requestedIssuer = providerForm.issuer.trim();
-    if (!requestedIssuer) return;
-    const request = providerDiscoveryRequest.begin();
-    setBusy(true);
-    setError("");
-    try {
-      const discovered = await adminApi.discoverAdminExternalOidcProvider(requestedIssuer, { signal: request.signal });
-      setProviderForm((current) => {
-        // Discovery is a patch for the issuer that was requested. Preserve
-        // every field edited while the network call was in flight and ignore
-        // a response that belongs to an older issuer/request.
-        if (!request.isCurrent() || current.issuer.trim() !== requestedIssuer) {
-          return current;
-        }
-        return {
-          ...current,
-          issuer: discovered.issuer,
-          authorization_endpoint: discovered.authorization_endpoint,
-          token_endpoint: discovered.token_endpoint,
-          userinfo_endpoint: discovered.userinfo_endpoint,
-          scopes: joinList(discovered.scopes)
-        };
-      });
-    } catch (err) {
-      if (request.isCurrent()) {
-        setError(messageOr(err, "discoverProviderFailed"));
-      }
-    } finally {
-      if (request.isCurrent()) setBusy(false);
-    }
-  }
-
-  async function saveProvider(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        slug: providerForm.slug,
-        display_name: providerForm.display_name,
-        organization_id: providerForm.organization_id || null,
-        issuer: providerForm.issuer,
-        client_id: providerForm.client_id,
-        client_secret: providerForm.client_secret,
-        clear_client_secret: providerForm.clear_client_secret,
-        authorization_endpoint: providerForm.authorization_endpoint,
-        token_endpoint: providerForm.token_endpoint,
-        userinfo_endpoint: providerForm.userinfo_endpoint,
-        redirect_path: providerForm.redirect_path,
-        scopes: splitList(providerForm.scopes),
-        email_domains: splitList(providerForm.email_domains).map(normalizeDomain),
-        is_active: providerForm.is_active,
-        allow_login: providerForm.allow_login,
-        allow_registration: providerForm.allow_registration
-      };
-      if (providerForm.id) {
-        await adminApi.updateAdminExternalOidcProvider(providerForm.id, body);
-      } else {
-        await adminApi.createAdminExternalOidcProvider(body);
-      }
-      setProviderForm(emptyProviderForm);
-      setProviderFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "saveProviderFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteProvider(id: string) {
-    await adminApi.deleteAdminExternalOidcProvider(id);
-    await loadAdminData();
-    await loadBootstrap();
-  }
-
-  async function saveLdapProvider(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        slug: ldapProviderForm.slug,
-        display_name: ldapProviderForm.display_name,
-        organization_id: ldapProviderForm.organization_id || null,
-        url: ldapProviderForm.url,
-        starttls: ldapProviderForm.starttls,
-        bind_dn: ldapProviderForm.bind_dn,
-        bind_password: ldapProviderForm.bind_password || null,
-        clear_bind_password: ldapProviderForm.clear_bind_password,
-        base_dn: ldapProviderForm.base_dn,
-        user_filter: ldapProviderForm.user_filter,
-        user_id_attribute: ldapProviderForm.user_id_attribute,
-        email_attribute: ldapProviderForm.email_attribute,
-        username_attribute: ldapProviderForm.username_attribute,
-        display_name_attribute: ldapProviderForm.display_name_attribute,
-        phone_attribute: ldapProviderForm.phone_attribute,
-        is_active: ldapProviderForm.is_active,
-        allow_login: ldapProviderForm.allow_login,
-        allow_registration: ldapProviderForm.allow_registration
-      };
-      if (ldapProviderForm.id) {
-        await adminApi.updateAdminLdapProvider(ldapProviderForm.id, body);
-      } else {
-        await adminApi.createAdminLdapProvider(body);
-      }
-      setLdapProviderForm(emptyLdapProviderForm);
-      setLdapProviderFormBaseline(null);
-      setEditor(null);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-      await loadBootstrap();
-    } catch (err) {
-      setError(messageOr(err, "saveLdapProviderFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteLdapProvider(id: string) {
-    await adminApi.deleteAdminLdapProvider(id);
-    await loadAdminData();
-    await loadBootstrap();
-  }
-
-  function editLdapProvider(provider: LdapProvider) {
-    const nextForm = {
-                        id: provider.id,
-                        slug: provider.slug,
-                        display_name: provider.display_name,
-                        organization_id: provider.organization_id ?? "",
-                        url: provider.url,
-      starttls: provider.starttls,
-      bind_dn: provider.bind_dn,
-      bind_password: "",
-      clear_bind_password: false,
-      base_dn: provider.base_dn,
-      user_filter: provider.user_filter,
-      user_id_attribute: provider.user_id_attribute,
-      email_attribute: provider.email_attribute,
-      username_attribute: provider.username_attribute,
-      display_name_attribute: provider.display_name_attribute,
-      phone_attribute: provider.phone_attribute,
-      is_active: provider.is_active,
-      allow_login: provider.allow_login,
-      allow_registration: provider.allow_registration
-    };
-    setLdapProviderForm(nextForm);
-    setLdapProviderFormBaseline(nextForm);
-    setEditor("ldap");
-  }
-
-  async function saveAuditWebhook(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const body = {
-        name: auditWebhookForm.name,
-        url: auditWebhookForm.url,
-        secret: auditWebhookForm.secret || null,
-        clear_secret: auditWebhookForm.clear_secret,
-        actions: splitList(auditWebhookForm.actions),
-        is_active: auditWebhookForm.is_active,
-        timeout_seconds: Number(auditWebhookForm.timeout_seconds)
-      };
-      if (auditWebhookForm.id) {
-        await adminApi.updateAdminAuditWebhook(auditWebhookForm.id, body);
-      } else {
-        await adminApi.createAdminAuditWebhook(body);
-      }
-      setAuditWebhookForm(emptyAuditWebhookForm);
-      setAuditWebhookFormBaseline(emptyAuditWebhookForm);
-      setVerificationMessage(t("changesSaved"));
-      await loadAdminData();
-    } catch (err) {
-      setError(messageOr(err, "saveAuditWebhookFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function editAuditWebhook(webhook: AuditWebhook) {
-    const nextForm = {
-      id: webhook.id,
-      name: webhook.name,
-      url: webhook.url,
-      secret: "",
-      clear_secret: false,
-      actions: webhook.actions.join("\n"),
-      is_active: webhook.is_active,
-      timeout_seconds: webhook.timeout_seconds
-    };
-    setAuditWebhookForm(nextForm);
-    setAuditWebhookFormBaseline(nextForm);
-  }
-
-  async function deleteAuditWebhook(id: string) {
-    await adminApi.deleteAdminAuditWebhook(id);
-    setAuditWebhookForm((current) => (current.id === id ? emptyAuditWebhookForm : current));
-    setAuditWebhookFormBaseline((current) => (current.id === id ? emptyAuditWebhookForm : current));
-    await loadAdminData();
-  }
-
-  async function refreshCurrentTab() {
-    setError("");
-    setRefreshing(true);
-    try {
-      if (tab === "billing") {
-        await walletWorkspaceRef.current?.reload();
-      } else if (tab === "account") {
-        await loadAccountData();
-      } else if (tab === "users") {
-        await userDirectory.reload();
-      } else {
-        await loadAdminData(tab, { force: true });
-      }
-      setVerificationMessage(t("operationCompleted"));
-    } catch (err) {
-      setError(messageOr(err, "refreshFailed"));
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  async function switchEnterprise(organizationId: string) {
-    if (!organizationId || organizationId === organizationContext?.id) return;
-    if (configurationFormsDirty() && !confirmDiscardChanges(t)) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      await switchSessionOrganization(organizationId);
-      setApplications([]);
-      setClients([]);
-      setOrganizationMembers([]);
-      setVerificationMessage(t("operationCompleted"));
-    } catch (err) {
-      setError(messageOr(err, "operationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveEnterprise(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      await api<Organization>("/api/me/organizations", {
-        method: "POST",
-        body: JSON.stringify({
-          slug: enterpriseForm.slug,
-          name: enterpriseForm.name,
-          description: enterpriseForm.description || null,
-          allowed_email_domains: splitList(enterpriseForm.allowed_email_domains).map(normalizeDomain)
-        })
-      });
-      setEnterpriseForm(emptyEnterpriseForm);
-      setEnterpriseFormBaseline(null);
-      setEditor(null);
-      await loadEnterpriseContext(user?.id);
-      setVerificationMessage(t("changesSaved"));
-      navigateToTab("applications");
-    } catch (err) {
-      setError(messageOr(err, "saveOrganizationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function providerFormIsDirty(): boolean {
-    return providerFormBaseline !== null
-      && isDirtyDomain(providerForm, providerFormBaseline);
-  }
-
-  function ldapProviderFormIsDirty(): boolean {
-    return ldapProviderFormBaseline !== null
-      && isDirtyDomain(ldapProviderForm, ldapProviderFormBaseline);
-  }
-
-  function auditWebhookFormIsDirty(): boolean {
-    return isDirtyDomain(auditWebhookForm, auditWebhookFormBaseline);
-  }
-
-  function registrationSettingsIsDirty(): boolean {
-    return registrationSettingsBaseline !== null
-      && registrationSettings !== null
-      && isDirtyDomain(registrationSettings, registrationSettingsBaseline);
-  }
-
-  function runtimeSettingsIsDirty(): boolean {
-    return runtimeSettingsBaseline !== null
-      && runtimeSettings !== null
-      && isDirtyDomain(runtimeSettings, runtimeSettingsBaseline);
-  }
-
-  function loginSettingsIsDirty(): boolean {
-    return loginSettingsBaseline !== null
-      && isDirtyDomain(loginSettingsDraft, loginSettingsBaseline);
-  }
-
-  function quickLinkFormIsDirty(): boolean {
-    return isDirtyDomain(quickLinkForm, quickLinkFormBaseline);
-  }
-
-  function applicationFormIsDirty(): boolean {
-    return applicationFormBaseline !== null
-      && isDirtyDomain(applicationForm, applicationFormBaseline);
-  }
-
-  function securityPolicyIsDirty(): boolean {
-    return securityPolicyBaseline !== null
-      && securityPolicy !== null
-      && isDirtyDomain(securityPolicy, securityPolicyBaseline);
-  }
-
-  function userFormIsDirty(): boolean {
-    return userFormBaseline !== null
-      && isDirtyDomain(userForm, userFormBaseline);
-  }
-
-  function enterpriseFormIsDirty(): boolean {
-    return enterpriseFormBaseline !== null
-      && isDirtyDomain(enterpriseForm, enterpriseFormBaseline);
-  }
-
-  function invitationFormIsDirty(): boolean {
-    return invitationFormBaseline !== null
-      && isDirtyDomain(invitationForm, invitationFormBaseline);
-  }
-
-  function roleFormIsDirty(): boolean {
-    return roleFormBaseline !== null
-      && isDirtyDomain(roleForm, roleFormBaseline);
-  }
-
-  function groupFormIsDirty(): boolean {
-    return groupFormBaseline !== null
-      && isDirtyDomain(groupForm, groupFormBaseline);
-  }
-
-  function organizationFormIsDirty(): boolean {
-    const formDirty = organizationFormBaseline !== null
-      && isDirtyDomain(organizationForm, organizationFormBaseline);
-    const membersDirty = organizationMemberRolesBaseline !== null
-      && isDirtyDomain(organizationMemberRoles, organizationMemberRolesBaseline);
-    return formDirty || membersDirty;
-  }
-
-  function configurationFormsDirty(): boolean {
-    return userFormIsDirty()
-      || enterpriseFormIsDirty()
-      || organizationFormIsDirty()
-      || providerFormIsDirty()
-      || ldapProviderFormIsDirty()
-      || applicationFormIsDirty()
-      || invitationFormIsDirty()
-      || roleFormIsDirty()
-      || groupFormIsDirty()
-      || auditWebhookFormIsDirty()
-      || registrationSettingsIsDirty()
-      || runtimeSettingsIsDirty()
-      || loginSettingsIsDirty()
-      || quickLinkFormIsDirty()
-      || securityPolicyIsDirty();
-  }
-
-  function closeEditor(force = false): boolean {
-    const editorDirty =
-      editor === "application" ? applicationFormIsDirty()
-      : editor === "user" ? userFormIsDirty()
-      : editor === "enterprise" ? enterpriseFormIsDirty()
-      : editor === "organization" ? organizationFormIsDirty()
-      : editor === "invitation" ? invitationFormIsDirty()
-      : editor === "role" ? roleFormIsDirty()
-      : editor === "group" ? groupFormIsDirty()
-      : editor === "provider" ? providerFormIsDirty()
-      : editor === "ldap" ? ldapProviderFormIsDirty()
-      : false;
-    if (!force && editorDirty && !confirmDiscardChanges(t)) {
-      return false;
-    }
-    if (editor === "organization") {
-      organizationMembersLoadId.current += 1;
-      setOrganizationMembersLoading(false);
-    }
-    if (editor === "user") {
-      setUserForm(emptyUserForm);
-      setUserFormBaseline(null);
-    }
-    if (editor === "enterprise") {
-      setEnterpriseForm(emptyEnterpriseForm);
-      setEnterpriseFormBaseline(null);
-    }
-    if (editor === "organization") {
-      setOrganizationForm(emptyOrganizationForm);
-      setOrganizationFormBaseline(null);
-      setOrganizationMemberRoles({});
-      setOrganizationMemberRolesBaseline(null);
-    }
-    if (editor === "application") {
-      applicationCreateMutationRef.current = null;
-      applicationDeleteMutationRef.current = null;
-      setApplicationForm(emptyApplicationForm);
-      setApplicationFormBaseline(null);
-    }
-    if (editor === "provider") {
-      setProviderForm(emptyProviderForm);
-      setProviderFormBaseline(null);
-      setProviderTemplateId("");
-      providerDiscoveryRequest.cancel();
-    }
-    if (editor === "ldap") {
-      setLdapProviderForm(emptyLdapProviderForm);
-      setLdapProviderFormBaseline(null);
-    }
-    if (editor === "invitation") {
-      setInvitationForm(emptyInvitationForm);
-      setInvitationFormBaseline(null);
-      setLastInvitationCode("");
-    }
-    if (editor === "role") {
-      setRoleForm(emptyRoleForm);
-      setRoleFormBaseline(null);
-    }
-    if (editor === "group") {
-      setGroupForm(emptyGroupForm);
-      setGroupFormBaseline(null);
-    }
-    setEditor(null);
-    setError("");
-    return true;
-  }
-
-  function requestConfirmation(
-    action: () => Promise<void> | void,
-    title = t("confirmAction"),
-    description = t("confirmActionDescription")
-  ) {
-    setError("");
-    setPendingConfirmation({ action, title, description });
-  }
-
-  async function runPendingConfirmation() {
-    if (!pendingConfirmation) return;
-    setBusy(true);
-    setError("");
-    try {
-      await pendingConfirmation.action();
-      setPendingConfirmation(null);
-      setVerificationMessage(t("operationCompleted"));
-    } catch (err) {
-      setError(messageOr(err, "operationFailed"));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const tabs = useMemo(
-    () => {
-      const accountTab = { id: "account" as const, label: t("account"), icon: UserRound };
-      const billingTab = user && !isRestrictedLoginCodeSession
-        ? { id: "billing" as const, label: t("billing"), icon: Coins }
-        : null;
-      const adminTabs = [
-        hasGlobalConsolePermission ? { id: "overview" as const, label: t("overview"), icon: Shield } : null,
-        canReadUsers ? { id: "users" as const, label: t("users"), icon: Users } : null,
-        canManageActiveOrganization ? { id: "applications" as const, label: t("applications"), icon: Building2 } : null,
-        canReadOrganizations ? { id: "organizations" as const, label: t("organizations"), icon: Building2 } : null,
-        canManageAuthorizationCodes ? { id: "invitations" as const, label: t("invitations"), icon: Ticket } : null,
-        canManageSettings ? { id: "registration" as const, label: t("registration"), icon: UserRound } : null,
-        canManageProviders ? { id: "providers" as const, label: t("providers"), icon: Link2 } : null,
-        canManageSettings ? { id: "portal" as const, label: t("portal"), icon: AtSign } : null,
-        (canManageSecurity || canReadAudit) ? { id: "security" as const, label: t("security"), icon: Shield } : null,
-        canManageSettings ? { id: "settings" as const, label: t("settings"), icon: Settings } : null
-      ].filter((item): item is NonNullable<typeof item> => Boolean(item));
-      return canAdmin
-        ? [accountTab, ...(billingTab ? [billingTab] : []), ...adminTabs]
-        : [accountTab, ...(billingTab ? [billingTab] : [])];
+  const refreshCurrentTab = useAdminRefresh({
+    tab,
+    setRefreshing,
+    setError,
+    setVerificationMessage,
+    formatError: messageOr,
+    translate: t,
+    reloadBilling: async () => {
+      await walletWorkspaceRef.current?.reload();
     },
-    [
-      locale,
-      canAdmin,
-      hasGlobalConsolePermission,
-      canReadUsers,
-      canManageActiveOrganization,
-      canReadOrganizations,
-      canManageAuthorizationCodes,
-      canManageSettings,
-      canManageProviders,
-      canManageSecurity,
-      canReadAudit,
-      user,
-      isRestrictedLoginCodeSession
-    ]
-  );
+    reloadAccount: loadAccountData,
+    reloadUsers: userDirectory.reload,
+    reloadAdmin: loadAdminData
+  });
 
-  const navigationGroups = useMemo(() => {
-    const groups = [
-      {
-        id: "workspace",
-        label: t("navWorkspace"),
-        hint: t("navWorkspaceHint"),
-        ids: ["overview", "billing"] as Tab[]
-      },
-      {
-        id: "directory",
-        label: t("navDirectory"),
-        hint: t("navDirectoryHint"),
-        ids: ["users", "organizations", "invitations"] as Tab[]
-      },
-      {
-        id: "applications",
-        label: t("navApplications"),
-        hint: t("navApplicationsHint"),
-        ids: ["applications"] as Tab[]
-      },
-      {
-        id: "access",
-        label: t("navAccess"),
-        hint: t("navAccessHint"),
-        ids: ["registration", "providers", "portal", "security", "settings"] as Tab[]
-      }
-    ];
-    return groups
-      .map((group) => ({
-        ...group,
-        items: group.ids
-          .map((id) => tabs.find((item) => item.id === id))
-          .filter((item): item is (typeof tabs)[number] => Boolean(item))
-      }))
-      .filter((group) => group.items.length > 0);
-  }, [locale, tabs]);
-
+  const { tabs, navigationGroups } = useAdminTabModel({
+    locale,
+    translate: t,
+    user: user ?? null,
+    isRestrictedLoginCodeSession,
+    canAdmin,
+    hasGlobalConsolePermission,
+    canReadUsers,
+    canManageActiveOrganization,
+    canReadOrganizations,
+    canManageAuthorizationCodes,
+    canManageSettings,
+    canManageProviders,
+    canManageSecurity,
+    canReadAudit
+  });
   const activeNavigationGroup = navigationGroups.find((group) => group.items.some((item) => item.id === tab));
 
   useEffect(() => {
@@ -3057,7 +1494,7 @@ export function App() {
   }, [enterpriseContextReady, tab, tabs, user]);
 
   useEffect(() => {
-    dirtyNavigation.setSource("app", configurationFormsDirty());
+    dirtyNavigation.setSource("app", configurationFormsDirty);
   }, [
     dirtyNavigation.setSource,
     userForm,
@@ -3112,7 +1549,6 @@ export function App() {
     document.title = label ? `${label} · Signet` : "Signet";
   }, [accountLoginExpanded, authAccountSwitch, authMode, authReturnTo, initialAuth.forceLogin, initialAuth.isAuthPage, initialAuth.selectAccount, locale, tab, tabs, user]);
 
-  const normalizedSearchQuery = searchQuery.trim().toLocaleLowerCase();
   // The invitation/provider tables resolve these references for every row.
   // Build indexes once per read-model change instead of scanning the full
   // client/organization collections inside each rendered cell.
@@ -3128,7 +1564,7 @@ export function App() {
   // and pagination. Filtering this page again in React makes server totals and
   // visible rows disagree when the two implementations drift.
   const filteredUsers = users;
-  const activeUserDirectoryPage = userDirectoryQuery.page;
+  const activeUserDirectoryPage = userDirectoryQuery.page ?? userDirectoryPage;
   const userPageStart = filteredUsers.length === 0
     ? 0
     : (activeUserDirectoryPage - 1) * userDirectoryPageSize + 1;
@@ -3148,72 +1584,27 @@ export function App() {
     selectedIds: selectedUserIds,
     setSelectedIds: setSelectedUserIds
   });
-  const filteredOrganizations = useMemo(() => organizations.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.slug,
-    item.description,
-    item.allowed_email_domains.join(" ")
-  )), [normalizedSearchQuery, organizations]);
-  const filteredApplications = useMemo(() => applications.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.slug,
-    item.description
-  )), [applications, normalizedSearchQuery]);
-  const filteredInvitations = useMemo(() => invitations.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.code_type,
-    item.login_code_level,
-    item.allowed_client_ids?.join(" "),
-    item.organization_id,
-    item.organization_role,
-    item.code_prefix,
-    item.description,
-    item.authorized_email,
-    item.authorized_username
-  )), [invitations, normalizedSearchQuery]);
-  const filteredProviders = useMemo(() => providers.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.display_name,
-    item.slug,
-    item.issuer,
-    item.email_domains.join(" ")
-  )), [normalizedSearchQuery, providers]);
-  const filteredLdapProviders = useMemo(() => ldapProviders.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.display_name,
-    item.slug,
-    item.url,
-    item.base_dn
-  )), [ldapProviders, normalizedSearchQuery]);
-  const filteredRoles = useMemo(() => roles.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.description,
-    item.permissions.join(" ")
-  )), [normalizedSearchQuery, roles]);
-  const filteredGroups = useMemo(() => groups.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.description
-  )), [groups, normalizedSearchQuery]);
-  const filteredAuditWebhooks = useMemo(() => auditWebhooks.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.name,
-    item.url,
-    item.actions.join(" "),
-    item.last_error
-  )), [auditWebhooks, normalizedSearchQuery]);
-  const filteredAuditEvents = useMemo(() => auditEvents.filter((item) => matchesSearch(
-    normalizedSearchQuery,
-    item.action,
-    item.target_kind,
-    item.target_id,
-    item.actor_user_id,
-    item.actor_client_id,
-    item.details
-  )), [auditEvents, normalizedSearchQuery]);
+  const {
+    filteredOrganizations,
+    filteredApplications,
+    filteredInvitations,
+    filteredProviders,
+    filteredLdapProviders,
+    filteredRoles,
+    filteredGroups,
+    filteredAuditWebhooks,
+    filteredAuditEvents
+  } = useAdminSearchProjections(searchQuery, {
+    organizations,
+    applications,
+    invitations,
+    providers,
+    ldapProviders,
+    roles,
+    groups,
+    auditWebhooks,
+    auditEvents
+  });
   const searchableTabs: Tab[] = [
     "users",
     "applications",
@@ -3227,39 +1618,11 @@ export function App() {
   const totalUserCount = overview?.users ?? 0;
   const activeClientCount = overview?.active_clients ?? 0;
   const totalClientCount = overview?.clients ?? 0;
-  const activeUserRate = totalUserCount > 0 ? Math.round((activeUserCount / totalUserCount) * 100) : 0;
-  const activeClientRate = totalClientCount > 0 ? Math.round((activeClientCount / totalClientCount) * 100) : 0;
-  const selectedLifecycleState = selectedManagedUsers.length > 0
-    ? lifecycleStateForUser(selectedManagedUsers[0])
-    : null;
-  const selectedUsersShareLifecycleState = Boolean(
+  const { availableActions: availableBulkUserActions } = useUserBulkActions(
+    selectedManagedUsers,
+    user?.id,
     selectedUsersAreCurrent
-    && selectedLifecycleState
-    && selectedManagedUsers.every((item) => lifecycleStateForUser(item) === selectedLifecycleState)
   );
-  const sharedLifecycleBulkActions: BulkUserAction[] = selectedUsersShareLifecycleState
-    ? selectedManagedUsers.reduce<BulkUserAction[] | null>((shared, item) => {
-      if (!shared) return null;
-      const available = availableUserActions(item, user?.id);
-      return shared.filter((action) => action !== "reset_mfa" && available.includes(action));
-    }, availableUserActions(selectedManagedUsers[0], user?.id).filter((action) => action !== "reset_mfa")) ?? []
-    : [];
-  // MFA reset is not a lifecycle transition. It remains available for any
-  // selection whose individual row actions all expose it (active/disabled),
-  // while lifecycle buttons themselves remain hidden for mixed selections.
-  const canBulkResetMfa = selectedUsersAreCurrent
-    && selectedManagedUsers.length > 0
-    && selectedManagedUsers.every((item) => availableUserActions(item, user?.id).includes("reset_mfa"));
-  const availableBulkUserActions: BulkUserAction[] = [
-    ...sharedLifecycleBulkActions,
-    ...(canBulkResetMfa ? ["reset_mfa" as const] : [])
-  ];
-
-  function resetUserDirectoryQueryState() {
-    setUserDirectoryPage(1);
-    setUserDirectoryCursorHistory([null]);
-    setSelectedUserIds([]);
-  }
 
   function resetUserFilters() {
     resetUserDirectoryQueryState();
@@ -3555,22 +1918,23 @@ export function App() {
                 cancelLabel={t("cancel")}
                 onCancel={closeEditor}
                 busy={busy}
-                dirty={enterpriseFormIsDirty()}
-                statusLabel={enterpriseFormIsDirty() ? t("unsavedChanges") : undefined}
+                dirty={enterpriseFormDirty}
+                statusLabel={enterpriseFormDirty ? t("unsavedChanges") : undefined}
                 savingLabel={t("saving")}
               />
             </form>
           </Modal>
         )}
-        {adminViewLoading && <div className="loading-bar" role="progressbar" aria-label={t("loading")} />}
-        {error && !editor && !pendingConfirmation && <div className="error" role="alert">{error}</div>}
-        {isRestrictedLoginCodeSession && (
-          <div className="info temporary-session-banner" role="status" aria-live="polite">
-            <Shield size={17} aria-hidden="true" />
-            <span>{t(isTrialEnrollmentSession ? "trialEnrollmentAccountReady" : "temporaryAccountReady")}</span>
-          </div>
-        )}
-        {verificationMessage && <div className="toast" role="status" aria-live="polite">{verificationMessage}</div>}
+        <AdminFeedbackStack
+          loading={adminViewLoading}
+          error={error}
+          editorOpen={Boolean(editor)}
+          confirmationOpen={Boolean(pendingConfirmation)}
+          restrictedLoginCodeSession={isRestrictedLoginCodeSession}
+          trialEnrollmentSession={isTrialEnrollmentSession}
+          verificationMessage={verificationMessage}
+          t={t}
+        />
         {!canAdmin && tab !== "account" && tab !== "billing" ? <div className="empty">{t("noUserAdminOnly")}</div> : null}
         {tab === "account" && (
           <AccountWorkspace
@@ -3605,55 +1969,20 @@ export function App() {
           </Suspense>
         )}
         {canAdmin && tab === "overview" && (
-          <section className="dashboard">
-            <article className="welcome-card">
-              <div>
-                <StatusBadge tone="success"><Activity size={13} />{t("serviceHealthy")}</StatusBadge>
-                <h3>{t("welcomeBack")}，{user.username}</h3>
-                <p>{t("overviewIntro")}</p>
-              </div>
-              <div className="quick-actions" role="group" aria-label={t("quickActions")}>
-                {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={16} />{t("users")}</button>}
-                {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={16} />{t("security")}</button>}
-              </div>
-            </article>
-            <div className="metrics-grid">
-              <Metric label={t("usersMetric")} value={totalUserCount} detail={`${activeUserCount} ${t("active")}`} />
-              <Metric label={t("activeRate")} value={`${activeUserRate}%`} detail={`${activeUserCount}/${totalUserCount} ${t("users")}`} />
-              <Metric label={t("clientsMetric")} value={totalClientCount} detail={`${activeClientCount} ${t("active")} · ${activeClientRate}%`} />
-              <Metric label={t("database")} value={overview?.database_kind ?? "-"} detail={t("settings")} />
-            </div>
-            <div className="overview-bottom-grid">
-              <article className="panel overview-status-card">
-                <div className="overview-card-heading">
-                  <div>
-                    <StatusBadge tone="success"><Activity size={13} />{t("serviceHealthy")}</StatusBadge>
-                    <h3>{t("overviewStatus")}</h3>
-                  </div>
-                  <Shield size={22} aria-hidden="true" />
-                </div>
-                <div className="overview-fact-grid">
-                  <Info label={t("issuerLabel")} value={overview?.issuer ?? bootstrap.issuer} />
-                  <Info label={t("database")} value={overview?.database_kind ?? "-"} />
-                  <Info label={t("usersMetric")} value={`${activeUserCount}/${totalUserCount} ${t("active")}`} />
-                  <Info label={t("clientsMetric")} value={`${activeClientCount}/${totalClientCount} ${t("active")}`} />
-                </div>
-              </article>
-              <article className="panel overview-workspace-card">
-                <div className="overview-card-heading">
-                  <div>
-                    <h3>{t("overviewWorkspace")}</h3>
-                    <p className="muted">{t("overviewIntro")}</p>
-                  </div>
-                </div>
-                <div className="overview-nav-grid">
-                  {canReadUsers && <button type="button" onClick={() => navigateToTab("users")}><Users size={17} /><span>{t("users")}</span><ExternalLink size={14} /></button>}
-                  {canReadOrganizations && <button type="button" onClick={() => navigateToTab("organizations")}><Building2 size={17} /><span>{t("organizations")}</span><ExternalLink size={14} /></button>}
-                  {canManageSecurity && <button type="button" onClick={() => navigateToTab("security")}><Shield size={17} /><span>{t("security")}</span><ExternalLink size={14} /></button>}
-                </div>
-              </article>
-            </div>
-          </section>
+          <AdminOverview
+            username={user.username}
+            overview={overview}
+            issuer={bootstrap.issuer}
+            canReadUsers={canReadUsers}
+            canReadOrganizations={canReadOrganizations}
+            canManageSecurity={canManageSecurity}
+            activeUserCount={activeUserCount}
+            totalUserCount={totalUserCount}
+            activeClientCount={activeClientCount}
+            totalClientCount={totalClientCount}
+            translate={t}
+            navigateToTab={navigateToTab}
+          />
         )}
         {canReadUsers && tab === "users" && (
           <section className="users-layout">
@@ -3662,7 +1991,7 @@ export function App() {
                 form={userForm}
                 busy={busy}
                 error={error}
-                dirty={userFormIsDirty()}
+                dirty={userFormDirty}
                 translate={t}
                 onChange={setUserForm}
                 onSubmit={saveUser}
@@ -3710,133 +2039,32 @@ export function App() {
                   {canManageUsers && <button type="button" onClick={() => { setUserForm(emptyUserForm); setUserFormBaseline(emptyUserForm); setEditor("user"); }}><Plus size={14} />{t("createUser")}</button>}
                   {canManageUsers && <button type="button" onClick={openBulkUserImport}><FileUp size={14} />{t("bulkUserImport")}</button>}
                 </div>
-                <label className="filter-control">
-                  <span>{t("userFilter")}</span>
-                  <select value={userFilter} onChange={(event) => {
-                    resetUserDirectoryQueryState();
-                    setUserFilter(event.target.value as UserFilter);
-                  }}>
-                    <option value="live">{t("liveUsers")}</option>
-                    <option value="active">{t("activeUsers")}</option>
-                    <option value="disabled">{t("disabledUsers")}</option>
-                    <option value="archived">{t("archivedUsers")}</option>
-                    <option value="authorization_code">{t("authorizationCodeUsers")}</option>
-                    <option value="all">{t("allUsers")}</option>
-                  </select>
-                </label>
               </div>
-              <section className="user-filter-panel" aria-label={t("userFilters")}>
-                <div className="user-filter-heading">
-                  <div>
-                    <Filter size={16} aria-hidden="true" />
-                    <strong>{t("userFilters")}</strong>
-                  </div>
-                  <button
-                    className="text-button"
-                    type="button"
-                    aria-expanded={userFiltersExpanded}
-                    onClick={() => setUserFiltersExpanded((value) => !value)}
-                  >
-                    {userFiltersExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-                    {userFiltersExpanded ? t("userFiltersLess") : t("userFiltersMore")}
-                  </button>
-                </div>
-                <div className="user-filter-grid user-filter-grid-common">
-                  <label className="user-filter-field">
-                    <span>{t("filterEmail")}</span>
-                    <input value={userEmailFilter} onChange={(event) => {
-                      resetUserDirectoryQueryState();
-                      setUserEmailFilter(event.target.value);
-                    }} />
-                  </label>
-                  <label className="user-filter-field">
-                    <span>{t("filterRole")}</span>
-                    <select value={userRoleFilter} onChange={(event) => {
-                      resetUserDirectoryQueryState();
-                      setUserRoleFilter(event.target.value as UserRoleFilter);
-                    }}>
-                      <option value="all">{t("allRoles")}</option>
-                      <option value="admin">{t("admin")}</option>
-                      <option value="user">{t("normalUser")}</option>
-                    </select>
-                  </label>
-                  <div className="user-filter-field">
-                    <span>{t("filterRegistrationDate")}</span>
-                    <div className="user-date-range">
-                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateFrom")}`} type="date" value={userRegistrationFrom} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserRegistrationFrom(event.target.value);
-                      }} />
-                      <span aria-hidden="true">–</span>
-                      <input aria-label={`${t("filterRegistrationDate")} ${t("filterDateTo")}`} type="date" value={userRegistrationTo} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserRegistrationTo(event.target.value);
-                      }} />
-                    </div>
-                  </div>
-                  <div className="user-filter-field">
-                    <span>{t("filterLastLoginDate")}</span>
-                    <div className="user-date-range">
-                      <input aria-label={`${t("filterLastLoginDate")} ${t("filterDateFrom")}`} type="date" value={userLastLoginFrom} onChange={(event) => setUserLastLoginFrom(event.target.value)} />
-                      <span aria-hidden="true">–</span>
-                      <input aria-label={`${t("filterLastLoginDate")} ${t("filterDateTo")}`} type="date" value={userLastLoginTo} onChange={(event) => setUserLastLoginTo(event.target.value)} />
-                    </div>
-                  </div>
-                </div>
-                {userFiltersExpanded && (
-                  <div className="user-filter-grid user-filter-grid-advanced">
-                    <label className="user-filter-field">
-                      <span>{t("filterPhone")}</span>
-                      <input value={userPhoneFilter} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserPhoneFilter(event.target.value);
-                      }} />
-                    </label>
-                    <label className="user-filter-field">
-                      <span>{t("filterLoginRegion")}</span>
-                      <select value={userLoginRegionFilter} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserLoginRegionFilter(event.target.value as UserLoginRegionFilter);
-                      }}>
-                        <option value="all">{t("allLoginRegions")}</option>
-                        <option value="domestic">{t("domestic")}</option>
-                        <option value="overseas">{t("overseas")}</option>
-                      </select>
-                    </label>
-                    <label className="user-filter-field">
-                      <span>{t("filterOrganization")}</span>
-                      <select value={userOrganizationFilter} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserOrganizationFilter(event.target.value);
-                      }}>
-                        <option value="">{t("allOrganizations")}</option>
-                        {userOrganizationFilter && !organizationOptions.some((organization) => organization.id === userOrganizationFilter) && (
-                          <option value={userOrganizationFilter}>{userOrganizationFilter}</option>
-                        )}
-                        {organizationOptions.map((organization) => (
-                          <option key={organization.id} value={organization.id}>
-                            {organization.name} · {organization.slug}{organization.is_active ? "" : ` · ${t("disabled")}`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="user-filter-field">
-                      <span>{t("filterLinkedIdentity")}</span>
-                      <select value={userLinkedIdentityFilter} onChange={(event) => {
-                        resetUserDirectoryQueryState();
-                        setUserLinkedIdentityFilter(event.target.value as UserLinkedIdentityFilter);
-                      }}>
-                        <option value="all">{t("allIdentityStates")}</option>
-                        <option value="linked">{t("linkedIdentityOnly")}</option>
-                        <option value="unlinked">{t("unlinkedIdentityOnly")}</option>
-                      </select>
-                    </label>
-                  </div>
-                )}
-                <div className="user-filter-footer">
-                  <button className="text-button" type="button" onClick={resetUserFilters}>{t("resetFilters")}</button>
-                </div>
-              </section>
+                <UserDirectoryFilterPanel
+                  filters={userDirectoryFilters}
+                  expanded={userFiltersExpanded}
+                  organizationOptions={organizationOptions}
+                  t={t}
+                  onToggleExpanded={() => setUserFiltersExpanded((value) => !value)}
+                  onChange={(field, value) => {
+                    resetUserDirectoryQueryState();
+                    switch (field) {
+                      case "userFilter": setUserFilter(value as UserFilter); break;
+                      case "userEmailFilter": setUserEmailFilter(value as string); break;
+                      case "userRoleFilter": setUserRoleFilter(value as UserRoleFilter); break;
+                      case "userRegistrationFrom": setUserRegistrationFrom(value as string); break;
+                      case "userRegistrationTo": setUserRegistrationTo(value as string); break;
+                      case "userLastLoginFrom": setUserLastLoginFrom(value as string); break;
+                      case "userLastLoginTo": setUserLastLoginTo(value as string); break;
+                      case "userPhoneFilter": setUserPhoneFilter(value as string); break;
+                      case "userLoginRegionFilter": setUserLoginRegionFilter(value as UserLoginRegionFilter); break;
+                      case "userOrganizationFilter": setUserOrganizationFilter(value as string); break;
+                      case "userLinkedIdentityFilter": setUserLinkedIdentityFilter(value as UserLinkedIdentityFilter); break;
+                      case "searchQuery": setSearchQuery(value as string); break;
+                    }
+                  }}
+                  onReset={resetUserFilters}
+                />
               {canManageUsers && selectedUserIds.length > 0 && (
                 <div className="bulk-user-actions" aria-live="polite">
                   <strong>{t("selectedUsers").replace("{count}", String(selectedUserIds.length))}</strong>
@@ -3946,7 +2174,7 @@ export function App() {
             loading={adminViewLoading}
             membersLoading={organizationMembersLoading}
             error={error}
-            dirty={organizationFormIsDirty()}
+            dirty={organizationFormDirty}
             locale={locale}
             translate={t}
             editorOpen={editor === "organization"}
@@ -3997,7 +2225,7 @@ export function App() {
                   </SelectField>
                   <Check label={t("active")} checked={applicationForm.is_active} onChange={(value) => setApplicationForm({ ...applicationForm, is_active: value })} />
                   <div className="form-actions">
-                    <span className="form-actions-status" aria-live="polite">{applicationFormIsDirty() ? t("unsavedChanges") : ""}</span>
+                    <span className="form-actions-status" aria-live="polite">{applicationFormDirty ? t("unsavedChanges") : ""}</span>
                     <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{applicationForm.id ? t("save") : t("create")}</button></div>
                   </div>
                 </form>
@@ -4041,7 +2269,7 @@ export function App() {
               isAdmin={Boolean(user?.is_admin)}
               busy={busy}
               error={error}
-              dirty={invitationFormIsDirty()}
+              dirty={invitationFormDirty}
               adminViewLoading={adminViewLoading}
               searchQuery={searchQuery}
               locale={locale}
@@ -4083,7 +2311,7 @@ export function App() {
               onDelete={(id) => requestConfirmation(() => deleteInvitation(id))}
               onReveal={(item) => void revealInvitationCode(item)}
               onOpenRedemptions={invitationRedemptions.open}
-              onCopyLastInvitationCode={copyLastInvitationCode}
+                onCopyLastInvitationCode={() => void copyInvitationCode(lastInvitationCode)}
               onCloseReveal={closeInvitationReveal}
               onCopyRevealedInvitationCode={() => void copyTextToClipboard(
                 revealedInvitationCode,
@@ -4101,7 +2329,7 @@ export function App() {
           <RegistrationSettingsPanel
             value={registrationSettings}
             busy={busy}
-            dirty={registrationSettingsIsDirty()}
+            dirty={registrationSettingsDirty}
             translate={t}
             onChange={setRegistrationSettings}
             onSubmit={saveRegistrationSettings}
@@ -4123,8 +2351,8 @@ export function App() {
               loading: adminViewLoading,
               searchActive: Boolean(searchQuery),
               error,
-              providerDirty: providerFormIsDirty(),
-              ldapDirty: ldapProviderFormIsDirty()
+              providerDirty: providerFormDirty,
+              ldapDirty: ldapProviderFormDirty
             }}
             actions={{
               updateProviderForm: (next) => {
@@ -4206,8 +2434,8 @@ export function App() {
             }}
             i18n={{ t }}
             dirty={{
-              loginSettings: loginSettingsIsDirty(),
-              quickLinkForm: quickLinkFormIsDirty()
+              loginSettings: loginSettingsDirty,
+              quickLinkForm: quickLinkFormDirty
             }}
           />
         )}
@@ -4243,10 +2471,10 @@ export function App() {
             filteredAuditWebhooks={filteredAuditWebhooks}
             filteredAuditEvents={filteredAuditEvents}
             editor={editor}
-            roleDirty={roleFormIsDirty()}
-            groupDirty={groupFormIsDirty()}
-            securityPolicyDirty={securityPolicyIsDirty()}
-            auditWebhookDirty={auditWebhookFormIsDirty()}
+            roleDirty={roleFormDirty}
+            groupDirty={groupFormDirty}
+            securityPolicyDirty={securityPolicyDirty}
+            auditWebhookDirty={auditWebhookFormDirty}
             onStartTotpSetup={startTotpSetup}
             onConfirmTotpSetup={confirmTotpSetup}
             onDisableMfa={() => requestConfirmation(disableMfa, t("disableMfa"), t("disableMfaDescription"))}
@@ -4291,7 +2519,7 @@ export function App() {
             settings={settings}
             runtimeSettings={runtimeSettings}
             busy={busy}
-            dirty={runtimeSettingsIsDirty()}
+            dirty={runtimeSettingsDirty}
             translate={t}
             onRuntimeSettingsChange={setRuntimeSettings}
             onRuntimeSettingsSubmit={saveRuntimeSettings}
@@ -4321,262 +2549,6 @@ export function App() {
           </div>
         </Modal>
       )}
-    </div>
-  );
-}
-
-function TopLanguage({
-  locale,
-  supportedLocales,
-  switchLocale,
-  label,
-  compact = false
-}: {
-  locale: Locale;
-  supportedLocales: string[];
-  switchLocale: (locale: Locale) => void;
-  label: string;
-  compact?: boolean;
-}) {
-  return (
-    <div className={compact ? "language-row compact-language" : "language-row"} role="group" aria-label={label}>
-      <Globe2 size={16} />
-      <span>{label}</span>
-      {supportedLocales.includes("zh-CN") && <button type="button" className={locale === "zh-CN" ? "active" : ""} aria-pressed={locale === "zh-CN"} onClick={() => switchLocale("zh-CN")}>中文</button>}
-      {supportedLocales.includes("en-US") && <button type="button" className={locale === "en-US" ? "active" : ""} aria-pressed={locale === "en-US"} onClick={() => switchLocale("en-US")}>EN</button>}
-    </div>
-  );
-}
-
-function Metric({ label, value, detail }: { label: string; value: string | number; detail: string }) {
-  const text = String(value);
-  const compact = text.length > 12;
-  const schemeBoundary = typeof value === "string" && /^https?:\/\//.test(value)
-    ? value.indexOf("//") + 2
-    : 0;
-  return (
-    <Card as="article" className="metric">
-      <span>{label}</span>
-      <strong className={compact ? "metric-compact" : undefined}>
-        {schemeBoundary ? <>{text.slice(0, schemeBoundary)}<wbr />{text.slice(schemeBoundary)}</> : value}
-      </strong>
-      <p>{detail}</p>
-    </Card>
-  );
-}
-
-function EmailField({
-  label,
-  value,
-  onChange,
-  domains,
-  customDomain,
-  onCustomDomainChange,
-  customLabel,
-  applyLabel,
-  required = true
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  domains: string[];
-  customDomain: string;
-  onCustomDomainChange: (value: string) => void;
-  customLabel: string;
-  applyLabel: string;
-  required?: boolean;
-}) {
-  const customSuffix = usableEmailDomain(customDomain);
-  return (
-    <div className="email-field">
-      <Field label={label} value={value} onChange={onChange} type="email" autoComplete="email" required={required} />
-      {domains.length > 0 && (
-        <div className="domain-pills" role="group" aria-label={label}>
-          {domains.map((domain) => (
-            <button type="button" key={domain} onClick={() => onChange(applyEmailDomain(value, domain))}>
-              @{domain}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="custom-domain">
-        <input aria-label={customLabel} autoComplete="off" value={customDomain} placeholder={customLabel} onChange={(event) => onCustomDomainChange(event.target.value)} />
-        <button type="button" disabled={!customSuffix} onClick={() => onChange(applyEmailDomain(value, customSuffix))}>
-          <AtSign size={14} />
-          {applyLabel}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function QuickJump({ links }: { links: QuickLink[] }) {
-  if (links.length === 0) return null;
-  return (
-    <div className="quick-jump">
-      {links.map((link) => <QuickJumpLink key={`${link.id}:${link.url}`} link={link} />)}
-    </div>
-  );
-}
-
-function QuickJumpLink({ link }: { link: QuickLink }) {
-  const faviconUrl = quickLinkFaviconUrl(link.url);
-  const [faviconState, setFaviconState] = useState<"loading" | "loaded" | "failed">(
-    faviconUrl ? "loading" : "failed"
-  );
-
-  return (
-    <a className="quick-jump-link" href={link.url} target="_blank" rel="noreferrer" title={link.label} aria-label={link.label}>
-      <span className={`quick-jump-icon${faviconState === "loaded" ? " has-favicon" : ""}`} aria-hidden="true">
-        <span className="quick-jump-fallback">{quickLinkInitial(link.label)}</span>
-        {faviconUrl && (
-          <img
-            src={faviconUrl}
-            alt=""
-            referrerPolicy="no-referrer"
-            onLoad={() => setFaviconState("loaded")}
-            onError={() => setFaviconState("failed")}
-          />
-        )}
-      </span>
-    </a>
-  );
-}
-
-function quickLinkFaviconUrl(url: string): string | null {
-  try {
-    const target = new URL(url);
-    return new URL("/favicon.ico", target.origin).toString();
-  } catch {
-    return null;
-  }
-}
-
-function quickLinkInitial(label: string): string {
-  return Array.from(label.trim())[0]?.toLocaleUpperCase() ?? "?";
-}
-
-function InlineCode({
-  icon,
-  label,
-  button,
-  value,
-  onChange,
-  onSend,
-  disabled = false
-}: {
-  icon: React.ReactNode;
-  label: string;
-  button: string;
-  value: string;
-  onChange: (value: string) => void;
-  onSend: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="inline-code">
-      <Field label={label} value={value} onChange={onChange} autoComplete="one-time-code" />
-      <button type="button" onClick={onSend} disabled={disabled}>{icon}{button}</button>
-    </div>
-  );
-}
-
-function UserDetailPanel({
-  detail,
-  locale,
-  t
-}: {
-  detail: UserDetail;
-  locale: Locale;
-  t: (key: TranslationKey) => string;
-}) {
-  return (
-    <section className="detail-panel modal-detail-panel">
-      <div className="detail-grid">
-        <Info label={t("email")} value={`${detail.user.email} · ${detail.user.email_verified_at ? t("verified") : t("unverified")}`} />
-        <Info label={t("phone")} value={`${detail.user.phone ?? "-"} · ${detail.user.phone_verified_at ? t("verified") : t("unverified")}`} />
-        <Info label={t("status")} value={detail.user.archived_at !== null ? t("archived") : detail.user.is_active ? t("active") : t("disabled")} />
-        <Info
-          label={t("registrationSource")}
-          value={detail.user.registration_source === "authorization_code" ? t("authorizationCodeRegistered") : t("localRegistration")}
-        />
-        <Info label={t("archivedAt")} value={formatTime(detail.user.archived_at, locale)} />
-        <Info label={t("registeredAt")} value={formatTime(detail.user.created_at, locale)} />
-        <Info label={t("lastLogin")} value={formatTime(detail.user.last_login_at, locale)} />
-        <Info label={t("lastIp")} value={detail.user.last_login_ip ?? "-"} />
-        <Info label={t("lastClient")} value={detail.user.last_oidc_client_id ?? "-"} />
-        <Info label={t("loginMethod")} value={detail.user.last_login_method ?? "-"} />
-      </div>
-      {detail.user.archived_at !== null && <p className="muted">{t("archivedReadOnly")}</p>}
-      <h4>{t("organizations")}</h4>
-      {detail.organizations.length === 0 ? <p className="muted">{t("noData")}</p> : detail.organizations.map((organization) => (
-        <div className="event-row" key={organization.id}>
-          <strong>{organization.name}</strong>
-          <span>{organization.slug} · {organization.role} · {organization.is_active ? t("active") : t("disabled")}</span>
-        </div>
-      ))}
-      <h4>{t("linkedIdentities")}</h4>
-      {detail.linked_identities.length === 0 ? <p className="muted">{t("noData")}</p> : detail.linked_identities.map((item) => (
-        <div className="event-row" key={item.id}>
-          <strong>{item.provider_slug}</strong>
-          <span>{item.external_email ?? item.external_subject}</span>
-        </div>
-      ))}
-      <h4>{t("loginEvents")}</h4>
-      {detail.login_events.length === 0 ? <p className="muted">{t("noData")}</p> : (
-        <ol className="login-event-list">
-          {detail.login_events.map((event) => {
-            const clientOrProvider = event.oidc_client_id ?? event.external_provider;
-            const clientOrProviderLabel = event.oidc_client_id
-              ? t("lastClient")
-              : t("linkedIdentities");
-            return (
-              <li className="login-event" key={event.id}>
-                <span className="login-event-marker" aria-hidden="true"><Activity size={16} /></span>
-                <div className="login-event-content">
-                  <div className="login-event-heading">
-                    <div className="login-event-method">
-                      <KeyRound size={16} aria-hidden="true" />
-                      <strong>{event.method || "-"}</strong>
-                    </div>
-                    <time dateTime={new Date(event.login_at * 1000).toISOString()}>
-                      <Clock3 size={15} aria-hidden="true" />
-                      <span>{formatTime(event.login_at, locale)}</span>
-                    </time>
-                  </div>
-                  <dl className="login-event-meta">
-                    <div>
-                      <dt><Globe2 size={14} aria-hidden="true" />{t("lastIp")}</dt>
-                      <dd>{event.ip_address ?? "-"}</dd>
-                    </div>
-                    {clientOrProvider && (
-                      <div>
-                        <dt><Link2 size={14} aria-hidden="true" />{clientOrProviderLabel}</dt>
-                        <dd>{clientOrProvider}</dd>
-                      </div>
-                    )}
-                    {event.user_agent && (
-                      <div className="login-event-device" title={event.user_agent}>
-                        <dt><Monitor size={14} aria-hidden="true" />{t("userAgent")}</dt>
-                        <dd>{event.user_agent}</dd>
-                      </div>
-                    )}
-                  </dl>
-                </div>
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </section>
-  );
-}
-
-function Info({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="info-cell">
-      <span>{label}</span>
-      <strong>{value}</strong>
     </div>
   );
 }

@@ -1,7 +1,7 @@
 use super::{
     AppError, AppResult, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
     NewClientClaimMapper, SessionMetadata, SessionRecord, bind_text_list, blocking, ph,
-    select_client_claim_mapper_sql,
+    placeholders, select_client_claim_mapper_sql,
 };
 use crate::util;
 use diesel::{
@@ -324,10 +324,7 @@ impl Db {
             let sql = format!(
                 "{} WHERE client_db_id IN ({}) ORDER BY client_db_id ASC, sort_order ASC, created_at ASC",
                 select_client_claim_mapper_sql(),
-                (1..=client_db_ids.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders(kind, 1, client_db_ids.len())
             );
             let rows = bind_text_list(&mut conn, sql_query(sql), &client_db_ids)
                 .load::<ClientClaimMapperRecord>(&mut conn)

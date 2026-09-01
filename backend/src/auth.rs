@@ -26,6 +26,13 @@ pub async fn current_user_from_cookie(
     let Some(session) = session_from_cookie(state, jar).await? else {
         return Ok(None);
     };
+    current_user_from_session(state, &session).await
+}
+
+pub async fn current_user_from_session(
+    state: &AppState,
+    session: &crate::db::SessionRecord,
+) -> AppResult<Option<CurrentUser>> {
     let Some(user) = state.db.find_user_by_id(&session.user_id).await? else {
         return Ok(None);
     };
@@ -52,7 +59,7 @@ pub async fn current_user_from_cookie(
     };
     Ok(Some(CurrentUser {
         user,
-        session_id: session.id,
+        session_id: session.id.clone(),
         session_kind,
     }))
 }

@@ -524,6 +524,13 @@ pub async fn enabled_module_config(
     let Some(module) = application_module(state, application_id, module_key).await? else {
         return Ok(None);
     };
+    validated_enabled_module_config(module_key, &module)
+}
+
+fn validated_enabled_module_config(
+    module_key: &str,
+    module: &ApplicationModuleRecord,
+) -> AppResult<Option<Map<String, Value>>> {
     if module.is_enabled != 1 {
         return Ok(None);
     }
@@ -557,6 +564,22 @@ pub struct ApplicationRuntimeSnapshot {
 }
 
 impl ApplicationRuntimeSnapshot {
+    pub async fn load_interactive(
+        state: &AppState,
+        client: &ClientRecord,
+        protocol: &str,
+    ) -> AppResult<Self> {
+        let runtime = Self::load(state, client, Some(protocol)).await?;
+        runtime.require_interactive()?;
+        Ok(runtime)
+    }
+
+    pub async fn load_service(state: &AppState, client: &ClientRecord) -> AppResult<Self> {
+        let runtime = Self::load(state, client, None).await?;
+        runtime.require_service()?;
+        Ok(runtime)
+    }
+
     pub async fn load(
         state: &AppState,
         client: &ClientRecord,
@@ -653,6 +676,13 @@ pub async fn ensure_application_runtime_active(
     if organization.is_active != 1 {
         return Err(AppError::Forbidden);
     }
+    ensure_discovery_runtime_active(state, application).await
+}
+
+async fn ensure_discovery_runtime_active(
+    state: &AppState,
+    application: &ApplicationRecord,
+) -> AppResult<()> {
     if let Some(discovery) = state.db.find_application_discovery(&application.id).await?
         && !crate::application_discovery::website_discovery_runtime_active(
             &discovery.management_mode,
@@ -666,6 +696,32 @@ pub async fn ensure_application_runtime_active(
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+pub async fn load_active_application(
+    state: &AppState,
+    application_id: &str,
+) -> AppResult<ApplicationRecord> {
+    let application = state
+        .db
+        .find_application_by_id(application_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_application_runtime_active(state, &application).await?;
+    Ok(application)
+}
+
+pub async fn load_active_application_for_client(
+    state: &AppState,
+    client_db_id: &str,
+) -> AppResult<ApplicationRecord> {
+    let application = state
+        .db
+        .find_application_for_client(client_db_id)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+    ensure_application_runtime_active(state, &application).await?;
+    Ok(application)
 }
 
 /// Returns the validated protocol-specific configuration for an application.
@@ -687,6 +743,25 @@ pub async fn enabled_protocol_config(
         return Ok(None);
     }
     Ok(Some(protocol_config.clone()))
+}
+
+pub async fn load_active_application_protocol_config(
+    state: &AppState,
+    application_slug: &str,
+    protocol: &str,
+) -> AppResult<(ApplicationRecord, Map<String, Value>)> {
+    let application = state
+        .db
+        .find_active_application_by_slug_with_module(application_slug, "protocols")
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let (application, module) = application;
+    ensure_discovery_runtime_active(state, &application).await?;
+    let config = validated_enabled_module_config("protocols", &module.ok_or(AppError::NotFound)?)?
+        .and_then(|config| config.get(protocol).and_then(Value::as_object).cloned())
+        .filter(|config| config.get("enabled").and_then(Value::as_bool) == Some(true))
+        .ok_or(AppError::NotFound)?;
+    Ok((application, config))
 }
 
 /// Validates database-backed references before a generic application module
@@ -1139,8 +1214,7 @@ pub async fn authorize_application_client(
     client: &ClientRecord,
     protocol: &str,
 ) -> AppResult<ApplicationRecord> {
-    let runtime = ApplicationRuntimeSnapshot::load(state, client, Some(protocol)).await?;
-    runtime.require_interactive()?;
+    let runtime = ApplicationRuntimeSnapshot::load_interactive(state, client, protocol).await?;
     Ok(runtime.application)
 }
 
@@ -1152,8 +1226,7 @@ pub async fn authorize_client_for_service_token(
     state: &AppState,
     client: &ClientRecord,
 ) -> AppResult<ApplicationRecord> {
-    let runtime = ApplicationRuntimeSnapshot::load(state, client, None).await?;
-    runtime.require_service()?;
+    let runtime = ApplicationRuntimeSnapshot::load_service(state, client).await?;
     if client.service_account_enabled != 1
         || !client
             .grant_types()
@@ -1840,9 +1913,31 @@ mod tests {
             .insert_client_for_application(&application.id, client_input.clone())
             .await
             .unwrap();
+        state
+            .db
+            .upsert_application_module(
+                &application.id,
+                "protocols",
+                &serde_json::json!({
+                    "oauth2_oidc": { "enabled": true },
+                    "jwt": { "enabled": true, "redirect_uris": [] }
+                })
+                .to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (_, jwt_config) =
+            load_active_application_protocol_config(&state, &application.slug, "jwt")
+                .await
+                .unwrap();
+        assert_eq!(
+            jwt_config.get("enabled").and_then(Value::as_bool),
+            Some(true)
+        );
 
         assert!(
-            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+            ApplicationRuntimeSnapshot::load_interactive(&state, &client, "oauth2_oidc")
                 .await
                 .is_ok()
         );
@@ -1866,7 +1961,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+            ApplicationRuntimeSnapshot::load_interactive(&state, &client, "oauth2_oidc")
                 .await
                 .is_err()
         );
@@ -1892,7 +1987,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+            ApplicationRuntimeSnapshot::load_interactive(&state, &client, "oauth2_oidc")
                 .await
                 .is_err()
         );
@@ -1927,7 +2022,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+            ApplicationRuntimeSnapshot::load_interactive(&state, &client, "oauth2_oidc")
                 .await
                 .is_err()
         );
@@ -1970,7 +2065,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ApplicationRuntimeSnapshot::load(&state, &client, Some("oauth2_oidc"))
+            ApplicationRuntimeSnapshot::load_interactive(&state, &client, "oauth2_oidc")
                 .await
                 .is_err()
         );

@@ -35,25 +35,26 @@ function emailDomain(value: string): string {
   return usableEmailDomain(domain);
 }
 
-function domainMatchesRule(domain: string, rule: string): boolean {
-  const normalizedRule = usableEmailDomain(rule);
-  return Boolean(normalizedRule && (domain === normalizedRule || domain.endsWith(`.${normalizedRule}`)));
-}
-
 export function findProviderForEmail(providers: ExternalProviderSummary[], email: string): ExternalProviderSummary | null {
   const domain = emailDomain(email);
   if (!domain) return null;
-  let matched: { provider: ExternalProviderSummary; rule: string } | null = null;
+
+  const providersByDomain = new Map<string, ExternalProviderSummary>();
   for (const provider of providers) {
     for (const rule of provider.email_domains) {
       const normalizedRule = usableEmailDomain(rule);
-      if (!normalizedRule || !domainMatchesRule(domain, normalizedRule)) continue;
-      if (!matched || normalizedRule.length > matched.rule.length) {
-        matched = { provider, rule: normalizedRule };
+      if (normalizedRule && !providersByDomain.has(normalizedRule)) {
+        providersByDomain.set(normalizedRule, provider);
       }
     }
   }
-  return matched?.provider ?? null;
+
+  const labels = domain.split(".");
+  for (let index = 0; index < labels.length; index += 1) {
+    const provider = providersByDomain.get(labels.slice(index).join("."));
+    if (provider) return provider;
+  }
+  return null;
 }
 
 export function applyEmailDomain(email: string, domain: string): string {

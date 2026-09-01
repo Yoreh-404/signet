@@ -3,7 +3,7 @@ use super::{
     GroupPatchPlan, GroupRecord, GroupRoleJoinRow, NewGroup, NewRole, PermissionRow, PublicUser,
     RoleIdRow, RolePermissionJoinRow, RoleRecord, ScimGroupMemberRecord, UserRecord,
     bind_text_list, blocking, dedupe_nonempty, normalize_application_entitlement_keys,
-    optimistic_concurrency_conflict, ph, select_group_sql,
+    optimistic_concurrency_conflict, ph, placeholder_rows, placeholders, select_group_sql,
 };
 use crate::{
     config::DatabaseKind,
@@ -359,10 +359,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT role_id, permission FROM role_permissions WHERE role_id IN ({}) ORDER BY role_id ASC, permission ASC",
-                (1..=role_ids.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders(kind, 1, role_ids.len())
             );
             let rows = bind_text_list(&mut conn, sql_query(sql), &role_ids)
                 .load::<RolePermissionJoinRow>(&mut conn)
@@ -893,10 +890,7 @@ impl Db {
                 let valid_members = if user_ids.is_empty() {
                     Vec::new()
                 } else {
-                    let user_placeholders = (1..=user_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let user_placeholders = placeholders(kind, 1, user_ids.len());
                     let sql = if application_id.is_some() {
                         let application_param = ph(kind, user_ids.len() + 1);
                         format!(
@@ -980,10 +974,7 @@ impl Db {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !removed.is_empty() {
-                    let placeholders = (2..=removed.len() + 1)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 2, removed.len());
                     let sql = format!(
                         "DELETE FROM group_members WHERE group_id = {} AND user_id IN ({placeholders})",
                         ph(kind, 1)
@@ -995,16 +986,10 @@ impl Db {
                         .map_err(AppError::from)?;
                 }
                 if !added.is_empty() {
-                    let placeholders = (1..=added.len() * 2)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>();
+                    let placeholders = placeholder_rows(kind, 1, added.len(), 2);
                     let sql = format!(
                         "INSERT INTO group_members (group_id, user_id) VALUES {}",
                         placeholders
-                            .chunks(2)
-                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
-                            .collect::<Vec<_>>()
-                            .join(", ")
                     );
                     let mut values = Vec::with_capacity(added.len() * 2);
                     for user_id in added.iter().cloned() {
@@ -1190,10 +1175,7 @@ impl Db {
                 let valid = if role_ids.is_empty() {
                     BTreeSet::new()
                 } else {
-                    let placeholders = (1..=role_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, role_ids.len());
                     let sql = format!("SELECT id FROM roles WHERE id IN ({placeholders})");
                     bind_text_list(conn, sql_query(sql), &role_ids)
                         .load::<RoleIdRow>(conn)
@@ -1223,10 +1205,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (2..=chunk.len() + 1)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 2, chunk.len());
                     let sql = format!(
                         "DELETE FROM user_roles WHERE user_id = {} AND role_id IN ({placeholders})",
                         ph(kind, 1)
@@ -1242,16 +1221,10 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len() * 2)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>();
+                    let placeholders = placeholder_rows(kind, 1, chunk.len(), 2);
                     let sql = format!(
                         "INSERT INTO user_roles (user_id, role_id) VALUES {}",
                         placeholders
-                            .chunks(2)
-                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
-                            .collect::<Vec<_>>()
-                            .join(", ")
                     );
                     let mut values = Vec::with_capacity(chunk.len() * 2);
                     for role_id in chunk {
@@ -1294,10 +1267,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT group_roles.group_id, roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN group_roles ON roles.id = group_roles.role_id WHERE group_roles.group_id IN ({}) ORDER BY group_roles.group_id ASC, roles.name ASC, roles.id ASC",
-                (1..=group_ids.len())
-                    .map(|index| ph(kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders(kind, 1, group_ids.len())
             );
             let rows = bind_text_list(&mut conn, sql_query(sql), &group_ids)
                 .load::<GroupRoleJoinRow>(&mut conn)
@@ -1367,10 +1337,7 @@ impl Db {
                 let valid = if role_ids.is_empty() {
                     BTreeSet::new()
                 } else {
-                    let placeholders = (1..=role_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, role_ids.len());
                     let sql = format!("SELECT id FROM roles WHERE id IN ({placeholders})");
                     bind_text_list(conn, sql_query(sql), &role_ids)
                         .load::<RoleIdRow>(conn)
@@ -1403,10 +1370,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (2..=chunk.len() + 1)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 2, chunk.len());
                     let sql = format!(
                         "DELETE FROM group_roles WHERE group_id = {} AND role_id IN ({placeholders})",
                         ph(kind, 1)
@@ -1425,16 +1389,10 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len() * 2)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>();
+                    let placeholders = placeholder_rows(kind, 1, chunk.len(), 2);
                     let sql = format!(
                         "INSERT INTO group_roles (group_id, role_id) VALUES {}",
                         placeholders
-                            .chunks(2)
-                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
-                            .collect::<Vec<_>>()
-                            .join(", ")
                     );
                     let mut values = Vec::with_capacity(chunk.len() * 2);
                     for role_id in chunk {
@@ -1544,10 +1502,7 @@ impl Db {
                 }
 
                 if !user_ids.is_empty() {
-                    let placeholders = (1..=user_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, user_ids.len());
                     let sql = format!(
                         "SELECT id AS user_id, archived_at FROM users WHERE id IN ({placeholders})"
                     );
@@ -1572,10 +1527,7 @@ impl Db {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !removed.is_empty() {
-                    let placeholders = (2..=removed.len() + 1)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 2, removed.len());
                     let sql = format!(
                         "DELETE FROM group_members WHERE group_id = {} AND user_id IN ({placeholders})",
                         ph(kind, 1)
@@ -1592,16 +1544,10 @@ impl Db {
                     .cloned()
                     .collect::<Vec<_>>();
                 if !added.is_empty() {
-                    let placeholders = (1..=added.len() * 2)
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>();
+                    let placeholders = placeholder_rows(kind, 1, added.len(), 2);
                     let sql = format!(
                         "INSERT INTO group_members (group_id, user_id) VALUES {}",
                         placeholders
-                            .chunks(2)
-                            .map(|pair| format!("({}, {})", pair[0], pair[1]))
-                            .collect::<Vec<_>>()
-                            .join(", ")
                     );
                     let mut values = Vec::with_capacity(added.len() * 2);
                     for user_id in added.iter().cloned() {

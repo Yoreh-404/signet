@@ -6,7 +6,7 @@ use super::{
     UserRegistrationSource, UserUpdate, VerificationCodeClaim, VerificationCodeDecision,
     VerificationCodeRecord, VerificationCodeVerifier, bind_text_list, blocking,
     count_all_users_sql, count_user_identity_conflicts_sql, ensure_first_user_registration_state,
-    insert_user_sql, ph, select_organization_sql, select_user_sql,
+    insert_user_sql, ph, placeholders, select_organization_sql, select_user_sql,
 };
 use crate::{organizations::OrganizationEmailPolicy, util};
 use diesel::{
@@ -87,10 +87,7 @@ impl Db {
                     BTreeMap::new()
                 } else {
                     let organization_ids = organization_ids.into_iter().collect::<Vec<_>>();
-                    let placeholders = (1..=organization_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, organization_ids.len());
                     let organization_sql = format!(
                         "{} WHERE id IN ({placeholders})",
                         select_organization_sql()

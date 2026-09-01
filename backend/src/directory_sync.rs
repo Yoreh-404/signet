@@ -293,12 +293,7 @@ pub async fn run_application_ldap_sync_with_provider<P: DirectorySyncProvider>(
     provider_id: &str,
     connector: &P,
 ) -> AppResult<DirectorySyncRunRecord> {
-    let application = state
-        .db
-        .find_application_by_id(application_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    applications::ensure_application_runtime_active(state, &application).await?;
+    let application = applications::load_active_application(state, application_id).await?;
     let module = applications::enabled_module_config(state, application_id, "directory_sync")
         .await?
         .ok_or_else(|| AppError::BadRequest("enable directory sync first".to_string()))?;

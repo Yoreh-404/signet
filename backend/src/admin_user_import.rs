@@ -17,7 +17,7 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub(super) const BULK_IMPORT_MAX_BYTES: usize = 1_048_576;
 pub(super) const BULK_IMPORT_MAX_ROWS: usize = 1_000;
@@ -433,8 +433,8 @@ pub(super) fn parse_bulk_import_csv(csv_document: &str) -> Result<ParsedBulkImpo
 
 pub(super) fn bulk_import_header_positions(
     headers: &csv::StringRecord,
-) -> Result<BTreeMap<String, usize>, String> {
-    let mut positions = BTreeMap::new();
+) -> Result<HashMap<String, usize>, String> {
+    let mut positions = HashMap::with_capacity(headers.len());
     for (index, value) in headers.iter().enumerate() {
         let value = if index == 0 {
             value.strip_prefix('\u{feff}').unwrap_or(value)
@@ -462,7 +462,7 @@ pub(super) fn bulk_import_header_positions(
 
 fn bulk_import_csv_value<'a>(
     record: &'a csv::StringRecord,
-    header_positions: &BTreeMap<String, usize>,
+    header_positions: &HashMap<String, usize>,
     field: &str,
 ) -> &'a str {
     record
@@ -498,9 +498,9 @@ pub(super) fn mark_bulk_import_row_invalid(
 }
 
 pub(super) fn validate_bulk_import_duplicates(batch: &mut ParsedBulkImport) {
-    let mut email_rows = BTreeMap::<String, usize>::new();
-    let mut username_rows = BTreeMap::<String, usize>::new();
-    for candidate in batch.candidates.clone() {
+    let mut email_rows = HashMap::<String, usize>::with_capacity(batch.candidates.len());
+    let mut username_rows = HashMap::<String, usize>::with_capacity(batch.candidates.len());
+    for candidate in &batch.candidates {
         if let Some(first_index) =
             email_rows.insert(candidate.email.clone(), candidate.result_index)
             && first_index != candidate.result_index
@@ -592,34 +592,38 @@ async fn validate_bulk_import_organizations(
         .await?
         .into_iter()
         .map(|organization| (organization.slug.clone(), organization))
-        .collect::<BTreeMap<_, _>>();
-    for (candidate_index, candidate) in batch.candidates.clone().into_iter().enumerate() {
-        if batch.rows[candidate.result_index].outcome == "invalid" {
+        .collect::<HashMap<_, _>>();
+    for candidate_index in 0..batch.candidates.len() {
+        let (result_index, organization_slug, email) = {
+            let candidate = &batch.candidates[candidate_index];
+            (
+                candidate.result_index,
+                candidate.organization_slug.clone(),
+                candidate.email.clone(),
+            )
+        };
+        if batch.rows[result_index].outcome == "invalid" {
             continue;
         }
-        let Some(slug) = candidate.organization_slug.as_deref() else {
+        let Some(slug) = organization_slug.as_deref() else {
             continue;
         };
         let Some(organization) = organizations_by_slug.get(slug) else {
             mark_bulk_import_row_invalid(
                 &mut batch.rows,
-                candidate.result_index,
+                result_index,
                 "organization_slug does not reference an existing organization",
             );
             continue;
         };
         if organization.is_active != 1 {
-            mark_bulk_import_row_invalid(
-                &mut batch.rows,
-                candidate.result_index,
-                "organization is inactive",
-            );
+            mark_bulk_import_row_invalid(&mut batch.rows, result_index, "organization is inactive");
             continue;
         }
-        if !organization.allows_email(&candidate.email)? {
+        if !organization.allows_email(&email)? {
             mark_bulk_import_row_invalid(
                 &mut batch.rows,
-                candidate.result_index,
+                result_index,
                 "email is not allowed by the organization policy",
             );
             continue;

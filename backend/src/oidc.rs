@@ -3,27 +3,22 @@ use crate::{
     assurance::{self, AssurancePolicy, SessionAuthenticationAssurance},
     audit::{self, AuditOutcome, AuditSink},
     auth::{self, AccountCapabilities},
-    auth_domain::ApplicationAuthContext,
     auth_flow, authorization_details,
     client_policy::{
         AuthorizationRequestSecurityView, AuthorizationRequestSource, ClientSecurityPolicy,
         DefaultClientSecurityPolicy,
     },
-    consent::{self, OidcConsentPolicy},
-    db::{
-        ApplicationRecord, ClientRecord, NewApplicationAuthContext, NewAuthorizationCode,
-        SessionRecord, UserRecord,
-    },
-    directory, dpop,
+    consent,
+    db::{ApplicationRecord, ClientRecord, NewAuthorizationCode, SessionRecord, UserRecord},
+    directory,
     error::{AppError, AppResult},
     html::escape as html_escape,
     mfa,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
-    oauth_targets::{self, AudienceValidationError, ResourceValidationError},
     oidc_authorization::AuthorizationSnapshot,
-    oidc_claims::RequestedClaims,
     oidc_client_auth::ClientAuthFields,
+    pkce::is_valid_code_challenge,
     redirects, security_policy,
     util::{self, url_decode, url_encode},
 };
@@ -32,13 +27,15 @@ use axum::Json;
 use axum::{
     Form, Router,
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 #[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[path = "oidc_authorization_flow.rs"]
+mod oidc_authorization_flow;
 #[path = "oidc_browser_interaction.rs"]
 mod oidc_browser_interaction;
 #[path = "oidc_metadata.rs"]
@@ -51,11 +48,27 @@ mod oidc_resource;
 mod oidc_token;
 #[path = "oidc_token_liveness.rs"]
 mod oidc_token_liveness;
+#[path = "oidc_user.rs"]
+mod oidc_user;
+#[path = "oidc_values.rs"]
+mod oidc_values;
+use oidc_authorization_flow::{
+    AuthorizationHttpContext, AuthorizationSessionFreshness, authorization_mfa_decision,
+    find_or_create_application_auth_context, requires_authorization_consent,
+};
 #[cfg(test)]
 use oidc_browser_interaction::prompt_without_login;
+#[cfg(test)]
 use oidc_browser_interaction::{
-    account_selection_prompted_request, reauthentication_request, return_to_request,
+    AuthorizationInteractionRequestStore, account_selection_prompted_request,
 };
+use oidc_browser_interaction::{
+    authorize_return_to_for_account_selection, authorize_return_to_for_interaction, consent_page,
+    prompt_without_select_account, reauthentication_request,
+};
+use oidc_user::{load_active_user, load_oidc_user};
+pub(crate) use oidc_values::normalize_resource;
+use oidc_values::{merge_token_resource, resolve_client_credentials_audience};
 use serde::Deserialize;
 use std::{collections::HashSet, net::SocketAddr};
 use time::Duration;
@@ -67,12 +80,17 @@ use crate::{
     db::{LoginCodeLevel, RefreshTokenInput},
     dpop::DpopBinding,
     jwt::TokenSubject,
+    oidc_claims::RequestedClaims,
     oidc_client_auth::ClientAuthForm,
     subject,
 };
 use oidc_metadata::{discovery, jwks};
 pub(crate) use oidc_request::ResolvedAuthorizeRequest;
-use oidc_request::{AuthorizeRequest, ConsentForm, PromptBehavior};
+use oidc_request::{
+    AuthorizeRequest, ConsentForm, PromptBehavior, optional_form_value, prompt_behavior,
+    required_query_value,
+};
+pub(crate) use oidc_request::{normalize_acr_values_param, parse_max_age, validate_max_age};
 use oidc_resource::{introspect, revoke, userinfo};
 use oidc_token::token;
 #[cfg(test)]
@@ -161,35 +179,6 @@ pub fn routes() -> Router<AppState> {
         .route("/login", get(login_page).post(login_form))
 }
 
-struct AuthorizationHttpContext<'a> {
-    state: &'a AppState,
-    headers: &'a HeaderMap,
-    remote_addr: Option<SocketAddr>,
-}
-
-trait AuthorizationSessionFreshness {
-    fn needs_reauthentication(
-        &self,
-        prompt: PromptBehavior,
-        max_age: Option<i64>,
-        now: i64,
-    ) -> bool;
-}
-
-impl AuthorizationSessionFreshness for SessionRecord {
-    fn needs_reauthentication(
-        &self,
-        prompt: PromptBehavior,
-        max_age: Option<i64>,
-        now: i64,
-    ) -> bool {
-        prompt.force_login
-            || max_age.is_some_and(|max_age| {
-                max_age == 0 || now.saturating_sub(self.created_at) > max_age
-            })
-    }
-}
-
 async fn resolve_authorize_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -228,24 +217,6 @@ impl AuthorizationRequestSecurityView for ResolvedAuthorizeRequest {
 
     fn code_challenge_method(&self) -> Option<&str> {
         self.code_challenge_method.as_deref()
-    }
-}
-
-trait AuthorizationInteractionRequestStore {
-    async fn store_interaction_request(
-        &self,
-        client_id: &str,
-        request: &ResolvedAuthorizeRequest,
-    ) -> AppResult<String>;
-}
-
-impl AuthorizationInteractionRequestStore for AppState {
-    async fn store_interaction_request(
-        &self,
-        client_id: &str,
-        request: &ResolvedAuthorizeRequest,
-    ) -> AppResult<String> {
-        crate::par::store_interaction_authorization_request(self, client_id, request).await
     }
 }
 
@@ -870,52 +841,6 @@ async fn authorize_consent(
     }
 }
 
-async fn requires_authorization_consent(
-    state: &AppState,
-    user: &UserRecord,
-    client: &ClientRecord,
-    requested_scopes: &[String],
-) -> AppResult<bool> {
-    let existing = state
-        .db
-        .find_client_grant(&user.id, &client.client_id)
-        .await?;
-    Ok(OidcConsentPolicy::new(state.settings.oidc.skip_consent)
-        .requires_prompt(existing.as_ref(), requested_scopes))
-}
-
-async fn authorization_mfa_decision(
-    context: &AuthorizationHttpContext<'_>,
-    current: &auth::CurrentUser,
-    client: &ClientRecord,
-    session: &SessionRecord,
-    request: &ResolvedAuthorizeRequest,
-) -> AppResult<MfaDecision> {
-    let user_has_totp = context
-        .state
-        .db
-        .find_totp_method(&current.user.id)
-        .await?
-        .is_some();
-    let policy = context.state.db.security_policy().await?;
-    let requested_assurance = request.requested_assurance()?;
-    let policy_requires_mfa = policy.requires_mfa_for_ip(
-        context
-            .state
-            .request_ip(context.headers, context.remote_addr)
-            .await?
-            .as_deref(),
-    )? || assurance::DefaultAssurancePolicy
-        .requires_mfa(&requested_assurance);
-    auth_flow::oidc_authorization_mfa_decision(
-        &policy,
-        client,
-        session,
-        user_has_totp,
-        policy_requires_mfa,
-    )
-}
-
 async fn enforce_authorization_mfa(
     context: &AuthorizationHttpContext<'_>,
     current: &auth::CurrentUser,
@@ -1006,55 +931,16 @@ async fn issue_authorization_code_redirect(
         assurance::DefaultAssurancePolicy.select_acr(&session_assurance, &requested_assurance)?;
     assurance::DefaultAssurancePolicy.assert_amr(&session_assurance, &requested_assurance)?;
     let now = util::now_ts();
-    let auth_context_id = if let Some(existing) = context
-        .state
-        .db
-        .find_application_auth_context(&client_binding.auth_domain_id, &user.id)
-        .await?
-    {
-        let existing_context = ApplicationAuthContext {
-            id: existing.id.clone(),
-            auth_domain_id: existing.auth_domain_id,
-            user_id: existing.user_id,
-            acr: existing.acr,
-            amr: util::from_json(&existing.amr)?,
-            authenticated_at: existing.authenticated_at,
-            expires_at: existing.expires_at,
-        };
-        if existing_context.can_satisfy(Some(&acr), now) {
-            existing_context.id
-        } else {
-            context
-                .state
-                .db
-                .insert_application_auth_context(NewApplicationAuthContext {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    auth_domain_id: client_binding.auth_domain_id.clone(),
-                    user_id: user.id.clone(),
-                    acr: acr.clone(),
-                    amr: session_assurance.amr.clone(),
-                    authenticated_at: session.created_at,
-                    expires_at: now + 3600,
-                })
-                .await?
-                .id
-        }
-    } else {
-        context
-            .state
-            .db
-            .insert_application_auth_context(NewApplicationAuthContext {
-                id: uuid::Uuid::new_v4().to_string(),
-                auth_domain_id: client_binding.auth_domain_id.clone(),
-                user_id: user.id.clone(),
-                acr: acr.clone(),
-                amr: session_assurance.amr.clone(),
-                authenticated_at: session.created_at,
-                expires_at: now + 3600,
-            })
-            .await?
-            .id
-    };
+    let auth_context_id = find_or_create_application_auth_context(
+        context.state,
+        &client_binding.auth_domain_id,
+        &user.id,
+        &acr,
+        &session_assurance.amr,
+        session.created_at,
+        now,
+    )
+    .await?;
     let authorization_details = authorization_details::normalize_authorization_details_for_client(
         client,
         request.authorization_details.as_deref(),
@@ -1100,128 +986,6 @@ async fn issue_authorization_code_redirect(
         .await?;
     let issuer = context.state.effective_issuer(context.headers).await?;
     crate::jarm::authorization_success_response(context.state, &issuer, client, &request, &code)
-}
-
-async fn consent_page(
-    state: &AppState,
-    jar: &CookieJar,
-    request: &ResolvedAuthorizeRequest,
-    client: &ClientRecord,
-    user: &UserRecord,
-    can_remember_authorization: bool,
-    requested_scopes: &[String],
-) -> AppResult<Html<String>> {
-    let csrf_token = html_escape(&crate::csrf::token_for_current_session(state, jar).await?);
-    let client_name = html_escape(&client.client_name);
-    let client_id = html_escape(&client.client_id);
-    let email = html_escape(&user.email);
-    let scope_value = html_escape(&consent::canonical_scopes(requested_scopes));
-    let resource = html_escape(request.resource.as_deref().unwrap_or_default());
-    let authorization_details_value = request.authorization_details.as_deref().unwrap_or_default();
-    let authorization_details = html_escape(authorization_details_value);
-    let login_hint = html_escape(request.login_hint.as_deref().unwrap_or_default());
-    let authorization_details_preview = if authorization_details_value.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<p>Structured authorization details:</p><pre>{}</pre>",
-            html_escape(authorization_details_value)
-        )
-    };
-    let scope_items = requested_scopes
-        .iter()
-        .map(|scope| format!("<li>{}</li>", html_escape(scope)))
-        .collect::<String>();
-    let response_type = html_escape(&request.response_type);
-    let redirect_uri = html_escape(&request.redirect_uri);
-    let prompt = html_escape(request.prompt.as_deref().unwrap_or_default());
-    let max_age_value = request.max_age.map(|value| value.to_string());
-    let max_age = html_escape(max_age_value.as_deref().unwrap_or_default());
-    let acr_values = html_escape(request.acr_values.as_deref().unwrap_or_default());
-    let claims_value = request
-        .claims
-        .as_ref()
-        .map(RequestedClaims::to_authorization_parameter)
-        .transpose()
-        .unwrap_or_default()
-        .unwrap_or_default();
-    let claims = html_escape(&claims_value);
-    let state_value = html_escape(request.state.as_deref().unwrap_or_default());
-    let nonce = html_escape(request.nonce.as_deref().unwrap_or_default());
-    let code_challenge = html_escape(request.code_challenge.as_deref().unwrap_or_default());
-    let code_challenge_method =
-        html_escape(request.code_challenge_method.as_deref().unwrap_or_default());
-    let response_mode = html_escape(request.response_mode.as_deref().unwrap_or_default());
-    let interaction_request = consent_interaction_request(state, request).await?;
-    let interaction_request = html_escape(&interaction_request);
-    let remember_control = if can_remember_authorization {
-        r#"<label><input type="checkbox" name="remember" value="1" checked /> Remember this authorization</label>"#
-    } else {
-        "<p>This restricted authorization-code session cannot remember authorization.</p>"
-    };
-    Ok(Html(format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Authorize {client_name}</title>
-  <style>
-    body {{ font-family: Inter, ui-sans-serif, system-ui, sans-serif; margin: 0; background: #f6f7f9; color: #111827; }}
-    main {{ min-height: 100vh; display: grid; place-items: center; padding: 24px; }}
-    section {{ width: min(440px, 100%); background: white; border: 1px solid #d8dee8; border-radius: 8px; padding: 24px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); }}
-    h1 {{ font-size: 22px; margin: 0 0 8px; }}
-    p {{ color: #667085; margin: 0 0 18px; }}
-    ul {{ margin: 0 0 18px; padding-left: 20px; }}
-    li {{ margin: 6px 0; }}
-    label {{ display: flex; gap: 8px; align-items: center; color: #344054; font-size: 14px; }}
-    input[type="checkbox"] {{ width: 16px; height: 16px; }}
-    .actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }}
-    button {{ min-height: 40px; border: 0; border-radius: 6px; font-weight: 700; cursor: pointer; }}
-    .approve {{ order: 2; color: white; background: #0f766e; }}
-    .deny {{ order: 1; color: #344054; background: #eef2f7; }}
-    small {{ color: #667085; overflow-wrap: anywhere; }}
-    pre {{ max-height: 160px; overflow: auto; padding: 10px; background: #f2f4f7; border-radius: 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }}
-  </style>
-</head>
-<body>
-  <main>
-    <section>
-      <h1>Authorize {client_name}</h1>
-      <p>{email} is signed in. This application is requesting access:</p>
-      <ul>{scope_items}</ul>
-      {authorization_details_preview}
-      <small>Client ID: {client_id}</small>
-      <form method="post" action="/oauth2/authorize">
-        <input type="hidden" name="_csrf" value="{csrf_token}" />
-        <input type="hidden" name="response_type" value="{response_type}" />
-        <input type="hidden" name="client_id" value="{client_id}" />
-        <input type="hidden" name="redirect_uri" value="{redirect_uri}" />
-        <input type="hidden" name="scope" value="{scope_value}" />
-        <input type="hidden" name="resource" value="{resource}" />
-        <input type="hidden" name="authorization_details" value="{authorization_details}" />
-        <input type="hidden" name="login_hint" value="{login_hint}" />
-        <input type="hidden" name="prompt" value="{prompt}" />
-        <input type="hidden" name="max_age" value="{max_age}" />
-        <input type="hidden" name="acr_values" value="{acr_values}" />
-        <input type="hidden" name="claims" value="{claims}" />
-        <input type="hidden" name="state" value="{state_value}" />
-        <input type="hidden" name="nonce" value="{nonce}" />
-        <input type="hidden" name="code_challenge" value="{code_challenge}" />
-        <input type="hidden" name="code_challenge_method" value="{code_challenge_method}" />
-        <input type="hidden" name="response_mode" value="{response_mode}" />
-        <input type="hidden" name="interaction_request" value="{interaction_request}" />
-        {remember_control}
-        <div class="actions">
-          <button class="approve" type="submit" name="action" value="approve">Allow</button>
-          <button class="deny" type="submit" name="action" value="deny">Deny</button>
-        </div>
-      </form>
-    </section>
-  </main>
-</body>
-</html>"#
-    )))
 }
 
 async fn redirect_authorization_error(
@@ -1362,12 +1126,11 @@ fn validate_authorization_request_parameters(request: &ResolvedAuthorizeRequest)
             return Err(AppError::Oidc(format!("{field} is invalid")));
         }
     }
-    if request.code_challenge.as_deref().is_some_and(|challenge| {
-        !(43..=128).contains(&challenge.len())
-            || challenge.bytes().any(|byte| {
-                !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~')
-            })
-    }) {
+    if request
+        .code_challenge
+        .as_deref()
+        .is_some_and(|challenge| !is_valid_code_challenge(challenge))
+    {
         return Err(AppError::Oidc("code_challenge is invalid".to_string()));
     }
     if request
@@ -1767,20 +1530,6 @@ pub(crate) async fn authenticate_client_at<T: ClientAuthFields>(
     crate::oidc_client_auth::authenticate_client_at(state, headers, payload, endpoint_path).await
 }
 
-fn authorization_token(headers: &HeaderMap) -> AppResult<(&'static str, &str)> {
-    let header = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AppError::Unauthorized)?;
-    if let Some(token) = header.strip_prefix("Bearer ") {
-        return Ok(("Bearer", token));
-    }
-    if let Some(token) = header.strip_prefix("DPoP ") {
-        return Ok((dpop::TOKEN_TYPE, token));
-    }
-    Err(AppError::Unauthorized)
-}
-
 fn normalize_client_credentials_scope(
     client: &ClientRecord,
     requested: Option<&str>,
@@ -1795,121 +1544,6 @@ fn normalize_client_credentials_scope(
         .collect::<Vec<_>>();
     validate_requested_scopes(client, &scopes)?;
     Ok(scopes.join(" "))
-}
-
-pub(crate) fn normalize_resource(resource: Option<&str>) -> AppResult<Option<String>> {
-    oauth_targets::normalize_resource(resource).map_err(|error| match error {
-        ResourceValidationError::Empty => {
-            AppError::Oidc("invalid resource parameter: value is empty".to_string())
-        }
-        ResourceValidationError::Whitespace => {
-            AppError::Oidc("invalid resource parameter: value contains whitespace".to_string())
-        }
-        ResourceValidationError::InvalidUrl(error) => {
-            AppError::Oidc(format!("invalid resource parameter: {error}"))
-        }
-        ResourceValidationError::Fragment => {
-            AppError::Oidc("resource parameter must not include a fragment".to_string())
-        }
-    })
-}
-
-fn resolve_client_credentials_audience(
-    client: &ClientRecord,
-    requested_resource: Option<String>,
-    requested_audience: Option<&str>,
-) -> AppResult<Option<String>> {
-    let requested_audience = requested_audience
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(normalize_audience)
-        .transpose()?;
-    if let (Some(resource), Some(audience)) = (&requested_resource, &requested_audience)
-        && resource != audience
-    {
-        return Err(AppError::Oidc(
-            "resource and audience identify different targets".to_string(),
-        ));
-    }
-    let configured =
-        (!client.audience.trim().is_empty()).then(|| client.audience.trim().to_string());
-    let requested = requested_resource.or(requested_audience);
-    if let (Some(expected), Some(requested)) = (&configured, &requested)
-        && expected != requested
-    {
-        return Err(AppError::Oidc(
-            "resource parameter does not match configured client audience".to_string(),
-        ));
-    }
-    Ok(requested.or(configured))
-}
-
-fn normalize_audience(audience: &str) -> AppResult<String> {
-    oauth_targets::normalize_audience(audience)
-        .map_err(|AudienceValidationError| AppError::Oidc("invalid audience parameter".to_string()))
-}
-
-fn merge_token_resource(
-    issued: Option<String>,
-    requested: Option<String>,
-) -> AppResult<Option<String>> {
-    let requested = normalize_resource(requested.as_deref())?;
-    match (issued, requested) {
-        (Some(issued), Some(requested)) if issued != requested => Err(AppError::Oidc(
-            "resource parameter does not match authorization request".to_string(),
-        )),
-        (Some(issued), _) => Ok(Some(issued)),
-        (None, requested) => Ok(requested),
-    }
-}
-
-async fn load_active_user(state: &AppState, user_id: &str) -> AppResult<UserRecord> {
-    let user = state
-        .db
-        .find_user_by_id(user_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    if user.is_active == 1
-        && user.archived_at.is_none()
-        && state
-            .db
-            .find_trial_enrollment_for_user(&user.id)
-            .await?
-            .is_none_or(|enrollment| enrollment.is_active_at(util::now_ts()))
-    {
-        Ok(user)
-    } else {
-        Err(AppError::Unauthorized)
-    }
-}
-
-async fn load_oidc_user(state: &AppState, user_id: &str) -> AppResult<UserRecord> {
-    let user = state
-        .db
-        .find_user_by_id(user_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    if user.is_active != 1 {
-        return Err(AppError::Unauthorized);
-    }
-    if state
-        .db
-        .find_trial_enrollment_for_user(&user.id)
-        .await?
-        .is_some_and(|enrollment| !enrollment.is_active_at(util::now_ts()))
-    {
-        return Err(AppError::Unauthorized);
-    }
-    if user.archived_at.is_none() {
-        return Ok(user);
-    }
-    let looks_temporary = user.email.ends_with("@temporary.local")
-        && state.db.user_has_invitation_redemption(&user.id).await?;
-    if looks_temporary {
-        Ok(user)
-    } else {
-        Err(AppError::Unauthorized)
-    }
 }
 
 pub(crate) fn absolute(base_url: &str, path: &str) -> String {
@@ -2025,43 +1659,6 @@ async fn reauthentication_login_response(
         url_encode(&account_flow)
     );
     Ok((jar, Redirect::to(&login_url)).into_response())
-}
-
-async fn authorize_return_to_for_interaction(
-    store: &impl AuthorizationInteractionRequestStore,
-    request: &ResolvedAuthorizeRequest,
-    strip_login_prompt: bool,
-) -> AppResult<String> {
-    let request = return_to_request(request, strip_login_prompt);
-    authorization_interaction_return_to(store, &request).await
-}
-
-async fn authorize_return_to_for_account_selection(
-    store: &impl AuthorizationInteractionRequestStore,
-    request: &ResolvedAuthorizeRequest,
-) -> AppResult<String> {
-    let request = account_selection_prompted_request(request);
-    authorization_interaction_return_to(store, &request).await
-}
-
-async fn authorization_interaction_return_to(
-    store: &impl AuthorizationInteractionRequestStore,
-    request: &ResolvedAuthorizeRequest,
-) -> AppResult<String> {
-    let request_uri = store
-        .store_interaction_request(&request.client_id, request)
-        .await?;
-    Ok(format!(
-        "/oauth2/authorize?interaction_request={}",
-        url_encode(&request_uri)
-    ))
-}
-
-async fn consent_interaction_request(
-    state: &AppState,
-    request: &ResolvedAuthorizeRequest,
-) -> AppResult<String> {
-    crate::par::store_interaction_authorization_request(state, &request.client_id, request).await
 }
 
 fn client_requires_account_selection(
@@ -2442,84 +2039,6 @@ fn strict_interaction_request_from_return_to(return_to: Option<&str>) -> Option<
     }
     let interaction_request = pairs[0].1.trim();
     (!interaction_request.is_empty()).then(|| interaction_request.to_string())
-}
-
-fn required_query_value(value: Option<String>, field: &str) -> AppResult<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::Oidc(format!("{field} is required")))
-}
-
-fn optional_form_value(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-pub(crate) fn parse_max_age(value: Option<&str>) -> AppResult<Option<i64>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let max_age = value
-        .parse::<i64>()
-        .map_err(|_| AppError::Oidc("max_age must be a non-negative integer".to_string()))?;
-    validate_max_age(max_age).map(Some)
-}
-
-pub(crate) fn validate_max_age(max_age: i64) -> AppResult<i64> {
-    if max_age < 0 {
-        return Err(AppError::Oidc(
-            "max_age must be a non-negative integer".to_string(),
-        ));
-    }
-    Ok(max_age)
-}
-
-pub(crate) fn normalize_acr_values_param(value: Option<&str>) -> AppResult<Option<String>> {
-    let values = assurance::parse_acr_values(value)?;
-    Ok((!values.is_empty()).then(|| values.join(" ")))
-}
-
-fn prompt_without_select_account(prompt: Option<&str>) -> Option<String> {
-    let prompt = prompt?
-        .split_whitespace()
-        .filter(|value| *value != "select_account")
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!prompt.is_empty()).then_some(prompt)
-}
-
-fn prompt_behavior(prompt: Option<&str>) -> AppResult<PromptBehavior> {
-    let values = prompt
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let mut behavior = PromptBehavior {
-        force_consent: false,
-        force_login: false,
-        select_account: false,
-        none: false,
-    };
-    if values.is_empty() {
-        return Ok(behavior);
-    }
-    for value in &values {
-        match *value {
-            "consent" => behavior.force_consent = true,
-            "login" => behavior.force_login = true,
-            "select_account" => behavior.select_account = true,
-            "none" => behavior.none = true,
-            other => return Err(AppError::Oidc(format!("unsupported prompt: {other}"))),
-        }
-    }
-    if behavior.none && values.len() > 1 {
-        return Err(AppError::Oidc(
-            "prompt=none cannot be combined with other prompt values".to_string(),
-        ));
-    }
-    Ok(behavior)
 }
 
 #[cfg(test)]

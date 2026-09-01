@@ -3,8 +3,7 @@ use super::oidc_token_liveness::{
     introspected_user_grant_is_live,
 };
 use super::{
-    authenticate_client_at, authorization_token, ensure_trial_enrollment_client_allowed_for_user,
-    load_oidc_user,
+    authenticate_client_at, ensure_trial_enrollment_client_allowed_for_user, load_oidc_user,
 };
 use crate::{
     AppState,
@@ -25,6 +24,21 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
 };
 use serde::Deserialize;
+
+pub(super) fn authorization_token(headers: &HeaderMap) -> AppResult<(&'static str, &str)> {
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        return Ok(("Bearer", token));
+    }
+    if let Some(token) = header.strip_prefix("DPoP ") {
+        return Ok((dpop::TOKEN_TYPE, token));
+    }
+    Err(AppError::Unauthorized)
+}
+
 pub(super) async fn userinfo(
     State(state): State<AppState>,
     method: Method,

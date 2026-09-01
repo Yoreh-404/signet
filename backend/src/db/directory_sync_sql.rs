@@ -1,11 +1,6 @@
 use super::{DatabaseKind, ph};
 
-pub(super) fn text_placeholders(kind: DatabaseKind, start: usize, count: usize) -> String {
-    (start..start + count)
-        .map(|index| ph(kind, index))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+pub(super) use super::placeholders as text_placeholders;
 
 pub(super) fn case_expression(kind: DatabaseKind, start: usize, count: usize) -> (String, usize) {
     let end = start + count * 2;

@@ -1,6 +1,8 @@
 use super::normalize_resource;
 use crate::{
-    assurance, client_policy::AuthorizationRequestSource, error::AppResult,
+    assurance,
+    client_policy::AuthorizationRequestSource,
+    error::{AppError, AppResult},
     oidc_claims::RequestedClaims,
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,75 @@ pub(super) struct PromptBehavior {
     pub(super) force_login: bool,
     pub(super) select_account: bool,
     pub(super) none: bool,
+}
+
+pub(super) fn required_query_value(value: Option<String>, field: &str) -> AppResult<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Oidc(format!("{field} is required")))
+}
+
+pub(super) fn optional_form_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn parse_max_age(value: Option<&str>) -> AppResult<Option<i64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let max_age = value
+        .parse::<i64>()
+        .map_err(|_| AppError::Oidc("max_age must be a non-negative integer".to_string()))?;
+    validate_max_age(max_age).map(Some)
+}
+
+pub(crate) fn validate_max_age(max_age: i64) -> AppResult<i64> {
+    if max_age < 0 {
+        return Err(AppError::Oidc(
+            "max_age must be a non-negative integer".to_string(),
+        ));
+    }
+    Ok(max_age)
+}
+
+pub(crate) fn normalize_acr_values_param(value: Option<&str>) -> AppResult<Option<String>> {
+    let values = assurance::parse_acr_values(value)?;
+    Ok((!values.is_empty()).then(|| values.join(" ")))
+}
+
+pub(super) fn prompt_behavior(prompt: Option<&str>) -> AppResult<PromptBehavior> {
+    let values = prompt
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut behavior = PromptBehavior {
+        force_consent: false,
+        force_login: false,
+        select_account: false,
+        none: false,
+    };
+    if values.is_empty() {
+        return Ok(behavior);
+    }
+    for value in &values {
+        match *value {
+            "consent" => behavior.force_consent = true,
+            "login" => behavior.force_login = true,
+            "select_account" => behavior.select_account = true,
+            "none" => behavior.none = true,
+            other => return Err(AppError::Oidc(format!("unsupported prompt: {other}"))),
+        }
+    }
+    if behavior.none && values.len() > 1 {
+        return Err(AppError::Oidc(
+            "prompt=none cannot be combined with other prompt values".to_string(),
+        ));
+    }
+    Ok(behavior)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

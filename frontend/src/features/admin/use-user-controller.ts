@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { emptyUserForm } from "../../lib/form-defaults";
 import type { BulkUserImportResult, UserDetail, UserFilter } from "../../types";
+import type {
+  UserLinkedIdentityFilter,
+  UserLoginRegionFilter,
+  UserRoleFilter,
+} from "../users/user-directory-filter-types";
 
-export type UserRoleFilter = "all" | "admin" | "user";
-export type UserLoginRegionFilter = "all" | "domestic" | "overseas";
-export type UserLinkedIdentityFilter = "all" | "linked" | "unlinked";
+export type { UserLinkedIdentityFilter, UserLoginRegionFilter, UserRoleFilter } from "../users/user-directory-filter-types";
 
 /** Owns the users directory query controls, selection, editor, and import UI. */
 export function useUserController() {

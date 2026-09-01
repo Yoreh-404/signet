@@ -9,9 +9,9 @@ use super::{
     ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord, ApplicationModuleRecord,
     ApplicationProfilePermissionOverrideRecord, ApplicationProfileRoleRecord, ApplicationRecord,
     ClientClaimMapperRecord, CountRow, Db, GroupRecord, RoleRecord, UserOrganizationRecord,
-    bind_text_list, blocking, ph, select_application_authorization_profile_sql,
-    select_application_client_binding_sql, select_application_profile_permission_override_sql,
-    select_application_profile_role_sql, select_application_sql, select_client_claim_mapper_sql,
+    bind_text_list, blocking, ph, placeholders, select_application_authorization_profile_sql,
+    select_application_profile_permission_override_sql, select_application_profile_role_sql,
+    select_application_sql, select_client_claim_mapper_sql,
 };
 use super::{normalize_application_entitlement_keys, select_application_module_sql};
 use crate::application_discovery_contract::{
@@ -91,9 +91,57 @@ struct ClientActivityRow {
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
+struct ClientBindingBoundaryRow {
+    #[diesel(sql_type = Nullable<Text>)]
+    organization_id: Option<String>,
+    #[diesel(sql_type = Integer)]
+    client_is_active: i32,
+    #[diesel(sql_type = Nullable<Text>)]
+    binding_application_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    binding_client_db_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    binding_protocol: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    binding_authorization_profile_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    binding_auth_domain_id: Option<String>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    binding_is_active: Option<i32>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    binding_created_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    binding_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
 struct OrganizationActivityRow {
     #[diesel(sql_type = Integer)]
     is_active: i32,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
+struct PolicyOrganizationMembershipRow {
+    #[diesel(sql_type = Integer)]
+    organization_is_active: i32,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_slug: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_kind: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_description: Option<String>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    membership_is_active: Option<i32>,
+    #[diesel(sql_type = Nullable<Text>)]
+    membership_role: Option<String>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    membership_created_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    membership_updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -273,24 +321,20 @@ impl AuthorizationPolicySnapshot {
     /// boundary used by client credentials; it intentionally excludes the
     /// interactive OIDC protocol flag.
     pub fn is_application_client_runtime_active(&self) -> bool {
-        let Some(application) = self.application.as_ref() else {
-            return false;
-        };
-        let Some(binding) = self.binding.as_ref() else {
-            return false;
-        };
-        self.client_id.is_some()
+        self.client_id
+            .as_deref()
+            .is_some_and(|client_id| self.has_client_application_boundary(client_id))
             && self.client_active
             && self.organization_active
-            && application.is_active == 1
+            && self
+                .application
+                .as_ref()
+                .is_some_and(|application| application.is_active == 1)
             && self.application_runtime_active
             && self
-                .client_organization_id
-                .as_deref()
-                .is_some_and(|organization_id| organization_id == application.organization_id)
-            && binding.is_active == 1
-            && binding.client_db_id == self.client_id.as_deref().unwrap_or_default()
-            && binding.application_id == application.id
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.is_active == 1)
     }
 
     /// Returns the complete interactive OIDC application/client boundary.
@@ -298,6 +342,30 @@ impl AuthorizationPolicySnapshot {
     /// `is_authorizable`; this method is safe for pre-login runtime checks.
     pub fn is_interactive_client_runtime_active(&self) -> bool {
         self.is_application_client_runtime_active() && self.protocol_enabled
+    }
+
+    pub fn has_client_application_boundary(&self, client_id: &str) -> bool {
+        let Some(application) = self.application.as_ref() else {
+            return false;
+        };
+        let Some(binding) = self.binding.as_ref() else {
+            return false;
+        };
+        self.client_id.as_deref() == Some(client_id)
+            && binding.client_db_id == client_id
+            && binding.application_id == application.id
+            && self
+                .client_organization_id
+                .as_deref()
+                .is_some_and(|organization_id| organization_id == application.organization_id)
+    }
+
+    pub fn has_profile_application_boundary(&self) -> bool {
+        self.profile.as_ref().is_none_or(|profile| {
+            self.application
+                .as_ref()
+                .is_some_and(|application| profile.application_id == application.id)
+        })
     }
 }
 
@@ -323,10 +391,7 @@ macro_rules! load_group_roles {
         } else {
             let sql = format!(
                 "SELECT group_roles.group_id, roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN group_roles ON roles.id = group_roles.role_id WHERE group_roles.group_id IN ({}) ORDER BY group_roles.group_id ASC, roles.name ASC, roles.id ASC",
-                (1..=group_ids.len())
-                    .map(|index| ph($kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders($kind, 1, group_ids.len())
             );
             let rows = bind_text_list($conn, sql_query(sql), group_ids)
                 .load::<GroupRoleSnapshotRow>($conn)
@@ -358,10 +423,7 @@ macro_rules! load_role_permissions {
         } else {
             let sql = format!(
                 "SELECT role_id, permission FROM role_permissions WHERE role_id IN ({}) ORDER BY role_id ASC, permission ASC",
-                (1..=role_ids.len())
-                    .map(|index| ph($kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders($kind, 1, role_ids.len())
             );
             let rows = bind_text_list($conn, sql_query(sql), &role_ids)
                 .load::<RolePermissionSnapshotRow>($conn)
@@ -389,10 +451,7 @@ macro_rules! load_profile_group_assignments {
             let sql = format!(
                 "SELECT profile_id, group_id AS subject_id, role_id, is_active FROM application_profile_group_roles WHERE profile_id = {} AND group_id IN ({}) ORDER BY group_id ASC, role_id ASC",
                 ph($kind, 1),
-                (2..=values.len())
-                    .map(|index| ph($kind, index))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                placeholders($kind, 2, values.len() - 1)
             );
             bind_text_list($conn, sql_query(sql), &values)
                 .load::<ApplicationProfileRoleAssignmentRecord>($conn)
@@ -1306,34 +1365,50 @@ impl Db {
                         ),
                     };
 
-                let client_state = if let Some(client_id) = client_id.as_ref() {
+                let client_boundary = if let Some(client_id) = client_id.as_ref() {
                     let sql = format!(
-                        "SELECT organization_id, is_active FROM clients WHERE id = {}",
+                        "SELECT clients.organization_id,
+                                clients.is_active AS client_is_active,
+                                application_client_bindings.application_id AS binding_application_id,
+                                application_client_bindings.client_db_id AS binding_client_db_id,
+                                application_client_bindings.protocol AS binding_protocol,
+                                application_client_bindings.authorization_profile_id AS binding_authorization_profile_id,
+                                application_client_bindings.auth_domain_id AS binding_auth_domain_id,
+                                application_client_bindings.is_active AS binding_is_active,
+                                application_client_bindings.created_at AS binding_created_at,
+                                application_client_bindings.updated_at AS binding_updated_at
+                         FROM clients
+                         LEFT JOIN application_client_bindings
+                           ON application_client_bindings.client_db_id = clients.id
+                         WHERE clients.id = {}",
                         ph(kind, 1)
                     );
                     sql_query(sql)
                         .bind::<Text, _>(client_id)
-                        .get_result::<ClientActivityRow>(conn)
+                        .get_result::<ClientBindingBoundaryRow>(conn)
                         .optional()
                         .map_err(AppError::from)?
                 } else {
                     None
                 };
-
-                let binding = if let Some(client_id) = client_id.as_ref() {
-                    let sql = format!(
-                        "{} WHERE client_db_id = {}",
-                        select_application_client_binding_sql(),
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(client_id)
-                        .get_result::<ApplicationClientBindingRecord>(conn)
-                        .optional()
-                        .map_err(AppError::from)?
-                } else {
-                    None
-                };
+                let client_state = client_boundary.as_ref().map(|boundary| ClientActivityRow {
+                    organization_id: boundary.organization_id.clone(),
+                    is_active: boundary.client_is_active,
+                });
+                let binding = client_boundary.as_ref().and_then(|boundary| {
+                    Some(ApplicationClientBindingRecord {
+                        application_id: boundary.binding_application_id.clone()?,
+                        client_db_id: boundary.binding_client_db_id.clone()?,
+                        protocol: boundary.binding_protocol.clone()?,
+                        authorization_profile_id: boundary
+                            .binding_authorization_profile_id
+                            .clone()?,
+                        auth_domain_id: boundary.binding_auth_domain_id.clone()?,
+                        is_active: boundary.binding_is_active?,
+                        created_at: boundary.binding_created_at?,
+                        updated_at: boundary.binding_updated_at?,
+                    })
+                });
 
                 let application_id = requested_application_id
                     .as_deref()
@@ -1405,29 +1480,47 @@ impl Db {
 
                 let (organization_active, membership, runtime_active) =
                     if let Some(application) = application.as_ref() {
-                        let organization_sql = format!(
-                            "SELECT is_active FROM organizations WHERE id = {}",
-                            ph(kind, 1)
-                        );
-                        let organization_active = sql_query(organization_sql)
-                            .bind::<Text, _>(&application.organization_id)
-                            .get_result::<OrganizationActivityRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                            .is_some_and(|organization| organization.is_active == 1);
-
                         let membership_sql = format!(
-                            "SELECT organizations.id, organizations.slug, organizations.name, COALESCE(organizations.kind, 'tenant') AS kind, organizations.description, organizations.is_active, organization_members.role, organization_members.created_at AS membership_created_at, organization_members.updated_at AS membership_updated_at FROM organization_members INNER JOIN organizations ON organizations.id = organization_members.organization_id WHERE organization_members.organization_id = {} AND organization_members.user_id = {}",
+                            "SELECT organizations.is_active AS organization_is_active,
+                                    organizations.id AS membership_id,
+                                    organizations.slug AS membership_slug,
+                                    organizations.name AS membership_name,
+                                    COALESCE(organizations.kind, 'tenant') AS membership_kind,
+                                    organizations.description AS membership_description,
+                                    organizations.is_active AS membership_is_active,
+                                    organization_members.role AS membership_role,
+                                    organization_members.created_at AS membership_created_at,
+                                    organization_members.updated_at AS membership_updated_at
+                             FROM organizations
+                             LEFT JOIN organization_members
+                               ON organization_members.organization_id = organizations.id
+                              AND organization_members.user_id = {}
+                             WHERE organizations.id = {}",
                             ph(kind, 1),
                             ph(kind, 2)
                         );
-                        let membership = sql_query(membership_sql)
-                            .bind::<Text, _>(&application.organization_id)
+                        let organization_membership = sql_query(membership_sql)
                             .bind::<Text, _>(&user_id)
-                            .get_result::<UserOrganizationRecord>(conn)
+                            .bind::<Text, _>(&application.organization_id)
+                            .get_result::<PolicyOrganizationMembershipRow>(conn)
                             .optional()
                             .map_err(AppError::from)?;
-
+                        let organization_active = organization_membership
+                            .as_ref()
+                            .is_some_and(|organization| organization.organization_is_active == 1);
+                        let membership = organization_membership.and_then(|row| {
+                            Some(UserOrganizationRecord {
+                                id: row.membership_id?,
+                                slug: row.membership_slug?,
+                                name: row.membership_name?,
+                                kind: row.membership_kind?,
+                                description: row.membership_description,
+                                is_active: row.membership_is_active?,
+                                role: row.membership_role?,
+                                membership_created_at: row.membership_created_at?,
+                                membership_updated_at: row.membership_updated_at?,
+                            })
+                        });
                         let discovery_sql = format!(
                             "SELECT management_mode, last_verified_revision, last_verified_expires_at, snapshot_json, operator_disabled FROM application_discovery WHERE application_id = {}",
                             ph(kind, 1)
@@ -1472,6 +1565,7 @@ impl Db {
                 } else {
                     BTreeMap::new()
                 };
+
                 let authorization_config = authorization_config(
                     application_modules.get("authorization").cloned(),
                 )?;
@@ -1627,7 +1721,6 @@ impl Db {
                 } else {
                     Vec::new()
                 };
-
                 let application_matches_client = match (application.as_ref(), client_state.as_ref()) {
                     (Some(application), Some(client)) => client.organization_id.as_deref()
                         == Some(application.organization_id.as_str()),

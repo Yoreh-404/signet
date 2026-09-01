@@ -1,6 +1,6 @@
 use super::billing_sql::select_payment_order_sql;
 use super::billing_types::{PaymentOrderLease, PaymentOrderRecord};
-use super::{Db, bind_text_list, blocking, ph};
+use super::{Db, bind_text_list, blocking, ph, placeholders};
 use crate::{
     config::DatabaseKind,
     error::{AppError, AppResult},
@@ -162,10 +162,7 @@ impl Db {
                 let select_sql = format!(
                     "{} WHERE id IN ({})",
                     select_payment_order_sql(),
-                    (1..=claimed_ids.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    placeholders(kind, 1, claimed_ids.len())
                 );
                 let claimed_by_id = bind_text_list(conn, sql_query(select_sql), &claimed_ids)
                     .load::<PaymentOrderRecord>(conn)

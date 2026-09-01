@@ -1,12 +1,76 @@
 //! Database connection construction and health checks.
 
-use super::{
-    AppError, AppResult, DatabaseKind, Db, Settings, blocking, connect_mysql, connect_postgres,
-    connect_sqlite,
+#[cfg(feature = "mysql")]
+use super::MysqlConnection;
+#[cfg(feature = "postgres")]
+use super::PgConnection;
+use super::{AppError, AppResult, DatabaseKind, DatabaseSettings, Db, Settings, blocking};
+#[cfg(feature = "sqlite")]
+use super::{SqliteConnection, SqliteConnectionCustomizer};
+use diesel::{
+    connection::SimpleConnection,
+    r2d2::{ConnectionManager, Pool},
 };
-use diesel::connection::SimpleConnection;
 use std::time::Duration;
 use tracing::warn;
+
+#[cfg(feature = "sqlite")]
+pub(super) fn connect_sqlite(settings: &DatabaseSettings) -> AppResult<Db> {
+    if let Some(parent) = std::path::Path::new(&settings.url).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| AppError::Database(format!("failed to create sqlite dir: {err}")))?;
+    }
+    let manager = ConnectionManager::<SqliteConnection>::new(settings.url.clone());
+    let pool = Pool::builder()
+        .max_size(settings.pool_size)
+        .connection_customizer(Box::new(SqliteConnectionCustomizer))
+        .build(manager)
+        .map_err(|err| AppError::Database(err.to_string()))?;
+    Ok(Db::Sqlite(pool))
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub(super) fn connect_sqlite(_settings: &DatabaseSettings) -> AppResult<Db> {
+    Err(AppError::Configuration(
+        "database.kind=sqlite requires cargo feature `sqlite`".to_string(),
+    ))
+}
+
+#[cfg(feature = "postgres")]
+pub(super) fn connect_postgres(settings: &DatabaseSettings) -> AppResult<Db> {
+    let manager = ConnectionManager::<PgConnection>::new(settings.url.clone());
+    let pool = Pool::builder()
+        .max_size(settings.pool_size)
+        .build(manager)
+        .map_err(|err| AppError::Database(err.to_string()))?;
+    Ok(Db::Postgres(pool))
+}
+
+#[cfg(not(feature = "postgres"))]
+pub(super) fn connect_postgres(_settings: &DatabaseSettings) -> AppResult<Db> {
+    Err(AppError::Configuration(
+        "database.kind=postgres requires cargo feature `postgres`".to_string(),
+    ))
+}
+
+#[cfg(feature = "mysql")]
+pub(super) fn connect_mysql(settings: &DatabaseSettings) -> AppResult<Db> {
+    let manager = ConnectionManager::<MysqlConnection>::new(settings.url.clone());
+    let pool = Pool::builder()
+        .max_size(settings.pool_size)
+        .build(manager)
+        .map_err(|err| AppError::Database(err.to_string()))?;
+    Ok(Db::Mysql(pool))
+}
+
+#[cfg(not(feature = "mysql"))]
+pub(super) fn connect_mysql(_settings: &DatabaseSettings) -> AppResult<Db> {
+    Err(AppError::Configuration(
+        "database.kind=mysql requires cargo feature `mysql`".to_string(),
+    ))
+}
 
 impl Db {
     pub fn connect(settings: &Settings) -> AppResult<Self> {

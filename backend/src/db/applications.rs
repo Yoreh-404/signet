@@ -11,13 +11,14 @@ use super::{
     ApplicationPermissionDefinitionRecord, ApplicationProfileRoleRecord, ApplicationRecord,
     AuditEventRecord, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
     InvitationRecord, NewApplication, NewApplicationAuthContext,
-    NewApplicationAuthorizationProfile, NewApplicationMember, OrganizationRecord,
+    NewApplicationAuthorizationProfile, NewApplicationMember, OrganizationRecord, StringIdRow,
     application_slug_base, application_slug_collision_candidate, bind_text_list, blocking, ph,
-    select_application_authorization_profile_sql, select_application_client_binding_sql,
-    select_application_identity_binding_sql, select_application_member_sql,
-    select_application_module_sql, select_application_permission_definition_sql,
-    select_application_profile_role_sql, select_application_sql, select_client_claim_mapper_sql,
-    select_client_sql, select_invitation_sql, select_organization_sql,
+    placeholders, select_application_authorization_profile_sql,
+    select_application_client_binding_sql, select_application_identity_binding_sql,
+    select_application_member_sql, select_application_module_sql,
+    select_application_permission_definition_sql, select_application_profile_role_sql,
+    select_application_sql, select_client_claim_mapper_sql, select_client_sql,
+    select_invitation_sql, select_organization_sql,
 };
 #[cfg(test)]
 use super::{
@@ -47,6 +48,27 @@ where
     let role_id = load()?;
     cache.insert(cache_key, role_id.clone());
     Ok(role_id)
+}
+
+macro_rules! find_active_application_by_slug_on_conn {
+    ($conn:expr, $kind:expr, $slug:expr) => {{
+        let sql = format!(
+            "{} WHERE slug = {} AND is_active = 1 AND organization_id IN (SELECT id FROM organizations WHERE is_active = 1) ORDER BY organization_id ASC",
+            select_application_sql(),
+            ph($kind, 1)
+        );
+        let applications = sql_query(sql)
+            .bind::<Text, _>($slug)
+            .load::<ApplicationRecord>($conn)
+            .map_err(AppError::from)?;
+        match applications.as_slice() {
+            [] => Ok(None),
+            [application] => Ok(Some(application.clone())),
+            _ => Err(AppError::BadRequest(
+                "application slug is ambiguous; use an organization-specific URL".to_string(),
+            )),
+        }
+    }};
 }
 
 /// Creates the locked compatibility aggregate for a protocol client while
@@ -202,10 +224,7 @@ impl Db {
         let application_ids = application_ids.to_vec();
         with_conn!(self, |conn, kind| {
             conn.transaction::<BTreeMap<String, ApplicationGraphRecordSet>, AppError, _>(|conn| {
-            let application_placeholders = (1..=application_ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let application_placeholders = placeholders(kind, 1, application_ids.len());
             let bindings_sql = format!(
                 "SELECT application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at FROM application_client_bindings WHERE application_id IN ({}) ORDER BY application_id ASC, created_at ASC",
                 application_placeholders
@@ -416,22 +435,40 @@ impl Db {
     ) -> AppResult<Option<ApplicationRecord>> {
         let slug = slug.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE slug = {} AND is_active = 1 AND organization_id IN (SELECT id FROM organizations WHERE is_active = 1) ORDER BY organization_id ASC",
-                select_application_sql(),
-                ph(kind, 1)
-            );
-            let applications = sql_query(sql)
-                .bind::<Text, _>(slug)
-                .load::<ApplicationRecord>(&mut conn)
-                .map_err(AppError::from)?;
-            match applications.as_slice() {
-                [] => Ok(None),
-                [application] => Ok(Some(application.clone())),
-                _ => Err(AppError::BadRequest(
-                    "application slug is ambiguous; use an organization-specific URL".to_string(),
-                )),
-            }
+            find_active_application_by_slug_on_conn!(&mut conn, kind, &slug)
+        })
+    }
+
+    pub async fn find_active_application_by_slug_with_module(
+        &self,
+        slug: &str,
+        module_key: &str,
+    ) -> AppResult<Option<(ApplicationRecord, Option<ApplicationModuleRecord>)>> {
+        let slug = slug.to_string();
+        let module_key = module_key.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<Option<(ApplicationRecord, Option<ApplicationModuleRecord>)>, AppError, _>(
+                |conn| {
+                    let Some(application) =
+                        find_active_application_by_slug_on_conn!(conn, kind, &slug)?
+                    else {
+                        return Ok(None);
+                    };
+                    let module_sql = format!(
+                        "{} WHERE application_id = {} AND module_key = {}",
+                        select_application_module_sql(),
+                        ph(kind, 1),
+                        ph(kind, 2)
+                    );
+                    let module = sql_query(module_sql)
+                        .bind::<Text, _>(&application.id)
+                        .bind::<Text, _>(&module_key)
+                        .get_result::<ApplicationModuleRecord>(conn)
+                        .optional()
+                        .map_err(AppError::from)?;
+                    Ok(Some((application, module)))
+                },
+            )
         })
     }
 
@@ -1240,10 +1277,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, chunk.len());
                     let orphan_sql = format!(
                         "SELECT id AS group_id FROM access_groups WHERE id IN ({placeholders}) AND NOT EXISTS (SELECT 1 FROM application_scim_groups WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM application_profile_group_roles WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM directory_sync_groups WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM group_roles WHERE group_id = access_groups.id) AND NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = access_groups.id)"
                     );
@@ -1259,10 +1293,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, chunk.len());
                     for table in ["group_members", "group_roles"] {
                         let sql = format!("DELETE FROM {table} WHERE group_id IN ({placeholders})");
                         bind_text_list(conn, sql_query(sql), chunk)
@@ -1310,10 +1341,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, chunk.len());
                     let client_sql = format!(
                         "{} WHERE id IN ({placeholders})",
                         select_client_sql()
@@ -1346,10 +1374,7 @@ impl Db {
                     if chunk.is_empty() {
                         continue;
                     }
-                    let placeholders = (1..=chunk.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, chunk.len());
                     let organization_sql = format!(
                         "SELECT id FROM organizations WHERE id IN ({placeholders})"
                     );
@@ -1742,11 +1767,6 @@ impl Db {
                     .optional()
                     .map_err(AppError::from)?
                     .ok_or(AppError::NotFound)?;
-                #[derive(diesel::QueryableByName)]
-                struct ActiveUserIdRow {
-                    #[diesel(sql_type = Text)]
-                    id: String,
-                }
                 const USER_VALIDATION_BATCH_SIZE: usize = 400;
                 let requested_user_ids = members
                     .iter()
@@ -1754,16 +1774,13 @@ impl Db {
                     .collect::<Vec<_>>();
                 let mut active_user_ids = BTreeSet::new();
                 for user_id_batch in requested_user_ids.chunks(USER_VALIDATION_BATCH_SIZE) {
-                    let placeholders = (1..=user_id_batch.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let placeholders = placeholders(kind, 1, user_id_batch.len());
                     let user_sql = format!(
                         "SELECT id FROM users WHERE id IN ({placeholders}) AND is_active = 1 AND archived_at IS NULL"
                     );
                     active_user_ids.extend(
                         bind_text_list(conn, sql_query(user_sql), user_id_batch)
-                            .load::<ActiveUserIdRow>(conn)
+                            .load::<StringIdRow>(conn)
                             .map_err(AppError::from)?
                             .into_iter()
                             .map(|user| user.id),
@@ -1878,12 +1895,6 @@ impl Db {
         application: &ApplicationRecord,
         user_ids: &[String],
     ) -> AppResult<BTreeSet<String>> {
-        #[derive(diesel::QueryableByName)]
-        struct UserIdRow {
-            #[diesel(sql_type = Text)]
-            id: String,
-        }
-
         const BATCH_SIZE: usize = 400;
         if application.is_active != 1 || user_ids.is_empty() {
             return Ok(BTreeSet::new());
@@ -1913,14 +1924,11 @@ impl Db {
                 }
                 let user_sql = format!(
                     "SELECT id FROM users WHERE id IN ({}) AND is_active = 1 AND archived_at IS NULL",
-                    (1..=chunk.len())
-                        .map(|index| ph(kind, index))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    placeholders(kind, 1, chunk.len())
                 );
                 accessible.extend(
                     bind_text_list(&mut conn, sql_query(user_sql), chunk)
-                        .load::<UserIdRow>(&mut conn)
+                        .load::<StringIdRow>(&mut conn)
                         .map_err(AppError::from)?
                         .into_iter()
                         .map(|row| row.id),

@@ -9,6 +9,8 @@ use crate::{
     AppState, applications, auth, authorization,
     db::{ApplicationRecord, NewApplicationJwtCode},
     error::{AppError, AppResult},
+    http_urls::validate_safe_http_endpoint,
+    pkce::is_valid_code_challenge,
     redirects, util,
 };
 use axum::{
@@ -157,7 +159,7 @@ async fn token(
         .code_verifier
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("code_verifier is required".to_string()))?;
-    if !is_valid_pkce_value(verifier) {
+    if !is_valid_code_challenge(verifier) {
         return Err(AppError::BadRequest("code_verifier is invalid".to_string()));
     }
     let expected_challenge = util::sha256_base64url(verifier);
@@ -256,16 +258,7 @@ async fn load_application(
     state: &AppState,
     slug: &str,
 ) -> AppResult<(ApplicationRecord, Map<String, Value>)> {
-    let application = state
-        .db
-        .find_active_application_by_slug(slug)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    applications::ensure_application_runtime_active(state, &application).await?;
-    let config = applications::enabled_protocol_config(state, &application.id, "jwt")
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok((application, config))
+    applications::load_active_application_protocol_config(state, slug, "jwt").await
 }
 
 async fn ensure_jwt_client_is_active(
@@ -423,7 +416,7 @@ fn validate_pkce(challenge: Option<&str>, method: Option<&str>) -> AppResult<()>
     let challenge = challenge.ok_or_else(|| {
         AppError::BadRequest("code_challenge is required for application JWT SSO".to_string())
     })?;
-    if !is_valid_pkce_value(challenge) {
+    if !is_valid_code_challenge(challenge) {
         return Err(AppError::BadRequest(
             "code_challenge is invalid".to_string(),
         ));
@@ -434,13 +427,6 @@ fn validate_pkce(challenge: Option<&str>, method: Option<&str>) -> AppResult<()>
         ));
     }
     Ok(())
-}
-
-fn is_valid_pkce_value(value: &str) -> bool {
-    (43..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 async fn validate_redirect_uri(
@@ -475,19 +461,7 @@ async fn validate_redirect_uri(
 }
 
 fn validate_redirect_url(value: &str) -> AppResult<()> {
-    let url = Url::parse(value)
-        .map_err(|_| AppError::BadRequest("redirect_uri is invalid".to_string()))?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    if !matches!(url.scheme(), "https" | "http")
-        || url.host_str().is_none()
-        || (url.scheme() == "http" && !loopback)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(AppError::BadRequest("redirect_uri is invalid".to_string()));
-    }
-    Ok(())
+    validate_safe_http_endpoint(value, "redirect_uri")
 }
 
 #[cfg(test)]

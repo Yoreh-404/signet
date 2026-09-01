@@ -50,16 +50,16 @@ pub async fn protect_browser_writes(
     }
 
     let jar = CookieJar::from_headers(request.headers());
-    let current = match auth::current_user_from_cookie(&state, &jar).await {
-        Ok(Some(current)) => current,
-        Ok(None) => return next.run(request).await,
-        Err(error) => return error.into_response(),
-    };
-    let session = match state.db.find_session(&current.session_id).await {
+    let session = match auth::session_from_cookie(&state, &jar).await {
         Ok(Some(session)) => session,
         Ok(None) => return next.run(request).await,
         Err(error) => return error.into_response(),
     };
+    match auth::current_user_from_session(&state, &session).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return next.run(request).await,
+        Err(error) => return error.into_response(),
+    }
     let supplied_token = request
         .headers()
         .get(CSRF_HEADER)

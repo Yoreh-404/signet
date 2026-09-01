@@ -3,7 +3,8 @@
 use super::{
     AppError, AppResult, ApplicationSamlInteractionRecord, ApplicationSamlSessionRecord,
     DatabaseKind, Db, NewApplicationSamlInteraction, NewApplicationSamlSession, bind_text_list,
-    blocking, ph, select_application_saml_interaction_sql, select_application_saml_session_sql,
+    blocking, ph, placeholders, select_application_saml_interaction_sql,
+    select_application_saml_session_sql,
 };
 use crate::util;
 use diesel::{
@@ -207,10 +208,7 @@ impl Db {
         let application_id = application_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=session_index_hashes.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, session_index_hashes.len());
             let application_placeholder = ph(kind, session_index_hashes.len() + 1);
             let now_placeholder = ph(kind, session_index_hashes.len() + 2);
             let sql = format!(

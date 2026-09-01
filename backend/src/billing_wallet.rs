@@ -24,12 +24,7 @@ pub(super) async fn transfer_wallet(
 ) -> AppResult<Json<WalletTransactionRecord>> {
     billing_enabled(&state.settings)?;
     let current = standard_current_user(&state, &jar).await?;
-    let application = state
-        .db
-        .find_application_by_id(&input.application_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    applications::ensure_application_runtime_active(&state, &application).await?;
+    let application = applications::load_active_application(&state, &input.application_id).await?;
     if !state
         .db
         .user_can_access_application(&application, &current.user.id)

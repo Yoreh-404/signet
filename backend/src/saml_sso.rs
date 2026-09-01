@@ -12,6 +12,7 @@ use crate::{
     db::{ApplicationRecord, NewApplicationSamlInteraction, NewApplicationSamlSession},
     error::{AppError, AppResult},
     html::escape as html_escape,
+    http_urls::validate_safe_http_endpoint,
     redirects, util,
 };
 use axum::{
@@ -34,7 +35,6 @@ use saml_rs::{LogoutRequest, LogoutResponse};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use url::Url;
 
 const SAML_INTERACTION_TTL_SECONDS: i64 = 300;
 const SAML_REPLAY_TTL_SECONDS: i64 = 600;
@@ -906,15 +906,8 @@ async fn load_application(
     state: &AppState,
     app_slug: &str,
 ) -> AppResult<(ApplicationRecord, SamlApplicationConfig)> {
-    let application = state
-        .db
-        .find_active_application_by_slug(app_slug)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    applications::ensure_application_runtime_active(state, &application).await?;
-    let protocol = applications::enabled_protocol_config(state, &application.id, "saml2")
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (application, protocol) =
+        applications::load_active_application_protocol_config(state, app_slug, "saml2").await?;
     let runtime = state.runtime_settings().await?;
     let config = parse_saml_config(&application.slug, &runtime.issuer, &protocol)?;
     Ok((application, config))
@@ -1112,18 +1105,7 @@ fn required_string(object: &Map<String, Value>, field: &str) -> AppResult<String
 }
 
 fn validate_web_endpoint(value: &str, label: &str) -> AppResult<()> {
-    let url = Url::parse(value).map_err(|_| AppError::BadRequest(format!("{label} is invalid")))?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    if !matches!(url.scheme(), "https" | "http")
-        || url.host_str().is_none()
-        || (url.scheme() == "http" && !loopback)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(AppError::BadRequest(format!("{label} is invalid")));
-    }
-    Ok(())
+    validate_safe_http_endpoint(value, label)
 }
 
 async fn build_idp(

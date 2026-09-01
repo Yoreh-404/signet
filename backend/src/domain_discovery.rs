@@ -3,6 +3,7 @@ use crate::{
     error::{AppError, AppResult},
     security_policy, util,
 };
+use std::collections::HashMap;
 
 pub trait EmailDomainRoutable {
     fn email_domain_rules(&self) -> AppResult<Vec<String>>;
@@ -41,23 +42,31 @@ pub fn find_provider_for_subject<'a, P: EmailDomainRoutable>(
     providers: &'a [P],
     subject: &str,
 ) -> AppResult<Option<EmailDomainRoute<'a, P>>> {
-    let mut best: Option<EmailDomainRoute<'a, P>> = None;
-    for provider in providers {
+    let Some(domain) = security_policy::email_domain(subject) else {
+        return Ok(None);
+    };
+    let mut provider_by_rule = HashMap::<String, usize>::new();
+    for (provider_index, provider) in providers.iter().enumerate() {
         let rules = provider.email_domain_rules()?;
-        let Some(rule) = best_matching_rule(subject, &rules) else {
-            continue;
-        };
-        let replace = best
-            .as_ref()
-            .is_none_or(|current| rule.len() > current.matched_domain.len());
-        if replace {
-            best = Some(EmailDomainRoute {
-                provider,
-                matched_domain: rule.to_string(),
-            });
+        for rule in rules {
+            provider_by_rule.entry(rule).or_insert(provider_index);
         }
     }
-    Ok(best)
+
+    for (start, _) in domain.char_indices() {
+        if start != 0 && domain.as_bytes()[start - 1] != b'.' {
+            continue;
+        }
+        let candidate = &domain[start..];
+        let Some(&provider_index) = provider_by_rule.get(candidate) else {
+            continue;
+        };
+        return Ok(Some(EmailDomainRoute {
+            provider: &providers[provider_index],
+            matched_domain: candidate.to_string(),
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

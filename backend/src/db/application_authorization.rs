@@ -4,7 +4,7 @@ use super::{
     ApplicationAuthorizationProfileCountRow, ApplicationAuthorizationProfileRecord,
     ApplicationPermissionDefinitionRecord, CountRow, DatabaseKind, Db, GroupPatchPlan, GroupRecord,
     NewApplicationAuthorizationProfile, NewApplicationPermissionDefinition, NewGroup, UserRecord,
-    bind_text_list, blocking, normalize_application_entitlement_keys, ph,
+    bind_text_list, blocking, normalize_application_entitlement_keys, ph, placeholders,
     select_application_authorization_profile_sql, select_application_permission_definition_sql,
     select_user_sql,
 };
@@ -373,10 +373,7 @@ impl Db {
         }
         let profile_ids = profile_ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=profile_ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, profile_ids.len());
             let sql = format!(
                 "SELECT profiles.id AS profile_id, (SELECT COUNT(*) FROM application_permission_definitions WHERE profile_id = profiles.id AND is_active = 1) AS permission_count, (SELECT COUNT(*) FROM application_profile_roles WHERE profile_id = profiles.id AND is_active = 1) AS role_count FROM application_authorization_profiles AS profiles WHERE profiles.id IN ({placeholders})"
             );

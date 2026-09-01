@@ -129,6 +129,13 @@ export const emptyOrganizationForm = {
   is_active: true
 };
 
+export const emptyEnterpriseForm = {
+  slug: "",
+  name: "",
+  description: "",
+  allowed_email_domains: ""
+};
+
 export const emptyProviderForm = {
   id: "",
   slug: "",

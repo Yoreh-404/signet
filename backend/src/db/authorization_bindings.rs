@@ -7,7 +7,7 @@
 
 use super::{
     AuditEventRecord, CountRow, DatabaseKind, Db, bind_text_list, blocking, dedupe_nonempty,
-    normalize_application_entitlement_keys, ph,
+    normalize_application_entitlement_keys, ph, placeholders,
 };
 use crate::{
     audit::AuditEvent,
@@ -561,10 +561,7 @@ impl Db {
                     );
                     if !role_ids.is_empty() {
                         let role_id_values = role_ids.iter().cloned().collect::<Vec<_>>();
-                        let placeholders = (2..=role_id_values.len() + 1)
-                            .map(|index| ph(kind, index))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let placeholders = placeholders(kind, 2, role_id_values.len());
                         let role_sql = format!(
                             "SELECT id FROM application_profile_roles WHERE profile_id = {} AND is_active = 1 AND id IN ({placeholders})",
                             ph(kind, 1)

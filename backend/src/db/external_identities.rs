@@ -5,7 +5,7 @@ use super::{
     LinkedIdentityRecord, NewExternalOidcProvider, NewLdapProvider, NewUser, OrganizationRecord,
     UserIdentityCandidate, UserRecord, UserRegistrationSource, bind_text_list, blocking,
     count_all_users_sql, count_user_identity_conflicts_sql, ensure_first_user_registration_state,
-    insert_user_sql, ldap_provider_key, ph, select_organization_sql, select_user_sql,
+    insert_user_sql, ldap_provider_key, ph, placeholders, select_organization_sql, select_user_sql,
 };
 use crate::config::DatabaseKind;
 use crate::error::{AppError, AppResult};
@@ -168,10 +168,7 @@ impl Db {
         }
         let ids = ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, ids.len());
             let sql = format!(
                 "{} WHERE id IN ({})",
                 select_external_oidc_provider_sql(),
@@ -423,10 +420,7 @@ impl Db {
         }
         let ids = ids.to_vec();
         with_conn!(self, |conn, kind| {
-            let placeholders = (1..=ids.len())
-                .map(|index| ph(kind, index))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = placeholders(kind, 1, ids.len());
             let sql = format!(
                 "{} WHERE id IN ({})",
                 select_ldap_provider_sql(),

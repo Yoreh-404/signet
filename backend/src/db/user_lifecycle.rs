@@ -5,7 +5,9 @@
 //! state snapshot, dependent authentication rows are cleared in one
 //! transaction, and one audit event is committed with the state change.
 
-use super::{AuditEventRecord, Db, UserRecord, bind_text_list, blocking, ph, select_user_sql};
+use super::{
+    AuditEventRecord, Db, UserRecord, bind_text_list, blocking, ph, placeholders, select_user_sql,
+};
 use crate::config::DatabaseKind;
 use crate::{
     error::{AppError, AppResult},
@@ -52,13 +54,6 @@ impl UserLifecycleBatchAction {
             Self::ResetMfa => "reset_mfa",
         }
     }
-}
-
-fn placeholders(kind: DatabaseKind, start: usize, count: usize) -> String {
-    (start..start + count)
-        .map(|index| ph(kind, index))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 macro_rules! delete_user_rows {

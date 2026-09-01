@@ -1,6 +1,5 @@
 use crate::{
-    AppState,
-    auth::{self, AccountCapabilities},
+    AppState, auth,
     db::UserOrganizationRecord,
     error::{AppError, AppResult},
 };
@@ -11,9 +10,7 @@ pub(super) async fn current_organization_context(
     jar: &CookieJar,
 ) -> AppResult<(auth::CurrentUser, UserOrganizationRecord)> {
     let current = auth::require_current_user(state, jar).await?;
-    if !current.can_mutate_account() {
-        return Err(AppError::Forbidden);
-    }
+    auth::ensure_current_account_mutable(&current)?;
     let organization = state
         .db
         .active_user_organization(&current.user.id)

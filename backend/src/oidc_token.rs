@@ -159,11 +159,8 @@ pub(super) async fn token_from_client_credentials(
     {
         return Err(AppError::Unauthorized);
     }
-    let runtime = applications::ApplicationRuntimeSnapshot::load(&state, &client, None)
+    let runtime = applications::ApplicationRuntimeSnapshot::load_service(&state, &client)
         .await
-        .map_err(|_| AppError::Unauthorized)?;
-    runtime
-        .require_service()
         .map_err(|_| AppError::Unauthorized)?;
     let scope = normalize_client_credentials_scope(&client, payload.scope.as_deref())?;
     let resource = resolve_client_credentials_audience(

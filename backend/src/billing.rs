@@ -1071,12 +1071,7 @@ async fn billing_application_context(
         .await?
         .filter(|client| client.is_active == 1)
         .ok_or(AppError::Unauthorized)?;
-    let application = state
-        .db
-        .find_application_for_client(&client.id)
-        .await?
-        .ok_or(AppError::Forbidden)?;
-    applications::ensure_application_runtime_active(state, &application).await?;
+    let application = applications::load_active_application_for_client(state, &client.id).await?;
     if !applications::application_protocol_enabled(state, &application.id, "oauth2_oidc").await? {
         return Err(AppError::Forbidden);
     }

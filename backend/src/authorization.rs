@@ -13,7 +13,7 @@ use crate::{
     util,
 };
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub use crate::db::AuthorizationPolicySnapshot;
 
@@ -96,10 +96,7 @@ pub async fn resolve_entitlements_for_profile(
         .db
         .load_profile_policy_snapshot(&application.id, &profile.id, &user.id)
         .await?;
-    validate_application_boundary(&snapshot, application.id.as_str())?;
-    if snapshot.profile.as_ref().map(|value| value.id.as_str()) != Some(profile.id.as_str()) {
-        return Err(AppError::Forbidden);
-    }
+    validate_profile_boundary(&snapshot, application.id.as_str(), profile.id.as_str())?;
     resolve_entitlements_from_snapshot(&snapshot, user)
 }
 
@@ -113,6 +110,18 @@ fn validate_application_boundary(
             .as_ref()
             .is_none_or(|application| application.id != application_id)
     {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+fn validate_profile_boundary(
+    snapshot: &AuthorizationPolicySnapshot,
+    application_id: &str,
+    profile_id: &str,
+) -> AppResult<()> {
+    validate_application_boundary(snapshot, application_id)?;
+    if snapshot.profile.as_ref().map(|profile| profile.id.as_str()) != Some(profile_id) {
         return Err(AppError::Forbidden);
     }
     Ok(())
@@ -148,7 +157,7 @@ pub fn resolve_entitlements_from_snapshot(
         .groups
         .iter()
         .map(|group| group.id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<HashSet<_>>();
 
     let mut roles = BTreeSet::new();
     let mut permissions = BTreeSet::new();

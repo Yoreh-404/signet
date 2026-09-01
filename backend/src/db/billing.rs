@@ -5,7 +5,7 @@ use super::billing_sql::{
     select_application_billing_settings_sql, select_payment_order_sql, select_payment_refund_sql,
     select_wallet_account_sql, select_wallet_hold_sql, select_wallet_transaction_sql,
 };
-use super::{CountRow, Db, blocking, ph};
+use super::{CountRow, Db, TotalRow, blocking, ph};
 use crate::{
     config::DatabaseKind,
     error::{AppError, AppResult},
@@ -1205,12 +1205,6 @@ impl Db {
         reason: &str,
         idempotency_key: &str,
     ) -> AppResult<PaymentRefundRecord> {
-        #[derive(diesel::QueryableByName)]
-        struct TotalRow {
-            #[diesel(sql_type = BigInt)]
-            total: i64,
-        }
-
         if idempotency_key.trim().is_empty() {
             return Err(AppError::BadRequest(
                 "billing idempotency_key is invalid".to_string(),
@@ -2234,12 +2228,6 @@ impl Db {
         amount_minor: i64,
         idempotency_key: &str,
     ) -> AppResult<WalletTransactionRecord> {
-        #[derive(diesel::QueryableByName)]
-        struct TotalRow {
-            #[diesel(sql_type = BigInt)]
-            total: i64,
-        }
-
         let transaction_id = transaction_id.to_string();
         let user_id = user_id.to_string();
         let idempotency_key = idempotency_key.to_string();
