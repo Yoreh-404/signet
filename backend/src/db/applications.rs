@@ -7,7 +7,7 @@ use super::{
     ApplicationAuthContextRecord, ApplicationAuthDomainRecord,
     ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
     ApplicationGraphRecordSet, ApplicationIdentityBindingRecord, ApplicationMemberRecord,
-    ApplicationMemberWithUserRecord, ApplicationModuleRecord,
+    ApplicationMemberWithUserRecord, ApplicationModuleRecord, ApplicationOidcClientRecord,
     ApplicationPermissionDefinitionRecord, ApplicationProfileRoleRecord, ApplicationRecord,
     AuditEventRecord, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
     InvitationRecord, NewApplication, NewApplicationAuthContext,
@@ -612,6 +612,30 @@ impl Db {
         })
     }
 
+    pub async fn find_application_oidc_client(
+        &self,
+        application_id: &str,
+        client_db_id: &str,
+    ) -> AppResult<Option<ApplicationOidcClientRecord>> {
+        let application_id = application_id.to_string();
+        let client_db_id = client_db_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT binding.client_db_id AS client_db_id, client.client_secret_hash AS client_secret_hash, client.audience AS audience FROM application_client_bindings AS binding INNER JOIN clients AS client ON client.id = binding.client_db_id WHERE binding.application_id = {} AND binding.client_db_id = {} AND binding.protocol = {}",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .bind::<Text, _>(client_db_id)
+                .bind::<Text, _>("oidc")
+                .get_result::<ApplicationOidcClientRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_application_client_binding_by_public_client_id(
         &self,
         client_id: &str,
@@ -866,6 +890,43 @@ impl Db {
         let (application, audit_event) = with_conn!(self, |conn, kind| {
             conn.transaction::<(ApplicationRecord, AuditEventRecord), AppError, _>(|conn| {
                 let application = update_application_on_conn!(conn, kind, &id, &application, now,)?;
+                let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
+                Ok((application, audit_event))
+            })
+        })?;
+        crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
+        Ok(application)
+    }
+
+    /// Updates an application, its module configuration, and management audit
+    /// record atomically. Website-managed applications keep their canonical
+    /// URL in the `protocols` module, so the two records must not drift.
+    pub async fn update_application_with_module_with_audit(
+        &self,
+        id: &str,
+        application: NewApplication,
+        module_key: &str,
+        config_json: &str,
+        is_enabled: bool,
+        event: crate::audit::AuditEvent,
+    ) -> AppResult<ApplicationRecord> {
+        let id = id.to_string();
+        let module_key = module_key.to_string();
+        let config_json = config_json.to_string();
+        let now = util::now_ts();
+        let webhook_db = self.clone();
+        let (application, audit_event) = with_conn!(self, |conn, kind| {
+            conn.transaction::<(ApplicationRecord, AuditEventRecord), AppError, _>(|conn| {
+                let application = update_application_on_conn!(conn, kind, &id, &application, now)?;
+                upsert_application_module_on_conn!(
+                    conn,
+                    kind,
+                    &id,
+                    &module_key,
+                    &config_json,
+                    is_enabled,
+                    now,
+                )?;
                 let audit_event = insert_audit_event_on_conn!(conn, kind, event)?;
                 Ok((application, audit_event))
             })

@@ -1,44 +1,23 @@
 import {
-  Archive,
   AtSign,
-  Ban,
   Building2,
   Coins,
-  FileUp,
-  Globe2,
-  KeyRound,
   Link2,
   LogOut,
   Mail,
   Moon,
   Phone,
-  Plus,
   RefreshCw,
-  RotateCcw,
-  Save,
   Settings,
   Shield,
   Shuffle,
   Sun,
-  Trash2,
   Ticket,
-  UserRound,
-  Users
+  UserRound
 } from "lucide-react";
 import { FormEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Card,
-  Check,
-  EmptyState,
-  Field,
-  FormActions,
-  FormErrorSummary,
-  ListField,
-  Modal,
-  SecretField,
-  SettingsSection,
-  SelectField,
-  StatusBadge
+  Modal
 } from "./components/ui";
 import {
   AuthorizationCodeLoginForm,
@@ -111,26 +90,30 @@ import { useAccountDataLoader } from "./features/account/use-account-data-loader
 import { SecurityWorkspace } from "./features/security/SecurityWorkspace";
 import { ProvidersWorkspace } from "./features/providers/ProvidersWorkspace";
 import { useUserDirectoryCursor } from "./features/users/use-user-directory";
+import { appendUserDirectoryCursor } from "./features/users/user-directory";
 import { useUserSelection } from "./features/users/use-user-selection";
 import { useUserDirectoryQuery } from "./features/users/use-user-directory-query";
 import { useUserBulkActions } from "./features/users/use-user-bulk-actions";
-import { UserDirectoryFilterPanel } from "./features/users/UserDirectoryFilterPanel";
-import type {
-  UserLinkedIdentityFilter,
-  UserLoginRegionFilter,
-  UserRoleFilter,
-} from "./features/users/user-directory-filter-types";
 import { UserEditorModal } from "./features/users/UserEditorModal";
-import { UserDetailPanel } from "./features/users/UserDetailPanel";
+import { UserDirectoryPanel } from "./features/users/UserDirectoryPanel";
+import { useUserDirectoryFilterActions } from "./features/users/use-user-directory-filter-actions";
 import { BulkUserImportModal } from "./features/users/BulkUserImportModal";
-import { UserTable } from "./features/users/UserTable";
 import { OrganizationsWorkspace } from "./features/organizations/OrganizationsWorkspace";
+import { ApplicationBasicsModal } from "./features/applications/ApplicationBasicsModal";
+import { EnterpriseCreateModal } from "./features/organizations/EnterpriseCreateModal";
+import { ConfirmationModal } from "./features/navigation/ConfirmationModal";
 import type { OrganizationFormState } from "./features/organizations/OrganizationWorkspace";
 import type { BulkUserImportFormState } from "./features/users/BulkUserImportModal";
 import { BULK_USER_IMPORT_TEMPLATE } from "./features/users/user-lifecycle";
-import type { BulkUserAction, UserLifecycleState } from "./features/users/user-lifecycle";
+import type { BulkUserAction } from "./features/users/user-lifecycle";
+import type { BulkLifecycleMutation } from "./features/users/bulk-lifecycle";
 import { confirmDiscardChanges } from "./features/admin/confirm-discard-changes";
 import { useUserController } from "./features/admin/use-user-controller";
+import { useBulkUserLifecycleAction } from "./features/users/use-bulk-user-lifecycle-action";
+import {
+  toExternalOidcProviderForm,
+  toUserEditorForm
+} from "./features/admin/form-adapters";
 import * as adminApi from "./lib/api/admin";
 import type { WalletWorkspaceHandle } from "./features/billing/WalletWorkspace";
 import { translations } from "./i18n";
@@ -164,10 +147,8 @@ import {
 import {
   emptyAuditWebhookForm,
   emptyAuthorizationCodeLoginForm,
-  emptyApplicationForm,
   emptyGroupForm,
   emptyEnterpriseForm,
-  emptyInvitationForm,
   emptyLdapProviderForm,
   emptyOrganizationForm,
   emptyPasswordResetForm,
@@ -251,11 +232,7 @@ export function App() {
     scopeKey: string | null;
     key: string;
   } | null>(null);
-  const bulkLifecycleMutationRef = useRef<{
-    action: adminApi.UserLifecycleBatchAction;
-    userIds: string[];
-    key: string;
-  } | null>(null);
+  const bulkLifecycleMutationRef = useRef<BulkLifecycleMutation | null>(null);
   const walletWorkspaceRef = useRef<WalletWorkspaceHandle | null>(null);
   const [initialLoadError, setInitialLoadError] = useState("");
   const accountController = useAccountController({
@@ -429,6 +406,7 @@ export function App() {
     organizationMembersLoadId
   } = organizationController;
   const {
+    createOrganization,
     editOrganization,
     setOrganizationMemberRole
   } = useOrganizationEditorActions({
@@ -470,10 +448,6 @@ export function App() {
     userAccess,
     setUserAccess
   } = useRoleController();
-  const selectedInvitationClientIds = useMemo(
-    () => new Set(invitationForm.allowed_client_ids),
-    [invitationForm.allowed_client_ids]
-  );
   const selectedDirectRoleIds = useMemo(
     () => new Set(userAccess?.direct_roles.map((role) => role.id) ?? []),
     [userAccess?.direct_roles]
@@ -846,6 +820,7 @@ export function App() {
     setGroupFormBaseline
   });
   const {
+    openCreateApplication,
     editApplication,
     saveApplication,
     deleteApplication
@@ -871,6 +846,8 @@ export function App() {
     formatError: messageOr
   });
   const {
+    openCreateInvitation,
+    editInvitation,
     saveInvitation,
     deleteInvitation,
     copyLastInvitationCode: copyInvitationCode,
@@ -1132,6 +1109,22 @@ export function App() {
     userLoginRegionFilter,
     userLinkedIdentityFilter,
   };
+  const { updateFilter: updateUserDirectoryFilter, resetFilters: resetUserFilters } = useUserDirectoryFilterActions({
+    resetQueryState: resetUserDirectoryQueryState,
+    setSearchQuery,
+    setUserFilter,
+    setUserOrganizationFilter,
+    setUserFiltersExpanded,
+    setUserEmailFilter,
+    setUserRoleFilter,
+    setUserRegistrationFrom,
+    setUserRegistrationTo,
+    setUserLastLoginFrom,
+    setUserLastLoginTo,
+    setUserPhoneFilter,
+    setUserLoginRegionFilter,
+    setUserLinkedIdentityFilter
+  });
   const userDirectory = useUserDirectoryCursor({
     endpoint: "/api/admin/users/cursor",
     query: userDirectoryQuery,
@@ -1549,28 +1542,16 @@ export function App() {
     document.title = label ? `${label} · Signet` : "Signet";
   }, [accountLoginExpanded, authAccountSwitch, authMode, authReturnTo, initialAuth.forceLogin, initialAuth.isAuthPage, initialAuth.selectAccount, locale, tab, tabs, user]);
 
-  // The invitation/provider tables resolve these references for every row.
-  // Build indexes once per read-model change instead of scanning the full
-  // client/organization collections inside each rendered cell.
-  const clientsByClientId = useMemo(
-    () => new Map(clients.map((client) => [client.client_id, client])),
-    [clients]
-  );
-  const organizationOptionsById = useMemo(
-    () => new Map(organizationOptions.map((organization) => [organization.id, organization])),
-    [organizationOptions]
-  );
   // The directory endpoint is the single owner of user filtering, sorting,
   // and pagination. Filtering this page again in React makes server totals and
   // visible rows disagree when the two implementations drift.
-  const filteredUsers = users;
   const activeUserDirectoryPage = userDirectoryQuery.page ?? userDirectoryPage;
-  const userPageStart = filteredUsers.length === 0
+  const userPageStart = users.length === 0
     ? 0
     : (activeUserDirectoryPage - 1) * userDirectoryPageSize + 1;
   const userPageEnd = userPageStart === 0
     ? 0
-    : userPageStart + filteredUsers.length - 1;
+    : userPageStart + users.length - 1;
   const {
     selectedIdSet: selectedUserIdSet,
     selectedUsers: selectedManagedUsers,
@@ -1580,7 +1561,7 @@ export function App() {
     toggleVisible: toggleVisibleUserSelection
   } = useUserSelection({
     users,
-    visibleUsers: filteredUsers,
+    visibleUsers: users,
     selectedIds: selectedUserIds,
     setSelectedIds: setSelectedUserIds
   });
@@ -1624,54 +1605,18 @@ export function App() {
     selectedUsersAreCurrent
   );
 
-  function resetUserFilters() {
-    resetUserDirectoryQueryState();
-    setUserFilter("live");
-    setUserOrganizationFilter("");
-    setUserFiltersExpanded(false);
-    setUserEmailFilter("");
-    setUserRoleFilter("all");
-    setUserRegistrationFrom("");
-    setUserRegistrationTo("");
-    setUserLastLoginFrom("");
-    setUserLastLoginTo("");
-    setUserPhoneFilter("");
-    setUserLoginRegionFilter("all");
-    setUserLinkedIdentityFilter("all");
-  }
-
-  function bulkUserActionTitle(action: BulkUserAction): string {
-    switch (action) {
-      case "enable": return t("bulkEnable");
-      case "disable": return t("bulkDisable");
-      case "archive": return t("bulkArchive");
-      case "delete": return t("bulkDelete");
-      case "reset_mfa": return t("bulkResetMfa");
-    }
-  }
-
-  function requestBulkUserAction(action: BulkUserAction) {
-    if (!availableBulkUserActions.includes(action)) return;
-    const targetIds = selectedManagedUsers.map((item) => item.id);
-    if (targetIds.length === 0 || targetIds.length !== selectedUserIds.length) return;
-    const targetIdSet = new Set(targetIds);
-    const title = bulkUserActionTitle(action);
-    const existingMutation = bulkLifecycleMutationRef.current;
-    const idempotencyKey = existingMutation
-      && existingMutation.action === action
-      && existingMutation.userIds.length === targetIds.length
-      && existingMutation.userIds.every((id) => targetIdSet.has(id))
-      ? existingMutation.key
-      : `ui-bulk-lifecycle-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
-    bulkLifecycleMutationRef.current = { action, userIds: [...targetIds], key: idempotencyKey };
-    requestConfirmation(async () => {
-      await adminApi.applyAdminUserLifecycle(action, targetIds, { idempotencyKey });
-      setSelectedUserIds((current) => current.filter((id) => !targetIdSet.has(id)));
-      await userDirectory.reload();
-      setVerificationMessage(t("bulkActionCompleted"));
-      bulkLifecycleMutationRef.current = null;
-    }, title);
-  }
+  const { requestBulkAction: requestBulkUserAction } = useBulkUserLifecycleAction({
+    selectedUsers: selectedManagedUsers,
+    selectedUserIds,
+    availableActions: availableBulkUserActions,
+    mutationRef: bulkLifecycleMutationRef,
+    requestConfirmation,
+    applyLifecycle: adminApi.applyAdminUserLifecycle,
+    setSelectedUserIds,
+    reloadUsers: userDirectory.reload,
+    setVerificationMessage,
+    translate: t
+  });
 
   if (initialLoadError) {
     return (
@@ -1906,24 +1851,16 @@ export function App() {
           }}
         />
         {editor === "enterprise" && (
-          <Modal title={t("createEnterprise")} closeLabel={t("close")} error={error} dismissible={!busy} onClose={closeEditor}>
-            <form className="panel" onSubmit={saveEnterprise}>
-              <p className="muted">{t("createEnterpriseHint")}</p>
-              <Field label={t("enterpriseSlug")} value={enterpriseForm.slug} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, slug: value })} />
-              <Field label={t("enterpriseName")} value={enterpriseForm.name} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, name: value })} />
-              <Field label={t("enterpriseDescription")} value={enterpriseForm.description} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, description: value })} textarea />
-              <Field label={t("enterpriseEmailDomains")} value={enterpriseForm.allowed_email_domains} onChange={(value) => setEnterpriseForm({ ...enterpriseForm, allowed_email_domains: value })} textarea />
-              <FormActions
-                submitLabel={t("createEnterprise")}
-                cancelLabel={t("cancel")}
-                onCancel={closeEditor}
-                busy={busy}
-                dirty={enterpriseFormDirty}
-                statusLabel={enterpriseFormDirty ? t("unsavedChanges") : undefined}
-                savingLabel={t("saving")}
-              />
-            </form>
-          </Modal>
+          <EnterpriseCreateModal
+            form={enterpriseForm}
+            busy={busy}
+            error={error}
+            dirty={enterpriseFormDirty}
+            translate={t}
+            onChange={setEnterpriseForm}
+            onSubmit={saveEnterprise}
+            onClose={closeEditor}
+          />
         )}
         <AdminFeedbackStack
           loading={adminViewLoading}
@@ -2033,134 +1970,66 @@ export function App() {
                 onReset={resetBulkUserImport}
               />
             )}
-            <div className="table-panel users-table-panel">
-              <div className="table-toolbar users-toolbar">
-                <div className="users-toolbar-actions">
-                  {canManageUsers && <button type="button" onClick={() => { setUserForm(emptyUserForm); setUserFormBaseline(emptyUserForm); setEditor("user"); }}><Plus size={14} />{t("createUser")}</button>}
-                  {canManageUsers && <button type="button" onClick={openBulkUserImport}><FileUp size={14} />{t("bulkUserImport")}</button>}
-                </div>
-              </div>
-                <UserDirectoryFilterPanel
-                  filters={userDirectoryFilters}
-                  expanded={userFiltersExpanded}
-                  organizationOptions={organizationOptions}
-                  t={t}
-                  onToggleExpanded={() => setUserFiltersExpanded((value) => !value)}
-                  onChange={(field, value) => {
-                    resetUserDirectoryQueryState();
-                    switch (field) {
-                      case "userFilter": setUserFilter(value as UserFilter); break;
-                      case "userEmailFilter": setUserEmailFilter(value as string); break;
-                      case "userRoleFilter": setUserRoleFilter(value as UserRoleFilter); break;
-                      case "userRegistrationFrom": setUserRegistrationFrom(value as string); break;
-                      case "userRegistrationTo": setUserRegistrationTo(value as string); break;
-                      case "userLastLoginFrom": setUserLastLoginFrom(value as string); break;
-                      case "userLastLoginTo": setUserLastLoginTo(value as string); break;
-                      case "userPhoneFilter": setUserPhoneFilter(value as string); break;
-                      case "userLoginRegionFilter": setUserLoginRegionFilter(value as UserLoginRegionFilter); break;
-                      case "userOrganizationFilter": setUserOrganizationFilter(value as string); break;
-                      case "userLinkedIdentityFilter": setUserLinkedIdentityFilter(value as UserLinkedIdentityFilter); break;
-                      case "searchQuery": setSearchQuery(value as string); break;
-                    }
-                  }}
-                  onReset={resetUserFilters}
-                />
-              {canManageUsers && selectedUserIds.length > 0 && (
-                <div className="bulk-user-actions" aria-live="polite">
-                  <strong>{t("selectedUsers").replace("{count}", String(selectedUserIds.length))}</strong>
-                  <div className="actions">
-                    {availableBulkUserActions.includes("enable") && <button type="button" onClick={() => requestBulkUserAction("enable")} disabled={busy}>
-                      <RotateCcw size={14} />{t("bulkEnable")}
-                    </button>}
-                    {availableBulkUserActions.includes("disable") && <button type="button" onClick={() => requestBulkUserAction("disable")} disabled={busy}>
-                      <Ban size={14} />{t("bulkDisable")}
-                    </button>}
-                    {availableBulkUserActions.includes("archive") && <button type="button" onClick={() => requestBulkUserAction("archive")} disabled={busy}>
-                      <Archive size={14} />{t("bulkArchive")}
-                    </button>}
-                    {availableBulkUserActions.includes("delete") && <button type="button" onClick={() => requestBulkUserAction("delete")} disabled={busy}>
-                      <Trash2 size={14} />{t("bulkDelete")}
-                    </button>}
-                    {availableBulkUserActions.includes("reset_mfa") && <button type="button" onClick={() => requestBulkUserAction("reset_mfa")} disabled={busy}>
-                      <KeyRound size={14} />{t("bulkResetMfa")}
-                    </button>}
-                    <button type="button" onClick={() => setSelectedUserIds([])} disabled={busy}>{t("clearSelection")}</button>
-                  </div>
-                </div>
-              )}
-              <UserTable
-                users={filteredUsers}
-                canManageUsers={canManageUsers}
-                currentUserId={user?.id}
-                selectedUserIdSet={selectedUserIdSet}
-                allVisibleSelected={allVisibleUsersSelected}
-                busy={busy}
-                locale={locale}
-                translate={t}
-                onToggleVisibleSelection={toggleVisibleUserSelection}
-                onToggleSelection={toggleUserSelection}
-                onEditUser={(item) => {
-                  const nextForm = {
-                    id: item.id,
-                    email: item.email,
-                    username: item.username,
-                    display_name: item.display_name ?? "",
-                    phone: item.phone ?? "",
-                    password: "",
-                    is_admin: item.is_admin,
-                    is_active: item.is_active
-                  };
-                  setUserForm(nextForm);
-                  setUserFormBaseline(nextForm);
-                  setEditor("user");
-                }}
-                onShowDetails={(id) => void showUserDetails(id)}
-                onResetMfa={resetUserMfa}
-                onAdvanceLifecycle={advanceUserLifecycle}
-                onEnableUser={enableUser}
-                onRequestConfirmation={requestConfirmation}
-              />
-              <div className="user-pagination" aria-label={t("users")}>
-                <span>
-                  {t("cursorPageSummary")
-                    .replace("{page}", String(activeUserDirectoryPage))
-                    .replace("{from}", String(userPageStart))
-                    .replace("{to}", String(userPageEnd))}
-                </span>
-                <div className="actions">
-                  <button
-                    type="button"
-                    className="text-button"
-                    aria-label={t("previousPage")}
-                    onClick={() => {
-                      setSelectedUserIds([]);
-                      setUserDirectoryPage((page) => Math.max(1, page - 1));
-                    }}
-                    disabled={adminViewLoading || activeUserDirectoryPage <= 1}
-                  >{t("previousPage")}</button>
-                  <button
-                    type="button"
-                    className="text-button"
-                    aria-label={t("nextPage")}
-                    onClick={() => {
-                      setSelectedUserIds([]);
-                      const nextCursor = userDirectoryNextCursor;
-                      if (!nextCursor) return;
-                      setUserDirectoryCursorHistory((history) => {
-                        const nextPage = activeUserDirectoryPage + 1;
-                        const nextHistory = history.slice(0, nextPage);
-                        nextHistory[nextPage - 1] = nextCursor;
-                        return nextHistory;
-                      });
-                      setUserDirectoryPage((page) => page + 1);
-                    }}
-                    disabled={adminViewLoading || !userDirectoryNextCursor}
-                  >{t("nextPage")}</button>
-                </div>
-              </div>
-              {!adminViewLoading && filteredUsers.length === 0 && <EmptyState title={searchQuery ? t("noSearchResults") : t("noData")} icon={<Users size={22} />} />}
-              {selectedUser && <Modal title={t("userDetails")} closeLabel={t("close")} onClose={() => setSelectedUser(null)} wide className="user-detail-modal"><UserDetailPanel detail={selectedUser} locale={locale} t={t} /></Modal>}
-            </div>
+            <UserDirectoryPanel
+              users={users}
+              currentUserId={user?.id}
+              selectedUserIdSet={selectedUserIdSet}
+              allVisibleSelected={allVisibleUsersSelected}
+              selectedCount={selectedManagedUsers.length}
+              availableBulkActions={availableBulkUserActions}
+              filters={userDirectoryFilters}
+              filtersExpanded={userFiltersExpanded}
+              organizationOptions={organizationOptions}
+              page={activeUserDirectoryPage}
+              pageStart={userPageStart}
+              pageEnd={userPageEnd}
+              loading={adminViewLoading}
+              hasNextPage={Boolean(userDirectoryNextCursor)}
+              searchQuery={searchQuery}
+              selectedUser={selectedUser}
+              busy={busy}
+              locale={locale}
+              canManageUsers={canManageUsers}
+              translate={t}
+              onToggleVisibleSelection={toggleVisibleUserSelection}
+              onToggleSelection={toggleUserSelection}
+              onEditUser={(item) => {
+                const nextForm = toUserEditorForm(item);
+                setUserForm(nextForm);
+                setUserFormBaseline(nextForm);
+                setEditor("user");
+              }}
+              onShowDetails={(id) => void showUserDetails(id)}
+              onResetMfa={resetUserMfa}
+              onAdvanceLifecycle={advanceUserLifecycle}
+              onEnableUser={enableUser}
+              onRequestConfirmation={requestConfirmation}
+              onFilterChange={updateUserDirectoryFilter}
+              onToggleFilters={() => setUserFiltersExpanded((value) => !value)}
+              onResetFilters={resetUserFilters}
+              onBulkAction={requestBulkUserAction}
+              onClearSelection={() => setSelectedUserIds([])}
+              onPreviousPage={() => {
+                setSelectedUserIds([]);
+                setUserDirectoryPage((page) => Math.max(1, page - 1));
+              }}
+              onNextPage={() => {
+                const nextCursor = userDirectoryNextCursor;
+                if (!nextCursor) return;
+                setSelectedUserIds([]);
+                setUserDirectoryCursorHistory((history) => {
+                  return appendUserDirectoryCursor(history, activeUserDirectoryPage, nextCursor);
+                });
+                setUserDirectoryPage((page) => page + 1);
+              }}
+              onCloseDetails={() => setSelectedUser(null)}
+              onCreateUser={() => {
+                setUserForm(emptyUserForm);
+                setUserFormBaseline(emptyUserForm);
+                setEditor("user");
+              }}
+              onOpenBulkImport={openBulkUserImport}
+            />
           </section>
         )}
         {canReadOrganizations && tab === "organizations" && (
@@ -2179,15 +2048,7 @@ export function App() {
             translate={t}
             editorOpen={editor === "organization"}
             searchActive={Boolean(searchQuery)}
-            onCreate={() => {
-              organizationMembersLoadId.current += 1;
-              setOrganizationForm(emptyOrganizationForm);
-              setOrganizationFormBaseline(emptyOrganizationForm);
-              setOrganizationMemberRoles({});
-              setOrganizationMemberRolesBaseline({});
-              setOrganizationMembersLoading(false);
-              setEditor("organization");
-            }}
+            onCreate={createOrganization}
             onEdit={(organization) => void editOrganization(organization)}
             onDelete={(id) => requestConfirmation(() => deleteOrganization(id))}
             onSave={saveOrganization}
@@ -2202,35 +2063,16 @@ export function App() {
         )}
         {canManageActiveOrganization && tab === "applications" && (
           <>
-            {editor === "application" && (
-              <Modal
-                title={applicationForm.id ? t("updateApplication") : t("createApplication")}
-                closeLabel={t("close")}
-                error={error}
-                dismissible={!busy}
-                onClose={closeEditor}
-              >
-                <form className="panel application-basics-form" onSubmit={saveApplication}>
-                  <div className="application-form-intro">
-                    <span className="application-hero-avatar"><Globe2 size={22} /></span>
-                    <div><strong>{t("websiteApplication")}</strong><p>{t("websiteApplicationHint")}</p></div>
-                  </div>
-                  <Field label={t("applicationSlug")} value={applicationForm.slug} onChange={(value) => setApplicationForm({ ...applicationForm, slug: value })} required />
-                  <Field label={t("applicationName")} value={applicationForm.name} onChange={(value) => setApplicationForm({ ...applicationForm, name: value })} required />
-                  <Field label={t("websiteUrl")} type="url" value={applicationForm.website_url} onChange={(value) => setApplicationForm({ ...applicationForm, website_url: value })} />
-                  <Field label={t("description")} value={applicationForm.description} onChange={(value) => setApplicationForm({ ...applicationForm, description: value })} textarea />
-                  <SelectField label={t("applicationAccountSelection")} value={applicationForm.account_selection_mode} onChange={(value) => setApplicationForm({ ...applicationForm, account_selection_mode: value as typeof applicationForm.account_selection_mode })}>
-                    <option value="optional">{t("accountSelectionOptional")}</option>
-                    <option value="required">{t("accountSelectionRequired")}</option>
-                  </SelectField>
-                  <Check label={t("active")} checked={applicationForm.is_active} onChange={(value) => setApplicationForm({ ...applicationForm, is_active: value })} />
-                  <div className="form-actions">
-                    <span className="form-actions-status" aria-live="polite">{applicationFormDirty ? t("unsavedChanges") : ""}</span>
-                    <div className="actions"><button type="submit" disabled={busy}><Save size={14} />{applicationForm.id ? t("save") : t("create")}</button></div>
-                  </div>
-                </form>
-              </Modal>
-            )}
+            {editor === "application" && <ApplicationBasicsModal
+              form={applicationForm}
+              busy={busy}
+              error={error}
+              dirty={applicationFormDirty}
+              translate={t}
+              onChange={setApplicationForm}
+              onSubmit={saveApplication}
+              onClose={closeEditor}
+            />}
             <Suspense fallback={<div className="loading-state">{t("loading")}</div>}>
               <ApplicationWorkspace
                 applications={filteredApplications}
@@ -2239,12 +2081,7 @@ export function App() {
                 organizationOptions={organizationOptions}
                 locale={locale}
                 canManage={canManageActiveOrganization}
-                onCreateApplication={() => {
-                  applicationCreateMutationRef.current = null;
-                  setApplicationForm(emptyApplicationForm);
-                  setApplicationFormBaseline(emptyApplicationForm);
-                  setEditor("application");
-                }}
+                onCreateApplication={openCreateApplication}
                 onEditApplication={(application) => void editApplication(application)}
                 onDeleteApplication={(id) => requestConfirmation(() => deleteApplication(id), t("delete"), t("deleteApplicationDescription"))}
                 onApplicationModuleChanged={updateApplicationModuleInState}
@@ -2281,33 +2118,8 @@ export function App() {
               onClose={() => {
                 if (closeEditor()) setLastInvitationCode("");
               }}
-              onCreate={() => {
-                setInvitationForm(emptyInvitationForm);
-                setInvitationFormBaseline(emptyInvitationForm);
-                setLastInvitationCode("");
-                setEditor("invitation");
-              }}
-              onEdit={(item) => {
-                const nextForm = {
-                  id: item.id,
-                  code_type: item.code_type,
-                  login_code_level: item.login_code_level ?? "account_recovery",
-                  allowed_client_ids: item.allowed_client_ids ?? [],
-                  organization_id: item.organization_id ?? "",
-                  organization_role: item.organization_role ?? "member",
-                  description: item.description ?? "",
-                  authorized_email: item.authorized_email ?? "",
-                  authorized_username: item.authorized_username ?? "",
-                  authorized_display_name: item.authorized_display_name ?? "",
-                  expires_at: toDatetimeLocalValue(item.expires_at),
-                  max_uses: item.max_uses ? String(item.max_uses) : "",
-                  is_active: item.is_active
-                };
-                setInvitationForm(nextForm);
-                setInvitationFormBaseline(nextForm);
-                setLastInvitationCode("");
-                setEditor("invitation");
-              }}
+              onCreate={openCreateInvitation}
+              onEdit={editInvitation}
               onDelete={(id) => requestConfirmation(() => deleteInvitation(id))}
               onReveal={(item) => void revealInvitationCode(item)}
               onOpenRedemptions={invitationRedemptions.open}
@@ -2346,7 +2158,6 @@ export function App() {
               providers: filteredProviders,
               ldapProviders: filteredLdapProviders,
               organizationOptions,
-              organizationOptionsById,
               organizationContext,
               loading: adminViewLoading,
               searchActive: Boolean(searchQuery),
@@ -2372,25 +2183,7 @@ export function App() {
               },
               editProvider: (provider) => {
                 providerDiscoveryRequest.cancel();
-                const nextForm = {
-                  id: provider.id,
-                  slug: provider.slug,
-                  display_name: provider.display_name,
-                  organization_id: provider.organization_id ?? "",
-                  issuer: provider.issuer,
-                  client_id: provider.client_id,
-                  client_secret: "",
-                  clear_client_secret: false,
-                  authorization_endpoint: provider.authorization_endpoint,
-                  token_endpoint: provider.token_endpoint,
-                  userinfo_endpoint: provider.userinfo_endpoint,
-                  redirect_path: provider.redirect_path,
-                  scopes: joinList(provider.scopes),
-                  email_domains: joinList(provider.email_domains),
-                  is_active: provider.is_active,
-                  allow_login: provider.allow_login,
-                  allow_registration: provider.allow_registration
-                };
+                const nextForm = toExternalOidcProviderForm(provider);
                 setProviderForm(nextForm);
                 setProviderFormBaseline(nextForm);
                 setProviderTemplateId("");
@@ -2527,27 +2320,17 @@ export function App() {
         )}
       </main>
       {pendingConfirmation && (
-        <Modal
-          title={pendingConfirmation.title}
-          closeLabel={t("close")}
+        <ConfirmationModal
+          confirmation={pendingConfirmation}
+          busy={busy}
           error={error}
-          dismissible={!busy}
+          translate={t}
           onClose={() => {
             setPendingConfirmation(null);
             setError("");
           }}
-        >
-          <div className="confirm-dialog">
-            <div className="confirm-icon"><Trash2 size={22} /></div>
-            <p>{pendingConfirmation.description}</p>
-            <div className="actions confirm-actions">
-              <button type="button" onClick={() => { setPendingConfirmation(null); setError(""); }} disabled={busy}>{t("cancel")}</button>
-              <button type="button" className="danger-button" onClick={() => void runPendingConfirmation()} disabled={busy}>
-                {t("continue")}
-              </button>
-            </div>
-          </div>
-        </Modal>
+          onConfirm={runPendingConfirmation}
+        />
       )}
     </div>
   );

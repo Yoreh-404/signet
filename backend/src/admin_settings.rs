@@ -1,4 +1,7 @@
-use super::admin_providers::normalize_optional_http_url;
+use super::{
+    admin_guards::{require_admin_reader, require_security_manager, require_settings_manager},
+    admin_providers::normalize_optional_http_url,
+};
 use crate::{
     AppState,
     access::Authorizer,
@@ -45,7 +48,7 @@ pub(super) async fn settings_summary(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> AppResult<Json<SettingsSummary>> {
-    super::require_admin_reader(&state, &jar).await?;
+    require_admin_reader(&state, &jar).await?;
     let runtime = state.runtime_settings().await?;
     Ok(Json(SettingsSummary {
         config_server_public_base_url: state.settings.server.public_base_url.clone(),
@@ -72,7 +75,7 @@ pub(super) async fn get_registration_settings(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<PublicRegistrationSettings>> {
-    super::require_settings_manager(&state, &jar).await?;
+    require_settings_manager(&state, &jar).await?;
     Ok(Json(state.db.registration_settings().await?.public()))
 }
 
@@ -92,7 +95,7 @@ pub(super) async fn update_registration_settings(
     jar: CookieJar,
     Json(payload): Json<RegistrationSettingsInput>,
 ) -> AppResult<Json<PublicRegistrationSettings>> {
-    let current = super::require_settings_manager(&state, &jar).await?;
+    let current = require_settings_manager(&state, &jar).await?;
     let settings = state
         .db
         .upsert_registration_settings(NewRegistrationSettings {
@@ -304,7 +307,7 @@ pub(super) async fn list_signing_keys(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<SigningKeyResponse>>> {
-    super::require_security_manager(&state, &jar).await?;
+    require_security_manager(&state, &jar).await?;
     let keys = state
         .db
         .list_signing_keys()
@@ -320,7 +323,7 @@ pub(super) async fn rotate_signing_key(
     jar: CookieJar,
     Json(payload): Json<RotateSigningKeyInput>,
 ) -> AppResult<Json<SigningKeyResponse>> {
-    let current = super::require_security_manager(&state, &jar).await?;
+    let current = require_security_manager(&state, &jar).await?;
     let key = state.db.rotate_signing_key(payload.kid).await?;
     let keys = state.db.list_signing_keys().await?;
     state.jwt.reload(keys)?;
@@ -359,7 +362,7 @@ pub(super) async fn get_runtime_settings(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> AppResult<Json<RuntimeSettingsResponse>> {
-    super::require_settings_manager(&state, &jar).await?;
+    require_settings_manager(&state, &jar).await?;
     runtime_settings_response(&state, &headers).await.map(Json)
 }
 
@@ -369,7 +372,7 @@ pub(super) async fn update_runtime_settings(
     headers: HeaderMap,
     Json(payload): Json<RuntimeSettingsInput>,
 ) -> AppResult<Json<RuntimeSettingsResponse>> {
-    let current = super::require_settings_manager(&state, &jar).await?;
+    let current = require_settings_manager(&state, &jar).await?;
     let public_base_url = normalize_base_url(&payload.public_base_url, "public_base_url")?;
     let issuer = match payload
         .issuer
@@ -427,7 +430,7 @@ pub(super) async fn get_login_settings(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<PublicLoginSettings>> {
-    super::require_settings_manager(&state, &jar).await?;
+    require_settings_manager(&state, &jar).await?;
     state.db.login_settings().await?.public().map(Json)
 }
 
@@ -436,7 +439,7 @@ pub(super) async fn update_login_settings(
     jar: CookieJar,
     Json(payload): Json<LoginSettingsInput>,
 ) -> AppResult<Json<PublicLoginSettings>> {
-    let current = super::require_settings_manager(&state, &jar).await?;
+    let current = require_settings_manager(&state, &jar).await?;
     let LoginSettingsInput {
         brand_logo_url,
         email_domains,
@@ -537,13 +540,21 @@ pub(super) fn normalize_quick_links(values: Vec<QuickLink>) -> AppResult<Vec<Qui
     Ok(links)
 }
 
-pub(super) fn normalize_optional_text(value: Option<String>) -> Option<String> {
+pub(crate) fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
 }
 
-pub(super) fn normalize_optional_email(value: Option<String>) -> AppResult<Option<String>> {
+pub(crate) fn normalize_required_text(value: String, field: &str) -> AppResult<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} cannot be empty")));
+    }
+    Ok(value)
+}
+
+pub(crate) fn normalize_optional_email(value: Option<String>) -> AppResult<Option<String>> {
     let Some(value) = normalize_optional_text(value) else {
         return Ok(None);
     };

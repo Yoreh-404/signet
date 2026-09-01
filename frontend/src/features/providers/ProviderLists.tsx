@@ -1,4 +1,5 @@
 import { Link2, Plus, Users } from "lucide-react";
+import { useMemo } from "react";
 
 import { EmptyState } from "../../components/ui";
 import type { TranslationKey } from "../../i18n";
@@ -17,7 +18,7 @@ export type OidcProviderListProps = {
   loading: boolean;
   searchActive: boolean;
   translate: Translate;
-  organizationOptionsById: ReadonlyMap<string, OrganizationOption>;
+  organizationOptions: OrganizationOption[];
   organizationContext: UserOrganization | null;
   onCreate: () => void;
   onEdit: (provider: ExternalProvider) => void;
@@ -29,12 +30,16 @@ export function OidcProviderList({
   loading,
   searchActive,
   translate: t,
-  organizationOptionsById,
+  organizationOptions,
   organizationContext,
   onCreate,
   onEdit,
   onDelete
 }: OidcProviderListProps) {
+  const organizationOptionsById = useMemo(
+    () => new Map(organizationOptions.map((organization) => [organization.id, organization])),
+    [organizationOptions]
+  );
   return (
     <section className="identity-source-section">
       <div className="table-toolbar identity-source-toolbar">

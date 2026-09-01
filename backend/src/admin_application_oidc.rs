@@ -101,15 +101,9 @@ pub(super) async fn update(
     {
         return Err(AppError::Forbidden);
     }
-    let binding = state
-        .db
-        .find_application_client_binding(&client_db_id)
-        .await?
-        .filter(|binding| binding.application_id == application.id && binding.protocol == "oidc")
-        .ok_or(AppError::NotFound)?;
     let existing = state
         .db
-        .find_client_by_id(&binding.client_db_id)
+        .find_application_oidc_client(&application.id, &client_db_id)
         .await?
         .ok_or(AppError::NotFound)?;
     let claim_mappers = client_input_to_claim_mappers(&payload)?;
@@ -117,7 +111,7 @@ pub(super) async fn update(
         .db
         .update_application_oidc_client_graph(
             &application.id,
-            &existing.id,
+            &existing.client_db_id,
             client_input_to_new(
                 payload,
                 existing.client_secret_hash.clone(),
@@ -149,20 +143,9 @@ pub(super) async fn delete(
 ) -> AppResult<Json<serde_json::Value>> {
     let (current, application) = managed_application(&state, &jar, &id).await?;
     ensure_website_application_modules_editable(&state, &application).await?;
-    let binding = state
-        .db
-        .find_application_client_binding(&client_db_id)
-        .await?
-        .filter(|binding| binding.application_id == application.id && binding.protocol == "oidc")
-        .ok_or(AppError::NotFound)?;
     let client = state
         .db
-        .find_client_by_id(&binding.client_db_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    state
-        .db
-        .delete_application_oidc_client_graph(&application.id, &client.id)
+        .delete_application_oidc_client_graph(&application.id, &client_db_id)
         .await?;
     state
         .db

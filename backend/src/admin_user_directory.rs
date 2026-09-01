@@ -1,5 +1,7 @@
 use crate::{
     AppState,
+    access::Authorizer,
+    auth,
     db::{
         LinkedIdentityRecord, LoginEventRecord, PublicUser, UserOptionRecord,
         UserOrganizationRecord,
@@ -14,14 +16,39 @@ use axum_extra::extract::cookie::CookieJar;
 use serde::Serialize;
 
 use super::{
+    admin_guards::{USER_READ_PERMISSIONS, require_user_reader},
+    admin_organization_scope::require_organization_manager_for,
     admin_user_query::{
         USER_OPTION_DEFAULT_LIMIT, USER_OPTION_MAX_LIMIT, UserDirectoryCursorResponse,
         UserListPageResponse, UserListQuery, UserOptionQuery, decode_user_directory_cursor,
         encode_user_directory_cursor, normalize_user_list_text, parse_user_list_number,
         parse_user_list_query, user_list_scope,
     },
-    require_user_list_reader, require_user_reader,
 };
+
+/// Global user reads require an explicit user-directory permission. An
+/// organization owner/admin may use the directory only with an organization
+/// boundary; `organizations.manage` is never treated as global `users.read`.
+async fn require_user_list_reader(
+    state: &AppState,
+    jar: &CookieJar,
+    organization_id: Option<&str>,
+) -> AppResult<auth::CurrentUser> {
+    let current = auth::require_current_user(state, jar).await?;
+    auth::ensure_current_account_mutable(&current)?;
+    if state
+        .db
+        .has_any_permission(&current.user, USER_READ_PERMISSIONS)
+        .await?
+    {
+        return Ok(current);
+    }
+    let Some(organization_id) = organization_id else {
+        return Err(AppError::Forbidden);
+    };
+    require_organization_manager_for(state, &current, organization_id).await?;
+    Ok(current)
+}
 
 pub(super) async fn list_users(
     State(state): State<AppState>,

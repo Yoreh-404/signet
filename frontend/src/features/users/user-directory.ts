@@ -24,7 +24,22 @@ export type {
 
 export const DEFAULT_USER_DIRECTORY_PAGE = 1;
 export const DEFAULT_USER_DIRECTORY_PAGE_SIZE = 25;
+export const MAX_USER_DIRECTORY_PAGE_SIZE = 200;
 export const DEFAULT_USER_DIRECTORY_STATUS: UserFilter = "live";
+
+export function appendUserDirectoryCursor(
+  history: readonly (string | null)[],
+  currentPage: number,
+  nextCursor: string | null,
+): Array<string | null> {
+  if (!nextCursor || !Number.isFinite(currentPage) || currentPage < 1) {
+    return [...history];
+  }
+  const nextPage = Math.trunc(currentPage) + 1;
+  const nextHistory = history.slice(0, nextPage);
+  nextHistory[nextPage - 1] = nextCursor;
+  return nextHistory;
+}
 
 const USER_FILTER_VALUES: readonly UserFilter[] = [
   "live",
@@ -79,7 +94,10 @@ function optionalEnum<T extends string>(value: unknown, values: readonly T[]): T
 export function normalizeUserDirectoryQuery(input: UserDirectoryQueryInput): UserDirectoryQuery {
   const query: UserDirectoryQuery = {
     page: positiveInteger(input.page, DEFAULT_USER_DIRECTORY_QUERY.page),
-    page_size: positiveInteger(input.page_size, DEFAULT_USER_DIRECTORY_QUERY.page_size),
+    page_size: Math.min(
+      MAX_USER_DIRECTORY_PAGE_SIZE,
+      positiveInteger(input.page_size, DEFAULT_USER_DIRECTORY_QUERY.page_size),
+    ),
     status: optionalEnum(input.status, USER_FILTER_VALUES) ?? DEFAULT_USER_DIRECTORY_QUERY.status
   };
   const cursor = optionalString(input.cursor);
@@ -225,7 +243,7 @@ export function normalizeUserDirectoryResponse(value: unknown): UserDirectoryPag
     ? Math.max(1, Math.trunc(record.page))
     : DEFAULT_USER_DIRECTORY_PAGE;
   const pageSize = typeof record.page_size === "number" && Number.isFinite(record.page_size)
-    ? Math.max(1, Math.trunc(record.page_size))
+    ? Math.min(MAX_USER_DIRECTORY_PAGE_SIZE, Math.max(1, Math.trunc(record.page_size)))
     : DEFAULT_USER_DIRECTORY_PAGE_SIZE;
   const total = typeof record.total === "number" && Number.isFinite(record.total)
     ? Math.max(0, Math.trunc(record.total))
@@ -247,7 +265,7 @@ export function normalizeUserDirectoryCursorResponse(value: unknown): UserDirect
     throw new Error("invalid user directory cursor response");
   }
   const pageSize = typeof record.page_size === "number" && Number.isFinite(record.page_size)
-    ? Math.max(1, Math.trunc(record.page_size))
+    ? Math.min(MAX_USER_DIRECTORY_PAGE_SIZE, Math.max(1, Math.trunc(record.page_size)))
     : DEFAULT_USER_DIRECTORY_PAGE_SIZE;
   const nextCursor = typeof record.next_cursor === "string" && record.next_cursor.trim()
     ? record.next_cursor

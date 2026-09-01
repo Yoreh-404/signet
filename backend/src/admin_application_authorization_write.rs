@@ -215,10 +215,8 @@ pub(super) async fn update_role(
     ensure_local_profile_catalog_editable(&state, &application, &profile).await?;
     let current_role = state
         .db
-        .list_application_profile_roles(&profile_id)
+        .find_application_profile_role(&profile_id, &role_id)
         .await?
-        .into_iter()
-        .find(|role| role.id == role_id)
         .ok_or(AppError::NotFound)?;
     if current_role.source == application_discovery::SOURCE_WEBSITE
         && payload.role_key != current_role.role_key

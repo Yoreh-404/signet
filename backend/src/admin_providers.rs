@@ -1,4 +1,8 @@
-use super::{admin_client_policy::validate_absolute_http_url, normalize_required_text};
+use super::{
+    admin_client_policy::validate_absolute_http_url,
+    admin_management_scope::current_organization_provider_manager,
+    admin_settings::{normalize_optional_text, normalize_required_text},
+};
 use crate::{
     AppState,
     audit::{self, AuditSink},
@@ -23,16 +27,18 @@ pub(super) async fn list_external_oidc_providers(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicExternalOidcProvider>>> {
     let (_, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
-    let mut providers = Vec::new();
-    for provider in state.db.list_external_oidc_providers().await? {
-        if !platform_manager
-            && provider.organization_id.as_deref() != Some(organization.id.as_str())
-        {
-            continue;
-        }
-        providers.push(provider.public()?);
+        current_organization_provider_manager(&state, &jar).await?;
+    let providers = if platform_manager {
+        state.db.list_external_oidc_providers().await?
+    } else {
+        state
+            .db
+            .list_external_oidc_providers_for_organization(&organization.id)
+            .await?
     }
+    .into_iter()
+    .map(|provider| provider.public())
+    .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(providers))
 }
 
@@ -40,7 +46,7 @@ pub(super) async fn list_external_oidc_provider_templates(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> AppResult<Json<Vec<OidcProviderTemplate>>> {
-    super::current_organization_provider_manager(&state, &jar).await?;
+    current_organization_provider_manager(&state, &jar).await?;
     Ok(Json(identity_sources::oidc_provider_templates()))
 }
 
@@ -54,7 +60,7 @@ pub(super) async fn discover_external_oidc_provider(
     jar: CookieJar,
     Json(payload): Json<OidcDiscoveryInput>,
 ) -> AppResult<Json<OidcDiscoveryResult>> {
-    super::current_organization_provider_manager(&state, &jar).await?;
+    current_organization_provider_manager(&state, &jar).await?;
     identity_sources::discover_oidc_provider(&payload.issuer)
         .await
         .map(Json)
@@ -89,7 +95,7 @@ pub(super) async fn create_external_oidc_provider(
     Json(payload): Json<ExternalOidcProviderInput>,
 ) -> AppResult<Json<PublicExternalOidcProvider>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let organization_id = if platform_manager {
         super::normalize_client_organization_id(&state, payload.organization_id.clone()).await?
     } else {
@@ -125,7 +131,7 @@ pub(super) async fn update_external_oidc_provider(
     Json(payload): Json<ExternalOidcProviderInput>,
 ) -> AppResult<Json<PublicExternalOidcProvider>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let existing = state
         .db
         .find_external_oidc_provider_by_id(&id)
@@ -174,7 +180,7 @@ pub(super) async fn delete_external_oidc_provider(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let existing = state
         .db
         .find_external_oidc_provider_by_id(&id)
@@ -202,7 +208,7 @@ pub(super) async fn list_ldap_providers(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<PublicLdapProvider>>> {
     let (_, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let providers = state
         .db
         .list_ldap_providers()
@@ -248,7 +254,7 @@ pub(super) async fn create_ldap_provider(
     Json(payload): Json<LdapProviderInput>,
 ) -> AppResult<Json<PublicLdapProvider>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let organization_id = if platform_manager {
         super::normalize_client_organization_id(&state, payload.organization_id.clone()).await?
     } else {
@@ -279,7 +285,7 @@ pub(super) async fn update_ldap_provider(
     Json(payload): Json<LdapProviderInput>,
 ) -> AppResult<Json<PublicLdapProvider>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let existing = state
         .db
         .find_ldap_provider_by_id(&id)
@@ -322,7 +328,7 @@ pub(super) async fn delete_ldap_provider(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let (current, organization, platform_manager) =
-        super::current_organization_provider_manager(&state, &jar).await?;
+        current_organization_provider_manager(&state, &jar).await?;
     let existing = state
         .db
         .find_ldap_provider_by_id(&id)
@@ -451,7 +457,7 @@ pub(super) fn normalize_ldap_provider_input(
     let bind_password = if payload.clear_bind_password {
         Some(String::new())
     } else {
-        super::normalize_optional_text(payload.bind_password)
+        normalize_optional_text(payload.bind_password)
     };
     Ok(NewLdapProvider {
         slug,

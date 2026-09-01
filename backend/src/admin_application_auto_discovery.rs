@@ -1,4 +1,6 @@
-use super::{admin_application_discovery, require_organization_manager_for};
+use super::{
+    admin_application_discovery, admin_organization_scope::require_organization_manager_for,
+};
 use crate::{
     AppState, application_discovery,
     audit::{self, AuditSink},

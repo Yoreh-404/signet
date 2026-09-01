@@ -1,4 +1,28 @@
-use super::*;
+use super::{
+    AppError, AppResult, AppState, ApplicationModuleInput, ApplicationModuleResponse, Json, Path,
+    State, application_module_response, applications, audit,
+    ensure_website_application_modules_editable, managed_application,
+};
+use crate::audit::AuditSink;
+use axum_extra::extract::cookie::CookieJar;
+
+const APPLICATION_MODULE_KEYS: &[&str] = &[
+    "protocols",
+    "login_adapters",
+    "directory_sync",
+    "authorization",
+];
+
+fn normalize_application_module_key(value: &str) -> AppResult<String> {
+    let key = value.trim();
+    if APPLICATION_MODULE_KEYS.contains(&key) {
+        return Ok(key.to_string());
+    }
+    Err(AppError::BadRequest(format!(
+        "unsupported application module: {key}"
+    )))
+}
+
 pub(super) async fn list(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -13,56 +37,6 @@ pub(super) async fn list(
         .map(application_module_response)
         .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(modules))
-}
-
-pub(super) async fn get_billing(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
-    let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    let settings = state.db.ensure_application_billing_settings(&id).await?;
-    Ok(Json(billing::application_billing_settings_response(
-        settings,
-    )?))
-}
-
-pub(super) async fn update_billing(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Path(id): Path<String>,
-    Json(payload): Json<billing::ApplicationBillingSettingsInput>,
-) -> AppResult<Json<billing::ApplicationBillingSettingsResponse>> {
-    let (current, application) = managed_application(&state, &jar, &id).await?;
-    let (accept_signet_balance, wallet_mode, supported_currencies) =
-        billing::normalize_application_billing_input(&state.settings, payload)?;
-    let settings = state
-        .db
-        .upsert_application_billing_settings(NewApplicationBillingSettings {
-            application_id: id.clone(),
-            accept_signet_balance,
-            wallet_mode,
-            supported_currencies,
-        })
-        .await?;
-    state
-        .db
-        .record_audit_event(audit::management_event(
-            current.user.id,
-            "application.billing_settings.update",
-            "application",
-            Some(id),
-            serde_json::json!({
-                "organization_id": application.organization_id,
-                "accept_signet_balance": settings.accept_signet_balance == 1,
-                "wallet_mode": settings.wallet_mode,
-                "supported_currencies": util::from_json::<Vec<String>>(&settings.supported_currencies)?,
-            }),
-        ))
-        .await?;
-    Ok(Json(billing::application_billing_settings_response(
-        settings,
-    )?))
 }
 
 pub(super) async fn update(

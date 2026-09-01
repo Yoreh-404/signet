@@ -5,6 +5,7 @@ import type { TranslationKey } from "../../i18n";
 import * as adminApi from "../../lib/api/admin";
 import { emptyInvitationForm } from "../../lib/form-defaults";
 import { toTimestamp } from "../../lib/formatters";
+import { toInvitationForm } from "./form-adapters";
 import type { Invitation, Tab, User } from "../../types";
 
 type InvitationForm = typeof emptyInvitationForm;
@@ -48,6 +49,21 @@ export function useInvitationActions({
   translate,
   formatError
 }: Options) {
+  const openCreateInvitation = useCallback(() => {
+    setInvitationForm(emptyInvitationForm);
+    setInvitationFormBaseline(emptyInvitationForm);
+    setLastInvitationCode("");
+    setEditor("invitation");
+  }, [setEditor, setInvitationForm, setInvitationFormBaseline, setLastInvitationCode]);
+
+  const editInvitation = useCallback((invitation: Invitation) => {
+    const nextForm = toInvitationForm(invitation);
+    setInvitationForm(nextForm);
+    setInvitationFormBaseline(nextForm);
+    setLastInvitationCode("");
+    setEditor("invitation");
+  }, [setEditor, setInvitationForm, setInvitationFormBaseline, setLastInvitationCode]);
+
   const saveInvitation = useCallback(async (event: FormEvent) => {
     event.preventDefault();
     const editingInvitation = Boolean(invitationForm.id);
@@ -169,6 +185,8 @@ export function useInvitationActions({
   }, [setInvitationRevealError, setRevealedInvitation, setRevealedInvitationCode, setRevealingInvitationId]);
 
   return {
+    openCreateInvitation,
+    editInvitation,
     saveInvitation,
     deleteInvitation,
     copyLastInvitationCode,

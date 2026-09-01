@@ -65,6 +65,16 @@ pub struct ApplicationClientBindingRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct ApplicationOidcClientRecord {
+    #[diesel(sql_type = Text)]
+    pub client_db_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub client_secret_hash: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub audience: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewApplication {
     pub organization_id: String,

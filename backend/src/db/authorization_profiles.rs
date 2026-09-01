@@ -22,6 +22,15 @@ fn list_application_profile_roles_sql(kind: DatabaseKind) -> String {
     )
 }
 
+fn find_application_profile_role_sql(kind: DatabaseKind) -> String {
+    format!(
+        "{} WHERE profile_id = {} AND id = {}",
+        select_application_profile_role_sql(),
+        ph(kind, 1),
+        ph(kind, 2)
+    )
+}
+
 impl Db {
     pub async fn list_application_profile_roles(
         &self,
@@ -33,6 +42,23 @@ impl Db {
             sql_query(sql)
                 .bind::<Text, _>(profile_id)
                 .load::<ApplicationProfileRoleRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_application_profile_role(
+        &self,
+        profile_id: &str,
+        role_id: &str,
+    ) -> AppResult<Option<ApplicationProfileRoleRecord>> {
+        let profile_id = profile_id.to_string();
+        let role_id = role_id.to_string();
+        with_conn!(self, |conn, kind| {
+            sql_query(find_application_profile_role_sql(kind))
+                .bind::<Text, _>(profile_id)
+                .bind::<Text, _>(role_id)
+                .get_result::<ApplicationProfileRoleRecord>(&mut conn)
+                .optional()
                 .map_err(AppError::from)
         })
     }
@@ -266,7 +292,7 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
-    use super::list_application_profile_roles_sql;
+    use super::{find_application_profile_role_sql, list_application_profile_roles_sql};
     use crate::config::DatabaseKind;
 
     #[test]
@@ -278,6 +304,18 @@ mod tests {
         assert_eq!(
             list_application_profile_roles_sql(DatabaseKind::Postgres),
             "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles WHERE profile_id = $1 ORDER BY is_active DESC, name ASC, id ASC"
+        );
+    }
+
+    #[test]
+    fn find_application_profile_role_sql_is_scoped_by_profile_and_role() {
+        assert_eq!(
+            find_application_profile_role_sql(DatabaseKind::Sqlite),
+            "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles WHERE profile_id = ? AND id = ?"
+        );
+        assert_eq!(
+            find_application_profile_role_sql(DatabaseKind::Postgres),
+            "SELECT id, profile_id, role_key, name, description, permissions, source, is_default, is_active, created_at, updated_at FROM application_profile_roles WHERE profile_id = $1 AND id = $2"
         );
     }
 }

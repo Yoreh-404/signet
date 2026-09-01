@@ -25,7 +25,6 @@ export type ProvidersWorkspaceProps = {
     providers: ExternalProvider[];
     ldapProviders: LdapProvider[];
     organizationOptions: OrganizationOption[];
-    organizationOptionsById: ReadonlyMap<string, OrganizationOption>;
     organizationContext: UserOrganization | null;
     loading: boolean;
     searchActive: boolean;
@@ -89,7 +88,7 @@ export function ProvidersWorkspace({ state, actions, access, i18n }: ProvidersWo
         loading={state.loading}
         searchActive={state.searchActive}
         translate={t}
-        organizationOptionsById={state.organizationOptionsById}
+        organizationOptions={state.organizationOptions}
         organizationContext={state.organizationContext}
         onCreate={actions.createProvider}
         onEdit={actions.editProvider}

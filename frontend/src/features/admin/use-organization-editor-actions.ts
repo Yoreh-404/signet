@@ -30,6 +30,24 @@ export function useOrganizationEditorActions({
   setError,
   messageOr
 }: Options) {
+  const createOrganization = useCallback(() => {
+    organizationMembersLoadId.current += 1;
+    setOrganizationForm(emptyOrganizationForm);
+    setOrganizationFormBaseline(emptyOrganizationForm);
+    setOrganizationMemberRoles({});
+    setOrganizationMemberRolesBaseline({});
+    setOrganizationMembersLoading(false);
+    openOrganizationEditor();
+  }, [
+    openOrganizationEditor,
+    organizationMembersLoadId,
+    setOrganizationForm,
+    setOrganizationFormBaseline,
+    setOrganizationMemberRoles,
+    setOrganizationMemberRolesBaseline,
+    setOrganizationMembersLoading
+  ]);
+
   const editOrganization = useCallback(async (organization: Organization) => {
     const loadId = ++organizationMembersLoadId.current;
     const nextForm = {
@@ -82,5 +100,5 @@ export function useOrganizationEditorActions({
     });
   }, [setOrganizationMemberRoles]);
 
-  return { editOrganization, setOrganizationMemberRole };
+  return { createOrganization, editOrganization, setOrganizationMemberRole };
 }

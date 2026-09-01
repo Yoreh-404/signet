@@ -121,6 +121,24 @@ impl Db {
         })
     }
 
+    pub async fn list_external_oidc_providers_for_organization(
+        &self,
+        organization_id: &str,
+    ) -> AppResult<Vec<ExternalOidcProviderRecord>> {
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "{} WHERE organization_id = {} ORDER BY display_name ASC",
+                select_external_oidc_provider_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(organization_id)
+                .load::<ExternalOidcProviderRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn find_external_oidc_provider(
         &self,
         slug: &str,

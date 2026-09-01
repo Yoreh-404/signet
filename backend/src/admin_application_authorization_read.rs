@@ -1,4 +1,7 @@
-use super::{managed_application, managed_authorization_profile};
+use super::{
+    admin_application_scope::managed_application,
+    admin_organization_types::OrganizationMemberResponse, managed_authorization_profile,
+};
 use crate::{
     AppState,
     access::permission_catalog,
@@ -52,7 +55,7 @@ struct ApplicationAuthorizationGroupResponse {
 
 #[derive(Debug, Serialize)]
 pub(super) struct ApplicationAuthorizationSubjectsResponse {
-    users: Vec<super::OrganizationMemberResponse>,
+    users: Vec<OrganizationMemberResponse>,
     groups: Vec<ApplicationAuthorizationGroupResponse>,
     organization_roles: Vec<String>,
 }
@@ -129,7 +132,7 @@ pub(super) async fn subjects(
         .await?
         .into_iter()
         .filter(|member| member.is_active == 1 && member.archived_at.is_none())
-        .map(|member| super::OrganizationMemberResponse {
+        .map(|member| OrganizationMemberResponse {
             organization_id: member.organization_id,
             user_id: member.user_id,
             role: member.role,

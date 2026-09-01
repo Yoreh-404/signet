@@ -64,6 +64,13 @@ export function useApplicationActions({
   translate,
   formatError
 }: Options) {
+  const openCreateApplication = useCallback(() => {
+    applicationCreateMutationRef.current = null;
+    setApplicationForm(emptyApplicationForm);
+    setApplicationFormBaseline(emptyApplicationForm);
+    openEditor();
+  }, [applicationCreateMutationRef, openEditor, setApplicationForm, setApplicationFormBaseline]);
+
   const editApplication = useCallback((application: TenantApplication) => {
     const protocolModule = application.modules?.find((module) => module.module_key === "protocols");
     const protocolConfig = protocolModule?.config && typeof protocolModule.config === "object"
@@ -227,5 +234,5 @@ export function useApplicationActions({
     setApplications
   ]);
 
-  return { editApplication, saveApplication, deleteApplication };
+  return { openCreateApplication, editApplication, saveApplication, deleteApplication };
 }

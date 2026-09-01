@@ -1,20 +1,37 @@
-use super::*;
+use super::{
+    admin_access, admin_account_context, admin_account_security, admin_account_sessions,
+    admin_application_authorization_preview, admin_application_authorization_read,
+    admin_application_authorization_write, admin_application_auto_discovery,
+    admin_application_billing, admin_application_crud, admin_application_directory_sync,
+    admin_application_discovery, admin_application_enrollment, admin_application_iap,
+    admin_application_jwt, admin_application_modules, admin_application_oidc,
+    admin_application_scim, admin_audit, admin_auth, admin_authorization_code_read,
+    admin_authorization_code_write, admin_client_response, admin_organizations, admin_providers,
+    admin_security, admin_settings, admin_user_access, admin_user_directory, admin_user_import,
+    admin_users, get_mutation_receipt,
+};
+use crate::AppState;
+use axum::{
+    Router,
+    routing::{delete, get, post, put},
+};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
+        .route("/api/login", post(admin_auth::login))
+        .route("/api/logout", post(admin_auth::logout))
         .route("/api/me", get(admin_account_context::me))
         .route(
             "/api/me/organizations",
-            get(admin_account_context::my_organizations).post(create_my_organization),
+            get(admin_account_context::my_organizations)
+                .post(admin_account_context::create_my_organization),
         )
         .route(
             "/api/me/organization-context",
             get(admin_account_context::my_organization_context)
                 .put(admin_account_context::set_my_organization_context),
         )
-        .route("/api/csrf", get(csrf_token))
+        .route("/api/csrf", get(admin_security::csrf_token))
         .route(
             "/api/me/sessions",
             get(admin_account_sessions::list_my_sessions),
@@ -46,7 +63,7 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/mfa/recovery-codes/rotate",
             post(admin_account_security::rotate_recovery_codes),
         )
-        .route("/api/admin/overview", get(overview))
+        .route("/api/admin/overview", get(super::admin_overview::overview))
         .route("/api/admin/settings", get(admin_settings::settings_summary))
         .route(
             "/api/admin/registration-settings",
@@ -71,7 +88,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/users",
-            get(admin_user_directory::list_users).post(create_user),
+            get(admin_user_directory::list_users).post(admin_users::create_user),
         )
         .route(
             "/api/admin/users/page",
@@ -89,16 +106,28 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/admin/users/import-csv",
             post(admin_user_import::import_users_csv),
         )
-        .route("/api/admin/users/bulk-lifecycle", post(bulk_user_lifecycle))
+        .route(
+            "/api/admin/users/bulk-lifecycle",
+            post(admin_users::bulk_user_lifecycle),
+        )
         .route(
             "/api/admin/users/{id}",
             get(admin_user_directory::user_detail)
-                .put(update_user)
-                .delete(delete_user),
+                .put(admin_users::update_user)
+                .delete(admin_users::delete_user),
         )
-        .route("/api/admin/users/{id}/enable", post(enable_user))
-        .route("/api/admin/users/{id}/password", post(set_user_password))
-        .route("/api/admin/users/{id}/mfa/reset", post(reset_user_mfa))
+        .route(
+            "/api/admin/users/{id}/enable",
+            post(admin_users::enable_user),
+        )
+        .route(
+            "/api/admin/users/{id}/password",
+            post(admin_users::set_user_password),
+        )
+        .route(
+            "/api/admin/users/{id}/mfa/reset",
+            post(admin_users::reset_user_mfa),
+        )
         .route(
             "/api/admin/users/{id}/login-events",
             get(admin_user_directory::user_login_events),
@@ -107,14 +136,19 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/admin/users/{id}/permissions",
             get(admin_user_directory::user_permissions),
         )
-        .route("/api/admin/clients", get(list_clients))
+        .route(
+            "/api/admin/clients",
+            get(admin_client_response::list_clients),
+        )
         .route(
             "/api/admin/applications",
-            get(list_applications).post(create_application),
+            get(admin_application_crud::list_applications)
+                .post(admin_application_crud::create_application),
         )
         .route(
             "/api/admin/applications/{id}",
-            put(update_application).delete(delete_application),
+            put(admin_application_crud::update_application)
+                .delete(admin_application_crud::delete_application),
         )
         .route(
             "/api/admin/applications/{id}/discovery",
@@ -126,7 +160,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/applications/{id}/client-bindings",
-            get(list_application_client_bindings),
+            get(admin_application_crud::list_application_client_bindings),
         )
         .route(
             "/api/admin/application-discovery/discover",
@@ -150,8 +184,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route(
             "/api/admin/applications/{id}/billing-settings",
-            get(admin_application_modules::get_billing)
-                .put(admin_application_modules::update_billing),
+            get(admin_application_billing::get).put(admin_application_billing::update),
         )
         .route(
             "/api/admin/applications/{id}/iap-rules",
@@ -247,15 +280,18 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/admin/iap-applications",
             get(admin_application_iap::list_iap_applications),
         )
-        .route("/api/admin/audit-events", get(list_audit_events))
+        .route(
+            "/api/admin/audit-events",
+            get(admin_audit::list_audit_events),
+        )
         .route("/api/admin/mutations/{id}", get(get_mutation_receipt))
         .route(
             "/api/admin/audit-webhooks",
-            get(list_audit_webhooks).post(create_audit_webhook),
+            get(admin_audit::list_audit_webhooks).post(admin_audit::create_audit_webhook),
         )
         .route(
             "/api/admin/audit-webhooks/{id}",
-            put(update_audit_webhook).delete(delete_audit_webhook),
+            put(admin_audit::update_audit_webhook).delete(admin_audit::delete_audit_webhook),
         )
         .route(
             "/api/admin/access/permissions",
@@ -314,43 +350,49 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/admin/organizations/{id}/member-invitations/{invitation_id}",
             delete(admin_organizations::delete_organization_member_invitation),
         )
-        .route("/api/admin/users/{id}/access", get(user_access))
-        .route("/api/admin/users/{id}/roles", put(update_user_roles))
+        .route(
+            "/api/admin/users/{id}/access",
+            get(admin_user_access::user_access),
+        )
+        .route(
+            "/api/admin/users/{id}/roles",
+            put(admin_user_access::update_user_roles),
+        )
         .route(
             "/api/admin/authorization-codes",
-            get(admin_invitation_management::list_invitations)
-                .post(admin_invitation_management::create_invitation),
+            get(admin_authorization_code_read::list_invitations)
+                .post(admin_authorization_code_write::create_invitation),
         )
         .route(
             "/api/admin/authorization-codes/{id}/reveal",
-            post(admin_invitation_management::reveal_invitation_code),
+            post(admin_authorization_code_read::reveal_invitation_code),
         )
         .route(
             "/api/admin/authorization-codes/{id}/redemptions",
-            get(admin_invitation_management::list_invitation_redemptions),
+            get(admin_authorization_code_read::list_invitation_redemptions),
         )
         .route(
             "/api/admin/authorization-codes/{id}",
-            put(admin_invitation_management::update_invitation)
-                .delete(admin_invitation_management::delete_invitation),
+            put(admin_authorization_code_write::update_invitation)
+                .delete(admin_authorization_code_write::delete_invitation),
         )
         .route(
             "/api/admin/invitations",
-            get(admin_invitation_management::list_invitations)
-                .post(admin_invitation_management::create_invitation),
+            get(admin_authorization_code_read::list_invitations)
+                .post(admin_authorization_code_write::create_invitation),
         )
         .route(
             "/api/admin/invitations/{id}/reveal",
-            post(admin_invitation_management::reveal_invitation_code),
+            post(admin_authorization_code_read::reveal_invitation_code),
         )
         .route(
             "/api/admin/invitations/{id}/redemptions",
-            get(admin_invitation_management::list_invitation_redemptions),
+            get(admin_authorization_code_read::list_invitation_redemptions),
         )
         .route(
             "/api/admin/invitations/{id}",
-            put(admin_invitation_management::update_invitation)
-                .delete(admin_invitation_management::delete_invitation),
+            put(admin_authorization_code_write::update_invitation)
+                .delete(admin_authorization_code_write::delete_invitation),
         )
         .route(
             "/api/admin/external-oidc-providers",

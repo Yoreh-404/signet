@@ -3,10 +3,14 @@ import type { Dispatch, FormEvent, SetStateAction } from "react";
 
 import type { TranslationKey } from "../../i18n";
 import * as adminApi from "../../lib/api/admin";
-import { normalizeDomain } from "../../lib/auth-flow";
 import { emptyLdapProviderForm, emptyProviderForm } from "../../lib/form-defaults";
-import { joinList, splitList } from "../../lib/formatters";
+import { joinList } from "../../lib/formatters";
 import type { ExternalProviderTemplate, LdapProvider } from "../../types";
+import {
+  toExternalOidcProviderPayload,
+  toLdapProviderForm,
+  toLdapProviderPayload
+} from "./form-adapters";
 import type { AdminEditor } from "./use-settings-controller";
 import type { LatestRequestToken } from "./use-latest-request";
 
@@ -110,24 +114,7 @@ export function useProviderAdminActions({
     setBusy(true);
     setError("");
     try {
-      const body = {
-        slug: providerForm.slug,
-        display_name: providerForm.display_name,
-        organization_id: providerForm.organization_id || null,
-        issuer: providerForm.issuer,
-        client_id: providerForm.client_id,
-        client_secret: providerForm.client_secret,
-        clear_client_secret: providerForm.clear_client_secret,
-        authorization_endpoint: providerForm.authorization_endpoint,
-        token_endpoint: providerForm.token_endpoint,
-        userinfo_endpoint: providerForm.userinfo_endpoint,
-        redirect_path: providerForm.redirect_path,
-        scopes: splitList(providerForm.scopes),
-        email_domains: splitList(providerForm.email_domains).map(normalizeDomain),
-        is_active: providerForm.is_active,
-        allow_login: providerForm.allow_login,
-        allow_registration: providerForm.allow_registration
-      };
+      const body = toExternalOidcProviderPayload(providerForm);
       if (providerForm.id) {
         await adminApi.updateAdminExternalOidcProvider(providerForm.id, body);
       } else {
@@ -169,26 +156,7 @@ export function useProviderAdminActions({
     setBusy(true);
     setError("");
     try {
-      const body = {
-        slug: ldapProviderForm.slug,
-        display_name: ldapProviderForm.display_name,
-        organization_id: ldapProviderForm.organization_id || null,
-        url: ldapProviderForm.url,
-        starttls: ldapProviderForm.starttls,
-        bind_dn: ldapProviderForm.bind_dn,
-        bind_password: ldapProviderForm.bind_password || null,
-        clear_bind_password: ldapProviderForm.clear_bind_password,
-        base_dn: ldapProviderForm.base_dn,
-        user_filter: ldapProviderForm.user_filter,
-        user_id_attribute: ldapProviderForm.user_id_attribute,
-        email_attribute: ldapProviderForm.email_attribute,
-        username_attribute: ldapProviderForm.username_attribute,
-        display_name_attribute: ldapProviderForm.display_name_attribute,
-        phone_attribute: ldapProviderForm.phone_attribute,
-        is_active: ldapProviderForm.is_active,
-        allow_login: ldapProviderForm.allow_login,
-        allow_registration: ldapProviderForm.allow_registration
-      };
+      const body = toLdapProviderPayload(ldapProviderForm);
       if (ldapProviderForm.id) {
         await adminApi.updateAdminLdapProvider(ldapProviderForm.id, body);
       } else {
@@ -226,27 +194,7 @@ export function useProviderAdminActions({
   }, [loadAdminData, loadBootstrap]);
 
   const editLdapProvider = useCallback((provider: LdapProvider) => {
-    const nextForm = {
-      id: provider.id,
-      slug: provider.slug,
-      display_name: provider.display_name,
-      organization_id: provider.organization_id ?? "",
-      url: provider.url,
-      starttls: provider.starttls,
-      bind_dn: provider.bind_dn,
-      bind_password: "",
-      clear_bind_password: false,
-      base_dn: provider.base_dn,
-      user_filter: provider.user_filter,
-      user_id_attribute: provider.user_id_attribute,
-      email_attribute: provider.email_attribute,
-      username_attribute: provider.username_attribute,
-      display_name_attribute: provider.display_name_attribute,
-      phone_attribute: provider.phone_attribute,
-      is_active: provider.is_active,
-      allow_login: provider.allow_login,
-      allow_registration: provider.allow_registration
-    };
+    const nextForm = toLdapProviderForm(provider);
     setLdapProviderForm(nextForm);
     setLdapProviderFormBaseline(nextForm);
     setEditor("ldap");

@@ -1,4 +1,21 @@
-use super::*;
+use super::{
+    admin_application_scope::{ensure_website_application_modules_editable, managed_application},
+    admin_guards::require_iap_reader,
+    iap_application_input_to_new,
+};
+use crate::{
+    AppState,
+    audit::{self, AuditSink},
+    db::PublicIapApplication,
+    error::{AppError, AppResult},
+};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
+use axum_extra::extract::cookie::CookieJar;
+use serde::Deserialize;
+
 #[derive(Debug, Deserialize)]
 pub(super) struct IapApplicationInput {
     pub(super) slug: String,
@@ -58,7 +75,7 @@ pub(super) async fn create_application_iap_rule(
     ensure_website_application_modules_editable(&state, &application).await?;
     let rule = state
         .db
-        .insert_iap_application(iap_application_input_to_new(&state, &id, payload).await?)
+        .insert_iap_application(iap_application_input_to_new(&state, &application, payload).await?)
         .await?;
     state
         .db
@@ -96,7 +113,7 @@ pub(super) async fn update_application_iap_rule(
         .db
         .update_iap_application(
             &existing.id,
-            iap_application_input_to_new(&state, &id, payload).await?,
+            iap_application_input_to_new(&state, &application, payload).await?,
         )
         .await?;
     state

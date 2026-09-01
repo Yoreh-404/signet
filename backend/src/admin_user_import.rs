@@ -1,4 +1,8 @@
-use super::{UserInput, normalize_required_text};
+use super::{
+    admin_guards::require_user_manager,
+    admin_settings::{normalize_optional_text, normalize_required_text},
+    admin_user_types::UserInput,
+};
 use crate::organizations::OrganizationEmailPolicy;
 use crate::{
     AppState,
@@ -106,9 +110,9 @@ pub(super) fn normalize_user_input(input: UserInput) -> AppResult<NormalizedUser
     Ok(NormalizedUserInput {
         email: normalize_required_email(input.email)?,
         username: normalize_required_text(input.username, "username")?,
-        display_name: super::normalize_optional_text(input.display_name),
-        phone: super::normalize_optional_text(input.phone),
-        password: super::normalize_optional_text(input.password),
+        display_name: normalize_optional_text(input.display_name),
+        phone: normalize_optional_text(input.phone),
+        password: normalize_optional_text(input.password),
         is_admin: input.is_admin,
         is_active: input.is_active,
     })
@@ -133,7 +137,7 @@ pub(super) async fn import_users_csv(
     Query(query): Query<BulkImportQuery>,
     csv_document: String,
 ) -> AppResult<Response> {
-    let current = super::require_user_manager(&state, &jar).await?;
+    let current = require_user_manager(&state, &jar).await?;
     if csv_document.len() > BULK_IMPORT_MAX_BYTES {
         return Err(AppError::BadRequest(format!(
             "CSV import exceeds the {} byte limit",
@@ -346,7 +350,7 @@ pub(super) fn parse_bulk_import_csv(csv_document: &str) -> Result<ParsedBulkImpo
                 None
             }
         };
-        let display_name = super::normalize_optional_text(
+        let display_name = normalize_optional_text(
             (!bulk_import_csv_value(&record, &header_positions, "display_name").is_empty()).then(
                 || bulk_import_csv_value(&record, &header_positions, "display_name").to_string(),
             ),

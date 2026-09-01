@@ -1,4 +1,35 @@
-use super::*;
+use super::admin_organization_types::{
+    OrganizationInput, OrganizationMemberInvitationCreateResponse,
+    OrganizationMemberInvitationInput, OrganizationMemberPayload, OrganizationMemberResponse,
+    OrganizationMembersInput, OrganizationOptionResponse, OrganizationResponse,
+};
+use crate::{
+    AppState,
+    audit::{self, AuditSink},
+    db::{
+        AuthorizationCodeType, InvitationRecord, LoginCodeLevel, NewInvitation, NewOrganization,
+        OrganizationMemberInput, OrganizationMemberWithUserRecord, OrganizationRecord,
+        PublicInvitation,
+    },
+    error::{AppError, AppResult},
+    organizations::{self, OrganizationEmailPolicy},
+    security_policy, util,
+};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
+use axum_extra::extract::cookie::CookieJar;
+use std::collections::BTreeSet;
+
+use super::admin_assignment_policy::{
+    ensure_assignable_user_ids, ensure_organization_members_editable,
+};
+use super::admin_guards::{
+    require_organization_manager, require_organization_option_reader, require_organization_reader,
+};
+use super::admin_organization_scope::managed_organization_for;
+use super::admin_settings::{normalize_optional_email, normalize_optional_text};
 
 pub(crate) async fn organization_response(
     state: &AppState,
@@ -239,14 +270,7 @@ pub(crate) async fn list_organization_members(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<OrganizationMemberResponse>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_current_account_mutable(&current)?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (_, _) = managed_organization_for(&state, &jar, &id).await?;
     Ok(Json(
         state
             .db
@@ -267,14 +291,7 @@ pub(crate) async fn upsert_organization_member(
     Path(id): Path<String>,
     Json(payload): Json<OrganizationMemberPayload>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_current_account_mutable(&current)?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (current, _) = managed_organization_for(&state, &jar, &id).await?;
     let member = organization_members_input(
         &state,
         OrganizationMembersInput {
@@ -317,13 +334,7 @@ pub(crate) async fn list_organization_member_invitations(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<PublicInvitation>>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (_, organization) = managed_organization_for(&state, &jar, &id).await?;
     Ok(Json(
         state
             .db
@@ -341,13 +352,7 @@ pub(crate) async fn create_organization_member_invitation(
     Path(id): Path<String>,
     Json(payload): Json<OrganizationMemberInvitationInput>,
 ) -> AppResult<Json<OrganizationMemberInvitationCreateResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (current, organization) = managed_organization_for(&state, &jar, &id).await?;
     if organization.is_active != 1 {
         return Err(AppError::BadRequest(
             "cannot invite members to a disabled organization".to_string(),
@@ -431,13 +436,7 @@ pub(crate) async fn delete_organization_member_invitation(
     jar: CookieJar,
     Path((id, invitation_id)): Path<(String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (current, organization) = managed_organization_for(&state, &jar, &id).await?;
     if !state
         .db
         .organization_registration_invitation_belongs_to(&organization.id, &invitation_id)
@@ -465,14 +464,7 @@ pub(crate) async fn update_organization_members(
     Path(id): Path<String>,
     Json(payload): Json<OrganizationMembersInput>,
 ) -> AppResult<Json<OrganizationResponse>> {
-    let current = auth::require_current_user(&state, &jar).await?;
-    auth::ensure_current_account_mutable(&current)?;
-    let organization = state
-        .db
-        .find_organization_by_id(&id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    require_organization_manager_for(&state, &current, &organization.id).await?;
+    let (current, _) = managed_organization_for(&state, &jar, &id).await?;
     // Signet is the platform-control tenant. Its roster may be managed only
     // by a global organization administrator, never merely by a membership
     // role within the system tenant.

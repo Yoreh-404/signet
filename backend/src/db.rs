@@ -357,8 +357,8 @@ pub use application_protocol_types::{
 };
 pub use application_types::{
     ApplicationAuthDomainRecord, ApplicationClientBindingRecord, ApplicationIdentityBindingRecord,
-    ApplicationMemberRecord, ApplicationMemberWithUserRecord, ApplicationRecord, NewApplication,
-    NewApplicationMember,
+    ApplicationMemberRecord, ApplicationMemberWithUserRecord, ApplicationOidcClientRecord,
+    ApplicationRecord, NewApplication, NewApplicationMember,
 };
 pub(crate) use audit_types::AuditWebhookOutboxRecord;
 pub use audit_types::{
@@ -3234,6 +3234,31 @@ mod tests {
             username_attribute: "uid".to_string(),
             display_name_attribute: "cn".to_string(),
             phone_attribute: "telephoneNumber".to_string(),
+            is_active: true,
+            allow_login: true,
+            allow_registration: true,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn test_external_oidc_provider(
+        slug: &str,
+        display_name: &str,
+        organization_id: Option<&str>,
+    ) -> NewExternalOidcProvider {
+        NewExternalOidcProvider {
+            slug: slug.to_string(),
+            display_name: display_name.to_string(),
+            organization_id: organization_id.map(ToOwned::to_owned),
+            issuer: format!("https://{slug}.example.test"),
+            client_id: format!("{slug}-client"),
+            client_secret: format!("{slug}-secret"),
+            authorization_endpoint: format!("https://{slug}.example.test/authorize"),
+            token_endpoint: format!("https://{slug}.example.test/token"),
+            userinfo_endpoint: format!("https://{slug}.example.test/userinfo"),
+            redirect_path: format!("/api/register/oidc/{slug}/callback"),
+            scopes: vec!["openid".to_string()],
+            email_domains: Vec::new(),
             is_active: true,
             allow_login: true,
             allow_registration: true,
@@ -6827,6 +6852,72 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn find_application_oidc_client_requires_application_and_oidc_binding() {
+        let (db, path) = sqlite_test_db().await;
+        let organization = db
+            .insert_organization(test_organization("oidc-client-read", "OIDC Client Read"))
+            .await
+            .unwrap();
+        let application = db
+            .insert_application(test_application(
+                &organization.id,
+                "oidc-client-read-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let other_application = db
+            .insert_application(test_application(
+                &organization.id,
+                "oidc-client-read-other-app",
+                crate::applications::ACCESS_ALL_SIGNET_USERS,
+            ))
+            .await
+            .unwrap();
+        let oidc_client = db
+            .insert_client_for_application(
+                &application.id,
+                test_client("oidc-client-read-client", &organization.id),
+            )
+            .await
+            .unwrap();
+
+        let resolved = db
+            .find_application_oidc_client(&application.id, &oidc_client.id)
+            .await
+            .unwrap()
+            .expect("the matching application OIDC binding should resolve");
+        assert_eq!(resolved.client_db_id, oidc_client.id);
+        assert_eq!(resolved.client_secret_hash, oidc_client.client_secret_hash);
+        assert_eq!(resolved.audience, oidc_client.audience);
+
+        assert!(
+            db.find_application_oidc_client(&other_application.id, &oidc_client.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let non_oidc_client = db
+            .insert_client(test_client("saml-client-read-client", &organization.id))
+            .await
+            .unwrap();
+        db.link_client_to_application(&application.id, &non_oidc_client.id, "saml", "default")
+            .await
+            .unwrap();
+        assert!(
+            db.find_application_oidc_client(&application.id, &non_oidc_client.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn dynamic_client_graph_rolls_back_when_registration_insert_fails() {
         let (db, path) = sqlite_test_db().await;
         let system = db.system_organization().await.unwrap();
@@ -9072,6 +9163,73 @@ mod tests {
         let public = saved.public().unwrap();
         assert!(public.allow_login);
         assert!(!public.allow_registration);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn external_oidc_provider_listing_is_scoped_to_organization() {
+        let (db, path) = sqlite_test_db().await;
+        let organization_a = db
+            .insert_organization(test_organization("oidc-org-a", "OIDC Org A"))
+            .await
+            .unwrap();
+        let organization_b = db
+            .insert_organization(test_organization("oidc-org-b", "OIDC Org B"))
+            .await
+            .unwrap();
+
+        db.insert_external_oidc_provider(test_external_oidc_provider(
+            "oidc-a-later",
+            "Zulu A",
+            Some(&organization_a.id),
+        ))
+        .await
+        .unwrap();
+        db.insert_external_oidc_provider(test_external_oidc_provider(
+            "oidc-a-earlier",
+            "Alpha A",
+            Some(&organization_a.id),
+        ))
+        .await
+        .unwrap();
+        db.insert_external_oidc_provider(test_external_oidc_provider(
+            "oidc-b",
+            "Beta B",
+            Some(&organization_b.id),
+        ))
+        .await
+        .unwrap();
+        db.insert_external_oidc_provider(test_external_oidc_provider(
+            "oidc-global",
+            "Global",
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let scoped = db
+            .list_external_oidc_providers_for_organization(&organization_a.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|provider| provider.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oidc-a-earlier", "oidc-a-later"]
+        );
+
+        let global = db.list_external_oidc_providers().await.unwrap();
+        assert_eq!(
+            global
+                .iter()
+                .map(|provider| provider.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oidc-a-earlier", "oidc-a-later", "oidc-b", "oidc-global"]
+        );
 
         drop(db);
         let _ = std::fs::remove_file(path);
