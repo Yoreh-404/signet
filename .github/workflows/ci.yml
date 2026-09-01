@@ -5,12 +5,17 @@ on:
     branches: [main, master]
   pull_request:
 
+concurrency:
+  group: signet-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   frontend:
     runs-on: [self-hosted, linux-arm64]
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Initialize shared Cargo cache
@@ -93,6 +98,7 @@ jobs:
 
   backend:
     runs-on: [self-hosted, linux-arm64]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Initialize shared Cargo cache

@@ -65,6 +65,7 @@ opensponge_cargo_cache_init() {
   if [ -z "${CARGO_HOME:-}" ]; then
     export CARGO_HOME="$cache_root/cargo-home"
   fi
+  export PATH="$CARGO_HOME/bin:${PATH:-}"
   export CARGO_REGISTRIES_CRATES_IO_PROTOCOL="${CARGO_REGISTRIES_CRATES_IO_PROTOCOL:-sparse}"
   export CARGO_NET_RETRY="${CARGO_NET_RETRY:-5}"
   export CARGO_HTTP_TIMEOUT="${CARGO_HTTP_TIMEOUT:-120}"
@@ -93,6 +94,9 @@ opensponge_cargo_cache_init() {
     for variable in CARGO_HOME CARGO_TARGET_DIR SCCACHE_DIR CARGO_REGISTRIES_CRATES_IO_PROTOCOL CARGO_NET_RETRY CARGO_HTTP_TIMEOUT CARGO_HTTP_MULTIPLEXING RUSTC_WRAPPER; do
       printf '%s=%s\n' "$variable" "${!variable:-}" >> "$GITHUB_ENV"
     done
+  fi
+  if [ -n "${GITHUB_PATH:-}" ]; then
+    printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
   fi
 }
 
