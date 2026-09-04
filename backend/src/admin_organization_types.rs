@@ -1,6 +1,8 @@
 use crate::db::PublicInvitation;
 use serde::{Deserialize, Serialize};
 
+use super::admin_defaults::{default_organization_role, default_true};
+
 #[derive(Debug, Serialize)]
 pub(super) struct OrganizationOptionResponse {
     pub(super) id: String,
@@ -42,9 +44,9 @@ pub(super) struct OrganizationMemberInvitationInput {
     #[serde(default)]
     pub(super) description: Option<String>,
     pub(super) expires_at: i64,
-    #[serde(default = "super::default_organization_role")]
+    #[serde(default = "default_organization_role")]
     pub(super) organization_role: String,
-    #[serde(default = "super::default_true")]
+    #[serde(default = "default_true")]
     pub(super) is_active: bool,
 }
 

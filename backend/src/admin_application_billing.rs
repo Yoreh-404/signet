@@ -1,6 +1,6 @@
 use super::{
-    AppResult, AppState, CookieJar, Json, NewApplicationBillingSettings, Path, State, audit,
-    billing, managed_application, util,
+    AppResult, AppState, CookieJar, Json, NewApplicationBillingSettings, Path, State,
+    admin_application_scope::managed_application, audit, billing, util,
 };
 use crate::audit::AuditSink;
 

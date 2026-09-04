@@ -408,7 +408,7 @@ impl Db {
         client: &ClientRecord,
     ) -> AppResult<()> {
         if self
-            .find_application_for_client(&client.id)
+            .find_application_for_client_binding(&client.id)
             .await?
             .is_some()
         {

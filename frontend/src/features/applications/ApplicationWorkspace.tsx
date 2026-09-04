@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   applicationDirectorySyncConfig,
   applicationProtocolsConfig,
@@ -39,7 +39,7 @@ import type {
 } from "../../types";
 
 
-export function ApplicationWorkspace({
+export const ApplicationWorkspace = memo(function ApplicationWorkspace({
   applications,
   providers,
   ldapProviders,
@@ -256,4 +256,4 @@ export function ApplicationWorkspace({
             </ApplicationWorkspaceRequestContextProvider>
     </ApplicationBasics>
   );
-}
+});

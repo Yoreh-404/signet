@@ -34,13 +34,15 @@ use saml_rs::{
 use saml_rs::{LogoutRequest, LogoutResponse};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SAML_INTERACTION_TTL_SECONDS: i64 = 300;
 const SAML_REPLAY_TTL_SECONDS: i64 = 600;
 const SAML_SESSION_FALLBACK_TTL_SECONDS: i64 = 86_400;
 const SAML_CLOCK_SKEW_MILLIS: i64 = 30_000;
 const MAX_SAML_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_SAML_SESSION_INDEXES: usize = 128;
+const MAX_SAML_SESSION_INDEX_LENGTH: usize = 1024;
 const NAME_ID_FORMAT_EMAIL: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
 const NAME_ID_FORMAT_PERSISTENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent";
 const ATTRIBUTE_NAME_FORMAT_BASIC: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:basic";
@@ -155,17 +157,15 @@ async fn sso_redirect(
             "SAML request is too large".to_string(),
         ));
     }
-    if contains_query_key(raw_query, "SAMLRequest") {
-        reject_duplicate_query_keys(
-            raw_query,
-            &["SAMLRequest", "RelayState", "SigAlg", "Signature"],
-        )?;
-        if contains_query_key(raw_query, "SAMLResponse") {
+    let query = parse_saml_query(raw_query);
+    if query.contains("SAMLRequest") {
+        query.reject_duplicates(&["SAMLRequest", "RelayState", "SigAlg", "Signature"])?;
+        if query.contains("SAMLResponse") {
             return Err(AppError::BadRequest(
                 "SAMLRequest and SAMLResponse cannot be combined".to_string(),
             ));
         }
-        let relay_state = validated_relay_state(query_value(raw_query, "RelayState"))?;
+        let relay_state = validated_relay_state(query.value("RelayState"))?;
         return process_sso_request(
             &state,
             &headers,
@@ -177,7 +177,7 @@ async fn sso_redirect(
         )
         .await;
     }
-    if contains_query_key(raw_query, "SAMLResponse") {
+    if query.contains("SAMLResponse") {
         return Err(AppError::BadRequest(
             "SAMLResponse is not accepted at the SAML request endpoint".to_string(),
         ));
@@ -185,15 +185,16 @@ async fn sso_redirect(
 
     let (application, config) = load_application(&state, &app_slug).await?;
     let base_url = state.effective_public_base_url(&headers).await?;
-    let sp_entity_id = query_value(raw_query, "sp_entity_id")
-        .or_else(|| query_value(raw_query, "entityID"))
+    let sp_entity_id = query
+        .value("sp_entity_id")
+        .or_else(|| query.value("entityID"))
         .unwrap_or_else(|| config.sp_entity_id.clone());
     if sp_entity_id != config.sp_entity_id {
         return Err(AppError::BadRequest(
             "unknown SAML service provider".to_string(),
         ));
     }
-    let relay_state = validated_relay_state(query_value(raw_query, "RelayState"))?;
+    let relay_state = validated_relay_state(query.value("RelayState"))?;
     begin_saml_flow(SamlFlowRequest {
         state: &state,
         jar: &jar,
@@ -255,27 +256,25 @@ async fn slo_get(
             "SAML logout request is too large".to_string(),
         ));
     }
-    if !contains_query_key(raw_query, "SAMLRequest") {
+    let query = parse_saml_query(raw_query);
+    if !query.contains("SAMLRequest") {
         return Err(AppError::BadRequest(
             "SAML logout endpoint requires SAMLRequest".to_string(),
         ));
     }
-    reject_duplicate_query_keys(
-        raw_query,
-        &[
-            "SAMLRequest",
-            "RelayState",
-            "SigAlg",
-            "Signature",
-            "SAMLResponse",
-        ],
-    )?;
-    if contains_query_key(raw_query, "SAMLResponse") {
+    query.reject_duplicates(&[
+        "SAMLRequest",
+        "RelayState",
+        "SigAlg",
+        "Signature",
+        "SAMLResponse",
+    ])?;
+    if query.contains("SAMLResponse") {
         return Err(AppError::BadRequest(
             "SAML LogoutResponse is not accepted without a pending request".to_string(),
         ));
     }
-    let relay_state = validated_relay_state(query_value(raw_query, "RelayState"))?;
+    let relay_state = validated_relay_state(query.value("RelayState"))?;
     process_slo_request(
         &state,
         &headers,
@@ -350,6 +349,7 @@ async fn process_slo_request(
     let flow = saml_rs::logout::parse_logout_request(&idp.setting, &sp.metadata, binding, &request)
         .map_err(inbound_saml_error)?;
     let logout = LogoutRequest::try_from(flow).map_err(inbound_saml_error)?;
+    validate_saml_session_indexes(logout.session_indexes())?;
     let expected_destination =
         idp.metadata
             .get_single_logout_service(binding)
@@ -401,16 +401,13 @@ async fn process_slo_request(
             .into_iter()
             .map(|record| (record.session_index_hash.clone(), record))
             .collect::<HashMap<_, _>>();
+        let mut matched_session_indexes = HashSet::new();
         for session_index in logout.session_indexes() {
             if let Some(record) = sessions_by_index.get(&saml_session_index_hash(
                 &application.id,
                 session_index.as_str(),
             )) && record.name_id_hash == saml_name_id_hash(&application.id, name_id)
-                && !sessions
-                    .iter()
-                    .any(|item: &crate::db::ApplicationSamlSessionRecord| {
-                        item.session_index_hash == record.session_index_hash
-                    })
+                && matched_session_indexes.insert(record.session_index_hash.as_str())
             {
                 sessions.push(record.clone());
             }
@@ -509,6 +506,23 @@ fn saml_session_index_hash(application_id: &str, session_index: &str) -> String 
     ))
 }
 
+fn validate_saml_session_indexes(session_indexes: &[saml_rs::SessionIndex]) -> AppResult<()> {
+    if session_indexes.len() > MAX_SAML_SESSION_INDEXES {
+        return Err(inbound_saml_error(format!(
+            "SAML LogoutRequest contains too many SessionIndex values (maximum {MAX_SAML_SESSION_INDEXES})"
+        )));
+    }
+    if session_indexes
+        .iter()
+        .any(|session_index| session_index.as_str().len() > MAX_SAML_SESSION_INDEX_LENGTH)
+    {
+        return Err(inbound_saml_error(format!(
+            "SAML LogoutRequest contains a SessionIndex longer than {MAX_SAML_SESSION_INDEX_LENGTH} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn saml_name_id_hash(application_id: &str, name_id: &str) -> String {
     util::token_hash(&format!(
         "signet:saml:name-id:v1:{application_id}:{name_id}"
@@ -569,12 +583,22 @@ async fn continue_sso(
 ) -> AppResult<Response> {
     let current = auth::require_current_user(&state, &jar).await?;
     ensure_saml_account_capability(&current)?;
+    let browser_context_id =
+        auth::browser_context_id_from_jar(&state, &jar).ok_or(AppError::Unauthorized)?;
+    if state
+        .db
+        .find_browser_context(&browser_context_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Unauthorized);
+    }
     let (application, config) = load_application(&state, &app_slug).await?;
     let base_url = state.effective_public_base_url(&headers).await?;
     let interaction = state
         .db
         .consume_application_saml_interaction(
-            &util::token_hash(query.handle.trim()),
+            &saml_interaction_handle_hash(query.handle.trim(), &browser_context_id),
             &application.id,
         )
         .await?;
@@ -651,11 +675,23 @@ async fn begin_saml_flow(request: SamlFlowRequest<'_>) -> AppResult<Response> {
         .await;
     }
 
+    let (browser_context_id, browser_context_cookie) =
+        if let Some(context_id) = auth::browser_context_id_from_jar(state, jar) {
+            if state.db.find_browser_context(&context_id).await?.is_some() {
+                (context_id, None)
+            } else {
+                let (context_id, cookie) = auth::create_browser_context(state).await?;
+                (context_id, Some(cookie))
+            }
+        } else {
+            let (context_id, cookie) = auth::create_browser_context(state).await?;
+            (context_id, Some(cookie))
+        };
     let handle = util::random_token(32);
     state
         .db
         .insert_application_saml_interaction(NewApplicationSamlInteraction {
-            handle_hash: util::token_hash(&handle),
+            handle_hash: saml_interaction_handle_hash(&handle, &browser_context_id),
             application_id: application.id.clone(),
             request_id: request_id.unwrap_or_default(),
             sp_entity_id: config.sp_entity_id.clone(),
@@ -672,7 +708,18 @@ async fn begin_saml_flow(request: SamlFlowRequest<'_>) -> AppResult<Response> {
             AppError::Internal(format!("failed to encode SAML continuation: {err}"))
         })?
     );
-    Ok(Redirect::to(&redirects::frontend_login_url(&return_to, None, true)).into_response())
+    let response = Redirect::to(&redirects::frontend_login_url(&return_to, None, true));
+    if let Some(cookie) = browser_context_cookie {
+        Ok((jar.clone().add(cookie), response).into_response())
+    } else {
+        Ok(response.into_response())
+    }
+}
+
+fn saml_interaction_handle_hash(handle: &str, browser_context_id: &str) -> String {
+    util::token_hash(&format!(
+        "signet:saml:interaction:v2:{browser_context_id}:{handle}"
+    ))
 }
 
 async fn parse_saml_request(
@@ -1274,28 +1321,58 @@ fn validated_relay_state(value: Option<String>) -> AppResult<Option<String>> {
         .map_err(inbound_saml_error)
 }
 
-fn query_value(raw_query: &str, key: &str) -> Option<String> {
-    url::form_urlencoded::parse(raw_query.as_bytes())
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value.into_owned())
+struct ParsedSamlQuery {
+    values: HashMap<String, Vec<String>>,
 }
 
-fn contains_query_key(raw_query: &str, key: &str) -> bool {
-    url::form_urlencoded::parse(raw_query.as_bytes()).any(|(name, _)| name == key)
-}
-
-fn reject_duplicate_query_keys(raw_query: &str, keys: &[&str]) -> AppResult<()> {
-    for key in keys {
-        let count = url::form_urlencoded::parse(raw_query.as_bytes())
-            .filter(|(name, _)| name == key)
-            .count();
-        if count > 1 {
-            return Err(AppError::BadRequest(format!(
-                "SAML query parameter {key} must appear once"
-            )));
-        }
+impl ParsedSamlQuery {
+    fn value(&self, key: &str) -> Option<String> {
+        self.values
+            .get(key)
+            .and_then(|values| values.first())
+            .cloned()
     }
-    Ok(())
+
+    fn contains(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn reject_duplicates(&self, keys: &[&str]) -> AppResult<()> {
+        for key in keys {
+            if self.values.get(*key).is_some_and(|values| values.len() > 1) {
+                return Err(AppError::BadRequest(format!(
+                    "SAML query parameter {key} must appear once"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_saml_query(raw_query: &str) -> ParsedSamlQuery {
+    let mut values = HashMap::<String, Vec<String>>::new();
+    for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        values
+            .entry(name.into_owned())
+            .or_default()
+            .push(value.into_owned());
+    }
+    ParsedSamlQuery { values }
+}
+
+#[cfg(test)]
+fn query_value(raw_query: &str, key: &str) -> Option<String> {
+    parse_saml_query(raw_query).value(key)
+}
+
+#[cfg(test)]
+fn contains_query_key(raw_query: &str, key: &str) -> bool {
+    parse_saml_query(raw_query).contains(key)
+}
+
+#[cfg(test)]
+fn reject_duplicate_query_keys(raw_query: &str, keys: &[&str]) -> AppResult<()> {
+    parse_saml_query(raw_query).reject_duplicates(keys)
 }
 
 fn inbound_saml_error(error: impl std::fmt::Display) -> AppError {
@@ -1333,6 +1410,39 @@ mod tests {
         assert!(
             reject_duplicate_query_keys("SAMLRequest=one&SAMLRequest=two", &["SAMLRequest"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn saml_interaction_handles_are_bound_to_browser_contexts() {
+        let first = saml_interaction_handle_hash("handle", "context-a");
+        let second = saml_interaction_handle_hash("handle", "context-b");
+        assert_ne!(first, second);
+        assert_eq!(first, saml_interaction_handle_hash("handle", "context-a"));
+    }
+
+    #[test]
+    fn saml_logout_session_indexes_are_bounded() {
+        let valid =
+            vec![saml_rs::SessionIndex::try_new("session-1").unwrap(); MAX_SAML_SESSION_INDEXES];
+        assert!(validate_saml_session_indexes(&valid).is_ok());
+
+        let too_many = vec![
+            saml_rs::SessionIndex::try_new("session-1").unwrap();
+            MAX_SAML_SESSION_INDEXES + 1
+        ];
+        assert!(validate_saml_session_indexes(&too_many).is_err());
+
+        let too_long = vec![
+            saml_rs::SessionIndex::try_new("x".repeat(MAX_SAML_SESSION_INDEX_LENGTH + 1)).unwrap(),
+        ];
+        assert!(validate_saml_session_indexes(&too_long).is_err());
+        assert!(
+            validate_saml_session_indexes(&[saml_rs::SessionIndex::try_new(
+                "x".repeat(MAX_SAML_SESSION_INDEX_LENGTH)
+            )
+            .unwrap(),])
+            .is_ok()
         );
     }
 

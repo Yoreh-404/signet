@@ -1,4 +1,5 @@
 import { ArrowRight, Eye } from "lucide-react";
+import { useMemo } from "react";
 import type {
   ApplicationAuthorizationPreview,
   ApplicationAuthorizationSubjects,
@@ -11,6 +12,7 @@ import {
   PermissionDefinitionDetails,
   PermissionTree,
 } from "./ApplicationPermissionTree";
+import { ApplicationRoleSelectionList } from "./ApplicationRoleSelectionList";
 import { Input } from "./components/ApplicationModulePrimitives";
 
 type ApplicationAuthorizationBindingsSectionProps = {
@@ -87,10 +89,20 @@ export function ApplicationAuthorizationBindingsSection({
   onPreview,
   toggleRoleId,
 }: ApplicationAuthorizationBindingsSectionProps) {
-  const activeRoles = (selectedIds: Set<string>) =>
-    applicationRoles.filter(
-      (role) => role.is_active || selectedIds.has(role.id),
-    );
+  const activeUserRoles = useMemo(
+    () =>
+      applicationRoles.filter(
+        (role) => role.is_active || userRoleIdSet.has(role.id),
+      ),
+    [applicationRoles, userRoleIdSet],
+  );
+  const activeGroupRoles = useMemo(
+    () =>
+      applicationRoles.filter(
+        (role) => role.is_active || groupRoleIdSet.has(role.id),
+      ),
+    [applicationRoles, groupRoleIdSet],
+  );
 
   return (
     <>
@@ -118,29 +130,17 @@ export function ApplicationAuthorizationBindingsSection({
                 ))}
               </select>
             </label>
-            <div className="application-permission-grid">
-              {activeRoles(userRoleIdSet).map((role) => (
-                <label className="application-choice" key={role.id}>
-                  <input
-                    type="checkbox"
-                    checked={userRoleIdSet.has(role.id)}
-                    onChange={() =>
-                      onUpdateUserRoles((current) =>
-                        toggleRoleId(current, role.id),
-                      )
-                    }
-                    disabled={authorizationSaving}
-                  />
-                  <span>
-                    <strong>{role.name}</strong>
-                    <small>{role.description || copy.noModuleConfig}</small>
-                  </span>
-                </label>
-              ))}
-              {applicationRoles.length === 0 && (
-                <p className="muted">{copy.noApplicationRoles}</p>
-              )}
-            </div>
+            <ApplicationRoleSelectionList
+              className="application-permission-grid"
+              roles={activeUserRoles}
+              selectedRoleIds={userRoleIdSet}
+              noDescriptionLabel={copy.noModuleConfig}
+              emptyLabel={copy.noApplicationRoles}
+              disabled={authorizationSaving}
+              onToggle={(roleId) =>
+                onUpdateUserRoles((current) => toggleRoleId(current, roleId))
+              }
+            />
           </>
         ) : (
           <p className="muted">{copy.noAuthorizationUsers}</p>
@@ -170,29 +170,17 @@ export function ApplicationAuthorizationBindingsSection({
                 ))}
               </select>
             </label>
-            <div className="application-permission-grid">
-              {activeRoles(groupRoleIdSet).map((role) => (
-                <label className="application-choice" key={role.id}>
-                  <input
-                    type="checkbox"
-                    checked={groupRoleIdSet.has(role.id)}
-                    onChange={() =>
-                      onUpdateGroupRoles((current) =>
-                        toggleRoleId(current, role.id),
-                      )
-                    }
-                    disabled={authorizationSaving}
-                  />
-                  <span>
-                    <strong>{role.name}</strong>
-                    <small>{role.description || copy.noModuleConfig}</small>
-                  </span>
-                </label>
-              ))}
-              {applicationRoles.length === 0 && (
-                <p className="muted">{copy.noApplicationRoles}</p>
-              )}
-            </div>
+            <ApplicationRoleSelectionList
+              className="application-permission-grid"
+              roles={activeGroupRoles}
+              selectedRoleIds={groupRoleIdSet}
+              noDescriptionLabel={copy.noModuleConfig}
+              emptyLabel={copy.noApplicationRoles}
+              disabled={authorizationSaving}
+              onToggle={(roleId) =>
+                onUpdateGroupRoles((current) => toggleRoleId(current, roleId))
+              }
+            />
           </>
         ) : (
           <p className="muted">{copy.noAuthorizationGroups}</p>
@@ -208,49 +196,33 @@ export function ApplicationAuthorizationBindingsSection({
         </div>
         <div className="authorization-mapping-list">
           {(authorizationSubjects?.organization_roles ?? []).map(
-            (organizationRole) => (
-              <div className="authorization-mapping-row" key={organizationRole}>
-                <strong>{organizationRole}</strong>
-                <div className="application-role-chip-list">
-                  {applicationRoles
-                    .filter(
+            (organizationRole) => {
+              const selectedRoleIds = organizationRoleIdSets.get(organizationRole);
+              return (
+                <div className="authorization-mapping-row" key={organizationRole}>
+                  <strong>{organizationRole}</strong>
+                  <ApplicationRoleSelectionList
+                    className="application-role-chip-list"
+                    roles={applicationRoles.filter(
                       (role) =>
-                        role.is_active ||
-                        organizationRoleIdSets
-                          .get(organizationRole)
-                          ?.has(role.id),
-                    )
-                    .map((role) => (
-                      <label className="application-choice" key={role.id}>
-                        <input
-                          type="checkbox"
-                          checked={
-                            organizationRoleIdSets
-                              .get(organizationRole)
-                              ?.has(role.id) ?? false
-                          }
-                          onChange={() =>
-                            onUpdateOrganizationRoles((current) => ({
-                              ...current,
-                              [organizationRole]: toggleRoleId(
-                                current[organizationRole] ?? [],
-                                role.id,
-                              ),
-                            }))
-                          }
-                          disabled={authorizationSaving}
-                        />
-                        <span>
-                          <strong>{role.name}</strong>
-                          <small>
-                            {role.description || copy.noModuleConfig}
-                          </small>
-                        </span>
-                      </label>
-                    ))}
+                        role.is_active || selectedRoleIds?.has(role.id),
+                    )}
+                    selectedRoleIds={selectedRoleIds ?? new Set<string>()}
+                    noDescriptionLabel={copy.noModuleConfig}
+                    disabled={authorizationSaving}
+                    onToggle={(roleId) =>
+                      onUpdateOrganizationRoles((current) => ({
+                        ...current,
+                        [organizationRole]: toggleRoleId(
+                          current[organizationRole] ?? [],
+                          roleId,
+                        ),
+                      }))
+                    }
+                  />
                 </div>
-              </div>
-            ),
+              );
+            },
           )}
         </div>
       </div>

@@ -5,14 +5,16 @@
 //! user role set, user overrides, group role set, and organization-role map
 //! cannot be observed or committed independently.
 
+use super::authorization_binding_policy::{distinct_role_ids, normalize_update};
 use super::{
-    AuditEventRecord, CountRow, DatabaseKind, Db, bind_text_list, blocking, dedupe_nonempty,
-    normalize_application_entitlement_keys, ph, placeholders,
+    AuditEventRecord, CountRow, DatabaseKind, Db, bind_text_list, blocking, ph, placeholders,
 };
+#[cfg(test)]
+use crate::organizations;
 use crate::{
     audit::AuditEvent,
     error::{AppError, AppResult},
-    organizations, util,
+    util,
 };
 use diesel::{
     Connection, OptionalExtension, RunQueryDsl,
@@ -23,7 +25,7 @@ use diesel::{
 use serde::Serialize;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
 };
 
 fn compare_permission_names(left: &str, right: &str) -> Ordering {
@@ -42,9 +44,6 @@ fn compare_permission_names(left: &str, right: &str) -> Ordering {
     }
 }
 
-const MAX_ROLE_IDS: usize = 900;
-const MAX_PERMISSION_OVERRIDES: usize = 900;
-const MAX_ORGANIZATION_BINDINGS: usize = 900;
 const WRITE_BATCH_SIZE: usize = 200;
 
 #[derive(Debug, Clone)]
@@ -82,16 +81,6 @@ pub struct AuthorizationBindingsSnapshot {
     pub user_bindings: BTreeMap<String, AuthorizationUserBindingSnapshot>,
     pub group_bindings: BTreeMap<String, Vec<String>>,
     pub organization_role_bindings: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Clone)]
-struct NormalizedAuthorizationBindingsUpdate {
-    user_id: Option<String>,
-    group_id: Option<String>,
-    user_role_ids: Vec<String>,
-    user_permission_overrides: Vec<AuthorizationBindingPermissionOverride>,
-    group_role_ids: Vec<String>,
-    organization_role_bindings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
@@ -144,127 +133,6 @@ struct OrganizationRoleBindingRow {
     organization_role: String,
     #[diesel(sql_type = Text)]
     role_id: String,
-}
-
-fn normalize_subject_id(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn normalize_role_ids(values: Vec<String>, field: &str) -> AppResult<Vec<String>> {
-    if values.len() > MAX_ROLE_IDS {
-        return Err(AppError::BadRequest(format!(
-            "{field} contains too many role ids"
-        )));
-    }
-    Ok(dedupe_nonempty(values))
-}
-
-fn normalize_permission_overrides(
-    values: Vec<AuthorizationBindingPermissionOverride>,
-) -> AppResult<Vec<AuthorizationBindingPermissionOverride>> {
-    if values.len() > MAX_PERMISSION_OVERRIDES {
-        return Err(AppError::BadRequest(
-            "user_permission_overrides contains too many entries".to_string(),
-        ));
-    }
-    let mut positions: HashMap<String, usize> = HashMap::new();
-    let mut normalized: Vec<AuthorizationBindingPermissionOverride> = Vec::new();
-    for value in values {
-        let permission = normalize_application_entitlement_keys(vec![value.permission])?
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::BadRequest("permission is required".to_string()))?;
-        let effect = value.effect.trim().to_ascii_lowercase();
-        if effect != "allow" && effect != "deny" {
-            return Err(AppError::BadRequest(
-                "permission effect must be allow or deny".to_string(),
-            ));
-        }
-        if let Some(index) = positions.get(&permission).copied() {
-            normalized[index].effect = effect;
-        } else {
-            positions.insert(permission.clone(), normalized.len());
-            normalized.push(AuthorizationBindingPermissionOverride { permission, effect });
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalize_organization_role_bindings(
-    values: BTreeMap<String, Vec<String>>,
-) -> AppResult<BTreeMap<String, Vec<String>>> {
-    let mut normalized = BTreeMap::new();
-    let mut raw_count = 0usize;
-    for (organization_role, role_ids) in values {
-        let organization_role = organizations::normalize_role(&organization_role)?;
-        raw_count = raw_count.saturating_add(role_ids.len());
-        if raw_count > MAX_ORGANIZATION_BINDINGS {
-            return Err(AppError::BadRequest(
-                "organization_role_bindings contains too many entries".to_string(),
-            ));
-        }
-        normalized.insert(organization_role, dedupe_nonempty(role_ids));
-    }
-    Ok(normalized)
-}
-
-fn distinct_role_ids(
-    user_role_ids: &[String],
-    group_role_ids: &[String],
-    organization_role_bindings: &BTreeMap<String, Vec<String>>,
-) -> BTreeSet<String> {
-    let mut role_ids = BTreeSet::new();
-    role_ids.extend(user_role_ids.iter().cloned());
-    role_ids.extend(group_role_ids.iter().cloned());
-    role_ids.extend(
-        organization_role_bindings
-            .values()
-            .flat_map(|role_ids| role_ids.iter().cloned()),
-    );
-    role_ids
-}
-
-fn normalize_update(
-    update: AuthorizationBindingsUpdate,
-) -> AppResult<NormalizedAuthorizationBindingsUpdate> {
-    let user_id = normalize_subject_id(update.user_id);
-    let group_id = normalize_subject_id(update.group_id);
-    let user_role_ids = normalize_role_ids(update.user_role_ids, "user_role_ids")?;
-    let group_role_ids = normalize_role_ids(update.group_role_ids, "group_role_ids")?;
-    let user_permission_overrides =
-        normalize_permission_overrides(update.user_permission_overrides)?;
-    let organization_role_bindings =
-        normalize_organization_role_bindings(update.organization_role_bindings)?;
-
-    if user_id.is_none() && (!user_role_ids.is_empty() || !user_permission_overrides.is_empty()) {
-        return Err(AppError::BadRequest(
-            "user_id is required when user bindings are supplied".to_string(),
-        ));
-    }
-    if group_id.is_none() && !group_role_ids.is_empty() {
-        return Err(AppError::BadRequest(
-            "group_id is required when group bindings are supplied".to_string(),
-        ));
-    }
-
-    let distinct_role_ids =
-        distinct_role_ids(&user_role_ids, &group_role_ids, &organization_role_bindings);
-    if distinct_role_ids.len() > MAX_ROLE_IDS {
-        return Err(AppError::BadRequest(
-            "authorization bindings contain too many distinct role ids".to_string(),
-        ));
-    }
-
-    Ok(NormalizedAuthorizationBindingsUpdate {
-        user_id,
-        group_id,
-        user_role_ids,
-        user_permission_overrides,
-        group_role_ids,
-        organization_role_bindings,
-    })
 }
 
 /// Loads all four edge sets using the connection currently held by the caller.

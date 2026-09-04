@@ -20,6 +20,14 @@ use diesel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Debug, diesel::QueryableByName)]
+struct UserOverviewCountRow {
+    #[diesel(sql_type = BigInt)]
+    total: i64,
+    #[diesel(sql_type = BigInt)]
+    active: i64,
+}
+
 impl UserListScope {
     fn where_sql(self) -> &'static str {
         match self {
@@ -792,6 +800,17 @@ impl Db {
                 .get_result::<CountRow>(&mut conn)
                 .map(|row| row.count)
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn count_user_overview(&self) -> AppResult<(i64, i64)> {
+        with_conn!(self, |conn, _kind| {
+            sql_query(
+                "SELECT COUNT(*) AS total, COUNT(CASE WHEN archived_at IS NULL AND is_active = 1 THEN 1 END) AS active FROM users",
+            )
+            .get_result::<UserOverviewCountRow>(&mut conn)
+            .map(|row| (row.total, row.active))
+            .map_err(AppError::from)
         })
     }
 

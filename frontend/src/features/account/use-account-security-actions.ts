@@ -4,6 +4,7 @@ import type { TranslationKey } from "../../i18n";
 import * as accountApi from "../../lib/api/account";
 import { passkeyCreationOptions, registrationCredentialJson } from "../../lib/webauthn";
 import type { MfaStatus, Passkey, TotpSetup } from "../../types";
+import type { AccountSecurityRefresh } from "./use-account-security-data";
 
 type RunUiAction = (action: () => Promise<void>, fallback?: TranslationKey) => Promise<boolean>;
 
@@ -18,7 +19,8 @@ type Options = {
   setMfaStatus: Dispatch<SetStateAction<MfaStatus | null>>;
   setNewRecoveryCodes: Dispatch<SetStateAction<string[]>>;
   setError: Dispatch<SetStateAction<string>>;
-  loadAccountData: () => Promise<void>;
+  securityRefresh: AccountSecurityRefresh;
+  removeSession: (id: string) => void;
   runUiAction: RunUiAction;
   formatError: (error: unknown, fallback: TranslationKey) => string;
 };
@@ -34,7 +36,8 @@ export function useAccountSecurityActions({
   setMfaStatus,
   setNewRecoveryCodes,
   setError,
-  loadAccountData,
+  securityRefresh,
+  removeSession,
   runUiAction,
   formatError
 }: Options) {
@@ -68,16 +71,16 @@ export function useAccountSecurityActions({
   const revokeMyConsent = useCallback(async (clientId: string) => {
     await runUiAction(async () => {
       await accountApi.revokeConsent(clientId);
-      await loadAccountData();
+      await securityRefresh.consents();
     }, "revokeAuthorizationFailed");
-  }, [loadAccountData, runUiAction]);
+  }, [runUiAction, securityRefresh]);
 
   const revokeMySession = useCallback(async (sessionId: string) => {
     await runUiAction(async () => {
       await accountApi.revokeSession(sessionId);
-      await loadAccountData();
+      removeSession(sessionId);
     }, "revokeSessionFailed");
-  }, [loadAccountData, runUiAction]);
+  }, [removeSession, runUiAction]);
 
   const startTotpSetup = useCallback(async () => {
     setNewRecoveryCodes([]);
@@ -95,18 +98,18 @@ export function useAccountSecurityActions({
       setNewRecoveryCodes(result.recovery_codes);
       setTotpSetup(null);
       setTotpSetupCode("");
-      await loadAccountData();
+      await securityRefresh.all();
     }, "confirmMfaSetupFailed");
-  }, [loadAccountData, runUiAction, setMfaStatus, setNewRecoveryCodes, setTotpSetup, setTotpSetupCode, totpSetup, totpSetupCode]);
+  }, [runUiAction, securityRefresh, setMfaStatus, setNewRecoveryCodes, setTotpSetup, setTotpSetupCode, totpSetup, totpSetupCode]);
 
   const rotateRecoveryCodes = useCallback(async () => {
     await runUiAction(async () => {
       const result = await accountApi.rotateRecoveryCodes();
       setMfaStatus(result.status);
       setNewRecoveryCodes(result.recovery_codes);
-      await loadAccountData();
+      await securityRefresh.all();
     }, "rotateRecoveryCodesFailed");
-  }, [loadAccountData, runUiAction, setMfaStatus, setNewRecoveryCodes]);
+  }, [runUiAction, securityRefresh, setMfaStatus, setNewRecoveryCodes]);
 
   const disableMfa = useCallback(async () => {
     setError("");
@@ -115,13 +118,13 @@ export function useAccountSecurityActions({
       setMfaStatus(result);
       setTotpSetup(null);
       setNewRecoveryCodes([]);
-      await loadAccountData();
+      await securityRefresh.all();
     } catch (error) {
       const message = formatError(error, "disableMfaFailed");
       setError(message);
       throw new Error(message);
     }
-  }, [formatError, loadAccountData, setError, setMfaStatus, setNewRecoveryCodes, setTotpSetup]);
+  }, [formatError, securityRefresh, setError, setMfaStatus, setNewRecoveryCodes, setTotpSetup]);
 
   return {
     registerPasskey,

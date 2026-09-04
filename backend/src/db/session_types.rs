@@ -22,6 +22,24 @@ pub struct SessionRecord {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct UserSessionSummary {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub ip_address: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_agent: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub expires_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetadata {
     pub ip_address: Option<String>,

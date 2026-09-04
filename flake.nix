@@ -24,8 +24,9 @@
           overlays = [ cargo2nix.overlays.default ];
         };
         lib = pkgs.lib;
-        source = lib.cleanSourceWith {
-          src = ./.;
+        source = builtins.path {
+          name = "signet-source";
+          path = ./.;
           filter = path: type:
             let name = lib.baseNameOf path;
             in name != ".git"
@@ -33,8 +34,9 @@
               && name != "node_modules"
               && name != "dist";
         };
-        frontendSource = lib.cleanSourceWith {
-          src = ./frontend;
+        frontendSource = builtins.path {
+          name = "signet-frontend-source";
+          path = ./frontend;
           filter = path: type:
             let name = lib.baseNameOf path;
             in name != "node_modules" && name != "dist";

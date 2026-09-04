@@ -1,10 +1,19 @@
 use super::{
-    AppError, AppResult, AppState, ApplicationModuleInput, ApplicationModuleResponse, Json, Path,
-    State, application_module_response, applications, audit,
-    ensure_website_application_modules_editable, managed_application,
+    AppError, AppResult, AppState, ApplicationModuleResponse, Json, Path, State,
+    admin_application_scope::managed_application, application_module_response, applications, audit,
+    ensure_website_application_modules_editable,
 };
 use crate::audit::AuditSink;
 use axum_extra::extract::cookie::CookieJar;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ApplicationModuleInput {
+    #[serde(default)]
+    config: serde_json::Value,
+    #[serde(default = "super::admin_defaults::default_true")]
+    is_enabled: bool,
+}
 
 const APPLICATION_MODULE_KEYS: &[&str] = &[
     "protocols",

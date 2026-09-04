@@ -256,18 +256,19 @@ impl Db {
         with_conn!(self, |conn, kind| {
             conn.transaction::<ClientRecord, AppError, _>(|conn| {
                 let binding_sql = format!(
-                    "{} WHERE client_db_id = {}",
+                    "{} WHERE application_id = {} AND client_db_id = {} AND protocol = {}",
                     select_application_client_binding_sql(),
-                    ph(kind, 1)
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
                 );
                 let binding = sql_query(binding_sql)
+                    .bind::<Text, _>(application_id.clone())
                     .bind::<Text, _>(client_db_id.clone())
+                    .bind::<Text, _>("oidc")
                     .get_result::<ApplicationClientBindingRecord>(conn)
                     .optional()
                     .map_err(AppError::from)?
-                    .filter(|binding| {
-                        binding.application_id == application_id && binding.protocol == "oidc"
-                    })
                     .ok_or(AppError::NotFound)?;
                 let existing_sql = format!("{} WHERE id = {}", select_client_sql(), ph(kind, 1));
                 let existing = sql_query(existing_sql)
@@ -276,6 +277,11 @@ impl Db {
                     .optional()
                     .map_err(AppError::from)?
                     .ok_or(AppError::NotFound)?;
+                if existing.organization_id.as_deref() != Some(organization_id.as_str()) {
+                    return Err(AppError::BadRequest(
+                        "OIDC client must belong to the application's organization".to_string(),
+                    ));
+                }
                 let application_sql = format!(
                     "SELECT COUNT(*) AS count FROM applications WHERE id = {} AND organization_id = {}",
                     ph(kind, 1),
@@ -393,18 +399,19 @@ impl Db {
         with_conn!(self, |conn, kind| {
             conn.transaction::<ClientRecord, AppError, _>(|conn| {
                 let binding_sql = format!(
-                    "{} WHERE client_db_id = {}",
+                    "{} WHERE application_id = {} AND client_db_id = {} AND protocol = {}",
                     select_application_client_binding_sql(),
-                    ph(kind, 1)
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
                 );
                 let binding = sql_query(binding_sql)
+                    .bind::<Text, _>(application_id.clone())
                     .bind::<Text, _>(client_db_id.clone())
+                    .bind::<Text, _>("oidc")
                     .get_result::<ApplicationClientBindingRecord>(conn)
                     .optional()
                     .map_err(AppError::from)?
-                    .filter(|binding| {
-                        binding.application_id == application_id && binding.protocol == "oidc"
-                    })
                     .ok_or(AppError::NotFound)?;
                 let profile_selector = format!(
                     "application_id = {} AND (connection_id = {} OR id = {})",

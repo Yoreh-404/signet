@@ -1,4 +1,4 @@
-import { pathSegment, requestJson, writeJson } from "./transport";
+import { pathSegment, requestJson, requestJsonWithResponse, writeJson } from "./transport";
 import type { ApiMutationOptions } from "./transport";
 import type {
   MfaConfirmResponse,
@@ -107,7 +107,31 @@ export function revokeConsent(clientId: string): Promise<void> {
 }
 
 export function listSessions(options: ReadOptions = {}): Promise<MySession[]> {
-  return requestJson<MySession[]>(`${ACCOUNT}/me/sessions`, options);
+  return listSessionsPage(options).then(({ sessions }) => sessions);
+}
+
+export type SessionListOptions = ReadOptions & {
+  cursor?: string | null;
+  limit?: number;
+};
+
+export type MySessionPage = {
+  sessions: MySession[];
+  nextCursor: string | null;
+};
+
+export function listSessionsPage(options: SessionListOptions = {}): Promise<MySessionPage> {
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  const query = params.toString();
+  return requestJsonWithResponse<MySession[]>(
+    `${ACCOUNT}/me/sessions${query ? `?${query}` : ""}`,
+    { signal: options.signal }
+  ).then(({ value, headers }) => ({
+    sessions: value,
+    nextCursor: headers.get("x-next-cursor")
+  }));
 }
 
 export function revokeSession(sessionId: string): Promise<void> {

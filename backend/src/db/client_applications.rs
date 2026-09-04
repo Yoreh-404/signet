@@ -9,6 +9,14 @@ use diesel::{
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 
+#[derive(Debug, diesel::QueryableByName)]
+struct ClientOverviewCountRow {
+    #[diesel(sql_type = BigInt)]
+    total: i64,
+    #[diesel(sql_type = BigInt)]
+    active: i64,
+}
+
 impl Db {
     pub async fn find_client_by_client_id(
         &self,
@@ -92,6 +100,17 @@ impl Db {
                 .get_result::<CountRow>(&mut conn)
                 .map(|row| row.count)
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn count_client_overview(&self) -> AppResult<(i64, i64)> {
+        with_conn!(self, |conn, _kind| {
+            sql_query(
+                "SELECT COUNT(*) AS total, COUNT(CASE WHEN is_active = 1 THEN 1 END) AS active FROM clients",
+            )
+            .get_result::<ClientOverviewCountRow>(&mut conn)
+            .map(|row| (row.total, row.active))
+            .map_err(AppError::from)
         })
     }
 
@@ -231,7 +250,9 @@ impl Db {
                 .get_result::<ClientRecord>(&mut conn)
                 .map_err(AppError::from)
         })?;
-        self.ensure_application_for_client(&created).await?;
+        if created.organization_id.is_none() {
+            self.ensure_application_for_client(&created).await?;
+        }
         self.find_client_by_id(&created.id)
             .await?
             .ok_or(AppError::NotFound)

@@ -1,5 +1,5 @@
 use super::admin_guards::require_admin_reader;
-use crate::{AppState, db::UserListScope, error::AppResult};
+use crate::{AppState, error::AppResult};
 use axum::{Json, extract::State, http::HeaderMap};
 use axum_extra::extract::cookie::CookieJar;
 use serde::Serialize;
@@ -20,12 +20,12 @@ pub(crate) async fn overview(
     headers: HeaderMap,
 ) -> AppResult<Json<OverviewResponse>> {
     require_admin_reader(&state, &jar).await?;
-    let (users, active_users, clients, active_clients) = tokio::try_join!(
-        state.db.count_users(UserListScope::All),
-        state.db.count_users(UserListScope::Active),
-        state.db.count_clients(false),
-        state.db.count_clients(true),
+    let (user_counts, client_counts) = tokio::try_join!(
+        state.db.count_user_overview(),
+        state.db.count_client_overview(),
     )?;
+    let (users, active_users) = user_counts;
+    let (clients, active_clients) = client_counts;
     Ok(Json(OverviewResponse {
         active_users: active_users as usize,
         users: users as usize,

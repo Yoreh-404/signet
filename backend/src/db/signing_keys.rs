@@ -12,6 +12,30 @@ impl Db {
         })
     }
 
+    pub async fn find_signing_key_by_kid(&self, kid: &str) -> AppResult<Option<SigningKeyRecord>> {
+        let kid = kid.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, kid, private_key_pem, is_active, created_at, activated_at, retired_at FROM signing_keys WHERE kid = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(kid)
+                .get_result::<SigningKeyRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_active_signing_key(&self) -> AppResult<Option<SigningKeyRecord>> {
+        with_conn!(self, |conn, _kind| {
+            sql_query("SELECT id, kid, private_key_pem, is_active, created_at, activated_at, retired_at FROM signing_keys WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1")
+                .get_result::<SigningKeyRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn ensure_signing_key_seed(
         &self,
         settings: &Settings,

@@ -54,6 +54,11 @@ export type ApiRequestInit = RequestInit & {
   ifMatch?: string;
 };
 
+export type ApiResponse<T> = {
+  value: T;
+  headers: Headers;
+};
+
 export type ApiMutationCommand<T> = {
   readonly idempotencyKey: string;
   execute: (overrides?: Omit<ApiRequestInit, "idempotencyKey">) => Promise<T>;
@@ -125,6 +130,8 @@ export type CachedApiResult<T> = {
 };
 
 const adminResponseCache = new Map<string, CachedApiEntry>();
+const ADMIN_RESPONSE_CACHE_MAX_ENTRIES = 64;
+const ADMIN_RESPONSE_CACHE_TTL_MS = 5 * 60_000;
 type PendingCachedApiRequest = {
   promise: Promise<CachedApiResult<unknown>>;
 };
@@ -135,6 +142,29 @@ let cacheGeneration = 0;
 
 function scopedCacheKey(key: string): string {
   return `${cacheScope ?? "anonymous"}:${key}`;
+}
+
+function evictExpiredAdminResponses(now: number): void {
+  for (const [key, entry] of adminResponseCache) {
+    if (now - entry.checkedAt >= ADMIN_RESPONSE_CACHE_TTL_MS) {
+      adminResponseCache.delete(key);
+    }
+  }
+}
+
+function enforceAdminResponseCacheLimit(): void {
+  while (adminResponseCache.size > ADMIN_RESPONSE_CACHE_MAX_ENTRIES) {
+    let oldestKey: string | undefined;
+    let oldestCheckedAt = Number.POSITIVE_INFINITY;
+    for (const [key, entry] of adminResponseCache) {
+      if (entry.checkedAt < oldestCheckedAt) {
+        oldestKey = key;
+        oldestCheckedAt = entry.checkedAt;
+      }
+    }
+    if (oldestKey === undefined) return;
+    adminResponseCache.delete(oldestKey);
+  }
 }
 
 /** Switches the memory cache when the authenticated browser account changes. */
@@ -154,6 +184,7 @@ export function clearApiCache() {
 }
 
 export function cachedApiValue<T>(key: string): T | undefined {
+  evictExpiredAdminResponses(Date.now());
   return adminResponseCache.get(scopedCacheKey(key))?.value as T | undefined;
 }
 
@@ -170,9 +201,10 @@ export async function cachedApi<T>(
 ): Promise<CachedApiResult<T>> {
   if (options.signal?.aborted) throw createAbortError();
 
+  const now = Date.now();
+  evictExpiredAdminResponses(now);
   const key = scopedCacheKey(options.key ?? path);
   const existing = adminResponseCache.get(key);
-  const now = Date.now();
   const minRevalidateMs = options.minRevalidateMs ?? 15_000;
   if (existing && !options.force && now - existing.checkedAt < minRevalidateMs) {
     return {
@@ -250,7 +282,10 @@ async function conditionalJsonRequest<T>(
   // request was on the wire. Never let that older representation repopulate
   // the new cache generation.
   const stale = generation !== cacheGeneration;
-  if (!stale) adminResponseCache.set(key, entry);
+  if (!stale) {
+    adminResponseCache.set(key, entry);
+    enforceAdminResponseCacheLimit();
+  }
   return { value: entry.value as T, changed: true, revalidated: true, stale };
 }
 
@@ -318,12 +353,40 @@ export async function api<T = void>(
   );
 }
 
+export async function apiWithResponse<T = void>(
+  path: string,
+  options: ApiRequestInit = {},
+  decoder?: ApiDecoder<T>
+): Promise<ApiResponse<T>> {
+  const method = (options.method ?? "GET").toUpperCase();
+  const idempotencyKey = options.idempotencyKey
+    ?? (isAdminMutation(path, method) ? createMutationKey() : undefined);
+  return requestWithResponse<T>(
+    path,
+    idempotencyKey === options.idempotencyKey
+      ? options
+      : { ...options, ...(idempotencyKey ? { idempotencyKey } : {}) },
+    true,
+    decoder
+  );
+}
+
 async function request<T>(
   path: string,
   options: ApiRequestInit,
   retryCsrf: boolean,
   decoder?: ApiDecoder<T>
 ): Promise<T> {
+  const response = await requestWithResponse(path, options, retryCsrf, decoder);
+  return response.value;
+}
+
+async function requestWithResponse<T>(
+  path: string,
+  options: ApiRequestInit,
+  retryCsrf: boolean,
+  decoder?: ApiDecoder<T>
+): Promise<ApiResponse<T>> {
   const { csrfTokenPath, idempotencyKey, ifMatch, ...fetchOptions } = options;
   const headers = new Headers(fetchOptions.headers);
   headers.set("accept", "application/json");
@@ -349,7 +412,7 @@ async function request<T>(
     const body = payload.parsed?.ok ? asApiErrorBody(payload.parsed.value) : null;
     if (retryCsrf && requiresCsrf && response.status === 403 && body?.error === "csrf_failed") {
       clearCsrfToken(csrfPath);
-      return request<T>(path, options, false, decoder);
+      return requestWithResponse<T>(path, options, false, decoder);
     }
     throw toApiError(response, payload);
   }
@@ -368,8 +431,10 @@ async function request<T>(
     // Clearing the small in-memory cache is cheap and prevents stale views.
     clearApiCache();
   }
-  if (!payload.text) return undefined as T;
-  return decodeApiValue(payload.parsed?.ok ? payload.parsed.value : payload.text, decoder);
+  const value = !payload.text
+    ? undefined as T
+    : decodeApiValue(payload.parsed?.ok ? payload.parsed.value : payload.text, decoder);
+  return { value, headers: response.headers };
 }
 
 function decodeApiValue<T>(value: unknown, decoder?: ApiDecoder<T>): T {

@@ -1,5 +1,5 @@
-import { api, cachedApi } from "../api";
-import type { ApiRequestInit } from "../api";
+import { api, apiWithResponse, cachedApi } from "../api";
+import type { ApiRequestInit, ApiResponse } from "../api";
 import { expectArray, expectRecord } from "./validation";
 import type { ApiDecoder } from "./validation";
 
@@ -35,6 +35,14 @@ export function requestJson<TResponse>(
   decoder?: ApiDecoder<TResponse>
 ): Promise<TResponse> {
   return api<TResponse>(path, options, decoder);
+}
+
+export function requestJsonWithResponse<TResponse>(
+  path: string,
+  options?: ApiRequestInit,
+  decoder?: ApiDecoder<TResponse>
+): Promise<ApiResponse<TResponse>> {
+  return apiWithResponse<TResponse>(path, options, decoder);
 }
 
 export const arrayResponse = <T>(value: unknown, label?: string): T[] => expectArray<T>(value, label);

@@ -100,10 +100,10 @@ async fn require_organization_manager(
     {
         return Ok(());
     }
-    let memberships = state.db.list_user_organizations(&current.user.id).await?;
-    let membership = memberships
-        .into_iter()
-        .find(|membership| membership.id == organization.id && membership.is_active == 1);
+    let membership = state
+        .db
+        .find_active_organization_membership(&current.user.id, &organization.id)
+        .await?;
     match membership
         .as_ref()
         .map(|membership| membership.role.as_str())

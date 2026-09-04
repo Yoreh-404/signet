@@ -41,6 +41,7 @@ impl AuthorizationSnapshot {
         client: &ClientRecord,
         user: &UserRecord,
     ) -> AppResult<Self> {
+        state.db.ensure_application_for_client(client).await?;
         let policy = state
             .db
             .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")

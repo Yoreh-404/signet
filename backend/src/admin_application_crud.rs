@@ -77,14 +77,14 @@ pub(super) async fn list_applications(
         .iter()
         .map(|application| application.id.clone())
         .collect::<Vec<_>>();
-    let graphs = state
+    let mut graphs = state
         .db
         .read_application_graph_batch(&application_ids)
         .await?;
     let result = applications
         .into_iter()
         .map(|application| {
-            let graph = graphs.get(&application.id).cloned().ok_or_else(|| {
+            let graph = graphs.remove(&application.id).ok_or_else(|| {
                 AppError::Internal(format!(
                     "application graph is missing for {}",
                     application.id
@@ -186,7 +186,7 @@ pub(super) async fn list_application_client_bindings(
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<ApplicationClientBindingResponse>>> {
     let (_current, _application) = managed_application(&state, &jar, &id).await?;
-    let graph = state.db.read_application_graph(&id).await?;
+    let graph = state.db.read_application_client_binding_graph(&id).await?;
     Ok(Json(application_client_binding_responses_from_graph(
         &graph,
         None,

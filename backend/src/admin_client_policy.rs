@@ -1,4 +1,4 @@
-use super::ClientInput;
+use super::admin_client_types::ClientInput;
 use crate::{
     backchannel_logout, claim_mapper, client_assertion, client_policy,
     db::{ClientClaimMapperRecord, NewClient, NewClientClaimMapper},

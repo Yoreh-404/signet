@@ -276,18 +276,12 @@ pub(super) async fn create_invitation(
         },
         util::random_token(18)
     );
-    let signing_key = state
-        .db
-        .list_signing_keys()
-        .await?
-        .into_iter()
-        .find(|key| key.is_active == 1)
-        .ok_or_else(|| {
-            AppError::Configuration(
-                "an active signing key is required to create a revealable authorization code"
-                    .to_string(),
-            )
-        })?;
+    let signing_key = state.db.find_active_signing_key().await?.ok_or_else(|| {
+        AppError::Configuration(
+            "an active signing key is required to create a revealable authorization code"
+                .to_string(),
+        )
+    })?;
     let code_reveal_ciphertext =
         util::encrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &code)?;
     let (invitation, code) = state

@@ -534,7 +534,7 @@ fn validated_enabled_module_config(
     if module.is_enabled != 1 {
         return Ok(None);
     }
-    let config = module_config(&module)?;
+    let config = module_config(module)?;
     let normalized = normalize_module_config(module_key, Value::Object(config))?;
     Ok(Some(normalized.as_object().cloned().ok_or_else(|| {
         AppError::Internal("application module config is not an object".to_string())
@@ -585,6 +585,7 @@ impl ApplicationRuntimeSnapshot {
         client: &ClientRecord,
         required_protocol: Option<&str>,
     ) -> AppResult<Self> {
+        state.db.ensure_application_for_client(client).await?;
         let policy = state
             .db
             .load_client_runtime_snapshot(&client.id, required_protocol)

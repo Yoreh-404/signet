@@ -1,4 +1,4 @@
-use super::managed_application;
+use super::admin_application_scope::managed_application;
 use crate::{
     AppState,
     audit::{self, AuditSink},

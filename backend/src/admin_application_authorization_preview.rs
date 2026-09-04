@@ -1,4 +1,9 @@
-use super::{application_authorization_user, managed_application, managed_authorization_profile};
+use super::{
+    admin_application_authorization_scope::{
+        application_authorization_user, managed_authorization_profile,
+    },
+    admin_application_scope::managed_application,
+};
 use crate::{
     AppState, authorization,
     error::{AppError, AppResult},
@@ -24,6 +29,40 @@ fn entitlements_value(
     Ok(value)
 }
 
+fn access_decision(
+    snapshot: &authorization::AuthorizationPolicySnapshot,
+    application_id: &str,
+) -> AppResult<authorization::ApplicationAccessDecision> {
+    if snapshot.client_id.is_some()
+        || snapshot
+            .application
+            .as_ref()
+            .is_none_or(|application| application.id != application_id)
+    {
+        return Err(AppError::Forbidden);
+    }
+    let application = snapshot.application.as_ref().ok_or(AppError::Forbidden)?;
+    let policy_version = crate::util::sha256_base64url(&format!(
+        "signet:application-policy:v2:{}:{}:{}",
+        application.id,
+        application.updated_at,
+        serde_json::to_string(&snapshot.authorization_config).unwrap_or_default()
+    ));
+    let allowed = application.is_active == 1
+        && snapshot.application_runtime_active
+        && snapshot.organization_active
+        && snapshot.user_active;
+    Ok(authorization::ApplicationAccessDecision {
+        allowed,
+        reason: if allowed {
+            "active_account"
+        } else {
+            "inactive_account_or_tenant"
+        },
+        policy_version,
+    })
+}
+
 pub(super) async fn profile(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -32,11 +71,14 @@ pub(super) async fn profile(
     let (_, application, profile) =
         managed_authorization_profile(&state, &jar, &id, &profile_id).await?;
     let user = application_authorization_user(&state, &application, &user_id).await?;
-    let decision = authorization::check_login_access(&state, &application, &user.id).await?;
+    let snapshot = state
+        .db
+        .load_profile_policy_snapshot(&application.id, &profile.id, &user.id)
+        .await?;
+    let decision = access_decision(&snapshot, &application.id)?;
     let entitlements = if decision.allowed {
         Some(entitlements_value(
-            authorization::resolve_entitlements_for_profile(&state, &application, &profile, &user)
-                .await?,
+            authorization::resolve_entitlements_from_snapshot(&snapshot, &user)?,
         )?)
     } else {
         None
@@ -53,10 +95,14 @@ pub(super) async fn application(
 ) -> AppResult<Json<serde_json::Value>> {
     let (_, application) = managed_application(&state, &jar, &id).await?;
     let user = application_authorization_user(&state, &application, &user_id).await?;
-    let decision = authorization::check_login_access(&state, &application, &user.id).await?;
+    let snapshot = state
+        .db
+        .load_application_policy_snapshot(&application.id, &user.id)
+        .await?;
+    let decision = access_decision(&snapshot, &application.id)?;
     let entitlements = if decision.allowed {
         Some(entitlements_value(
-            authorization::resolve_entitlements(&state, &application, &user).await?,
+            authorization::resolve_entitlements_from_snapshot(&snapshot, &user)?,
         )?)
     } else {
         None

@@ -1,10 +1,10 @@
 //! Application-scoped authorization catalog and directory persistence.
 
 use super::{
-    ApplicationAuthorizationProfileCountRow, ApplicationAuthorizationProfileRecord,
-    ApplicationPermissionDefinitionRecord, CountRow, DatabaseKind, Db, GroupPatchPlan, GroupRecord,
-    NewApplicationAuthorizationProfile, NewApplicationPermissionDefinition, NewGroup, UserRecord,
-    bind_text_list, blocking, normalize_application_entitlement_keys, ph, placeholders,
+    ApplicationAuthorizationProfileRecord, ApplicationPermissionDefinitionRecord, CountRow,
+    DatabaseKind, Db, GroupPatchPlan, GroupRecord, NewApplicationAuthorizationProfile,
+    NewApplicationPermissionDefinition, NewGroup, UserRecord, bind_text_list, blocking,
+    normalize_application_entitlement_keys, ph, placeholders,
     select_application_authorization_profile_sql, select_application_permission_definition_sql,
     select_user_sql,
 };
@@ -13,6 +13,8 @@ use crate::util;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl, sql_query};
 use std::collections::BTreeMap;
+
+use super::query_types::ApplicationAuthorizationProfileCountRow;
 
 impl Db {
     pub async fn list_application_authorization_groups(
@@ -240,37 +242,21 @@ impl Db {
                     .execute(conn)
                     .map_err(AppError::from)?;
 
-                let scim_reference_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_scim_groups WHERE group_id = {}",
-                    ph(kind, 1)
+                let references_sql = format!(
+                    "SELECT CASE WHEN EXISTS (SELECT 1 FROM application_scim_groups WHERE group_id = {}) OR EXISTS (SELECT 1 FROM application_profile_group_roles WHERE group_id = {}) OR EXISTS (SELECT 1 FROM directory_sync_groups WHERE group_id = {}) THEN 1 ELSE 0 END AS count",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
                 );
-                let scim_references = sql_query(scim_reference_sql)
+                let has_references = sql_query(references_sql)
+                    .bind::<Text, _>(&group_id)
+                    .bind::<Text, _>(&group_id)
                     .bind::<Text, _>(&group_id)
                     .get_result::<CountRow>(conn)
                     .map_err(AppError::from)?
-                    .count;
-                let profile_role_reference_sql = format!(
-                    "SELECT COUNT(*) AS count FROM application_profile_group_roles WHERE group_id = {}",
-                    ph(kind, 1)
-                );
-                let profile_role_references = sql_query(profile_role_reference_sql)
-                    .bind::<Text, _>(&group_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count;
-                let directory_reference_sql = format!(
-                    "SELECT COUNT(*) AS count FROM directory_sync_groups WHERE group_id = {}",
-                    ph(kind, 1)
-                );
-                let directory_references = sql_query(directory_reference_sql)
-                    .bind::<Text, _>(&group_id)
-                    .get_result::<CountRow>(conn)
-                    .map_err(AppError::from)?
-                    .count;
-                if scim_references == 0
-                    && profile_role_references == 0
-                    && directory_references == 0
-                {
+                    .count
+                    != 0;
+                if !has_references {
                     for table in ["group_members", "group_roles"] {
                         let sql = format!(
                             "DELETE FROM {table} WHERE group_id = {}",
@@ -375,7 +361,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let placeholders = placeholders(kind, 1, profile_ids.len());
             let sql = format!(
-                "SELECT profiles.id AS profile_id, (SELECT COUNT(*) FROM application_permission_definitions WHERE profile_id = profiles.id AND is_active = 1) AS permission_count, (SELECT COUNT(*) FROM application_profile_roles WHERE profile_id = profiles.id AND is_active = 1) AS role_count FROM application_authorization_profiles AS profiles WHERE profiles.id IN ({placeholders})"
+                "SELECT profiles.id AS profile_id, COALESCE(permission_counts.permission_count, 0) AS permission_count, COALESCE(role_counts.role_count, 0) AS role_count FROM application_authorization_profiles AS profiles LEFT JOIN (SELECT profile_id, COUNT(*) AS permission_count FROM application_permission_definitions WHERE is_active = 1 GROUP BY profile_id) AS permission_counts ON permission_counts.profile_id = profiles.id LEFT JOIN (SELECT profile_id, COUNT(*) AS role_count FROM application_profile_roles WHERE is_active = 1 GROUP BY profile_id) AS role_counts ON role_counts.profile_id = profiles.id WHERE profiles.id IN ({placeholders})"
             );
             let rows = bind_text_list(&mut conn, sql_query(sql), &profile_ids)
                 .load::<ApplicationAuthorizationProfileCountRow>(&mut conn)

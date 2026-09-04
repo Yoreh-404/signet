@@ -383,6 +383,7 @@ export function ApplicationAuthorizationModule({
             copy={copy}
             applicationRoles={applicationRoles}
             applicationPermissionCatalog={applicationPermissionCatalog}
+            knownPermissionKeys={knownPermissions}
             roleDraft={roleDraft}
             roleDraftPermissionSet={roleDraftPermissionSet}
             customRolePermissions={customRolePermissions}

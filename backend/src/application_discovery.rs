@@ -8,18 +8,14 @@
 
 use crate::{
     AppState,
-    application_contract::{ApplicationContract, ClientContract, IntegrationProfile},
+    application_contract::ApplicationContract,
     config::AutoRegistrationAllowlistEntry,
     db::{ApplicationDiscoveryRecord, NewApplication, NewClient},
     error::{AppError, AppResult},
     util,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use sha2::Sha256;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
@@ -33,6 +29,21 @@ use tokio::{
     time::Instant,
 };
 use url::{Host, Url};
+
+mod crypto;
+mod normalization;
+#[cfg(test)]
+#[path = "application_discovery/normalization_tests.rs"]
+mod normalization_tests;
+mod pure;
+use crypto::{PinnedJwks, verify_jws, verify_jws_with_embedded_key};
+use normalization::{
+    contract_authorization_module, index_policy_effects, normalize_authorization_bindings,
+    normalize_client_protocol, normalize_contract_client, normalize_contract_profiles_with_effects,
+    normalize_contract_protocols, normalize_directory_sync, normalize_module,
+    validate_protocol_client_bindings,
+};
+use pure::{audience_contains, is_forbidden_ip, manifest_content_digest, validate_host};
 
 pub const FORMAT: &str = crate::application_contract::FORMAT;
 pub const DISCOVERY_PATH: &str = "/.well-known/signet-authorization.json";
@@ -48,8 +59,6 @@ const MAX_CLIENT_ID_LENGTH: usize = 255;
 const MAX_SCOPE_LENGTH: usize = 256;
 const MAX_DISCOVERY_SWEEP_APPLICATIONS: usize = 10_000;
 const MAX_DISCOVERY_CHALLENGE_TTL_SECONDS: i64 = 900;
-const DISCOVERY_CHALLENGE_VERSION: &str = "v1";
-const DISCOVERY_CHALLENGE_LABEL: &[u8] = b"signet:application-discovery-challenge:v1:";
 const REGISTRATION_PROOF_EXTENSION: &str = "registration_proof";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,32 +212,6 @@ struct RegistrationProof {
     challenge: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct JwsHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
-    #[serde(default)]
-    jwk: Option<PinnedJwk>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct PinnedJwks {
-    keys: Vec<PinnedJwk>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct PinnedJwk {
-    kty: String,
-    crv: String,
-    x: String,
-    #[serde(default)]
-    kid: Option<String>,
-    #[serde(rename = "use", default)]
-    use_: Option<String>,
-    #[serde(default)]
-    alg: Option<String>,
-}
 #[derive(Debug, Clone, Serialize)]
 pub struct NormalizedProfile {
     pub permissions: Vec<NormalizedPermission>,
@@ -265,7 +248,6 @@ pub struct NormalizedOrganizationRoleMapping {
 
 #[derive(Debug, Clone, Default)]
 pub struct NormalizedAuthorizationMappings {
-    pub default_role: Option<String>,
     pub group_mappings: Vec<NormalizedGroupMapping>,
     pub organization_role_mappings: Vec<NormalizedOrganizationRoleMapping>,
 }
@@ -428,32 +410,7 @@ pub fn new_discovery_challenge(secret: &str, origin: &str, ttl_seconds: i64) -> 
     let issued_at = util::now_ts();
     let nonce = util::random_token(32);
     let origin = website_origin(origin)?.to_ascii_lowercase();
-    let timestamp = issued_at.to_string();
-    let ttl = ttl_seconds.to_string();
-    let mac = discovery_challenge_mac(secret, &origin, &timestamp, &ttl, &nonce)?;
-    Ok(format!(
-        "{DISCOVERY_CHALLENGE_VERSION}.{timestamp}.{ttl}.{nonce}.{mac}"
-    ))
-}
-
-fn discovery_challenge_mac(
-    secret: &str,
-    origin: &str,
-    issued_at: &str,
-    ttl_seconds: &str,
-    nonce: &str,
-) -> AppResult<String> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|_| AppError::Configuration("invalid discovery challenge secret".into()))?;
-    mac.update(DISCOVERY_CHALLENGE_LABEL);
-    mac.update(origin.as_bytes());
-    mac.update(b":");
-    mac.update(issued_at.as_bytes());
-    mac.update(b":");
-    mac.update(ttl_seconds.as_bytes());
-    mac.update(b":");
-    mac.update(nonce.as_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    crypto::encode_challenge(secret, &origin, issued_at, ttl_seconds, &nonce)
 }
 
 fn auto_registration_entry<'a>(
@@ -761,54 +718,6 @@ pub async fn auto_register_application(
     Ok(record)
 }
 
-fn validate_host(host: Option<Host<&str>>) -> AppResult<()> {
-    let Some(host) = host else {
-        return Err(AppError::BadRequest(
-            "website URL must include a host".to_string(),
-        ));
-    };
-    let host_name = host.to_string();
-    if host_name.eq_ignore_ascii_case("localhost")
-        || host_name.ends_with(".localhost")
-        || host_name.ends_with(".local")
-    {
-        return Err(AppError::BadRequest(
-            "website URL cannot target a local hostname".to_string(),
-        ));
-    }
-    let ip = match host {
-        Host::Ipv4(value) => IpAddr::V4(value),
-        Host::Ipv6(value) => IpAddr::V6(value),
-        Host::Domain(_) => return Ok(()),
-    };
-    if is_forbidden_ip(ip) {
-        return Err(AppError::BadRequest(
-            "website URL cannot target a private network address".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(value) => {
-            value.is_loopback()
-                || value.is_private()
-                || value.is_link_local()
-                || value.is_unspecified()
-                || value.is_multicast()
-                || value.is_broadcast()
-        }
-        IpAddr::V6(value) => {
-            value.is_loopback()
-                || value.is_unspecified()
-                || value.is_multicast()
-                || (value.segments()[0] & 0xfe00) == 0xfc00
-                || (value.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
-
 fn validate_fetch_url(discovery_url: &str, allow_private_networks: bool) -> AppResult<Url> {
     let parsed = Url::parse(discovery_url.trim())
         .map_err(|_| AppError::BadRequest("application discovery URL is invalid".to_string()))?;
@@ -875,26 +784,6 @@ async fn resolve_public_host(url: &Url, allow_private_networks: bool) -> AppResu
             )
         })?;
     Ok(address)
-}
-
-fn manifest_content_digest(payload: &[u8]) -> AppResult<String> {
-    let mut value = serde_json::from_slice::<Value>(payload)
-        .map_err(|_| AppError::BadRequest("application discovery schema is invalid".to_string()))?;
-    let object = value.as_object_mut().ok_or_else(|| {
-        AppError::BadRequest("application discovery schema is invalid".to_string())
-    })?;
-    object.remove("iat");
-    object.remove("exp");
-    if let Some(extensions) = object.get_mut("extensions").and_then(Value::as_object_mut) {
-        // The proof is bound to one challenge and therefore changes on every
-        // bootstrap fetch. It must not make an unchanged contract revision
-        // look like a content change.
-        extensions.remove(REGISTRATION_PROOF_EXTENSION);
-    }
-    let canonical = serde_json::to_string(&value).map_err(|_| {
-        AppError::Internal("failed to encode application discovery digest".to_string())
-    })?;
-    Ok(util::sha256_base64url(&canonical))
 }
 
 pub struct DiscoveryFetchRequest<'a> {
@@ -1112,74 +1001,25 @@ async fn fetch_discovery_body(
     Ok(body)
 }
 
-fn validate_challenge(challenge: &str) -> AppResult<()> {
-    let parts = challenge.split('.').collect::<Vec<_>>();
-    if parts.len() != 5
-        || parts[0] != DISCOVERY_CHALLENGE_VERSION
-        || parts[1].parse::<i64>().ok().is_none_or(|value| value <= 0)
-        || parts[2]
-            .parse::<i64>()
-            .ok()
-            .is_none_or(|value| !(1..=MAX_DISCOVERY_CHALLENGE_TTL_SECONDS).contains(&value))
-        || parts[3].len() < 16
-        || parts[3].len() > 128
-        || !parts[3]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        || URL_SAFE_NO_PAD
-            .decode(parts[4])
-            .ok()
-            .is_none_or(|value| value.len() != 32)
-    {
-        return Err(AppError::BadRequest(
-            "discovery challenge is invalid".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn verify_discovery_challenge(
     secret: &str,
     expected_origin: &str,
     challenge: &str,
 ) -> AppResult<()> {
-    validate_challenge(challenge)?;
     if secret.trim().len() < 32 {
         return Err(AppError::Configuration(
             "discovery challenge secret is not configured".to_string(),
         ));
     }
-    let parts = challenge.split('.').collect::<Vec<_>>();
-    let issued_at = parts[1]
-        .parse::<i64>()
-        .map_err(|_| AppError::BadRequest("discovery challenge is invalid".to_string()))?;
-    let ttl_seconds = parts[2]
-        .parse::<i64>()
-        .map_err(|_| AppError::BadRequest("discovery challenge is invalid".to_string()))?;
     let now = util::now_ts();
-    if issued_at > now.saturating_add(60)
-        || issued_at
-            .checked_add(ttl_seconds)
-            .is_none_or(|expires_at| expires_at <= now)
-    {
-        return Err(AppError::Unauthorized);
-    }
     let origin = website_origin(expected_origin)?.to_ascii_lowercase();
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|_| AppError::Configuration("invalid discovery challenge secret".into()))?;
-    mac.update(DISCOVERY_CHALLENGE_LABEL);
-    mac.update(origin.as_bytes());
-    mac.update(b":");
-    mac.update(parts[1].as_bytes());
-    mac.update(b":");
-    mac.update(parts[2].as_bytes());
-    mac.update(b":");
-    mac.update(parts[3].as_bytes());
-    let provided = URL_SAFE_NO_PAD
-        .decode(parts[4])
-        .map_err(|_| AppError::BadRequest("discovery challenge is invalid".to_string()))?;
-    mac.verify_slice(&provided)
-        .map_err(|_| AppError::Unauthorized)
+    crypto::verify_challenge(
+        secret,
+        &origin,
+        challenge,
+        now,
+        MAX_DISCOVERY_CHALLENGE_TTL_SECONDS,
+    )
 }
 
 fn parse_contract(payload: &[u8]) -> AppResult<ApplicationContract> {
@@ -1281,98 +1121,6 @@ fn extract_jws(body: &[u8]) -> AppResult<String> {
     Ok(text.to_string())
 }
 
-fn verify_jws(token: &str, pinned_jwks: &str) -> AppResult<Vec<u8>> {
-    let (header, payload, signature, signing_input) = parse_jws(token)?;
-    let key_set =
-        serde_json::from_str::<PinnedJwks>(pinned_jwks).map_err(|_| AppError::Unauthorized)?;
-    let candidates = key_set
-        .keys
-        .iter()
-        .filter(|key| {
-            key.kty == "OKP"
-                && key.crv == "Ed25519"
-                && key.use_.as_deref().is_none_or(|value| value == "sig")
-                && key.alg.as_deref().is_none_or(|value| value == "EdDSA")
-                && header
-                    .kid
-                    .as_deref()
-                    .is_none_or(|kid| key.kid.as_deref() == Some(kid))
-        })
-        .collect::<Vec<_>>();
-    let key = match (header.kid.as_deref(), candidates.as_slice()) {
-        (_, []) => return Err(AppError::Unauthorized),
-        (Some(_), [key, ..]) => *key,
-        (None, [key]) => *key,
-        (None, _) => return Err(AppError::Unauthorized),
-    };
-    verify_signature(&header, key, &signing_input, &signature)?;
-    Ok(payload)
-}
-
-fn verify_jws_with_embedded_key(token: &str) -> AppResult<(Vec<u8>, PinnedJwk)> {
-    let (header, payload, signature, signing_input) = parse_jws(token)?;
-    let key = header.jwk.clone().ok_or(AppError::Unauthorized)?;
-    verify_signature(&header, &key, &signing_input, &signature)?;
-    Ok((payload, key))
-}
-
-fn parse_jws(token: &str) -> AppResult<(JwsHeader, Vec<u8>, Signature, String)> {
-    let mut parts = token.split('.');
-    let encoded_header = parts.next().ok_or(AppError::Unauthorized)?;
-    let encoded_payload = parts.next().ok_or(AppError::Unauthorized)?;
-    let encoded_signature = parts.next().ok_or(AppError::Unauthorized)?;
-    if parts.next().is_some() {
-        return Err(AppError::Unauthorized);
-    }
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(encoded_header)
-        .map_err(|_| AppError::Unauthorized)?;
-    let header =
-        serde_json::from_slice::<JwsHeader>(&header_bytes).map_err(|_| AppError::Unauthorized)?;
-    if header.alg != "EdDSA" {
-        return Err(AppError::Unauthorized);
-    }
-    let payload = URL_SAFE_NO_PAD
-        .decode(encoded_payload)
-        .map_err(|_| AppError::Unauthorized)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(encoded_signature)
-        .map_err(|_| AppError::Unauthorized)
-        .and_then(|value| Signature::from_slice(&value).map_err(|_| AppError::Unauthorized))?;
-    Ok((
-        header,
-        payload,
-        signature,
-        format!("{encoded_header}.{encoded_payload}"),
-    ))
-}
-
-fn verify_signature(
-    header: &JwsHeader,
-    key: &PinnedJwk,
-    signing_input: &str,
-    signature: &Signature,
-) -> AppResult<()> {
-    if key.kty != "OKP"
-        || key.crv != "Ed25519"
-        || key.use_.as_deref().is_some_and(|value| value != "sig")
-        || key.alg.as_deref().is_some_and(|value| value != "EdDSA")
-        || header.kid.is_some() && header.kid.as_deref() != key.kid.as_deref()
-    {
-        return Err(AppError::Unauthorized);
-    }
-    let public_key: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(&key.x)
-        .map_err(|_| AppError::Unauthorized)?
-        .try_into()
-        .map_err(|_| AppError::Unauthorized)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key).map_err(|_| AppError::Unauthorized)?;
-    verifying_key
-        .verify(signing_input.as_bytes(), signature)
-        .map_err(|_| AppError::Unauthorized)
-}
-
 fn normalize_application_contract(
     contract: &ApplicationContract,
     payload: &[u8],
@@ -1390,13 +1138,12 @@ fn normalize_application_contract(
     {
         return Err(AppError::Unauthorized);
     }
+    let policy_effects = index_policy_effects(&contract.modules.policies);
     let clients = contract
         .modules
         .clients
         .iter()
-        .map(|client| {
-            normalize_contract_client(client, organization_id, &contract.modules.policies)
-        })
+        .map(|client| normalize_contract_client(client, organization_id, &policy_effects))
         .collect::<AppResult<Vec<_>>>()?;
     let client_protocols = contract
         .modules
@@ -1409,7 +1156,7 @@ fn normalize_application_contract(
             ))
         })
         .collect::<AppResult<BTreeMap<_, _>>>()?;
-    let profiles = normalize_contract_profiles(contract)?;
+    let profiles = normalize_contract_profiles_with_effects(contract, &policy_effects)?;
     let authorization = contract_authorization_module(&profiles)?;
     let authorization_mappings = normalize_authorization_bindings(&authorization, &profiles)?;
     let protocols = normalize_contract_protocols(
@@ -1490,544 +1237,6 @@ pub fn verify_and_normalize(
         expected_audience,
         organization_id,
     )
-}
-
-fn audience_contains(value: &Value, expected: &str) -> bool {
-    match value {
-        Value::String(value) => value == expected,
-        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(expected)),
-        _ => false,
-    }
-}
-
-fn normalize_contract_client(
-    client: &ClientContract,
-    organization_id: &str,
-    policies: &[crate::application_contract::PolicyContract],
-) -> AppResult<NewClient> {
-    let client_id = visible_text(&client.client_id, MAX_CLIENT_ID_LENGTH, "client_id")?;
-    let client_name = if client.display_name.trim().is_empty() {
-        client_id.clone()
-    } else {
-        normalize_display_text(&client.display_name, 160, "client_name")?
-    };
-    let auth_method = client.token_endpoint_auth_method.trim();
-    if !matches!(auth_method, "none" | "private_key_jwt") {
-        return Err(AppError::BadRequest(
-            "v3 clients cannot transport shared secrets".to_string(),
-        ));
-    }
-    let jwks = client
-        .jwks
-        .as_ref()
-        .filter(|value| !value.is_null())
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|_| AppError::BadRequest("client jwks is invalid".to_string()))?
-        .unwrap_or_default();
-    let audiences = normalize_string_list(&client.audiences, 2048, "audience")?;
-    let scopes = normalize_string_list(&client.scopes, MAX_SCOPE_LENGTH, "scope")?;
-    let grant_types = normalize_string_list(&client.grant_types, 128, "grant_type")?;
-    let response_types = normalize_string_list(&client.response_types, 128, "response_type")?;
-    let service_account_enabled = client
-        .profiles
-        .contains(&IntegrationProfile::MachineIdentity);
-    let service_account_permissions = policies
-        .iter()
-        .filter(|policy| policy.client_ids.iter().any(|id| id == &client.client_id))
-        .flat_map(|policy| policy.permissions.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let client_require_mfa = client.require_mfa
-        || policies.iter().any(|policy| {
-            policy.client_ids.iter().any(|id| id == &client.client_id) && policy.require_mfa
-        });
-    let client_require_dpop = client.require_dpop
-        || policies.iter().any(|policy| {
-            policy.client_ids.iter().any(|id| id == &client.client_id) && policy.require_dpop
-        });
-    let logo_uri = client
-        .metadata
-        .get("logo_uri")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    Ok(NewClient {
-        client_id,
-        client_secret_hash: None,
-        client_name,
-        logo_uri,
-        organization_id: Some(organization_id.to_string()),
-        redirect_uris: normalize_url_list(&client.redirect_uris, "redirect_uri")?,
-        post_logout_redirect_uris: normalize_url_list(
-            &client.post_logout_redirect_uris,
-            "post_logout_redirect_uri",
-        )?,
-        scopes,
-        audience: audiences.first().cloned().unwrap_or_default(),
-        grant_types,
-        response_types,
-        token_endpoint_auth_method: auth_method.to_string(),
-        require_pkce: client.require_pkce,
-        require_mfa: client_require_mfa,
-        require_pushed_authorization_requests: false,
-        require_s256_pkce: client.require_s256_pkce,
-        require_confidential_client: auth_method != "none",
-        require_dpop: client_require_dpop,
-        require_account_selection: false,
-        trust_email_verified: false,
-        authorization_details_types: Vec::new(),
-        subject_type: if service_account_enabled {
-            "pairwise".to_string()
-        } else {
-            "public".to_string()
-        },
-        sector_identifier_uri: String::new(),
-        jwks_uri: client.jwks_uri.clone().unwrap_or_default(),
-        jwks,
-        backchannel_logout_uri: String::new(),
-        backchannel_logout_session_required: false,
-        frontchannel_logout_uri: String::new(),
-        frontchannel_logout_session_required: false,
-        service_account_enabled,
-        service_account_permissions,
-        is_active: client.active,
-    })
-}
-
-fn normalize_client_protocol(value: &str) -> AppResult<String> {
-    let protocol = visible_text(value, 64, "client protocol")?.to_ascii_lowercase();
-    if !matches!(
-        protocol.as_str(),
-        "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
-    ) {
-        return Err(AppError::BadRequest(
-            "v3 client protocol is unsupported".to_string(),
-        ));
-    }
-    Ok(protocol)
-}
-
-fn normalize_contract_profiles(
-    contract: &ApplicationContract,
-) -> AppResult<BTreeMap<String, NormalizedProfile>> {
-    let all_permission_keys = contract
-        .modules
-        .policies
-        .iter()
-        .flat_map(|policy| policy.permissions.iter().cloned())
-        .chain(
-            contract
-                .modules
-                .roles
-                .iter()
-                .flat_map(|role| role.permissions.iter().cloned()),
-        )
-        .map(|permission| normalize_permission_key(&permission))
-        .collect::<AppResult<BTreeSet<_>>>()?;
-    let build_profile = |allowed_permissions: &BTreeSet<String>| -> AppResult<NormalizedProfile> {
-        let permissions = allowed_permissions
-            .iter()
-            .map(|key| {
-                Ok(NormalizedPermission {
-                    key: key.clone(),
-                    label: key.rsplit(':').next().unwrap_or(key).to_string(),
-                    description: None,
-                })
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        let mut roles = Vec::new();
-        for role in &contract.modules.roles {
-            let normalized_role_permissions = role
-                .permissions
-                .iter()
-                .map(|permission| normalize_permission_key(permission))
-                .collect::<AppResult<Vec<_>>>()?;
-            if normalized_role_permissions
-                .iter()
-                .any(|permission| !allowed_permissions.contains(permission))
-            {
-                continue;
-            }
-            let key = visible_text(&role.role_id, 128, "role_id")?;
-            roles.push(NormalizedRole {
-                key: key.clone(),
-                name: key,
-                description: None,
-                permissions: normalized_role_permissions,
-                is_default: role.default_role,
-            });
-        }
-        if roles.iter().filter(|role| role.is_default).count() > 1 {
-            return Err(AppError::BadRequest(
-                "v3 profile declares more than one default role".to_string(),
-            ));
-        }
-        Ok(NormalizedProfile { permissions, roles })
-    };
-
-    let application_profile = build_profile(&all_permission_keys)?;
-    let mut profiles = BTreeMap::new();
-    profiles.insert("default".to_string(), application_profile);
-    for client in &contract.modules.clients {
-        let is_machine_identity = client
-            .profiles
-            .contains(&IntegrationProfile::MachineIdentity);
-        let mut allowed_permissions = if is_machine_identity {
-            BTreeSet::new()
-        } else {
-            all_permission_keys.clone()
-        };
-        allowed_permissions.extend(
-            contract
-                .modules
-                .policies
-                .iter()
-                .filter(|policy| {
-                    policy
-                        .client_ids
-                        .iter()
-                        .any(|client_id| client_id == &client.client_id)
-                })
-                .flat_map(|policy| policy.permissions.iter().cloned())
-                .map(|permission| normalize_permission_key(&permission))
-                .collect::<AppResult<BTreeSet<_>>>()?,
-        );
-        profiles.insert(
-            client.client_id.clone(),
-            build_profile(&allowed_permissions)?,
-        );
-    }
-    Ok(profiles)
-}
-
-fn contract_authorization_module(
-    _profiles: &BTreeMap<String, NormalizedProfile>,
-) -> AppResult<Value> {
-    // Roles and their default flag are persisted in the physical profile
-    // records. The module is only the non-role policy shell; serializing the
-    // old `default_role`/`custom_roles` fields here would reintroduce the
-    // removed application-wide role facade and is rejected by module
-    // validation.
-    let object = serde_json::json!({
-        "inherit_enterprise_roles": true,
-        "permissions": [],
-        "denied_permissions": [],
-        "claims": []
-    })
-    .as_object()
-    .cloned()
-    .ok_or_else(|| AppError::Internal("failed to build authorization module".to_string()))?;
-    normalize_module("authorization", &object, "")
-}
-
-fn normalize_contract_protocols(
-    connections: &[crate::application_contract::ConnectionContract],
-    client_protocols: &BTreeMap<String, String>,
-    expected_issuer: &str,
-) -> AppResult<Value> {
-    let mut protocols = serde_json::Map::new();
-    let mut clients_by_protocol = BTreeMap::<String, Vec<String>>::new();
-    for (client_id, protocol) in client_protocols {
-        let module_key = protocol_module_key(protocol);
-        clients_by_protocol
-            .entry(module_key.to_string())
-            .or_default()
-            .push(client_id.clone());
-    }
-    for (module_key, client_ids) in clients_by_protocol {
-        protocols.insert(
-            module_key,
-            serde_json::json!({"enabled": true, "client_ids": client_ids}),
-        );
-    }
-    for connection in connections {
-        let key = match connection.kind.as_str() {
-            "saml2" => "saml2",
-            "cas" => "cas",
-            "jwt" => "jwt",
-            "scim" | "ldap" => continue,
-            other if connection.required => {
-                return Err(AppError::BadRequest(format!(
-                    "v3 connection kind {other} is not supported"
-                )));
-            }
-            _ => continue,
-        };
-        let mut value = connection.settings.clone();
-        value.insert("enabled".to_string(), Value::Bool(true));
-        value.insert(
-            "connection_id".to_string(),
-            Value::String(connection.connection_id.clone()),
-        );
-        let protocol = protocols
-            .entry(key.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        let Some(protocol) = protocol.as_object_mut() else {
-            return Err(AppError::Internal(
-                "protocol module entry is not an object".to_string(),
-            ));
-        };
-        for (field, field_value) in value {
-            protocol.insert(field, field_value);
-        }
-    }
-    normalize_module("protocols", &protocols, expected_issuer)
-}
-
-fn protocol_module_key(protocol: &str) -> &str {
-    match protocol {
-        "oidc" => "oauth2_oidc",
-        "saml" => "saml2",
-        other => other,
-    }
-}
-
-fn normalize_directory_sync(
-    connections: &[crate::application_contract::ConnectionContract],
-    expected_issuer: &str,
-) -> AppResult<Value> {
-    let scim = connections
-        .iter()
-        .filter(|connection| connection.kind == "scim")
-        .collect::<Vec<_>>();
-    let ldap = connections
-        .iter()
-        .filter(|connection| connection.kind == "ldap")
-        .collect::<Vec<_>>();
-    if scim.len() > 1 {
-        return Err(AppError::BadRequest(
-            "v3 declares more than one SCIM connection".to_string(),
-        ));
-    }
-    let object = serde_json::json!({
-        "enabled": !scim.is_empty() || !ldap.is_empty(),
-        "scim_enabled": !scim.is_empty(),
-        "ldap_provider_ids": ldap.iter().filter_map(|connection| connection.settings.get("provider_id").and_then(Value::as_str)).collect::<Vec<_>>(),
-        "scim_audience": scim.first().and_then(|connection| connection.settings.get("audience")).and_then(Value::as_str).unwrap_or_default()
-    });
-    normalize_module(
-        "directory_sync",
-        object
-            .as_object()
-            .ok_or_else(|| AppError::Internal("failed to build directory sync".to_string()))?,
-        expected_issuer,
-    )
-}
-
-fn normalize_module(
-    module_key: &str,
-    object: &Map<String, Value>,
-    expected_issuer: &str,
-) -> AppResult<Value> {
-    let mut object = object.clone();
-    if module_key == "protocols" {
-        object.insert(
-            "website_url".to_string(),
-            Value::String(expected_issuer.to_string()),
-        );
-    }
-    let value = Value::Object(object);
-    crate::applications::normalize_module_config(module_key, value)
-}
-
-fn validate_protocol_client_bindings(protocols: &Value, clients: &[NewClient]) -> AppResult<()> {
-    let known = clients
-        .iter()
-        .map(|client| client.client_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let Some(protocols) = protocols.as_object() else {
-        return Err(AppError::BadRequest(
-            "protocols module must be an object".to_string(),
-        ));
-    };
-    for protocol in protocols.values() {
-        let Some(client_ids) = protocol
-            .as_object()
-            .and_then(|object| object.get("client_ids"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        for client_id in client_ids.iter().filter_map(Value::as_str) {
-            if !known.contains(client_id) {
-                return Err(AppError::BadRequest(
-                    "protocols references an undeclared client".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn normalize_authorization_bindings(
-    authorization: &Value,
-    profiles: &BTreeMap<String, NormalizedProfile>,
-) -> AppResult<NormalizedAuthorizationMappings> {
-    let object = authorization.as_object().ok_or_else(|| {
-        AppError::BadRequest("application discovery authorization must be an object".to_string())
-    })?;
-    let default_profile = profiles.get("default").ok_or_else(|| {
-        AppError::BadRequest("application discovery must declare a default profile".to_string())
-    })?;
-    let default_roles = default_profile
-        .roles
-        .iter()
-        .map(|role| role.key.as_str())
-        .collect::<BTreeSet<_>>();
-    let role_name = |value: &Value| {
-        let role = value.as_str().ok_or_else(|| {
-            AppError::BadRequest("authorization role mappings must contain strings".to_string())
-        })?;
-        let role = visible_text(role, 128, "authorization role")?;
-        if !default_roles.contains(role.as_str()) {
-            return Err(AppError::BadRequest(
-                "authorization references an undeclared default-profile role".to_string(),
-            ));
-        }
-        Ok(role)
-    };
-    let default_role = object.get("default_role").map(role_name).transpose()?;
-
-    let mut group_mappings = Vec::new();
-    if let Some(value) = object.get("group_mappings") {
-        let values = value.as_array().ok_or_else(|| {
-            AppError::BadRequest("authorization group_mappings must be a list".to_string())
-        })?;
-        if values.len() > 512 {
-            return Err(AppError::BadRequest(
-                "authorization group_mappings is too large".to_string(),
-            ));
-        }
-        for value in values {
-            let mapping = value.as_object().ok_or_else(|| {
-                AppError::BadRequest(
-                    "authorization group_mappings entries must be objects".to_string(),
-                )
-            })?;
-            let group = mapping
-                .get("group")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AppError::BadRequest("authorization group mappings require a group".to_string())
-                })
-                .and_then(|value| visible_text(value, 255, "authorization group"))?;
-            let role = mapping
-                .get("role")
-                .ok_or_else(|| {
-                    AppError::BadRequest("authorization group mappings require a role".to_string())
-                })
-                .and_then(&role_name)?;
-            group_mappings.push(NormalizedGroupMapping { group, role });
-        }
-    }
-
-    let mut organization_role_mappings = Vec::new();
-    if let Some(value) = object.get("organization_role_mappings") {
-        let mappings = value.as_object().ok_or_else(|| {
-            AppError::BadRequest(
-                "authorization organization_role_mappings must be an object".to_string(),
-            )
-        })?;
-        if mappings.len() > 32 {
-            return Err(AppError::BadRequest(
-                "authorization organization_role_mappings is too large".to_string(),
-            ));
-        }
-        for (organization_role, role) in mappings {
-            organization_role_mappings.push(NormalizedOrganizationRoleMapping {
-                organization_role: visible_text(organization_role, 64, "organization role")?,
-                role: role_name(role)?,
-            });
-        }
-    }
-
-    for field in [
-        "user_roles",
-        "group_roles",
-        "organization_roles",
-        "user_assignments",
-        "role_assignments",
-        "user_role_assignments",
-        "group_role_assignments",
-        "organization_role_assignments",
-        "assignments",
-    ] {
-        if object.contains_key(field) {
-            return Err(AppError::BadRequest(
-                "v3 authorization contracts cannot declare user role assignments".to_string(),
-            ));
-        }
-    }
-
-    Ok(NormalizedAuthorizationMappings {
-        default_role,
-        group_mappings,
-        organization_role_mappings,
-    })
-}
-
-fn normalize_permission_key(value: &str) -> AppResult<String> {
-    let value = visible_text(value, 256, "permission key")?;
-    if value.split(':').any(str::is_empty) {
-        return Err(AppError::BadRequest(
-            "permission key is invalid".to_string(),
-        ));
-    }
-    Ok(value)
-}
-
-fn normalize_string_list(
-    values: &[String],
-    max_length: usize,
-    field: &str,
-) -> AppResult<Vec<String>> {
-    let mut normalized = BTreeSet::new();
-    for value in values {
-        normalized.insert(visible_text(value, max_length, field)?);
-    }
-    Ok(normalized.into_iter().collect())
-}
-
-fn normalize_url_list(values: &[String], field: &str) -> AppResult<Vec<String>> {
-    let mut result = Vec::with_capacity(values.len());
-    for value in values {
-        let value = visible_text(value, 2048, field)?;
-        let parsed = url::Url::parse(&value)
-            .map_err(|_| AppError::BadRequest(format!("{field} is invalid")))?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(AppError::BadRequest(format!("{field} is invalid")));
-        }
-        result.push(value);
-    }
-    Ok(result)
-}
-
-fn normalize_display_text(value: &str, max_length: usize, field: &str) -> AppResult<String> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > max_length || value.chars().any(|ch| ch.is_control()) {
-        return Err(AppError::BadRequest(format!("{field} is invalid")));
-    }
-    Ok(value.to_string())
-}
-
-fn visible_text(value: &str, max_length: usize, field: &str) -> AppResult<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > max_length
-        || value
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        return Err(AppError::BadRequest(format!("{field} is invalid")));
-    }
-    Ok(value.to_string())
 }
 
 async fn current_discovery_record(
@@ -2384,6 +1593,7 @@ pub fn spawn_periodic_sync(state: AppState) -> DiscoverySyncWorker {
 mod tests {
     use super::*;
     use axum::{Router, http::header, routing::get};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
 
@@ -2543,7 +1753,7 @@ mod tests {
                 connection_id: "unknown".to_string(),
                 kind: "unsupported".to_string(),
                 required: true,
-                settings: Map::new(),
+                settings: serde_json::Map::new(),
             }],
             &BTreeMap::new(),
             "https://axon.example",

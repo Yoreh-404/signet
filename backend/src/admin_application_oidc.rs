@@ -1,8 +1,9 @@
 use super::{
-    ClientInput, MissingApplicationClientPolicy, application_client_binding_responses_from_graph,
+    MissingApplicationClientPolicy, admin_application_scope::managed_application,
+    admin_client_types::ClientInput, application_client_binding_responses_from_graph,
     client_input_to_claim_mappers, client_input_to_new,
-    ensure_website_application_modules_editable, managed_application,
-    public_client_with_claim_mappers, validate_client_input,
+    ensure_website_application_modules_editable, public_client_with_claim_mappers,
+    validate_client_input,
 };
 use crate::{
     AppState,
@@ -22,7 +23,7 @@ pub(super) async fn list(
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<PublicClient>>> {
     managed_application(&state, &jar, &id).await?;
-    let graph = state.db.read_application_graph(&id).await?;
+    let graph = state.db.read_application_client_binding_graph(&id).await?;
     let clients = application_client_binding_responses_from_graph(
         &graph,
         Some("oidc"),

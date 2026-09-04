@@ -1,5 +1,6 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type { Dispatch, SetStateAction } from "react";
+import { listApplicationClientBindings } from "../../lib/api/applications/protocol";
 import type {
   ApplicationClientBinding,
   ApplicationModule,
@@ -18,6 +19,8 @@ export function useApplicationAdminStateActions({
   setApplications,
   setClients
 }: Options) {
+  const bindingRefreshId = useRef(0);
+
   const updateApplicationModuleInState = useCallback((
     applicationId: string,
     module: ApplicationModule,
@@ -39,8 +42,10 @@ export function useApplicationAdminStateActions({
 
   const updateApplicationOidcClientsInState = useCallback((
     applicationId: string,
-    nextClients: Client[]
+    _nextClients: Client[]
   ) => {
+    const refreshId = bindingRefreshId.current + 1;
+    bindingRefreshId.current = refreshId;
     const previousApplicationClientIds = new Set(
       applications
         .find((application) => application.id === applicationId)
@@ -48,30 +53,30 @@ export function useApplicationAdminStateActions({
         .filter((binding) => binding.protocol === "oidc")
         .map((binding) => binding.id) ?? []
     );
-    setClients((current) => {
-      const retained = current.filter((client) => !previousApplicationClientIds.has(client.id));
-      return [...retained, ...nextClients];
-    });
-    setApplications((current) => current.map((application) => {
-      if (application.id !== applicationId) return application;
-      const previousOidcBindings = application.client_bindings.filter((binding) => binding.protocol === "oidc");
-      const oidcBindings = nextClients.map((client) => {
-        const previous = previousOidcBindings.find((binding) => binding.id === client.id);
-        return {
-          ...client,
-          protocol: "oidc" as const,
-          authorization_profile_id: previous?.authorization_profile_id ?? "default",
-          auth_domain_id: previous?.auth_domain_id ?? `auth-domain:${applicationId}`
-        };
-      });
-      return {
-        ...application,
-        client_bindings: [
-          ...application.client_bindings.filter((binding) => binding.protocol !== "oidc"),
-          ...oidcBindings
-        ]
-      };
-    }));
+    void listApplicationClientBindings(applicationId, { force: true })
+      .then((nextBindings) => {
+        if (bindingRefreshId.current !== refreshId) return;
+        const nextOidcBindings = nextBindings.filter((binding) => binding.protocol === "oidc");
+        const nextOidcClientIds = new Set(nextOidcBindings.map((binding) => binding.id));
+        setClients((current) => [
+          ...current.filter(
+            (client) =>
+              !previousApplicationClientIds.has(client.id) && !nextOidcClientIds.has(client.id),
+          ),
+          ...nextOidcBindings,
+        ]);
+        setApplications((current) => current.map((application) => {
+          if (application.id !== applicationId) return application;
+          return {
+            ...application,
+            client_bindings: [
+              ...application.client_bindings.filter((binding) => binding.protocol !== "oidc"),
+              ...nextOidcBindings,
+            ],
+          };
+        }));
+      })
+      .catch(() => {});
   }, [applications, setApplications, setClients]);
 
   return {

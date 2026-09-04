@@ -1,7 +1,7 @@
 use super::{
     AppError, AppResult, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
-    NewClientClaimMapper, SessionMetadata, SessionRecord, bind_text_list, blocking, ph,
-    placeholders, select_client_claim_mapper_sql,
+    NewClientClaimMapper, SessionMetadata, SessionRecord, UserSessionSummary, bind_text_list,
+    blocking, ph, placeholders, select_client_claim_mapper_sql,
 };
 use crate::util;
 use diesel::{
@@ -9,6 +9,23 @@ use diesel::{
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 use std::collections::BTreeMap;
+
+macro_rules! delete_session_associations {
+    ($conn:expr, $kind:expr, $session_id:expr) => {{
+        for (table, column) in [
+            ("session_credentials", "session_id"),
+            ("browser_context_accounts", "session_id"),
+            ("application_saml_sessions", "signet_session_id"),
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph($kind, 1));
+            sql_query(sql)
+                .bind::<Text, _>($session_id)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        Ok::<(), AppError>(())
+    }};
+}
 
 impl Db {
     async fn list_logout_clients_for_user(
@@ -223,21 +240,77 @@ impl Db {
         })
     }
 
+    pub async fn list_user_session_summaries(
+        &self,
+        user_id: &str,
+    ) -> AppResult<Vec<UserSessionSummary>> {
+        let user_id = user_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, user_id, ip_address, user_agent, login_method, expires_at, created_at FROM sessions WHERE user_id = {} AND expires_at >= {} ORDER BY created_at DESC",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<BigInt, _>(now)
+                .load::<UserSessionSummary>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_user_session_summaries_page(
+        &self,
+        user_id: &str,
+        limit: usize,
+        cursor: Option<(i64, String)>,
+    ) -> AppResult<Vec<UserSessionSummary>> {
+        let user_id = user_id.to_string();
+        let now = util::now_ts();
+        let limit = (limit.saturating_add(1)) as i64;
+        with_conn!(self, |conn, kind| {
+            if let Some((created_at, id)) = cursor {
+                let sql = format!(
+                    "SELECT id, user_id, ip_address, user_agent, login_method, expires_at, created_at FROM sessions WHERE user_id = {} AND expires_at >= {} AND (created_at < {} OR (created_at = {} AND id < {})) ORDER BY created_at DESC, id DESC LIMIT {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3),
+                    ph(kind, 4),
+                    ph(kind, 5),
+                    ph(kind, 6)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(created_at)
+                    .bind::<BigInt, _>(created_at)
+                    .bind::<Text, _>(id)
+                    .bind::<BigInt, _>(limit)
+                    .load::<UserSessionSummary>(&mut conn)
+                    .map_err(AppError::from)
+            } else {
+                let sql = format!(
+                    "SELECT id, user_id, ip_address, user_agent, login_method, expires_at, created_at FROM sessions WHERE user_id = {} AND expires_at >= {} ORDER BY created_at DESC, id DESC LIMIT {}",
+                    ph(kind, 1),
+                    ph(kind, 2),
+                    ph(kind, 3)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(limit)
+                    .load::<UserSessionSummary>(&mut conn)
+                    .map_err(AppError::from)
+            }
+        })
+    }
+
     pub async fn delete_session(&self, id: &str) -> AppResult<()> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
             conn.transaction::<(), AppError, _>(|conn| {
-                for (table, column) in [
-                    ("session_credentials", "session_id"),
-                    ("browser_context_accounts", "session_id"),
-                    ("application_saml_sessions", "signet_session_id"),
-                ] {
-                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
-                    sql_query(sql)
-                        .bind::<Text, _>(&id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
+                delete_session_associations!(conn, kind, &id)?;
                 let sql = format!("DELETE FROM sessions WHERE id = {}", ph(kind, 1));
                 sql_query(sql)
                     .bind::<Text, _>(id)
@@ -268,17 +341,32 @@ impl Db {
                 if !exists {
                     return Ok(false);
                 }
-                for (table, column) in [
-                    ("session_credentials", "session_id"),
-                    ("browser_context_accounts", "session_id"),
-                    ("application_saml_sessions", "signet_session_id"),
-                ] {
-                    let sql = format!("DELETE FROM {table} WHERE {column} = {}", ph(kind, 1));
-                    sql_query(sql)
-                        .bind::<Text, _>(&session_id)
-                        .execute(conn)
-                        .map_err(AppError::from)?;
-                }
+                delete_session_associations!(conn, kind, &session_id)?;
+                let sql = format!(
+                    "DELETE FROM sessions WHERE user_id = {} AND id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(user_id)
+                    .bind::<Text, _>(session_id)
+                    .execute(conn)
+                    .map(|affected| affected > 0)
+                    .map_err(AppError::from)
+            })
+        })
+    }
+
+    pub async fn delete_verified_user_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AppResult<bool> {
+        let user_id = user_id.to_string();
+        let session_id = session_id.to_string();
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<bool, AppError, _>(|conn| {
+                delete_session_associations!(conn, kind, &session_id)?;
                 let sql = format!(
                     "DELETE FROM sessions WHERE user_id = {} AND id = {}",
                     ph(kind, 1),

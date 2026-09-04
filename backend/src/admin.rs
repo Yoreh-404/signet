@@ -1,9 +1,6 @@
 use crate::{
     AppState, applications, audit, auth, billing,
-    db::{
-        ApplicationAuthorizationProfileRecord, ApplicationRecord, NewApplicationBillingSettings,
-        NewIapApplication,
-    },
+    db::{ApplicationRecord, NewApplicationBillingSettings, NewIapApplication},
     error::{AppError, AppResult},
     iap, mutations, util,
 };
@@ -13,10 +10,13 @@ use axum::{
     http::HeaderMap,
 };
 use axum_extra::extract::cookie::CookieJar;
-use serde::Deserialize;
 
 #[path = "admin_client_policy.rs"]
 mod admin_client_policy;
+#[path = "admin_client_types.rs"]
+mod admin_client_types;
+#[path = "admin_defaults.rs"]
+mod admin_defaults;
 #[path = "admin_guards.rs"]
 mod admin_guards;
 #[path = "admin_providers.rs"]
@@ -30,6 +30,8 @@ mod admin_user_types;
 use admin_client_policy::{
     client_input_to_claim_mappers, client_input_to_new, validate_client_input,
 };
+#[cfg(test)]
+use admin_client_types::ClientInput;
 #[path = "admin_organization_scope.rs"]
 mod admin_organization_scope;
 #[path = "admin_organization_types.rs"]
@@ -39,6 +41,8 @@ use admin_organization_scope::client_organization_from_context;
 mod admin_application_authorization_preview;
 #[path = "admin_application_authorization_read.rs"]
 mod admin_application_authorization_read;
+#[path = "admin_application_authorization_scope.rs"]
+mod admin_application_authorization_scope;
 #[path = "admin_application_authorization_write.rs"]
 mod admin_application_authorization_write;
 #[path = "admin_application_auto_discovery.rs"]
@@ -70,10 +74,7 @@ mod admin_overview;
 #[path = "admin_security.rs"]
 mod admin_security;
 use admin_application_iap::IapApplicationInput;
-use admin_application_scope::{
-    application_is_website_managed, ensure_website_application_modules_editable,
-    managed_application,
-};
+use admin_application_scope::ensure_website_application_modules_editable;
 #[path = "admin_application_billing.rs"]
 mod admin_application_billing;
 #[path = "admin_application_modules.rs"]
@@ -121,10 +122,6 @@ use admin_user_import::normalize_user_input;
 use admin_user_query::USER_DIRECTORY_DEFAULT_PAGE_SIZE;
 #[cfg(test)]
 use admin_user_query::{UserListQuery, parse_user_list_query, user_list_scope};
-
-fn default_true() -> bool {
-    true
-}
 
 #[cfg(test)]
 use crate::db::QuickLink;
@@ -181,145 +178,6 @@ async fn get_mutation_receipt(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(receipt.into()))
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientInput {
-    client_id: String,
-    client_name: String,
-    #[serde(default)]
-    logo_uri: String,
-    #[serde(default)]
-    organization_id: Option<String>,
-    client_secret: Option<String>,
-    redirect_uris: Vec<String>,
-    post_logout_redirect_uris: Vec<String>,
-    scopes: Vec<String>,
-    #[serde(default)]
-    audience: Option<String>,
-    grant_types: Vec<String>,
-    response_types: Vec<String>,
-    token_endpoint_auth_method: String,
-    require_pkce: bool,
-    #[serde(default)]
-    require_mfa: bool,
-    #[serde(default)]
-    require_pushed_authorization_requests: bool,
-    #[serde(default)]
-    require_s256_pkce: bool,
-    #[serde(default)]
-    require_confidential_client: bool,
-    #[serde(default)]
-    require_dpop: bool,
-    #[serde(default)]
-    require_account_selection: bool,
-    #[serde(default)]
-    trust_email_verified: bool,
-    #[serde(default)]
-    authorization_details_types: Vec<String>,
-    subject_type: String,
-    sector_identifier_uri: String,
-    #[serde(default)]
-    jwks_uri: String,
-    #[serde(default)]
-    jwks: String,
-    #[serde(default)]
-    backchannel_logout_uri: String,
-    #[serde(default)]
-    backchannel_logout_session_required: bool,
-    #[serde(default)]
-    frontchannel_logout_uri: String,
-    #[serde(default)]
-    frontchannel_logout_session_required: bool,
-    #[serde(default)]
-    service_account_enabled: bool,
-    #[serde(default)]
-    service_account_permissions: Vec<String>,
-    is_active: bool,
-    #[serde(default)]
-    claim_mappers: Vec<ClientClaimMapperInput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientClaimMapperInput {
-    claim_name: String,
-    source: String,
-    source_value: String,
-    value_type: String,
-    include_in_id_token: bool,
-    include_in_access_token: bool,
-    include_in_userinfo: bool,
-    is_active: bool,
-    #[serde(default)]
-    sort_order: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplicationModuleInput {
-    #[serde(default)]
-    config: serde_json::Value,
-    #[serde(default = "default_true")]
-    is_enabled: bool,
-}
-
-fn default_organization_role() -> String {
-    "member".to_string()
-}
-
-fn default_application_jwt_client_type() -> String {
-    "public".to_string()
-}
-
-fn default_jwt_secret_grace_seconds() -> i64 {
-    300
-}
-
-async fn ensure_local_profile_catalog_editable(
-    state: &AppState,
-    application: &ApplicationRecord,
-    _profile: &ApplicationAuthorizationProfileRecord,
-) -> AppResult<()> {
-    if application_is_website_managed(state, application).await? {
-        return Err(AppError::BadRequest(
-            "website-managed role catalogs are read-only; update the website manifest".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn managed_authorization_profile(
-    state: &AppState,
-    jar: &CookieJar,
-    application_id: &str,
-    profile_id: &str,
-) -> AppResult<(
-    auth::CurrentUser,
-    ApplicationRecord,
-    ApplicationAuthorizationProfileRecord,
-)> {
-    let (current, application) = managed_application(state, jar, application_id).await?;
-    let profile = state
-        .db
-        .find_application_authorization_profile_by_id(profile_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if profile.application_id != application.id {
-        return Err(AppError::NotFound);
-    }
-    Ok((current, application, profile))
-}
-
-async fn application_authorization_user(
-    state: &AppState,
-    application: &ApplicationRecord,
-    user_id: &str,
-) -> AppResult<crate::db::UserRecord> {
-    let user = state
-        .db
-        .find_application_authorization_user(&application.id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok(user)
 }
 
 async fn iap_application_input_to_new(
@@ -1286,6 +1144,26 @@ mod tests {
             client.frontchannel_logout_uri,
             "https://app.example.com/front-logout"
         );
+    }
+
+    #[test]
+    fn client_update_preserves_secret_when_omitted_and_clears_when_auth_is_public() {
+        let mut initial_input = client_input();
+        initial_input.token_endpoint_auth_method = "client_secret_basic".to_string();
+        initial_input.client_secret = Some("initial-secret".to_string());
+        let initial = client_input_to_new(initial_input, None, None, None).unwrap();
+        let initial_hash = initial.client_secret_hash.clone().unwrap();
+
+        let mut preserve_input = client_input();
+        preserve_input.token_endpoint_auth_method = "client_secret_basic".to_string();
+        let preserved =
+            client_input_to_new(preserve_input, Some(initial_hash.clone()), None, None).unwrap();
+        assert_eq!(preserved.client_secret_hash, Some(initial_hash.clone()));
+
+        let mut clear_input = client_input();
+        clear_input.token_endpoint_auth_method = "none".to_string();
+        let cleared = client_input_to_new(clear_input, Some(initial_hash), None, None).unwrap();
+        assert_eq!(cleared.client_secret_hash, None);
     }
 
     #[test]

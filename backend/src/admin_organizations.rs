@@ -144,16 +144,9 @@ pub(crate) async fn list_organizations(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<OrganizationResponse>>> {
     require_organization_reader(&state, &jar).await?;
-    let (member_counts, organizations) = tokio::try_join!(
-        state.db.list_organization_member_counts(),
-        state.db.list_organizations(),
-    )?;
+    let organizations = state.db.list_organizations_with_member_counts().await?;
     let mut response = Vec::new();
-    for organization in organizations {
-        let member_count = member_counts
-            .get(&organization.id)
-            .copied()
-            .unwrap_or_default();
+    for (organization, member_count) in organizations {
         response.push(organization_response_with_member_count(
             organization,
             member_count,
@@ -373,18 +366,12 @@ pub(crate) async fn create_organization_member_invitation(
     }
     let organization_role = organizations::normalize_role(&payload.organization_role)?;
     let code = format!("ORG-{}", util::random_token(18));
-    let signing_key = state
-        .db
-        .list_signing_keys()
-        .await?
-        .into_iter()
-        .find(|key| key.is_active == 1)
-        .ok_or_else(|| {
-            AppError::Configuration(
-                "an active signing key is required to create a revealable organization invitation"
-                    .to_string(),
-            )
-        })?;
+    let signing_key = state.db.find_active_signing_key().await?.ok_or_else(|| {
+        AppError::Configuration(
+            "an active signing key is required to create a revealable organization invitation"
+                .to_string(),
+        )
+    })?;
     let ciphertext =
         util::encrypt_authorization_code_for_reveal(&signing_key.private_key_pem, &code)?;
     let (invitation, code) = state

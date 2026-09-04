@@ -13,6 +13,30 @@ use diesel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Debug, diesel::QueryableByName)]
+struct OrganizationWithMemberCountRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    slug: String,
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    kind: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    description: Option<String>,
+    #[diesel(sql_type = Text)]
+    allowed_email_domains: String,
+    #[diesel(sql_type = Integer)]
+    is_active: i32,
+    #[diesel(sql_type = BigInt)]
+    created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    updated_at: i64,
+    #[diesel(sql_type = BigInt)]
+    member_count: i64,
+}
+
 impl Db {
     pub async fn list_organizations(&self) -> AppResult<Vec<OrganizationRecord>> {
         with_conn!(self, |conn, _kind| {
@@ -23,6 +47,38 @@ impl Db {
             sql_query(sql)
                 .load::<OrganizationRecord>(&mut conn)
                 .map_err(AppError::from)
+        })
+    }
+
+    pub async fn list_organizations_with_member_counts(
+        &self,
+    ) -> AppResult<Vec<(OrganizationRecord, i64)>> {
+        with_conn!(self, |conn, _kind| {
+            sql_query(
+                "SELECT organizations.id, organizations.slug, organizations.name, COALESCE(organizations.kind, 'tenant') AS kind, organizations.description, COALESCE(organizations.allowed_email_domains, '[]') AS allowed_email_domains, organizations.is_active, organizations.created_at, organizations.updated_at, COUNT(organization_members.user_id) AS member_count FROM organizations LEFT JOIN organization_members ON organization_members.organization_id = organizations.id GROUP BY organizations.id, organizations.slug, organizations.name, organizations.kind, organizations.description, organizations.allowed_email_domains, organizations.is_active, organizations.created_at, organizations.updated_at ORDER BY organizations.is_active DESC, organizations.slug ASC",
+            )
+            .load::<OrganizationWithMemberCountRow>(&mut conn)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            OrganizationRecord {
+                                id: row.id,
+                                slug: row.slug,
+                                name: row.name,
+                                kind: row.kind,
+                                description: row.description,
+                                allowed_email_domains: row.allowed_email_domains,
+                                is_active: row.is_active,
+                                created_at: row.created_at,
+                                updated_at: row.updated_at,
+                            },
+                            row.member_count,
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(AppError::from)
         })
     }
 
@@ -683,6 +739,23 @@ impl Db {
         })
     }
 
+    pub async fn list_active_organization_members(
+        &self,
+        organization_id: &str,
+    ) -> AppResult<Vec<OrganizationMemberWithUserRecord>> {
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT organization_members.organization_id, organization_members.user_id, organization_members.role, organization_members.created_at AS membership_created_at, organization_members.updated_at AS membership_updated_at, users.email, users.username, users.display_name, users.is_active, users.archived_at FROM organization_members INNER JOIN users ON users.id = organization_members.user_id WHERE organization_members.organization_id = {} AND users.is_active = 1 AND users.archived_at IS NULL ORDER BY organization_members.role ASC, users.email ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(organization_id)
+                .load::<OrganizationMemberWithUserRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn list_user_organizations(
         &self,
         user_id: &str,
@@ -696,6 +769,28 @@ impl Db {
             sql_query(sql)
                 .bind::<Text, _>(user_id)
                 .load::<UserOrganizationRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
+    pub async fn find_active_organization_membership(
+        &self,
+        user_id: &str,
+        organization_id: &str,
+    ) -> AppResult<Option<UserOrganizationRecord>> {
+        let user_id = user_id.to_string();
+        let organization_id = organization_id.to_string();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT organizations.id, organizations.slug, organizations.name, COALESCE(organizations.kind, 'tenant') AS kind, organizations.description, organizations.is_active, organization_members.role, organization_members.created_at AS membership_created_at, organization_members.updated_at AS membership_updated_at FROM organization_members INNER JOIN organizations ON organizations.id = organization_members.organization_id WHERE organization_members.user_id = {} AND organization_members.organization_id = {} AND organization_members.is_active = 1 AND organizations.is_active = 1",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .bind::<Text, _>(organization_id)
+                .get_result::<UserOrganizationRecord>(&mut conn)
+                .optional()
                 .map_err(AppError::from)
         })
     }
@@ -723,11 +818,17 @@ impl Db {
         if selected.is_some() {
             return Ok(selected);
         }
-        Ok(self
-            .list_user_organizations(&user_id)
-            .await?
-            .into_iter()
-            .find(|organization| organization.is_active == 1))
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT organizations.id, organizations.slug, organizations.name, COALESCE(organizations.kind, 'tenant') AS kind, organizations.description, organizations.is_active, organization_members.role, organization_members.created_at AS membership_created_at, organization_members.updated_at AS membership_updated_at FROM organization_members INNER JOIN organizations ON organizations.id = organization_members.organization_id WHERE organization_members.user_id = {} AND organizations.is_active = 1 ORDER BY organizations.slug ASC LIMIT 1",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(user_id)
+                .get_result::<UserOrganizationRecord>(&mut conn)
+                .optional()
+                .map_err(AppError::from)
+        })
     }
 
     pub async fn set_active_user_organization(

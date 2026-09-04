@@ -555,13 +555,16 @@ impl Settings {
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
-        if let Ok(value) = env::var("SSO_PUBLIC_BASE_URL") {
+        let public_base_url = env::var("SSO_PUBLIC_BASE_URL")
+            .or_else(|_| env::var("SIGNET_PUBLIC_BASE_URL"))
+            .or_else(|_| env::var("SIGNET_ISSUER"));
+        if let Ok(value) = public_base_url {
             self.server.public_base_url = value;
             if env::var("SSO_ISSUER").is_err() {
                 self.oidc.issuer = self.server.public_base_url.clone();
             }
         }
-        if let Ok(value) = env::var("SSO_ISSUER") {
+        if let Ok(value) = env::var("SSO_ISSUER").or_else(|_| env::var("SIGNET_ISSUER")) {
             self.oidc.issuer = value;
         }
         if let Ok(value) = env::var("SSO_TRUST_PROXY_HEADERS") {

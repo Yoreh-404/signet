@@ -3,7 +3,7 @@ use crate::{
     error::{AppError, AppResult},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, future::Future};
+use std::future::Future;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,8 +226,8 @@ impl Authorizer for Db {
         if user.is_admin == 1 {
             return Ok(true);
         }
-        let permissions = self.list_effective_permissions(&user.id).await?;
-        Ok(permissions.iter().any(|item| item == permission.as_str()))
+        self.has_effective_permission(&user.id, permission.as_str())
+            .await
     }
 
     async fn has_any_permission(
@@ -241,17 +241,12 @@ impl Authorizer for Db {
         if user.is_admin == 1 {
             return Ok(true);
         }
-        // `list_effective_permissions` already returns the complete effective
-        // set.  Resolve it once instead of issuing the same query once per
-        // candidate permission (the admin guard lists can contain many).
-        let effective = self
-            .list_effective_permissions(&user.id)
-            .await?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        Ok(permissions
+        let permission_names = permissions
             .iter()
-            .any(|permission| effective.contains(permission.as_str())))
+            .map(|permission| permission.as_str())
+            .collect::<Vec<_>>();
+        self.has_any_effective_permission(&user.id, &permission_names)
+            .await
     }
 }
 

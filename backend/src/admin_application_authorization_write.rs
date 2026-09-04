@@ -1,4 +1,9 @@
-use super::{ensure_local_profile_catalog_editable, managed_authorization_profile};
+use super::{
+    admin_application_authorization_scope::{
+        ensure_local_profile_catalog_editable, managed_authorization_profile,
+    },
+    admin_defaults::default_true,
+};
 use crate::{
     AppState, application_discovery,
     audit::{self, AuditSink},
@@ -39,7 +44,7 @@ pub(super) struct ApplicationProfileRoleInput {
     description: Option<String>,
     #[serde(default)]
     permissions: Vec<String>,
-    #[serde(default = "super::default_true")]
+    #[serde(default = "default_true")]
     is_active: bool,
     #[serde(default)]
     is_default: bool,

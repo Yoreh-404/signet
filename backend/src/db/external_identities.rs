@@ -111,10 +111,7 @@ impl Db {
 
     pub async fn list_external_oidc_providers(&self) -> AppResult<Vec<ExternalOidcProviderRecord>> {
         with_conn!(self, |conn, _kind| {
-            let sql = format!(
-                "{} ORDER BY display_name ASC",
-                select_external_oidc_provider_sql()
-            );
+            let sql = format!("{} ORDER BY slug ASC", select_external_oidc_provider_sql());
             sql_query(sql)
                 .load::<ExternalOidcProviderRecord>(&mut conn)
                 .map_err(AppError::from)
@@ -128,7 +125,7 @@ impl Db {
         let organization_id = organization_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "{} WHERE organization_id = {} ORDER BY display_name ASC",
+                "{} WHERE organization_id = {} ORDER BY slug ASC",
                 select_external_oidc_provider_sql(),
                 ph(kind, 1)
             );

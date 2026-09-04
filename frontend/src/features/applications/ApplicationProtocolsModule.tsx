@@ -4,10 +4,9 @@ import {
   Globe2,
   LockKeyhole
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import * as applicationApi from "../../lib/api/applications";
-import { stableDomainEqual } from "../admin/stable-domain-comparator";
 import type { DirtyNavigationController } from "../navigation/useDirtyNavigation";
 import type {
   ApplicationJwtClient,
@@ -25,7 +24,7 @@ import {
   stringValue
 } from "./application-module-values";
 import { useApplicationWorkspaceRequestContext } from "./use-application-workspace-request-context";
-import { useApplicationDirtySource } from "./use-application-dirty-source";
+import { useApplicationModuleDraft } from "./use-application-module-draft";
 import { ApplicationOidcClients } from "./ApplicationOidcClients";
 import {
   Input,
@@ -138,14 +137,9 @@ export function ApplicationProtocolsModule({
   onApplicationOidcClientsChanged,
   onRequestConfirmation
 }: ApplicationProtocolsModuleProps) {
-  const [draftConfig, setDraftConfig] = useState<Record<string, unknown> | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [feedback, setFeedback] = useState("");
   const [jwtClient, setJwtClient] = useState<ApplicationJwtClient | null>(null);
   const [rotatedSecret, setRotatedSecret] = useState("");
   const [secretSaving, setSecretSaving] = useState(false);
-  const onReadModelChangeRef = useRef(onReadModelChange);
-  onReadModelChangeRef.current = onReadModelChange;
   const {
     requestGuard,
     beginRequest,
@@ -154,35 +148,26 @@ export function ApplicationProtocolsModule({
     requestOptions
   } = useApplicationWorkspaceRequestContext();
 
-  const config = draftConfig ?? applicationProtocolsConfig(application);
-
-  function hasUnsavedChanges(): boolean {
-    return draftConfig !== null && !stableDomainEqual(draftConfig, applicationProtocolsConfig(application));
-  }
-
-  useApplicationDirtySource({
+  const {
+    config,
+    draftConfig,
+    setDraftConfig,
+    saving,
+    setSaving,
+    feedback,
+    setFeedback
+  } = useApplicationModuleDraft({
+    application,
     dirtyNavigation,
     dirtySource: APPLICATION_PROTOCOLS_DIRTY_SOURCE,
-    dirty: hasUnsavedChanges(),
-    onDirtyChange
+    resolveConfig: applicationProtocolsConfig,
+    onDirtyChange,
+    onReadModelChange
   });
 
   useEffect(() => {
-    return () => {
-      onReadModelChangeRef.current?.(application.id, null);
-    };
-  }, [application.id]);
-
-  useEffect(() => {
-    onReadModelChangeRef.current?.(application.id, draftConfig ?? applicationProtocolsConfig(application));
-  }, [application, draftConfig]);
-
-  useEffect(() => {
-    setDraftConfig(null);
-    setFeedback("");
     setJwtClient(null);
     setRotatedSecret("");
-    setSaving(false);
     setSecretSaving(false);
   }, [application.id]);
 

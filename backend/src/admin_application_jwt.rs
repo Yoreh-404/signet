@@ -1,5 +1,8 @@
 use super::{
-    default_application_jwt_client_type, default_jwt_secret_grace_seconds, managed_application,
+    admin_application_scope::managed_application,
+    admin_defaults::{
+        default_application_jwt_client_type, default_jwt_secret_grace_seconds, default_true,
+    },
 };
 use crate::{
     AppState, applications,
@@ -32,7 +35,7 @@ pub(super) struct ApplicationJwtClientInput {
     client_id: String,
     #[serde(default = "default_application_jwt_client_type")]
     client_type: String,
-    #[serde(default = "super::default_true")]
+    #[serde(default = "default_true")]
     is_active: bool,
 }
 

@@ -252,6 +252,7 @@ pub(super) async fn update_security_policy(
     let record = policy_record_for_validation(&next)?;
     security_policy::validate_policy_input(&record)?;
     let settings = state.db.upsert_security_policy(next).await?;
+    let public = settings.public()?;
     state
         .db
         .record_audit_event(audit::management_event(
@@ -260,19 +261,19 @@ pub(super) async fn update_security_policy(
             "security_policy",
             Some("default".to_string()),
             serde_json::json!({
-                "trusted_ip_cidrs": settings.public()?.trusted_ip_cidrs,
+                "trusted_ip_cidrs": &public.trusted_ip_cidrs,
                 "require_mfa_outside_trusted_networks": settings.require_mfa_outside_trusted_networks == 1,
-                "allowed_ip_cidrs": settings.public()?.allowed_ip_cidrs,
-                "blocked_ip_cidrs": settings.public()?.blocked_ip_cidrs,
-                "allowed_email_domains": settings.public()?.allowed_email_domains,
-                "blocked_email_domains": settings.public()?.blocked_email_domains,
+                "allowed_ip_cidrs": &public.allowed_ip_cidrs,
+                "blocked_ip_cidrs": &public.blocked_ip_cidrs,
+                "allowed_email_domains": &public.allowed_email_domains,
+                "blocked_email_domains": &public.blocked_email_domains,
                 "captcha_enabled": settings.captcha_enabled == 1,
                 "captcha_after_failed_attempts": settings.captcha_after_failed_attempts,
                 "captcha_ttl_seconds": settings.captcha_ttl_seconds
             }),
         ))
         .await?;
-    settings.public().map(Json)
+    Ok(Json(public))
 }
 
 #[derive(Debug, Serialize)]

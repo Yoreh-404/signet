@@ -1,7 +1,6 @@
 use super::{
-    AuditEventRecord, CountRow, Db, GroupListFilter, GroupMemberLifecycleRow, GroupMemberPublicRow,
-    GroupPatchPlan, GroupRecord, GroupRoleJoinRow, NewGroup, NewRole, PermissionRow, PublicUser,
-    RoleIdRow, RolePermissionJoinRow, RoleRecord, ScimGroupMemberRecord, UserRecord,
+    AuditEventRecord, CountRow, Db, GroupMemberLifecycleRow, GroupMemberPublicRow, GroupPatchPlan,
+    GroupRecord, GroupRoleJoinRow, NewGroup, NewRole, PublicUser, RoleIdRow, RoleRecord,
     bind_text_list, blocking, dedupe_nonempty, normalize_application_entitlement_keys,
     optimistic_concurrency_conflict, ph, placeholder_rows, placeholders, select_group_sql,
 };
@@ -14,24 +13,33 @@ use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl, sql_query};
 use std::collections::{BTreeMap, BTreeSet};
 
-impl Db {
-    pub async fn list_effective_permissions(&self, user_id: &str) -> AppResult<Vec<String>> {
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT DISTINCT permission FROM role_permissions WHERE role_id IN (SELECT role_id FROM user_roles WHERE user_id = {}) OR role_id IN (SELECT group_roles.role_id FROM group_roles INNER JOIN group_members ON group_roles.group_id = group_members.group_id WHERE group_members.user_id = {}) ORDER BY permission ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&user_id)
-                .bind::<Text, _>(&user_id)
-                .load::<PermissionRow>(&mut conn)
-                .map(|rows| rows.into_iter().map(|row| row.permission).collect())
-                .map_err(AppError::from)
-        })
-    }
+const ROLE_PERMISSION_BATCH_SIZE: usize = 100;
 
+macro_rules! insert_role_permissions_on_conn {
+    ($conn:expr, $kind:expr, $role_id:expr, $permissions:expr) => {{
+        for chunk in $permissions.chunks(ROLE_PERMISSION_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = placeholder_rows($kind, 1, chunk.len(), 2);
+            let sql = format!(
+                "INSERT INTO role_permissions (role_id, permission) VALUES {}",
+                placeholders
+            );
+            let mut values = Vec::with_capacity(chunk.len() * 2);
+            for permission in chunk {
+                values.push($role_id.to_string());
+                values.push(permission.clone());
+            }
+            bind_text_list($conn, sql_query(sql), &values)
+                .execute($conn)
+                .map_err(AppError::from)?;
+        }
+        Ok::<(), AppError>(())
+    }};
+}
+
+impl Db {
     pub async fn ensure_system_roles(&self) -> AppResult<()> {
         let all_permissions = crate::access::Permission::ALL
             .iter()
@@ -132,29 +140,6 @@ impl Db {
         })
     }
 
-    pub async fn list_roles(&self) -> AppResult<Vec<RoleRecord>> {
-        with_conn!(self, |conn, _kind| {
-            sql_query("SELECT id, name, description, is_system, created_at, updated_at FROM roles ORDER BY name ASC")
-                .load::<RoleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn find_role_by_id(&self, id: &str) -> AppResult<Option<RoleRecord>> {
-        let id = id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT id, name, description, is_system, created_at, updated_at FROM roles WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<RoleRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
     pub async fn insert_role(&self, role: NewRole) -> AppResult<RoleRecord> {
         let id = uuid::Uuid::new_v4().to_string();
         let name = role.name.trim().to_string();
@@ -170,6 +155,7 @@ impl Db {
         let permissions = normalize_application_entitlement_keys(role.permissions)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
+            conn.transaction::<_, AppError, _>(|conn| {
             let sql = format!(
                 "INSERT INTO roles (id, name, description, is_system, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
                 ph(kind, 1),
@@ -186,21 +172,10 @@ impl Db {
                 .bind::<Integer, _>(i32::from(role.is_system))
                 .bind::<BigInt, _>(now)
                 .bind::<BigInt, _>(now)
-                .execute(&mut conn)
+                .execute(conn)
                 .map_err(AppError::from)?;
 
-            for permission in permissions {
-                let sql = format!(
-                    "INSERT INTO role_permissions (role_id, permission) VALUES ({}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&id)
-                    .bind::<Text, _>(permission)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
+            insert_role_permissions_on_conn!(conn, kind, &id, &permissions)?;
 
             let sql = format!(
                 "SELECT id, name, description, is_system, created_at, updated_at FROM roles WHERE id = {}",
@@ -208,8 +183,9 @@ impl Db {
             );
             sql_query(sql)
                 .bind::<Text, _>(id)
-                .get_result::<RoleRecord>(&mut conn)
+                .get_result::<RoleRecord>(conn)
                 .map_err(AppError::from)
+            })
         })
     }
 
@@ -228,13 +204,14 @@ impl Db {
         let permissions = normalize_application_entitlement_keys(role.permissions)?;
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
+            conn.transaction::<_, AppError, _>(|conn| {
             let sql = format!(
                 "SELECT id, name, description, is_system, created_at, updated_at FROM roles WHERE id = {}",
                 ph(kind, 1)
             );
             let existing = sql_query(sql)
                 .bind::<Text, _>(&id)
-                .get_result::<RoleRecord>(&mut conn)
+                .get_result::<RoleRecord>(conn)
                 .optional()
                 .map_err(AppError::from)?
                 .ok_or(AppError::NotFound)?;
@@ -258,7 +235,7 @@ impl Db {
                 .bind::<Integer, _>(i32::from(role.is_system))
                 .bind::<BigInt, _>(now)
                 .bind::<Text, _>(&id)
-                .execute(&mut conn)
+                .execute(conn)
                 .map_err(AppError::from)?;
 
             let sql = format!(
@@ -267,21 +244,10 @@ impl Db {
             );
             sql_query(sql)
                 .bind::<Text, _>(&id)
-                .execute(&mut conn)
+                .execute(conn)
                 .map_err(AppError::from)?;
 
-            for permission in permissions {
-                let sql = format!(
-                    "INSERT INTO role_permissions (role_id, permission) VALUES ({}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&id)
-                    .bind::<Text, _>(permission)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
+            insert_role_permissions_on_conn!(conn, kind, &id, &permissions)?;
 
             let sql = format!(
                 "SELECT id, name, description, is_system, created_at, updated_at FROM roles WHERE id = {}",
@@ -289,8 +255,9 @@ impl Db {
             );
             sql_query(sql)
                 .bind::<Text, _>(id)
-                .get_result::<RoleRecord>(&mut conn)
+                .get_result::<RoleRecord>(conn)
                 .map_err(AppError::from)
+            })
         })
     }
 
@@ -325,177 +292,6 @@ impl Db {
                 .bind::<Text, _>(id)
                 .execute(&mut conn)
                 .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_role_permissions(&self, role_id: &str) -> AppResult<Vec<String>> {
-        let role_id = role_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT permission FROM role_permissions WHERE role_id = {} ORDER BY permission ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(role_id)
-                .load::<PermissionRow>(&mut conn)
-                .map(|rows| rows.into_iter().map(|row| row.permission).collect())
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Loads permissions for a bounded set of roles in one query.  Entitlement
-    /// resolution commonly needs the direct and group roles of one account;
-    /// resolving each role separately turns a login into an avoidable
-    /// role-count round trip fan-out.
-    pub async fn list_role_permissions_by_role_ids(
-        &self,
-        role_ids: &[String],
-    ) -> AppResult<BTreeMap<String, Vec<String>>> {
-        if role_ids.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let role_ids = role_ids.to_vec();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT role_id, permission FROM role_permissions WHERE role_id IN ({}) ORDER BY role_id ASC, permission ASC",
-                placeholders(kind, 1, role_ids.len())
-            );
-            let rows = bind_text_list(&mut conn, sql_query(sql), &role_ids)
-                .load::<RolePermissionJoinRow>(&mut conn)
-                .map_err(AppError::from)?;
-            let mut grouped = BTreeMap::new();
-            for row in rows {
-                grouped
-                    .entry(row.role_id)
-                    .or_insert_with(Vec::new)
-                    .push(row.permission);
-            }
-            Ok(grouped)
-        })
-    }
-
-    /// Reads a bounded group page.  `application_id = None` means the global
-    /// directory; otherwise visibility is enforced through the application
-    /// SCIM binding in SQL.
-    pub async fn list_groups_page(
-        &self,
-        application_id: Option<&str>,
-        filter: Option<GroupListFilter>,
-        offset: usize,
-        limit: usize,
-    ) -> AppResult<(i64, Vec<GroupRecord>)> {
-        let application_id = application_id.map(str::to_string);
-        let (display_name, id) = match filter {
-            Some(GroupListFilter::DisplayName(value)) => (Some(value), None),
-            Some(GroupListFilter::Id(value)) => (None, Some(value)),
-            None => (None, None),
-        };
-        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        with_conn!(self, |conn, kind| {
-            let application_param = ph(kind, 1);
-            let application_value = ph(kind, 2);
-            let display_name_param = ph(kind, 3);
-            let display_name_value = ph(kind, 4);
-            let id_param = ph(kind, 5);
-            let id_value = ph(kind, 6);
-            let predicates = format!(
-                "({application_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups WHERE application_scim_groups.application_id = {application_value} AND application_scim_groups.group_id = access_groups.id)) AND ({display_name_param} IS NULL OR LOWER(access_groups.name) = LOWER({display_name_value})) AND ({id_param} IS NULL OR access_groups.id = {id_value})"
-            );
-            let count_sql =
-                format!("SELECT COUNT(*) AS count FROM access_groups WHERE {predicates}");
-            let count = sql_query(count_sql)
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(display_name.clone())
-                .bind::<Nullable<Text>, _>(display_name.clone())
-                .bind::<Nullable<Text>, _>(id.clone())
-                .bind::<Nullable<Text>, _>(id.clone())
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count;
-            let sql = format!(
-                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups WHERE {predicates} ORDER BY access_groups.name ASC LIMIT {} OFFSET {}",
-                ph(kind, 7),
-                ph(kind, 8),
-            );
-            let groups = sql_query(sql)
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(application_id)
-                .bind::<Nullable<Text>, _>(display_name.clone())
-                .bind::<Nullable<Text>, _>(display_name)
-                .bind::<Nullable<Text>, _>(id.clone())
-                .bind::<Nullable<Text>, _>(id)
-                .bind::<BigInt, _>(limit)
-                .bind::<BigInt, _>(offset)
-                .load::<GroupRecord>(&mut conn)
-                .map_err(AppError::from)?;
-            Ok((count, groups))
-        })
-    }
-
-    /// Returns only the fields needed to render SCIM group members for the
-    /// current page of groups.  The page is selected in a subquery, so this is
-    /// one set-based read instead of one member query per group.
-    pub async fn list_scim_group_member_refs_page(
-        &self,
-        application_id: Option<&str>,
-        filter: Option<GroupListFilter>,
-        offset: usize,
-        limit: usize,
-    ) -> AppResult<Vec<ScimGroupMemberRecord>> {
-        let application_id = application_id.map(str::to_string);
-        let (display_name, id) = match filter {
-            Some(GroupListFilter::DisplayName(value)) => (Some(value), None),
-            Some(GroupListFilter::Id(value)) => (None, Some(value)),
-            None => (None, None),
-        };
-        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        with_conn!(self, |conn, kind| {
-            let application_param = ph(kind, 1);
-            let application_value = ph(kind, 2);
-            let display_name_param = ph(kind, 3);
-            let display_name_value = ph(kind, 4);
-            let id_param = ph(kind, 5);
-            let id_value = ph(kind, 6);
-            let predicates = format!(
-                "({application_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups WHERE application_scim_groups.application_id = {application_value} AND application_scim_groups.group_id = access_groups.id)) AND ({display_name_param} IS NULL OR LOWER(access_groups.name) = LOWER({display_name_value})) AND ({id_param} IS NULL OR access_groups.id = {id_value})"
-            );
-            let page_subquery = format!(
-                "SELECT access_groups.id FROM access_groups WHERE {predicates} ORDER BY access_groups.name ASC LIMIT {} OFFSET {}",
-                ph(kind, 7),
-                ph(kind, 8),
-            );
-            let application_scope_param = ph(kind, 9);
-            let application_scope_value = ph(kind, 10);
-            let organization_scope = format!(
-                "({application_scope_param} IS NULL OR EXISTS (SELECT 1 FROM application_scim_groups AS scoped_groups INNER JOIN applications AS scoped_applications ON scoped_applications.id = scoped_groups.application_id INNER JOIN organization_members AS scoped_members ON scoped_members.organization_id = scoped_applications.organization_id AND scoped_members.user_id = users.id WHERE scoped_groups.application_id = {application_scope_value} AND scoped_groups.group_id = group_members.group_id))"
-            );
-            let sql = format!(
-                "SELECT group_members.group_id, users.id AS user_id, users.username, users.display_name FROM users INNER JOIN group_members ON users.id = group_members.user_id WHERE group_members.group_id IN ({page_subquery}) AND {organization_scope} ORDER BY group_members.group_id ASC, users.email ASC"
-            );
-            sql_query(sql)
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(display_name.clone())
-                .bind::<Nullable<Text>, _>(display_name.clone())
-                .bind::<Nullable<Text>, _>(id.clone())
-                .bind::<Nullable<Text>, _>(id.clone())
-                .bind::<BigInt, _>(limit)
-                .bind::<BigInt, _>(offset)
-                .bind::<Nullable<Text>, _>(application_id.clone())
-                .bind::<Nullable<Text>, _>(application_id)
-                .load::<ScimGroupMemberRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_groups(&self) -> AppResult<Vec<GroupRecord>> {
-        with_conn!(self, |conn, _kind| {
-            sql_query("SELECT id, name, description, created_at, updated_at, version FROM access_groups ORDER BY name ASC")
-                .load::<GroupRecord>(&mut conn)
                 .map_err(AppError::from)
         })
     }
@@ -570,25 +366,6 @@ impl Db {
                     .push(row.public());
             }
             Ok(grouped)
-        })
-    }
-
-    /// Returns groups that can be used as application authorization subjects.
-    /// The organization boundary is evaluated in SQL and the result is a
-    /// narrow group projection, avoiding the old `list_groups` plus one
-    /// `list_group_members` query per group pattern.
-    pub async fn find_group_by_id(&self, id: &str) -> AppResult<Option<GroupRecord>> {
-        let id = id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT id, name, description, created_at, updated_at, version FROM access_groups WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<GroupRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
         })
     }
 
@@ -1124,34 +901,6 @@ impl Db {
         })
     }
 
-    pub async fn list_user_roles(&self, user_id: &str) -> AppResult<Vec<RoleRecord>> {
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN user_roles ON roles.id = user_roles.role_id WHERE user_roles.user_id = {} ORDER BY roles.name ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .load::<RoleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_user_groups(&self, user_id: &str) -> AppResult<Vec<GroupRecord>> {
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN group_members ON access_groups.id = group_members.group_id WHERE group_members.user_id = {} ORDER BY access_groups.name ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(user_id)
-                .load::<GroupRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
     pub async fn replace_user_roles(&self, user_id: &str, role_ids: Vec<String>) -> AppResult<()> {
         let user_id = user_id.to_string();
         let role_ids = dedupe_nonempty(role_ids);
@@ -1237,50 +986,6 @@ impl Db {
                 }
                 Ok(())
             })
-        })
-    }
-
-    pub async fn list_group_roles(&self, group_id: &str) -> AppResult<Vec<RoleRecord>> {
-        let group_id = group_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN group_roles ON roles.id = group_roles.role_id WHERE group_roles.group_id = {} ORDER BY roles.name ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(group_id)
-                .load::<RoleRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    /// Loads role edges for several groups in one query and keeps the group
-    /// key in the result so callers can assemble the subject graph in memory.
-    pub async fn list_group_roles_by_group_ids(
-        &self,
-        group_ids: &[String],
-    ) -> AppResult<BTreeMap<String, Vec<RoleRecord>>> {
-        if group_ids.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let group_ids = group_ids.to_vec();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT group_roles.group_id, roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN group_roles ON roles.id = group_roles.role_id WHERE group_roles.group_id IN ({}) ORDER BY group_roles.group_id ASC, roles.name ASC, roles.id ASC",
-                placeholders(kind, 1, group_ids.len())
-            );
-            let rows = bind_text_list(&mut conn, sql_query(sql), &group_ids)
-                .load::<GroupRoleJoinRow>(&mut conn)
-                .map_err(AppError::from)?;
-            let mut grouped = BTreeMap::new();
-            for row in rows {
-                let group_id = row.group_id.clone();
-                grouped
-                    .entry(group_id)
-                    .or_insert_with(Vec::new)
-                    .push(row.role());
-            }
-            Ok(grouped)
         })
     }
 
@@ -1412,20 +1117,6 @@ impl Db {
                 crate::webhooks::spawn_audit_webhook_delivery(webhook_db, audit_event);
             }
             Ok(())
-        })
-    }
-
-    pub async fn list_group_members(&self, group_id: &str) -> AppResult<Vec<UserRecord>> {
-        let group_id = group_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT users.id, users.email, users.username, users.display_name, users.phone, users.password_hash, users.email_verified_at, users.phone_verified_at, users.is_admin, users.is_active, users.archived_at, users.registration_source, users.last_login_at, users.last_login_ip, users.last_oidc_client_id, users.last_login_method, users.created_at, users.updated_at FROM users INNER JOIN group_members ON users.id = group_members.user_id WHERE group_members.group_id = {} ORDER BY users.email ASC",
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(group_id)
-                .load::<UserRecord>(&mut conn)
-                .map_err(AppError::from)
         })
     }
 

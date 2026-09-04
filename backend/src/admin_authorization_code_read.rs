@@ -60,10 +60,8 @@ pub(super) async fn reveal_invitation_code(
     })?;
     let signing_key = state
         .db
-        .list_signing_keys()
+        .find_signing_key_by_kid(&key_id)
         .await?
-        .into_iter()
-        .find(|key| key.kid == key_id)
         .ok_or_else(|| {
             AppError::Configuration(
                 "authorization code reveal key is unavailable; retain retired signing keys while revealable codes exist"

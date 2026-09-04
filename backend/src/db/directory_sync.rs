@@ -6,7 +6,13 @@
 //! aggregate here avoids leaking provider protocol details into the generic
 //! database methods and prevents a failed reconcile from leaving a half-sync.
 
+use super::directory_sync_read::{
+    ArchivedGroupMemberRow, DIRECTORY_SYNC_BATCH_SIZE, OrganizationMemberUpdatedAtRow,
+    ProviderUserSubjectRow, UserIdRow, UserIdentityColumn, UserIdentityKeyRow,
+};
 use super::directory_sync_sql::{case_expression, text_placeholders};
+#[path = "directory_sync_policy.rs"]
+mod directory_sync_policy;
 use super::{
     CountRow, Db, DirectorySyncGroupRecord, DirectorySyncMembershipRecord, DirectorySyncRunRecord,
     DirectorySyncRunUpdate, LinkedIdentityRecord, UpdatedAtRow, UserRecord, UserRegistrationSource,
@@ -24,10 +30,11 @@ use diesel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+use directory_sync_policy::{DirectorySyncPolicyError, validate_snapshot};
+
 // Keep every variable-length read well below SQLite's default variable limit
 // while leaving the same query shape usable by PostgreSQL and MySQL. Queries
 // with fixed arguments add those arguments to this budget explicitly.
-const DIRECTORY_SYNC_BATCH_SIZE: usize = 400;
 const DIRECTORY_SYNC_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -83,63 +90,6 @@ pub struct DirectorySyncApplyStats {
     pub disabled_count: i64,
 }
 
-#[derive(Debug, Clone, diesel::QueryableByName)]
-struct ArchivedGroupMemberRow {
-    #[diesel(sql_type = Text)]
-    group_id: String,
-    #[diesel(sql_type = Text)]
-    user_id: String,
-    #[diesel(sql_type = Nullable<BigInt>)]
-    archived_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-struct UserIdentityKeyRow {
-    #[diesel(sql_type = Text)]
-    id: String,
-    #[diesel(sql_type = Text)]
-    email: String,
-    #[diesel(sql_type = Text)]
-    username: String,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-struct UserIdRow {
-    #[diesel(sql_type = Text)]
-    user_id: String,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-struct ProviderUserSubjectRow {
-    #[diesel(sql_type = Text)]
-    user_id: String,
-    #[diesel(sql_type = Text)]
-    external_subject: String,
-}
-
-#[derive(Debug, Clone, diesel::QueryableByName)]
-struct OrganizationMemberUpdatedAtRow {
-    #[diesel(sql_type = Text)]
-    user_id: String,
-    #[diesel(sql_type = BigInt)]
-    updated_at: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UserIdentityColumn {
-    Email,
-    Username,
-}
-
-impl UserIdentityColumn {
-    fn sql(self) -> &'static str {
-        match self {
-            Self::Email => "email",
-            Self::Username => "username",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PendingUserUpdate {
     user: UserRecord,
@@ -169,271 +119,6 @@ struct PendingGroup {
     is_new: bool,
 }
 
-macro_rules! load_linked_identities_by_subjects {
-    ($conn:expr, $kind:expr, $provider_key:expr, $subjects:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let provider_key = $provider_key;
-        let subjects = $subjects;
-    let mut identities = BTreeMap::new();
-    for chunk in subjects.chunks(DIRECTORY_SYNC_BATCH_SIZE) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = Vec::with_capacity(chunk.len() + 1);
-        values.push(provider_key.to_string());
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT id, user_id, provider_slug, external_subject, external_email, created_at, updated_at FROM linked_identities WHERE provider_slug = {} AND external_subject IN ({})",
-            ph(kind, 1),
-            text_placeholders(kind, 2, chunk.len())
-        );
-        let rows = bind_text_list(conn, sql_query(sql), &values)
-            .load::<LinkedIdentityRecord>(conn)
-            .map_err(AppError::from)?;
-        for identity in rows {
-            identities.insert(identity.external_subject.clone(), identity);
-        }
-    }
-        Ok::<BTreeMap<String, LinkedIdentityRecord>, AppError>(identities)
-    }};
-}
-
-macro_rules! load_users_by_ids {
-    ($conn:expr, $kind:expr, $user_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let user_ids = $user_ids;
-        let mut users = BTreeMap::new();
-        for chunk in user_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let sql = format!(
-                "{} WHERE id IN ({})",
-                select_user_sql(),
-                text_placeholders(kind, 1, chunk.len())
-            );
-            let rows = bind_text_list(conn, sql_query(sql), chunk)
-                .load::<UserRecord>(conn)
-                .map_err(AppError::from)?;
-            for user in rows {
-                users.insert(user.id.clone(), user);
-            }
-        }
-        Ok::<BTreeMap<String, UserRecord>, AppError>(users)
-    }};
-}
-
-macro_rules! load_user_identity_rows {
-    ($conn:expr, $kind:expr, $column:expr, $values:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let column = $column;
-        let values = $values;
-        let mut rows = Vec::new();
-        for chunk in values.chunks(DIRECTORY_SYNC_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let sql = format!(
-                "SELECT id, email, username FROM users WHERE {} IN ({})",
-                column.sql(),
-                text_placeholders(kind, 1, chunk.len())
-            );
-            rows.extend(
-                bind_text_list(conn, sql_query(sql), chunk)
-                    .load::<UserIdentityKeyRow>(conn)
-                    .map_err(AppError::from)?,
-            );
-        }
-        Ok::<Vec<UserIdentityKeyRow>, AppError>(rows)
-    }};
-}
-
-macro_rules! load_identity_owner_maps {
-    ($conn:expr, $kind:expr, $emails:expr, $usernames:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let emails = $emails;
-        let usernames = $usernames;
-        let mut email_owners = BTreeMap::new();
-        let mut username_owners = BTreeMap::new();
-        for (column, values) in [
-            (UserIdentityColumn::Email, emails),
-            (UserIdentityColumn::Username, usernames),
-        ] {
-            for row in load_user_identity_rows!(conn, kind, column, values)? {
-                email_owners.insert(row.email.clone(), row.id.clone());
-                username_owners.insert(row.username.clone(), row.id);
-            }
-        }
-        Ok::<(BTreeMap<String, String>, BTreeMap<String, String>), AppError>((
-            email_owners,
-            username_owners,
-        ))
-    }};
-}
-
-macro_rules! load_organization_member_ids {
-    ($conn:expr, $kind:expr, $organization_id:expr, $user_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let organization_id = $organization_id;
-        let user_ids = $user_ids;
-    let mut member_ids = BTreeSet::new();
-    for chunk in user_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 1) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = vec![organization_id.to_string()];
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT user_id FROM organization_members WHERE organization_id = {} AND user_id IN ({})",
-            ph(kind, 1),
-            text_placeholders(kind, 2, chunk.len())
-        );
-        for row in bind_text_list(conn, sql_query(sql), &values)
-            .load::<UserIdRow>(conn)
-            .map_err(AppError::from)?
-        {
-            member_ids.insert(row.user_id);
-        }
-    }
-        Ok::<BTreeSet<String>, AppError>(member_ids)
-    }};
-}
-
-macro_rules! load_provider_subjects_by_user_ids {
-    ($conn:expr, $kind:expr, $provider_key:expr, $user_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let provider_key = $provider_key;
-        let user_ids = $user_ids;
-    let mut subjects_by_user = BTreeMap::<String, BTreeSet<String>>::new();
-    for chunk in user_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 1) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = vec![provider_key.to_string()];
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT user_id, external_subject FROM linked_identities WHERE provider_slug = {} AND user_id IN ({})",
-            ph(kind, 1),
-            text_placeholders(kind, 2, chunk.len())
-        );
-        for row in bind_text_list(conn, sql_query(sql), &values)
-            .load::<ProviderUserSubjectRow>(conn)
-            .map_err(AppError::from)?
-        {
-            subjects_by_user
-                .entry(row.user_id)
-                .or_default()
-                .insert(row.external_subject);
-        }
-    }
-        Ok::<BTreeMap<String, BTreeSet<String>>, AppError>(subjects_by_user)
-    }};
-}
-
-macro_rules! load_organization_member_updated_at {
-    ($conn:expr, $kind:expr, $organization_id:expr, $user_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let organization_id = $organization_id;
-        let user_ids = $user_ids;
-    let mut updated_at_by_user = BTreeMap::new();
-    for chunk in user_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 1) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = vec![organization_id.to_string()];
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT user_id, updated_at FROM organization_members WHERE organization_id = {} AND user_id IN ({})",
-            ph(kind, 1),
-            text_placeholders(kind, 2, chunk.len())
-        );
-        for row in bind_text_list(conn, sql_query(sql), &values)
-            .load::<OrganizationMemberUpdatedAtRow>(conn)
-            .map_err(AppError::from)?
-        {
-            updated_at_by_user.insert(row.user_id, row.updated_at);
-        }
-    }
-        Ok::<BTreeMap<String, i64>, AppError>(updated_at_by_user)
-    }};
-}
-
-macro_rules! load_other_managed_owner_ids {
-    ($conn:expr, $kind:expr, $application_id:expr, $provider_id:expr, $organization_id:expr, $user_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let application_id = $application_id;
-        let provider_id = $provider_id;
-        let organization_id = $organization_id;
-        let user_ids = $user_ids;
-    let mut owner_ids = BTreeSet::new();
-    for chunk in user_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 3) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = chunk.to_vec();
-        values.push(organization_id.to_string());
-        values.push(application_id.to_string());
-        values.push(provider_id.to_string());
-        let sql = format!(
-            "SELECT directory_sync_memberships.user_id AS user_id FROM directory_sync_memberships INNER JOIN applications ON applications.id = directory_sync_memberships.application_id WHERE directory_sync_memberships.user_id IN ({}) AND directory_sync_memberships.managed = 1 AND applications.organization_id = {} AND NOT (directory_sync_memberships.application_id = {} AND directory_sync_memberships.provider_id = {}) GROUP BY directory_sync_memberships.user_id",
-            text_placeholders(kind, 1, chunk.len()),
-            ph(kind, chunk.len() + 1),
-            ph(kind, chunk.len() + 2),
-            ph(kind, chunk.len() + 3)
-        );
-        for row in bind_text_list(conn, sql_query(sql), &values)
-            .load::<UserIdRow>(conn)
-            .map_err(AppError::from)?
-        {
-            owner_ids.insert(row.user_id);
-        }
-    }
-        Ok::<BTreeSet<String>, AppError>(owner_ids)
-    }};
-}
-
-macro_rules! load_archived_group_members_by_group_ids {
-    ($conn:expr, $kind:expr, $organization_id:expr, $group_ids:expr $(,)?) => {{
-        let conn = &mut *$conn;
-        let kind = $kind;
-        let organization_id = $organization_id;
-        let group_ids = $group_ids;
-    let mut archived_by_group = BTreeMap::<String, BTreeSet<String>>::new();
-    for chunk in group_ids.chunks(DIRECTORY_SYNC_BATCH_SIZE - 1) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut values = vec![organization_id.to_string()];
-        values.extend(chunk.iter().cloned());
-        let sql = format!(
-            "SELECT group_members.group_id AS group_id, users.id AS user_id, users.archived_at FROM users INNER JOIN group_members ON group_members.user_id = users.id INNER JOIN organization_members ON organization_members.user_id = users.id WHERE organization_members.organization_id = {} AND group_members.group_id IN ({})",
-            ph(kind, 1),
-            text_placeholders(kind, 2, chunk.len())
-        );
-        for row in bind_text_list(conn, sql_query(sql), &values)
-            .load::<ArchivedGroupMemberRow>(conn)
-            .map_err(AppError::from)?
-        {
-            if row.archived_at.is_some() {
-                archived_by_group
-                    .entry(row.group_id)
-                    .or_default()
-                    .insert(row.user_id);
-            }
-        }
-    }
-        Ok::<BTreeMap<String, BTreeSet<String>>, AppError>(archived_by_group)
-    }};
-}
-
 fn ensure_preloaded_identity_available(
     email_owners: &BTreeMap<String, String>,
     username_owners: &BTreeMap<String, String>,
@@ -453,6 +138,24 @@ fn ensure_preloaded_identity_available(
         ));
     }
     Ok(())
+}
+
+fn directory_sync_policy_error(error: DirectorySyncPolicyError) -> AppError {
+    let message = match error {
+        DirectorySyncPolicyError::DuplicateUserSubject => {
+            "directory sync contains duplicate user subjects"
+        }
+        DirectorySyncPolicyError::DuplicateUserDn => "directory sync contains duplicate user DNs",
+        DirectorySyncPolicyError::SubjectDnCollision => {
+            "directory sync contains a subject/DN collision"
+        }
+        DirectorySyncPolicyError::DuplicateEmail => "directory sync contains duplicate email",
+        DirectorySyncPolicyError::DuplicateUsername => "directory sync contains duplicate username",
+        DirectorySyncPolicyError::DuplicateGroupExternalId => {
+            "directory sync contains duplicate group subjects"
+        }
+    };
+    AppError::BadRequest(message.to_string())
 }
 
 fn replace_identity_owner(
@@ -1451,6 +1154,7 @@ impl Db {
             expected_provider_updated_at,
             expected_organization_updated_at,
         } = context;
+        validate_snapshot(&snapshot).map_err(directory_sync_policy_error)?;
         let now = util::now_ts();
         let total_seen = snapshot.users.len() as i64;
 
@@ -1524,23 +1228,16 @@ impl Db {
                     total_seen,
                     ..DirectorySyncApplyStats::default()
                 };
-                let mut seen_subjects = BTreeSet::new();
-                for directory_user in &snapshot.users {
-                    if !seen_subjects.insert(directory_user.subject.clone()) {
-                        return Err(AppError::BadRequest(
-                            "directory sync contains duplicate user subjects".to_string(),
-                        ));
-                    }
-                }
-                let mut seen_groups = BTreeSet::new();
-                for directory_group in &snapshot.groups {
-                    if !seen_groups.insert(directory_group.external_id.clone()) {
-                        return Err(AppError::BadRequest(
-                            "directory sync contains duplicate group subjects".to_string(),
-                        ));
-                    }
-                }
-
+                let seen_subjects = snapshot
+                    .users
+                    .iter()
+                    .map(|directory_user| directory_user.subject.clone())
+                    .collect::<BTreeSet<_>>();
+                let seen_groups = snapshot
+                    .groups
+                    .iter()
+                    .map(|directory_group| directory_group.external_id.clone())
+                    .collect::<BTreeSet<_>>();
                 // All identity and account reads happen before the first
                 // mutation. Each helper chunks its IN list so this remains
                 // valid for SQLite, PostgreSQL, and MySQL parameter limits.
@@ -2102,270 +1799,6 @@ impl Db {
                     .map_err(AppError::from)?;
                 Ok(removed_organization_membership)
             })
-        })
-    }
-
-    pub async fn find_directory_sync_group(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-        external_id: &str,
-    ) -> AppResult<Option<DirectorySyncGroupRecord>> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        let external_id = external_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(provider_id)
-                .bind::<Text, _>(external_id)
-                .get_result::<DirectorySyncGroupRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn list_directory_sync_groups(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-    ) -> AppResult<Vec<DirectorySyncGroupRecord>> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} ORDER BY external_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(provider_id)
-                .load::<DirectorySyncGroupRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn upsert_directory_sync_group(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-        external_id: &str,
-        group_id: &str,
-        last_seen_at: i64,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        let external_id = external_id.to_string();
-        let group_id = group_id.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let exists_sql = format!(
-                "SELECT COUNT(*) AS count FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            let exists = sql_query(exists_sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&provider_id)
-                .bind::<Text, _>(&external_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                > 0;
-            if exists {
-                let update_sql = format!(
-                    "UPDATE directory_sync_groups SET group_id = {}, last_seen_at = {}, updated_at = {} WHERE application_id = {} AND provider_id = {} AND external_id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6)
-                );
-                sql_query(update_sql)
-                    .bind::<Text, _>(&group_id)
-                    .bind::<BigInt, _>(last_seen_at)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&provider_id)
-                    .bind::<Text, _>(&external_id)
-                    .execute(&mut conn)
-                    .map(|_| ())
-                    .map_err(AppError::from)
-            } else {
-                let insert_sql = format!(
-                    "INSERT INTO directory_sync_groups (application_id, provider_id, external_id, group_id, last_seen_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&provider_id)
-                    .bind::<Text, _>(&external_id)
-                    .bind::<Text, _>(&group_id)
-                    .bind::<BigInt, _>(last_seen_at)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(&mut conn)
-                    .map(|_| ())
-                    .map_err(AppError::from)
-            }
-        })
-    }
-
-    pub async fn delete_directory_sync_group(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-        external_id: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        let external_id = external_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "DELETE FROM directory_sync_groups WHERE application_id = {} AND provider_id = {} AND external_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(provider_id)
-                .bind::<Text, _>(external_id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
-        })
-    }
-    pub async fn upsert_directory_sync_membership(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-        user_id: &str,
-        managed: bool,
-        last_seen_at: i64,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        let user_id = user_id.to_string();
-        let now = util::now_ts();
-        with_conn!(self, |conn, kind| {
-            let exists_sql = format!(
-                "SELECT COUNT(*) AS count FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            let exists = sql_query(exists_sql)
-                .bind::<Text, _>(&application_id)
-                .bind::<Text, _>(&provider_id)
-                .bind::<Text, _>(&user_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                > 0;
-            if exists {
-                let update_sql = format!(
-                    "UPDATE directory_sync_memberships SET last_seen_at = {}, updated_at = {} WHERE application_id = {} AND provider_id = {} AND user_id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5)
-                );
-                sql_query(update_sql)
-                    .bind::<BigInt, _>(last_seen_at)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&provider_id)
-                    .bind::<Text, _>(&user_id)
-                    .execute(&mut conn)
-                    .map(|_| ())
-                    .map_err(AppError::from)
-            } else {
-                let insert_sql = format!(
-                    "INSERT INTO directory_sync_memberships (application_id, provider_id, user_id, managed, last_seen_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7)
-                );
-                sql_query(insert_sql)
-                    .bind::<Text, _>(&application_id)
-                    .bind::<Text, _>(&provider_id)
-                    .bind::<Text, _>(&user_id)
-                    .bind::<Integer, _>(i32::from(managed))
-                    .bind::<BigInt, _>(last_seen_at)
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(&mut conn)
-                    .map(|_| ())
-                    .map_err(AppError::from)
-            }
-        })
-    }
-
-    pub async fn list_directory_sync_memberships(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-    ) -> AppResult<Vec<DirectorySyncMembershipRecord>> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT application_id, provider_id, user_id, managed, last_seen_at, created_at, updated_at FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} ORDER BY user_id ASC",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(provider_id)
-                .load::<DirectorySyncMembershipRecord>(&mut conn)
-                .map_err(AppError::from)
-        })
-    }
-
-    pub async fn delete_directory_sync_membership(
-        &self,
-        application_id: &str,
-        provider_id: &str,
-        user_id: &str,
-    ) -> AppResult<()> {
-        let application_id = application_id.to_string();
-        let provider_id = provider_id.to_string();
-        let user_id = user_id.to_string();
-        with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "DELETE FROM directory_sync_memberships WHERE application_id = {} AND provider_id = {} AND user_id = {}",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(application_id)
-                .bind::<Text, _>(provider_id)
-                .bind::<Text, _>(user_id)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
         })
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     auth,
     db::{
         LinkedIdentityRecord, LoginEventRecord, PublicUser, UserOptionRecord,
-        UserOrganizationRecord,
+        UserOrganizationRecord, UserRecord,
     },
     error::{AppError, AppResult},
 };
@@ -50,6 +50,10 @@ async fn require_user_list_reader(
     Ok(current)
 }
 
+fn public_users(users: Vec<UserRecord>) -> Vec<PublicUser> {
+    users.into_iter().map(UserRecord::public).collect()
+}
+
 pub(super) async fn list_users(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -67,7 +71,7 @@ pub(super) async fn list_users(
         )
         .await?;
     Ok(Json(UserListPageResponse {
-        items: page.users.into_iter().map(|user| user.public()).collect(),
+        items: public_users(page.users),
         page: parsed.page,
         page_size: page.limit,
         total: page.total,
@@ -87,7 +91,7 @@ pub(super) async fn list_users_cursor(
         .list_admin_users_page_after(parsed.scope, parsed.filters, cursor, parsed.page_size)
         .await?;
     Ok(Json(UserDirectoryCursorResponse {
-        items: page.users.into_iter().map(|user| user.public()).collect(),
+        items: public_users(page.users),
         page_size: page.limit,
         next_cursor: page
             .next_cursor

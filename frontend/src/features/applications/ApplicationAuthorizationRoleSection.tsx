@@ -1,5 +1,4 @@
 import { ArrowRight, Pencil, Plus, Trash2 } from "lucide-react";
-import { useMemo } from "react";
 import type {
   ApplicationPermissionDefinition,
   ApplicationProfileRole,
@@ -22,6 +21,7 @@ type ApplicationAuthorizationRoleSectionProps = {
   copy: ApplicationAuthorizationCopy;
   applicationRoles: ApplicationProfileRole[];
   applicationPermissionCatalog: ApplicationPermissionDefinition[];
+  knownPermissionKeys: Set<string>;
   roleDraft: ApplicationRoleDraft | null;
   roleDraftPermissionSet: Set<string>;
   customRolePermissions: string[];
@@ -40,6 +40,7 @@ export function ApplicationAuthorizationRoleSection({
   copy,
   applicationRoles,
   applicationPermissionCatalog,
+  knownPermissionKeys,
   roleDraft,
   roleDraftPermissionSet,
   customRolePermissions,
@@ -52,11 +53,6 @@ export function ApplicationAuthorizationRoleSection({
   onClearRole,
   onSaveRole,
 }: ApplicationAuthorizationRoleSectionProps) {
-  const knownPermissionKeys = useMemo(
-    () => new Set(applicationPermissionCatalog.map((item) => item.key)),
-    [applicationPermissionCatalog],
-  );
-
   return (
     <>
       <div className="subsection-heading">

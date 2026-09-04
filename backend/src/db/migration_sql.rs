@@ -630,10 +630,12 @@ pub(crate) const SQLITE_MIGRATIONS: &[&str] = &[
         organization_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         role TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (organization_id, user_id)
     )",
+    "ALTER TABLE organization_members ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
     "CREATE INDEX IF NOT EXISTS idx_organization_members_user ON organization_members(user_id, organization_id)",
     "CREATE TABLE IF NOT EXISTS user_organization_contexts (
         user_id TEXT PRIMARY KEY,
@@ -1907,10 +1909,12 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
         organization_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         role TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (organization_id, user_id)
     )",
+    "ALTER TABLE organization_members ADD COLUMN IF NOT EXISTS is_active INTEGER NOT NULL DEFAULT 1",
     "CREATE INDEX IF NOT EXISTS idx_organization_members_user ON organization_members(user_id, organization_id)",
     "CREATE TABLE IF NOT EXISTS user_organization_contexts (
         user_id TEXT PRIMARY KEY,
@@ -3185,11 +3189,13 @@ pub(crate) const MYSQL_MIGRATIONS: &[&str] = &[
         organization_id VARCHAR(64) NOT NULL,
         user_id VARCHAR(64) NOT NULL,
         role VARCHAR(32) NOT NULL,
+        is_active INT NOT NULL DEFAULT 1,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (organization_id, user_id),
         INDEX idx_organization_members_user (user_id, organization_id)
     )",
+    "ALTER TABLE organization_members ADD COLUMN is_active INT NOT NULL DEFAULT 1",
     "CREATE TABLE IF NOT EXISTS user_organization_contexts (
         user_id VARCHAR(64) PRIMARY KEY,
         organization_id VARCHAR(64) NOT NULL,

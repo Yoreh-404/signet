@@ -5,12 +5,8 @@ import type { TranslationKey } from "../../i18n";
 import * as adminApi from "../../lib/api/admin";
 import { emptyLdapProviderForm, emptyProviderForm } from "../../lib/form-defaults";
 import { joinList } from "../../lib/formatters";
-import type { ExternalProviderTemplate, LdapProvider } from "../../types";
-import {
-  toExternalOidcProviderPayload,
-  toLdapProviderForm,
-  toLdapProviderPayload
-} from "./form-adapters";
+import type { ExternalProviderTemplate } from "../../types";
+import { toExternalOidcProviderPayload, toLdapProviderPayload } from "./form-adapters";
 import type { AdminEditor } from "./use-settings-controller";
 import type { LatestRequestToken } from "./use-latest-request";
 
@@ -193,13 +189,6 @@ export function useProviderAdminActions({
     await loadBootstrap();
   }, [loadAdminData, loadBootstrap]);
 
-  const editLdapProvider = useCallback((provider: LdapProvider) => {
-    const nextForm = toLdapProviderForm(provider);
-    setLdapProviderForm(nextForm);
-    setLdapProviderFormBaseline(nextForm);
-    setEditor("ldap");
-  }, [setEditor, setLdapProviderForm, setLdapProviderFormBaseline]);
-
   return {
     providerRedirectPath,
     applyProviderTemplate,
@@ -207,7 +196,6 @@ export function useProviderAdminActions({
     saveProvider,
     deleteProvider,
     saveLdapProvider,
-    deleteLdapProvider,
-    editLdapProvider
+    deleteLdapProvider
   };
 }

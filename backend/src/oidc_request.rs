@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct AuthorizeRequest {
+pub(crate) struct AuthorizeRequest {
     pub(super) interaction_request: Option<String>,
     pub(super) request: Option<String>,
     pub(super) request_uri: Option<String>,

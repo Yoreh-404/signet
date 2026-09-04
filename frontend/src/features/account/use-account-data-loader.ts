@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import * as accountApi from "../../lib/api/account";
 import type { MfaStatus, MyConsent, MySession, Passkey } from "../../types";
+import type { Dispatch, SetStateAction } from "react";
 import type { SessionController } from "../session/useSessionController";
+import { useAccountSecurityData, type AccountSecurityDataContract } from "./use-account-security-data";
+import { useAccountSessions } from "./use-account-sessions";
 
 type AccountDataLoaderProps = {
   controller: SessionController;
@@ -11,7 +14,14 @@ type AccountDataLoaderProps = {
   setMfaStatus: (value: MfaStatus | null) => void;
   setPasskeys: (value: Passkey[]) => void;
   setMyConsents: (value: MyConsent[]) => void;
-  setMySessions: (value: MySession[]) => void;
+  setMySessions: Dispatch<SetStateAction<MySession[]>>;
+};
+
+type AccountDataRefresh = {
+  mfaStatus: boolean;
+  passkeys: boolean;
+  consents: boolean;
+  sessions: boolean;
 };
 
 export function useAccountDataLoader({
@@ -26,16 +36,41 @@ export function useAccountDataLoader({
 }: AccountDataLoaderProps) {
   const accountLoadId = useRef(0);
   const accountAbortController = useRef<AbortController | null>(null);
+  const {
+    hasMore: hasMoreSessions,
+    loadMore: loadMoreSessions,
+    loadingMore: loadingMoreSessions,
+    removeSession,
+    replacePage: replaceSessionsPage,
+    reset: resetSessions
+  } = useAccountSessions({
+    controller: sessionController,
+    onError,
+    setMySessions
+  });
+  const {
+    clear: clearSecurityData,
+    commit: commitSecurityData,
+    load: loadSecurityData
+  } = useAccountSecurityData({
+    setMfaStatus,
+    setPasskeys,
+    setMyConsents
+  });
 
   const invalidate = useCallback(() => {
     accountLoadId.current += 1;
     accountAbortController.current?.abort();
     accountAbortController.current = null;
-  }, [accountAbortController, accountLoadId]);
+    resetSessions();
+  }, [resetSessions]);
 
-  const load = useCallback(async () => {
+  const reload = useCallback(async (refresh: AccountDataRefresh) => {
     const requestId = ++accountLoadId.current;
     accountAbortController.current?.abort();
+    if (refresh.sessions) {
+      resetSessions();
+    }
     const abortController = new AbortController();
     accountAbortController.current = abortController;
     const started = sessionController.getSnapshot();
@@ -56,23 +91,21 @@ export function useAccountDataLoader({
     try {
       if (!started.user) {
         if (!isCurrent()) return;
-        setMfaStatus(null);
-        setPasskeys([]);
-        setMyConsents([]);
-        setMySessions([]);
+        clearSecurityData(refresh);
+        if (refresh.sessions) setMySessions([]);
         return;
       }
-      const [nextMfaStatus, nextPasskeys, nextConsents, nextSessions] = await Promise.all([
-        accountApi.getMfaStatus({ signal: abortController.signal }),
-        accountApi.listPasskeys({ signal: abortController.signal }),
-        accountApi.listConsents({ signal: abortController.signal }),
-        accountApi.listSessions({ signal: abortController.signal })
+      const [nextSecurityData, nextSessions] = await Promise.all([
+        loadSecurityData(refresh, abortController.signal),
+        refresh.sessions
+          ? accountApi.listSessionsPage({ signal: abortController.signal })
+          : Promise.resolve(undefined)
       ]);
       if (!isCurrent()) return;
-      setMfaStatus(nextMfaStatus);
-      setPasskeys(nextPasskeys);
-      setMyConsents(nextConsents);
-      setMySessions(nextSessions);
+      commitSecurityData(nextSecurityData);
+      if (nextSessions !== undefined) {
+        replaceSessionsPage(nextSessions);
+      }
     } catch (error) {
       if (!isCurrent()) return;
       throw error;
@@ -80,14 +113,35 @@ export function useAccountDataLoader({
       if (accountAbortController.current === abortController) accountAbortController.current = null;
     }
   }, [
-    accountAbortController,
-    accountLoadId,
     sessionController,
-    setMfaStatus,
-    setMyConsents,
     setMySessions,
-    setPasskeys
+    clearSecurityData,
+    commitSecurityData,
+    loadSecurityData,
+    replaceSessionsPage,
+    resetSessions
   ]);
+
+  const reloadSessions = useCallback(
+    () => reload({ mfaStatus: false, passkeys: false, consents: false, sessions: true }),
+    [reload]
+  );
+  const reloadConsents = useCallback(
+    () => reload({ mfaStatus: false, passkeys: false, consents: true, sessions: false }),
+    [reload]
+  );
+  const reloadAll = useCallback(
+    () => reload({ mfaStatus: true, passkeys: true, consents: true, sessions: true }),
+    [reload]
+  );
+  const securityRefresh = useMemo(
+    () => ({ all: reloadAll, consents: reloadConsents }),
+    [reloadAll, reloadConsents]
+  );
+  const accountData = useMemo<AccountSecurityDataContract>(
+    () => ({ securityRefresh, removeSession }),
+    [removeSession, securityRefresh]
+  );
 
   useEffect(() => {
     if (!enabled) {
@@ -95,11 +149,20 @@ export function useAccountDataLoader({
       return;
     }
     const loadScope = scopeKey;
-    void load().catch((error) => {
+    void reloadAll().catch((error) => {
       if (scopeKey === loadScope) onError?.(error);
     });
     return invalidate;
-  }, [enabled, invalidate, load, onError, scopeKey]);
+  }, [enabled, invalidate, onError, reloadAll, scopeKey]);
 
-  return { load, invalidate };
+  return {
+    accountData,
+    hasMoreSessions,
+    invalidate,
+    load: reloadAll,
+    loadMoreSessions,
+    loadingMoreSessions,
+    reloadAll,
+    reloadSessions
+  };
 }

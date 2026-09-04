@@ -6,6 +6,10 @@ import { ApiError } from "../../lib/api";
 import * as applicationApi from "../../lib/api/applications";
 import { emptyApplicationForm } from "../../lib/form-defaults";
 import type { ApplicationSection, Tab, TenantApplication } from "../../types";
+import {
+  toApplicationForm,
+  toApplicationPayload
+} from "../applications/form-adapters";
 
 type ApplicationForm = typeof emptyApplicationForm;
 
@@ -72,21 +76,7 @@ export function useApplicationActions({
   }, [applicationCreateMutationRef, openEditor, setApplicationForm, setApplicationFormBaseline]);
 
   const editApplication = useCallback((application: TenantApplication) => {
-    const protocolModule = application.modules?.find((module) => module.module_key === "protocols");
-    const protocolConfig = protocolModule?.config && typeof protocolModule.config === "object"
-      ? protocolModule.config
-      : {};
-    const websiteUrl = typeof protocolConfig.website_url === "string" ? protocolConfig.website_url : "";
-    const nextForm = {
-      id: application.id,
-      slug: application.slug,
-      name: application.name,
-      website_url: websiteUrl,
-      description: application.description ?? "",
-      account_selection_mode: application.account_selection_mode,
-      unique_identity_factors: application.unique_identity_factors,
-      is_active: application.is_active
-    };
+    const nextForm = toApplicationForm(application);
     setApplicationForm(nextForm);
     setApplicationFormBaseline(nextForm);
     openEditor();
@@ -98,15 +88,7 @@ export function useApplicationActions({
     setBusy(true);
     setError("");
     try {
-      const input = {
-        slug: applicationForm.slug,
-        name: applicationForm.name,
-        website_url: applicationForm.website_url.trim() || null,
-        description: applicationForm.description || null,
-        account_selection_mode: applicationForm.account_selection_mode,
-        unique_identity_factors: applicationForm.unique_identity_factors,
-        is_active: applicationForm.is_active
-      };
+      const input = toApplicationPayload(applicationForm);
       let application: TenantApplication;
       if (applicationForm.id) {
         application = await applicationApi.updateApplication(applicationForm.id, input);

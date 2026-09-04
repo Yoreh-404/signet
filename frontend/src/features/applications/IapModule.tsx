@@ -6,6 +6,7 @@ import type { IapApplication, OrganizationOption } from "../../types";
 import { Input, ModuleFeedback, ModuleHeader, Toggle } from "./components/ApplicationModulePrimitives";
 import { useApplicationModuleLifecycle } from "./use-application-module-lifecycle";
 import { useApplicationWorkspaceRequestContext } from "./use-application-workspace-request-context";
+import { toIapRulePayload } from "./form-adapters";
 
 export type IapRuleDraft = {
   id: string;
@@ -165,20 +166,7 @@ export function IapModule({
     setSaving(true);
     let committed = false;
     try {
-      const payload = {
-        slug: draft.slug.trim(),
-        name: draft.name.trim(),
-        description: draft.description.trim() || null,
-        external_host: draft.external_host.trim(),
-        path_prefix: draft.path_prefix.trim() || "/",
-        required_organization_id: draft.required_organization_id || null,
-        required_organization_roles: draft.required_organization_roles,
-        required_permissions: draft.required_permissions
-          .split(/\r?\n/)
-          .map((item) => item.trim())
-          .filter(Boolean),
-        is_active: draft.is_active
-      };
+      const payload = toIapRulePayload(draft);
       const saved = draft.id
         ? await applicationApi.updateApplicationIapRule(applicationId, draft.id, payload, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined })
         : await applicationApi.createApplicationIapRule(applicationId, payload, { signal: request.signal, idempotencyKey: request.idempotencyKey ?? undefined });

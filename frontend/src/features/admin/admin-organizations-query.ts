@@ -1,6 +1,6 @@
-import { adminUserOptionsPath } from "../../lib/api/admin";
-import type { Organization, UserOption } from "../../types";
+import type { Organization } from "../../types";
 import type { AdminReadQueryContext } from "./admin-read-query";
+import { loadAdminUserOptionsQuery } from "./admin-user-options-query";
 
 export type AdminOrganizationsQueryOptions = AdminReadQueryContext & {
   canReadOrganizations: boolean;
@@ -29,11 +29,10 @@ export async function loadAdminOrganizationsQuery({
         }))
       );
     }),
-    canManageOrganizations
-      ? loadCached<UserOption[]>(
-          adminUserOptionsPath({ status: "live", limit: 200 }),
-          (next) => updateReadModel("userOptions", next)
-        )
-      : Promise.resolve(undefined)
+    loadAdminUserOptionsQuery({
+      loadCached,
+      updateReadModel,
+      enabled: canManageOrganizations
+    })
   ]);
 }

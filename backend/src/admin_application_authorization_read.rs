@@ -1,6 +1,7 @@
 use super::{
+    admin_application_authorization_scope::managed_authorization_profile,
     admin_application_scope::managed_application,
-    admin_organization_types::OrganizationMemberResponse, managed_authorization_profile,
+    admin_organization_types::OrganizationMemberResponse,
 };
 use crate::{
     AppState,
@@ -126,12 +127,16 @@ pub(super) async fn subjects(
     Path(id): Path<String>,
 ) -> AppResult<Json<ApplicationAuthorizationSubjectsResponse>> {
     let (_, application) = managed_application(&state, &jar, &id).await?;
-    let users = state
-        .db
-        .list_organization_members(&application.organization_id)
-        .await?
+    let (users_result, groups_result) = tokio::join!(
+        state
+            .db
+            .list_active_organization_members(&application.organization_id),
+        state
+            .db
+            .list_application_authorization_groups(&application.organization_id),
+    );
+    let users = users_result?
         .into_iter()
-        .filter(|member| member.is_active == 1 && member.archived_at.is_none())
         .map(|member| OrganizationMemberResponse {
             organization_id: member.organization_id,
             user_id: member.user_id,
@@ -145,10 +150,7 @@ pub(super) async fn subjects(
             updated_at: member.membership_updated_at,
         })
         .collect();
-    let groups = state
-        .db
-        .list_application_authorization_groups(&application.organization_id)
-        .await?
+    let groups = groups_result?
         .into_iter()
         .map(|group| ApplicationAuthorizationGroupResponse {
             id: group.id,

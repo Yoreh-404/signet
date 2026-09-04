@@ -1,5 +1,6 @@
 use super::{
     admin_client_policy::validate_absolute_http_url,
+    admin_defaults::default_true,
     admin_management_scope::current_organization_provider_manager,
     admin_settings::{normalize_optional_text, normalize_required_text},
 };
@@ -84,7 +85,7 @@ pub(super) struct ExternalOidcProviderInput {
     pub(super) scopes: Vec<String>,
     pub(super) email_domains: Vec<String>,
     pub(super) is_active: bool,
-    #[serde(default = "super::default_true")]
+    #[serde(default = "default_true")]
     pub(super) allow_login: bool,
     pub(super) allow_registration: bool,
 }

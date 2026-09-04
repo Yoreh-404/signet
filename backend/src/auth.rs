@@ -51,7 +51,7 @@ pub async fn current_user_from_session(
     };
     let Some(session_kind) = AccountSessionKind::for_session_with_trial_enrollment(
         &user,
-        &session,
+        session,
         has_redemption,
         trial_enrollment.is_some(),
     ) else {
