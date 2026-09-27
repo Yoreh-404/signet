@@ -362,11 +362,7 @@ impl Fixture {
             .unwrap();
         let cookie = format!("{}={session_token}", settings.security.cookie_name);
         let jwt = JwtManager::new(&settings).unwrap();
-        let state = AppState {
-            settings,
-            db: db.clone(),
-            jwt,
-        };
+        let state = AppState::new(settings, db.clone(), jwt);
         let http = admin::routes().with_state(state.clone());
 
         Self {

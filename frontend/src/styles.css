@@ -7082,3 +7082,525 @@ tbody tr:hover {
     display: none;
   }
 }
+
+/* Admin/application visual refinement: quieter chrome, stronger hierarchy and
+ * a more layered workspace without changing any interaction contract. */
+:root[data-theme="dark"] {
+  --page: #07111b;
+  --page-deep: #0a1723;
+  --surface: rgba(12, 25, 37, 0.86);
+  --surface-solid: #0d1a27;
+  --surface-muted: #101f2e;
+  --surface-hover: #14283a;
+  --text: #edf3f8;
+  --text-soft: #c5d1dc;
+  --muted: #8295a8;
+  --border: #1d3448;
+  --border-strong: #31506a;
+  --brand-soft: #0d3436;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .2), 0 10px 30px rgba(0, 0, 0, .1);
+  --shadow-md: 0 24px 70px rgba(0, 0, 0, .34);
+}
+
+body {
+  color: var(--text);
+  background:
+    radial-gradient(circle at 72% -12%, color-mix(in srgb, var(--brand) 10%, transparent), transparent 34%),
+    radial-gradient(circle at 14% 108%, color-mix(in srgb, var(--info) 6%, transparent), transparent 31%),
+    var(--page);
+  background-attachment: fixed;
+}
+
+.app-shell {
+  grid-template-columns: 252px minmax(0, 1fr);
+}
+
+.app-shell > aside {
+  gap: 15px;
+  padding: 20px 14px 14px;
+  border-right-color: color-mix(in srgb, var(--border) 78%, transparent);
+  background: color-mix(in srgb, var(--surface) 91%, transparent);
+  box-shadow: none;
+  backdrop-filter: blur(22px) saturate(1.08);
+}
+
+.brand-row.compact {
+  min-height: 40px;
+  gap: 11px;
+  padding: 0 5px 2px;
+}
+
+.brand-row.compact .brand-mark {
+  width: 38px;
+  height: 38px;
+  border: 1px solid color-mix(in srgb, var(--brand) 32%, transparent);
+  border-radius: 11px;
+  color: var(--brand-contrast);
+  background: linear-gradient(145deg, color-mix(in srgb, var(--brand) 92%, white 8%), var(--brand));
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--brand) 18%, transparent);
+}
+
+.brand-row.compact h1 {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 780;
+  letter-spacing: -.02em;
+}
+
+.compact-language {
+  padding: 3px 4px 11px;
+  border-bottom-color: color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.app-shell > aside nav {
+  gap: 2px;
+  padding-right: 1px;
+}
+
+.nav-group {
+  gap: 3px;
+}
+
+.nav-group + .nav-group {
+  margin-top: 7px;
+  padding-top: 9px;
+  border-top-color: color-mix(in srgb, var(--border) 68%, transparent);
+}
+
+.app-shell > aside nav button {
+  position: relative;
+  min-height: 39px;
+  gap: 10px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: color-mix(in srgb, var(--text-soft) 90%, var(--muted));
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+.app-shell > aside nav button:hover {
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-hover) 74%, transparent);
+  transform: translateX(1px);
+}
+
+.app-shell > aside nav button.active {
+  border-color: color-mix(in srgb, var(--brand) 28%, var(--border));
+  color: var(--text);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--brand-soft) 94%, var(--surface-solid)), color-mix(in srgb, var(--brand-soft) 58%, var(--surface-solid)));
+  box-shadow: none;
+}
+
+.app-shell > aside nav button.active::before {
+  position: absolute;
+  inset: 9px auto 9px -1px;
+  width: 2px;
+  border-radius: 99px;
+  background: var(--brand);
+  content: "";
+}
+
+.sidebar-footer {
+  gap: 5px;
+  padding-top: 10px;
+  border-top-color: color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.account-card {
+  min-height: 48px;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--surface-muted) 84%, transparent);
+}
+
+.content {
+  max-width: 1760px;
+  padding: 24px clamp(24px, 3vw, 48px) 56px;
+}
+
+.page-header {
+  min-height: 66px;
+  margin: -8px -10px 26px;
+  padding: 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+  background: color-mix(in srgb, var(--page) 54%, transparent);
+  backdrop-filter: blur(20px) saturate(1.1);
+}
+
+.page-heading h2 {
+  font-size: clamp(22px, 2.1vw, 28px);
+  font-weight: 720;
+  letter-spacing: -.025em;
+}
+
+.enterprise-switcher,
+.icon-button,
+.search-control input {
+  border-color: color-mix(in srgb, var(--border) 88%, transparent);
+  background: color-mix(in srgb, var(--surface-solid) 92%, transparent);
+  box-shadow: 0 1px 1px rgba(0, 0, 0, .05);
+}
+
+.enterprise-switcher,
+.icon-button {
+  border-radius: 11px;
+}
+
+.icon-button {
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.icon-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--border));
+  color: var(--brand);
+  background: color-mix(in srgb, var(--brand-soft) 56%, var(--surface-solid));
+  transform: translateY(-1px);
+}
+
+.application-workspace {
+  gap: 18px;
+  padding-bottom: 36px;
+}
+
+.application-workspace-heading {
+  align-items: center;
+}
+
+.application-workspace-heading > div:first-child {
+  max-width: 820px;
+}
+
+.application-workspace-heading h3 {
+  margin-top: 7px;
+  font-size: clamp(29px, 3vw, 38px);
+  font-weight: 720;
+  letter-spacing: -.045em;
+}
+
+.application-workspace-heading p {
+  max-width: 780px;
+  margin-top: 7px;
+  line-height: 1.7;
+}
+
+.application-workspace-heading .primary-action {
+  min-height: 39px;
+  border-radius: 10px;
+  box-shadow: 0 12px 30px color-mix(in srgb, var(--brand) 18%, transparent);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.application-workspace-heading .primary-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 16px 34px color-mix(in srgb, var(--brand) 23%, transparent);
+}
+
+.application-stat-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 15px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--surface-solid) 96%, var(--brand-soft)), var(--surface-solid));
+  box-shadow: 0 10px 36px rgba(0, 0, 0, .045);
+}
+
+.application-stat-strip > div {
+  min-height: 72px;
+  gap: 4px;
+  border-right-color: color-mix(in srgb, var(--border) 78%, transparent);
+}
+
+.application-stat-strip span {
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: .035em;
+}
+
+.application-stat-strip strong {
+  font-size: 21px;
+  font-weight: 720;
+}
+
+.application-workspace-layout {
+  grid-template-columns: 276px minmax(0, 1fr);
+  gap: 16px;
+}
+
+.application-picker,
+.application-detail {
+  border-color: color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 17px;
+  background: color-mix(in srgb, var(--surface-solid) 96%, transparent);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .055);
+}
+
+.application-picker {
+  display: block;
+  height: auto;
+  padding: 0;
+  border-right: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+}
+
+.application-picker-heading {
+  padding: 14px 14px 12px;
+  border-bottom-color: color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.application-picker-list {
+  gap: 4px;
+  padding: 8px;
+}
+
+.application-picker-list > button {
+  min-height: 61px;
+  border-radius: 11px;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.application-picker-list > button:hover {
+  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+  background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+  transform: translateX(1px);
+}
+
+.application-picker-list > button.selected {
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--border));
+  background: linear-gradient(90deg, color-mix(in srgb, var(--brand-soft) 92%, var(--surface-solid)), color-mix(in srgb, var(--brand-soft) 56%, var(--surface-solid)));
+  box-shadow: inset 2px 0 0 var(--brand);
+}
+
+.application-avatar {
+  width: 36px;
+  height: 36px;
+  border: 1px solid color-mix(in srgb, var(--brand) 13%, transparent);
+}
+
+.status-dot {
+  background: var(--border-strong);
+}
+
+.status-dot.active {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 10%, transparent);
+}
+
+.application-detail {
+  position: relative;
+  isolation: isolate;
+}
+
+.application-detail-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 23px 24px 21px;
+  background:
+    radial-gradient(circle at 14% 0%, color-mix(in srgb, var(--brand) 10%, transparent), transparent 34%),
+    linear-gradient(135deg, color-mix(in srgb, var(--brand-soft) 48%, var(--surface-solid)), var(--surface-solid) 62%);
+}
+
+.application-detail-hero::after {
+  position: absolute;
+  z-index: -1;
+  top: -52px;
+  right: 4%;
+  width: 190px;
+  height: 190px;
+  border: 1px solid color-mix(in srgb, var(--brand) 10%, transparent);
+  border-radius: 50%;
+  content: "";
+}
+
+.application-hero-avatar {
+  width: 52px;
+  height: 52px;
+  border: 1px solid color-mix(in srgb, var(--brand) 18%, transparent);
+  border-radius: 14px;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--brand-soft) 96%, var(--surface-solid)), color-mix(in srgb, var(--brand-soft) 64%, var(--surface-solid)));
+  box-shadow: 0 12px 28px color-mix(in srgb, var(--brand) 10%, transparent);
+}
+
+.application-breadcrumb {
+  margin-bottom: 6px;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.application-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  margin-left: 4px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 60%, transparent);
+  border-radius: 99px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface-muted) 80%, transparent);
+  font-size: 9px;
+  font-weight: 720;
+}
+
+.application-status-badge.active {
+  border-color: color-mix(in srgb, var(--success) 22%, var(--border));
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 7%, var(--surface-solid));
+}
+
+.application-status-badge .status-dot {
+  width: 5px;
+  height: 5px;
+  box-shadow: none;
+}
+
+.application-detail-hero h4 {
+  font-size: 23px;
+  font-weight: 730;
+  letter-spacing: -.035em;
+}
+
+.application-website-link {
+  margin-top: 8px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--brand-soft) 44%, transparent);
+}
+
+.application-detail-tabs {
+  gap: 4px;
+  padding: 8px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--surface-muted) 48%, var(--surface-solid));
+}
+
+.application-detail-tabs button {
+  min-height: 35px;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-size: 11.5px;
+  font-weight: 680;
+}
+
+.application-detail-tabs button:hover {
+  border-color: color-mix(in srgb, var(--border) 76%, transparent);
+  background: color-mix(in srgb, var(--surface-hover) 70%, transparent);
+}
+
+.application-detail-tabs button.active {
+  border-color: color-mix(in srgb, var(--brand) 24%, var(--border));
+  color: var(--brand);
+  background: color-mix(in srgb, var(--brand-soft) 72%, var(--surface-solid));
+}
+
+.application-detail-tabs .tab-status {
+  min-height: 17px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: color-mix(in srgb, var(--surface-solid) 72%, transparent);
+  font-size: 9px;
+  line-height: 15px;
+}
+
+.application-overview-panel {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface-muted) 19%, transparent), transparent 120px);
+}
+
+.application-module-grid {
+  gap: 10px;
+  padding: 17px 0 18px;
+}
+
+.application-module-summary {
+  min-height: 74px;
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
+  background: linear-gradient(145deg, color-mix(in srgb, var(--surface-solid) 98%, var(--surface-muted)), color-mix(in srgb, var(--surface-muted) 38%, var(--surface-solid)));
+}
+
+.application-module-summary:hover {
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--border));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--brand-soft) 18%, var(--surface-solid)), var(--surface-solid));
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .06);
+  transform: translateY(-2px);
+}
+
+.application-next-step {
+  gap: 12px;
+  padding: 14px 15px;
+  border: 1px solid color-mix(in srgb, var(--brand) 18%, var(--border));
+  border-radius: 12px;
+  background: linear-gradient(100deg, color-mix(in srgb, var(--brand-soft) 52%, var(--surface-solid)), color-mix(in srgb, var(--surface-muted) 56%, var(--surface-solid)));
+}
+
+.application-next-step button {
+  min-height: 31px;
+  padding: 0 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand-soft) 56%, transparent);
+}
+
+.application-danger-zone {
+  padding: 14px 22px 18px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  background: color-mix(in srgb, var(--surface-muted) 28%, transparent);
+}
+
+@media (min-width: 901px) and (max-width: 1180px) {
+  .app-shell {
+    grid-template-columns: 232px minmax(0, 1fr);
+  }
+
+  .application-workspace-layout {
+    grid-template-columns: 248px minmax(0, 1fr);
+  }
+
+  .application-detail-tabs .tab-status {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .application-workspace-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .application-picker {
+    position: static;
+  }
+}
+
+@media (max-width: 720px) {
+  .content {
+    padding: 16px 14px 36px;
+  }
+
+  .application-stat-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .application-stat-strip > div {
+    min-height: 60px;
+    border-right: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  }
+
+  .application-stat-strip > div:last-child {
+    border-bottom: 0;
+  }
+
+  .application-detail-hero,
+  .application-overview-panel,
+  .application-module-content {
+    padding: 18px;
+  }
+
+  .application-module-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+}

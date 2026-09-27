@@ -81,7 +81,7 @@ pub(super) fn audience_contains(value: &Value, expected: &str) -> bool {
     }
 }
 
-pub(super) fn normalize_permission_key(value: &str) -> AppResult<String> {
+pub(crate) fn normalize_permission_key(value: &str) -> AppResult<String> {
     let value = visible_text(value, 256, "permission key")?;
     if value.split(':').any(str::is_empty) {
         return Err(crate::error::AppError::BadRequest(

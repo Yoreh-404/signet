@@ -1,0 +1,34 @@
+# Hardened single-site deployment example for the official Rust signet-edge.
+# The reverse proxy is expected to run on the same host and use
+# docs/examples/nginx-oidc-edge.conf (127.0.0.1:4180).
+#
+# The secret file contains one or more comma-separated canonical unpadded
+# base64url values, each decoding to exactly 32 bytes. Put the newest key first;
+# retain older keys temporarily while rotating existing browser cookies.
+
+services:
+  signet-edge:
+    image: signet-edge:local
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SIGNET_EDGE_PUBLIC_ORIGIN: https://legacy.example.net
+      SIGNET_EDGE_ISSUER: https://sso.example.com
+      SIGNET_EDGE_CLIENT_ID: legacy-edge-demo-browser
+      SIGNET_EDGE_COOKIE_KEYS_FILE: /run/secrets/signet_edge_cookie_keys
+      SIGNET_EDGE_BIND_HOST: 0.0.0.0
+      SIGNET_EDGE_BIND_PORT: "4180"
+      SIGNET_EDGE_MAX_SESSION_SECONDS: "600"
+      SIGNET_EDGE_UPSTREAM_TIMEOUT_MS: "5000"
+    secrets:
+      - signet_edge_cookie_keys
+    ports:
+      - 127.0.0.1:4180:4180
+
+secrets:
+  signet_edge_cookie_keys:
+    file: ./secrets/signet-edge-cookie-keys

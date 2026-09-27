@@ -77,6 +77,7 @@ pub(super) async fn create_application_iap_rule(
         .db
         .insert_iap_application(iap_application_input_to_new(&state, &application, payload).await?)
         .await?;
+    state.invalidate_iap_applications_cache();
     state
         .db
         .record_audit_event(audit::management_event(
@@ -116,6 +117,7 @@ pub(super) async fn update_application_iap_rule(
             iap_application_input_to_new(&state, &application, payload).await?,
         )
         .await?;
+    state.invalidate_iap_applications_cache();
     state
         .db
         .record_audit_event(audit::management_event(
@@ -146,6 +148,7 @@ pub(super) async fn delete_application_iap_rule(
         .filter(|rule| rule.application_id.as_deref() == Some(id.as_str()))
         .ok_or(AppError::NotFound)?;
     state.db.delete_iap_application(&existing.id).await?;
+    state.invalidate_iap_applications_cache();
     state
         .db
         .record_audit_event(audit::management_event(

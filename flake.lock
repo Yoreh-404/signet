@@ -17,11 +17,11 @@
         "lastModified": 1750364353,
         "narHash": "sha256-l06DIwnB4JHwP1isUUXk85F+AHQkUSUyAWnAmRxXICg=",
         "type": "tarball",
-        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12"
+        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/a709c74619e1a2b68ed12bb398e12fbe29d69657"
       },
       "original": {
         "type": "tarball",
-        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12"
+        "url": "https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/a709c74619e1a2b68ed12bb398e12fbe29d69657"
       }
     },
     "flake-compat": {
@@ -89,14 +89,14 @@
         ]
       },
       "locked": {
-        "lastModified": 1787246814,
-        "narHash": "sha256-pEd4/iPY3Zm/EhhHmeB1QnIWXJSLx7gJzD/05mm2MCo=",
+        "lastModified": 1788678114,
+        "narHash": "sha256-pcqbpV4ZI79al6KAlr+WJjaEo/PYfgctRlG43D5BSJM=",
         "type": "tarball",
-        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable"
+        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/4748ec2f5ed4a881474ed4c98aa71a5308cdac8d"
       },
       "original": {
         "type": "tarball",
-        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable"
+        "url": "https://codeload.github.com/oxalica/rust-overlay/tar.gz/4748ec2f5ed4a881474ed4c98aa71a5308cdac8d"
       }
     },
     "systems": {

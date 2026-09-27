@@ -149,6 +149,62 @@ pub(crate) struct BrowserContextAccountOptionRow {
 }
 
 #[derive(Debug, Clone, diesel::QueryableByName)]
+pub(crate) struct IapSessionPrincipalRow {
+    #[diesel(sql_type = Text)]
+    pub session_id: String,
+    #[diesel(sql_type = Text)]
+    pub session_user_id: String,
+    #[diesel(sql_type = Text)]
+    pub session_csrf_token: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub session_ip_address: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub session_user_agent: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub session_login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub session_expires_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub session_created_at: i64,
+    #[diesel(sql_type = Text)]
+    pub user_id: String,
+    #[diesel(sql_type = Text)]
+    pub user_email: String,
+    #[diesel(sql_type = Text)]
+    pub user_username: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_display_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_phone: Option<String>,
+    #[diesel(sql_type = Text)]
+    pub user_password_hash: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub user_email_verified_at: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub user_phone_verified_at: Option<i64>,
+    #[diesel(sql_type = Integer)]
+    pub user_is_admin: i32,
+    #[diesel(sql_type = Integer)]
+    pub user_is_active: i32,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub user_archived_at: Option<i64>,
+    #[diesel(sql_type = Text)]
+    pub user_registration_source: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub user_last_login_at: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_last_login_ip: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_last_oidc_client_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub user_last_login_method: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    pub user_created_at: i64,
+    #[diesel(sql_type = BigInt)]
+    pub user_updated_at: i64,
+}
+
+#[derive(Debug, Clone, diesel::QueryableByName)]
 pub(crate) struct ApplicationAuthorizationProfileCountRow {
     #[diesel(sql_type = Text)]
     pub profile_id: String,

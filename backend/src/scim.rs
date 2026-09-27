@@ -1769,7 +1769,7 @@ mod tests {
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        (AppState { settings, db, jwt }, path)
+        (AppState::new(settings, db, jwt), path)
     }
 
     #[cfg(feature = "sqlite")]
@@ -2395,11 +2395,7 @@ mod tests {
         // resource boundary even though its signature and client are valid.
         let mut expired_settings = state.settings.clone();
         expired_settings.oidc.access_token_ttl_seconds = -1;
-        let expired_state = AppState {
-            settings: expired_settings,
-            db: state.db.clone(),
-            jwt: state.jwt.clone(),
-        };
+        let expired_state = AppState::new(expired_settings, state.db.clone(), state.jwt.clone());
         let expired_app = crate::oidc::routes()
             .merge(routes())
             .with_state(expired_state);

@@ -793,11 +793,8 @@ async fn application_role_lifecycle_cleans_mappings_and_rechecks_entitlements() 
 
     let settings: crate::Settings =
         toml::from_str(include_str!("../../../../config/default.toml")).unwrap();
-    let state = crate::AppState {
-        jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
-        settings,
-        db: db.clone(),
-    };
+    let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+    let state = crate::AppState::new(settings, db.clone(), jwt);
     let entitlements = crate::authorization::resolve_entitlements(
         &state,
         &application,
@@ -1040,11 +1037,8 @@ async fn application_entitlements_keep_login_open_but_scope_policy_to_tenant_mem
 
     let settings: crate::Settings =
         toml::from_str(include_str!("../../../../config/default.toml")).unwrap();
-    let state = crate::AppState {
-        jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
-        settings,
-        db: db.clone(),
-    };
+    let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+    let state = crate::AppState::new(settings, db.clone(), jwt);
     let member_record = db.find_user_by_id(&member.id).await.unwrap().unwrap();
     let outsider_record = db.find_user_by_id(&outsider.id).await.unwrap().unwrap();
 

@@ -74,6 +74,7 @@ pub(crate) async fn resolve_authorization_request_object_for_client(
 ) -> AppResult<ResolvedAuthorizeRequest> {
     let audiences = request_object_audiences(state, headers).await?;
     let claims = client_assertion::verify_signed_client_jwt::<AuthorizationRequestObject>(
+        Some(state),
         client,
         request_object,
         &audiences,
@@ -259,6 +260,7 @@ mod tests {
         )
         .unwrap();
         let claims = client_assertion::verify_signed_client_jwt::<AuthorizationRequestObject>(
+            None,
             &client,
             &token,
             &["https://sso.example.com".to_string()],

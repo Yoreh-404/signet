@@ -2,15 +2,17 @@ use crate::{
     AppState,
     db::ClientRecord,
     error::{AppError, AppResult},
+    state::CachedHttpDocument,
     util,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::net::lookup_host;
 use url::Url;
@@ -163,6 +165,7 @@ pub async fn authenticate_private_key_jwt(
     }
     let assertion = assertion.ok_or(AppError::Unauthorized)?;
     let claims = verify_signed_client_jwt(
+        Some(state),
         client,
         assertion,
         accepted_audiences,
@@ -210,6 +213,7 @@ pub async fn authenticate_client_secret_jwt(
 }
 
 pub(crate) async fn verify_signed_client_jwt<T>(
+    state: Option<&AppState>,
     client: &ClientRecord,
     token: &str,
     accepted_audiences: &[String],
@@ -219,7 +223,7 @@ pub(crate) async fn verify_signed_client_jwt<T>(
 where
     T: DeserializeOwned,
 {
-    let jwks = load_client_jwks(client).await?;
+    let jwks = load_client_jwks(state, client).await?;
     verify_signed_client_jwt_with_jwks(
         &client.client_id,
         token,
@@ -235,6 +239,7 @@ where
 /// assertions bind `iss` to the OAuth client id; signed website manifests
 /// instead bind it to the website origin, so they need this separate context.
 pub async fn verify_signed_jwt_for_issuer<T>(
+    state: Option<&AppState>,
     client: &ClientRecord,
     token: &str,
     accepted_audiences: &[String],
@@ -244,7 +249,7 @@ pub async fn verify_signed_jwt_for_issuer<T>(
 where
     T: DeserializeOwned,
 {
-    let jwks = load_client_jwks(client).await?;
+    let jwks = load_client_jwks(state, client).await?;
     verify_signed_jwt_with_jwks(
         token,
         accepted_audiences,
@@ -255,7 +260,10 @@ where
     )
 }
 
-async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
+async fn load_client_jwks(
+    state: Option<&AppState>,
+    client: &ClientRecord,
+) -> AppResult<ClientJwks> {
     if !client.jwks.trim().is_empty() {
         let jwks =
             serde_json::from_str::<ClientJwks>(&client.jwks).map_err(|_| AppError::Unauthorized)?;
@@ -266,6 +274,54 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     if jwks_uri.is_empty() {
         return Err(AppError::Unauthorized);
     }
+    let state = state.ok_or(AppError::Unauthorized)?;
+    let cache_key = format!("{}\n{}", client.client_id, jwks_uri);
+    if let Some(cached) = state.client_jwks_cache_entry(&cache_key)?
+        && Instant::now() < cached.fresh_until
+    {
+        return parse_cached_jwks(&cached.body);
+    }
+    let refresh_lock = state.client_jwks_refresh_lock(&cache_key)?;
+    let _refresh = refresh_lock.lock().await;
+    if let Some(cached) = state.client_jwks_cache_entry(&cache_key)?
+        && Instant::now() < cached.fresh_until
+    {
+        return parse_cached_jwks(&cached.body);
+    }
+    let cached = state.client_jwks_cache_entry(&cache_key)?;
+    match fetch_remote_jwks(state, jwks_uri, cached.as_ref()).await {
+        Ok(document) => {
+            let jwks = parse_cached_jwks(&document.body)?;
+            state.store_client_jwks_cache_entry(cache_key, document)?;
+            Ok(jwks)
+        }
+        Err(error) => {
+            if let Some(cached) = cached
+                && Instant::now() < cached.stale_until
+            {
+                tracing::warn!(
+                    client_id = %client.client_id,
+                    jwks_uri = %jwks_uri,
+                    "remote client JWKS refresh failed; using bounded stale cache"
+                );
+                return parse_cached_jwks(&cached.body);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn parse_cached_jwks(body: &[u8]) -> AppResult<ClientJwks> {
+    let jwks = serde_json::from_slice::<ClientJwks>(body).map_err(|_| AppError::Unauthorized)?;
+    validate_jwks(&jwks).map_err(|_| AppError::Unauthorized)?;
+    Ok(jwks)
+}
+
+async fn fetch_remote_jwks(
+    state: &AppState,
+    jwks_uri: &str,
+    cached: Option<&CachedHttpDocument>,
+) -> AppResult<CachedHttpDocument> {
     let (jwks_url, resolved_address) = resolve_public_jwks_url(jwks_uri).await?;
     let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -278,14 +334,47 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
     let client = client_builder
         .build()
         .map_err(|err| AppError::Internal(format!("failed to build jwks client: {err}")))?;
-    let mut response = client
-        .get(jwks_url)
-        .send()
-        .await
-        .map_err(|_| AppError::Unauthorized)?;
+    let mut request = client.get(jwks_url);
+    if let Some(etag) = cached.and_then(|cached| cached.etag.as_deref()) {
+        request = request.header(header::IF_NONE_MATCH, etag);
+    }
+    let mut response = request.send().await.map_err(|_| AppError::Unauthorized)?;
+    let now = Instant::now();
+    if response.status() == StatusCode::NOT_MODIFIED {
+        let Some(cached) = cached else {
+            return Err(AppError::Unauthorized);
+        };
+        let cache_policy = revalidated_response_cache_policy(
+            response.headers(),
+            cached,
+            state.settings.performance.client_jwks_cache_seconds,
+            state.settings.performance.client_jwks_max_cache_seconds,
+        );
+        let stale = stale_window(state, cache_policy);
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .or_else(|| cached.etag.clone());
+        return Ok(CachedHttpDocument {
+            body: cached.body.clone(),
+            etag,
+            fresh_until: now + cache_policy.freshness,
+            stale_until: now + cache_policy.freshness + stale,
+            cacheable: cache_policy.cacheable,
+            stored_at: now,
+        });
+    }
     if !response.status().is_success() {
         return Err(AppError::Unauthorized);
     }
+    let cache_policy = response_cache_policy(
+        response.headers(),
+        state.settings.performance.client_jwks_cache_seconds,
+        state.settings.performance.client_jwks_max_cache_seconds,
+    );
+    let stale = stale_window(state, cache_policy);
     if response
         .content_length()
         .is_some_and(|length| length > MAX_JWKS_BYTES as u64)
@@ -299,9 +388,113 @@ async fn load_client_jwks(client: &ClientRecord) -> AppResult<ClientJwks> {
         }
         body.extend_from_slice(&chunk);
     }
-    let jwks = serde_json::from_slice::<ClientJwks>(&body).map_err(|_| AppError::Unauthorized)?;
-    validate_jwks(&jwks).map_err(|_| AppError::Unauthorized)?;
-    Ok(jwks)
+    parse_cached_jwks(&body)?;
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    Ok(CachedHttpDocument {
+        body,
+        etag,
+        fresh_until: now + cache_policy.freshness,
+        stale_until: now + cache_policy.freshness + stale,
+        cacheable: cache_policy.cacheable,
+        stored_at: now,
+    })
+}
+
+fn stale_window(state: &AppState, cache_policy: ResponseCachePolicy) -> Duration {
+    if cache_policy.allow_stale {
+        Duration::from_secs(
+            state
+                .settings
+                .performance
+                .client_jwks_stale_if_error_seconds,
+        )
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseCachePolicy {
+    freshness: Duration,
+    cacheable: bool,
+    allow_stale: bool,
+}
+
+fn revalidated_response_cache_policy(
+    headers: &reqwest::header::HeaderMap,
+    cached: &CachedHttpDocument,
+    fallback_seconds: u64,
+    max_seconds: u64,
+) -> ResponseCachePolicy {
+    if headers.contains_key(header::CACHE_CONTROL) {
+        return response_cache_policy(headers, fallback_seconds, max_seconds);
+    }
+    ResponseCachePolicy {
+        freshness: cached
+            .fresh_until
+            .saturating_duration_since(cached.stored_at),
+        cacheable: cached.cacheable,
+        allow_stale: cached.stale_until > cached.fresh_until,
+    }
+}
+
+fn response_cache_policy(
+    headers: &reqwest::header::HeaderMap,
+    fallback_seconds: u64,
+    max_seconds: u64,
+) -> ResponseCachePolicy {
+    let cache_control = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let mut no_store = false;
+    let mut no_cache = false;
+    let mut must_revalidate = false;
+    let mut origin_max_age = None;
+    for directive in cache_control.split(',').map(str::trim) {
+        if directive.eq_ignore_ascii_case("no-store") {
+            no_store = true;
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("no-cache") {
+            no_cache = true;
+            continue;
+        }
+        if directive.eq_ignore_ascii_case("must-revalidate")
+            || directive.eq_ignore_ascii_case("proxy-revalidate")
+        {
+            must_revalidate = true;
+            continue;
+        }
+        let Some((name, value)) = directive.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("max-age") {
+            origin_max_age = value.trim().trim_matches('"').parse::<u64>().ok();
+        }
+    }
+    let age = headers
+        .get(header::AGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let freshness_seconds = if no_store || no_cache {
+        0
+    } else {
+        origin_max_age
+            .unwrap_or(fallback_seconds)
+            .min(max_seconds)
+            .saturating_sub(age)
+    };
+    ResponseCachePolicy {
+        freshness: Duration::from_secs(freshness_seconds),
+        cacheable: !no_store,
+        allow_stale: !no_store && !no_cache && !must_revalidate && freshness_seconds > 0,
+    }
 }
 
 async fn resolve_public_jwks_url(value: &str) -> AppResult<(Url, Option<SocketAddr>)> {
@@ -657,5 +850,108 @@ mod tests {
         assert!(validate_jwks_uri("http://169.254.169.254/latest/meta-data").is_err());
         assert!(validate_jwks_uri("https://user:secret@example.test/keys").is_err());
         assert!(validate_jwks_uri("https://keys.example.test/jwks").is_ok());
+    }
+
+    #[test]
+    fn remote_jwks_cache_ttl_honors_and_clamps_origin_max_age() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            response_cache_policy(&headers, 300, 3600).freshness,
+            Duration::from_secs(300)
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("public, Max-Age = \"120\""),
+        );
+        headers.insert(header::AGE, reqwest::header::HeaderValue::from_static("20"));
+        assert_eq!(
+            response_cache_policy(&headers, 300, 3600).freshness,
+            Duration::from_secs(100)
+        );
+
+        headers.insert(
+            header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("max-age=99999"),
+        );
+        headers.remove(header::AGE);
+        assert_eq!(
+            response_cache_policy(&headers, 300, 3600).freshness,
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn remote_jwks_cache_respects_revalidation_and_no_store_directives() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("no-cache, max-age=120"),
+        );
+        let policy = response_cache_policy(&headers, 300, 3600);
+        assert!(policy.cacheable);
+        assert_eq!(policy.freshness, Duration::ZERO);
+        assert!(!policy.allow_stale);
+
+        headers.insert(
+            header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("max-age=120, must-revalidate"),
+        );
+        let policy = response_cache_policy(&headers, 300, 3600);
+        assert_eq!(policy.freshness, Duration::from_secs(120));
+        assert!(!policy.allow_stale);
+
+        headers.insert(
+            header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("no-store"),
+        );
+        let policy = response_cache_policy(&headers, 300, 3600);
+        assert!(!policy.cacheable);
+        assert_eq!(policy.freshness, Duration::ZERO);
+        assert!(!policy.allow_stale);
+    }
+
+    #[test]
+    fn remote_jwks_304_without_cache_control_preserves_original_policy() {
+        let now = Instant::now();
+        let cached_no_cache = CachedHttpDocument {
+            body: Vec::new(),
+            etag: Some("\"v1\"".to_string()),
+            fresh_until: now,
+            stale_until: now,
+            cacheable: true,
+            stored_at: now,
+        };
+        let headers = reqwest::header::HeaderMap::new();
+        let policy = revalidated_response_cache_policy(&headers, &cached_no_cache, 300, 3600);
+        assert_eq!(policy.freshness, Duration::ZERO);
+        assert!(policy.cacheable);
+        assert!(!policy.allow_stale);
+
+        let cached_must_revalidate = CachedHttpDocument {
+            body: Vec::new(),
+            etag: Some("\"v2\"".to_string()),
+            fresh_until: now + Duration::from_secs(120),
+            stale_until: now + Duration::from_secs(120),
+            cacheable: true,
+            stored_at: now,
+        };
+        let policy =
+            revalidated_response_cache_policy(&headers, &cached_must_revalidate, 300, 3600);
+        assert_eq!(policy.freshness, Duration::from_secs(120));
+        assert!(!policy.allow_stale);
+
+        let cached_stale_ok = CachedHttpDocument {
+            body: Vec::new(),
+            etag: Some("\"v3\"".to_string()),
+            fresh_until: now + Duration::from_secs(90),
+            stale_until: now + Duration::from_secs(390),
+            cacheable: true,
+            stored_at: now,
+        };
+        let policy = revalidated_response_cache_policy(&headers, &cached_stale_ok, 300, 3600);
+        assert_eq!(policy.freshness, Duration::from_secs(90));
+        assert!(policy.allow_stale);
     }
 }

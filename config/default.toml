@@ -14,6 +14,38 @@ url = "data/gpt-sso.sqlite3"
 pool_size = 10
 run_migrations = true
 
+[performance]
+# Low-churn control-plane data stays process-local for a short bounded window;
+# the TTL also bounds cross-replica convergence without putting Redis on the
+# authentication hot path. Millisecond caches can be set to 0 to disable them.
+runtime_settings_cache_millis = 1000
+iap_routing_cache_millis = 1000
+# Only while another request is actively refreshing an expired routing index,
+# peers may briefly reuse the previous control-plane snapshot.
+iap_routing_stale_while_refresh_millis = 100
+# Collapses parallel asset requests from one browser/session+IAP rule. This is
+# a microcache, not an authorization store: 0 disables it; keep the TTL tiny.
+iap_authorization_cache_millis = 250
+# Only while another request is actively refreshing an expired decision,
+# peers may reuse that decision for this additional bounded grace window.
+# Set to 0 to make every request wait for the refresh instead.
+iap_authorization_stale_while_refresh_millis = 100
+iap_authorization_cache_max_entries = 8192
+# OIDC discovery derives authorization_details types from registered clients;
+# briefly cache that projection rather than loading the full client table.
+oidc_metadata_cache_millis = 1000
+# Remote private_key_jwt/JAR JWKS honor origin max-age up to this ceiling and
+# can be served briefly stale only when the already-validated origin fails.
+client_jwks_cache_seconds = 300
+client_jwks_max_cache_seconds = 3600
+client_jwks_stale_if_error_seconds = 300
+client_jwks_max_entries = 1024
+# Signet's own /oauth2/jwks endpoint publishes a stable ETag. Keep max-age
+# short so signing-key rotations are visible quickly; clients can revalidate
+# cheaply with If-None-Match and receive 304.
+public_jwks_cache_seconds = 15
+signing_key_sync_seconds = 2
+
 [oidc]
 issuer = "http://localhost:8080"
 authorization_endpoint = "/oauth2/authorize"
@@ -25,13 +57,16 @@ access_token_ttl_seconds = 600
 id_token_ttl_seconds = 900
 authorization_code_ttl_seconds = 300
 refresh_token_ttl_seconds = 2592000
-# Cross-project service scopes are intentionally explicit and still require
-# each client/service account to be granted the scope before it can request a
-# token. They are listed here so Axon, memory-atlas, and axon-code-service can
-# use the same Signet deployment without adding local JWT/HMAC trust roots.
+# Built-in browser/resource scopes and cross-project service scopes are
+# intentionally explicit. A client/service account must still be granted a
+# scope before it can request it; listing a scope here only makes the Signet
+# deployment capable of issuing it.
 supported_scopes = [
-  "openid", "profile", "email", "offline_access", "scim.read", "scim.write",
+  "openid", "profile", "email", "offline_access", "iap.assert", "scim.read", "scim.write",
   "axon.code.service", "axon.agent.invoke:memory", "axon.hub.read", "axon.hub.submit",
+  "axon-next:mcp", "axon-next:models", "axon-next:chat", "axon-next:client-tools",
+  "axon-next:vault", "axon-next:plugins", "axon-next:triggers", "axon-next:workflows",
+  "axon-next:channels", "axon-next:agents", "axon-next:ui", "axon-next:sessions",
   "anchordocs.service", "ocr.service", "memory.service", "memory.agent.callback",
   "memory.code.index", "memory.code.write", "memory.read", "memory.write", "memory.agent",
   "anchordocs.read", "anchordocs.write",
@@ -175,6 +210,9 @@ key_id = "dev-key-1"
 # active JWT key, but the matching X.509 certificate is required when SAML is enabled.
 saml_private_key_pem = ""
 saml_signing_certificate_pem = ""
+# ForwardAuth emits a signed, audience-bound assertion in addition to the
+# compatibility identity headers. Keep it short-lived for safe edge caching.
+iap_assertion_ttl_seconds = 30
 admin_api_prefix = "/api/admin"
 
 [registration]

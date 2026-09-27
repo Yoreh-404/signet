@@ -5,8 +5,14 @@ use std::collections::BTreeSet;
 pub trait ServiceAccountProfile {
     fn service_account_enabled(&self) -> bool;
     fn service_account_permissions(&self) -> AppResult<Vec<String>>;
+    fn service_account_permissions_for_source(
+        &self,
+        source_mode: Option<&str>,
+    ) -> AppResult<Vec<String>>;
     fn service_account_subject(&self) -> String;
     fn service_account_claims(&self) -> AppResult<Map<String, Value>>;
+    fn service_account_claims_with_permissions(&self, permissions: &[String])
+    -> Map<String, Value>;
 }
 
 impl ServiceAccountProfile for ClientRecord {
@@ -20,6 +26,18 @@ impl ServiceAccountProfile for ClientRecord {
         )?)
     }
 
+    fn service_account_permissions_for_source(
+        &self,
+        source_mode: Option<&str>,
+    ) -> AppResult<Vec<String>> {
+        let values = crate::util::from_json::<Vec<String>>(&self.service_account_permissions)?;
+        if source_mode == Some(crate::application_discovery_contract::SOURCE_MODE_DISCOVERY) {
+            normalize_application_permissions(values)
+        } else {
+            normalize_permissions(values)
+        }
+    }
+
     fn service_account_subject(&self) -> String {
         format!("service-account:{}", self.client_id)
     }
@@ -30,13 +48,20 @@ impl ServiceAccountProfile for ClientRecord {
         } else {
             Vec::new()
         };
+        Ok(self.service_account_claims_with_permissions(&permissions))
+    }
+
+    fn service_account_claims_with_permissions(
+        &self,
+        permissions: &[String],
+    ) -> Map<String, Value> {
         let mut claims = Map::new();
         claims.insert("service_account".to_string(), Value::Bool(true));
         claims.insert(
             "permissions".to_string(),
-            Value::Array(permissions.into_iter().map(Value::String).collect()),
+            Value::Array(permissions.iter().cloned().map(Value::String).collect()),
         );
-        Ok(claims)
+        claims
     }
 }
 
@@ -48,6 +73,24 @@ pub fn normalize_permissions(values: Vec<String>) -> AppResult<Vec<String>> {
             continue;
         }
         permissions.insert(Permission::try_from(permission)?.as_str().to_string());
+    }
+    Ok(permissions.into_iter().collect())
+}
+
+/// Website-discovered application permissions belong to the accepted
+/// application authorization profile rather than Signet's platform-admin RBAC
+/// enum. Preserve that application namespace while applying the same canonical
+/// permission-key syntax used by discovery normalization.
+pub fn normalize_application_permissions(values: Vec<String>) -> AppResult<Vec<String>> {
+    let mut permissions = BTreeSet::new();
+    for value in values {
+        let permission = value.trim();
+        if permission.is_empty() {
+            continue;
+        }
+        permissions.insert(crate::application_discovery::normalize_permission_key(
+            permission,
+        )?);
     }
     Ok(permissions.into_iter().collect())
 }
@@ -114,6 +157,37 @@ mod tests {
             vec!["clients.manage".to_string(), "users.read".to_string()]
         );
         assert!(normalize_permissions(vec!["missing.permission".to_string()]).is_err());
+    }
+
+    #[test]
+    fn discovered_service_account_permissions_use_application_namespace() {
+        assert_eq!(
+            normalize_application_permissions(vec![
+                " memory.code.write ".to_string(),
+                "memory.service".to_string(),
+                "memory.code.write".to_string(),
+            ])
+            .unwrap(),
+            vec![
+                "memory.code.write".to_string(),
+                "memory.service".to_string(),
+            ]
+        );
+        assert!(normalize_application_permissions(vec!["memory::write".to_string()]).is_err());
+
+        let client = client_record(true, vec!["memory.code.write", "memory.service"]);
+        assert_eq!(
+            client
+                .service_account_permissions_for_source(Some(
+                    crate::application_discovery_contract::SOURCE_MODE_DISCOVERY,
+                ))
+                .unwrap(),
+            vec![
+                "memory.code.write".to_string(),
+                "memory.service".to_string(),
+            ]
+        );
+        assert!(client.service_account_permissions().is_err());
     }
 
     #[test]

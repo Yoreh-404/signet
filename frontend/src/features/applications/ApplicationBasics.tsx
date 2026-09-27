@@ -168,7 +168,7 @@ export function ApplicationBasics({
             {applications.map((application) => (
               <button type="button" key={application.id} className={application.id === selected?.id ? "selected" : ""} onClick={() => commands.selectApplication(application.id)}>
                 <span className="application-avatar">{Array.from(application.name)[0]?.toUpperCase() ?? "W"}</span>
-                <span className="application-picker-copy"><strong>{application.name}</strong><small>{application.slug}</small><em><span className="status-dot" aria-hidden="true" />{application.is_active ? copy.active : copy.disabled}</em></span>
+                <span className="application-picker-copy"><strong>{application.name}</strong><small>{application.slug}</small><em><span className={`status-dot ${application.is_active ? "active" : ""}`} aria-hidden="true" />{application.is_active ? copy.active : copy.disabled}</em></span>
                 <ChevronRight size={16} />
               </button>
             ))}
@@ -177,7 +177,7 @@ export function ApplicationBasics({
         {selected && (
           <div className="application-detail">
             <div className="application-detail-hero">
-              <div className="application-hero-identity"><span className="application-hero-avatar"><Globe2 size={25} /></span><div><div className="application-breadcrumb"><span>{copy.websites}</span><ChevronRight size={13} /><span>{selected.slug}</span></div><h4>{selected.name}</h4><p>{selected.description || copy.accessBundleHint}</p>{websiteUrl && <a className="application-website-link" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={12} />{websiteUrl}</a>}</div></div>
+              <div className="application-hero-identity"><span className="application-hero-avatar"><Globe2 size={25} /></span><div><div className="application-breadcrumb"><span>{copy.websites}</span><ChevronRight size={13} /><span>{selected.slug}</span><span className={`application-status-badge ${selected.is_active ? "active" : ""}`}><span className={`status-dot ${selected.is_active ? "active" : ""}`} aria-hidden="true" />{selected.is_active ? copy.active : copy.disabled}</span></div><h4>{selected.name}</h4><p>{selected.description || copy.accessBundleHint}</p>{websiteUrl && <a className="application-website-link" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={12} />{websiteUrl}</a>}</div></div>
               <div className="application-hero-actions">{canManage && <button type="button" className="icon-button" onClick={() => commands.editApplication(selected)} title={copy.edit} aria-label={copy.edit}><Pencil size={16} /></button>}</div>
             </div>
             <nav className="application-detail-tabs" aria-label={copy.accessBundle}>

@@ -106,7 +106,7 @@ async fn bootstrap(
     Query(query): Query<BootstrapQuery>,
 ) -> AppResult<Json<BootstrapResponse>> {
     let has_users = state.db.user_count().await? > 0;
-    let issuer = state.db.runtime_settings().await?.issuer;
+    let issuer = state.runtime_settings().await?.issuer;
     let settings = state.db.registration_settings().await?.public();
     let target_application =
         registration_target_application(&state, &headers, query.return_to.as_deref()).await?;
@@ -766,7 +766,7 @@ async fn register(
         )
         .await?;
     if first_user && let Some(origin) = crate::csrf::normalized_origin(&headers) {
-        let runtime = state.db.runtime_settings().await?;
+        let runtime = state.runtime_settings().await?;
         state
             .db
             .upsert_runtime_settings(NewRuntimeSettings {
@@ -775,6 +775,7 @@ async fn register(
                 trust_proxy_headers: runtime.trust_proxy_headers == 1,
             })
             .await?;
+        state.invalidate_runtime_settings_cache();
     }
     let jar = auth::issue_session_with_login_event(
         &state,

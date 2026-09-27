@@ -236,6 +236,7 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
     }
 
     let mut client_ids = BTreeSet::new();
+    let mut jwt_browser_client_count = 0_usize;
     for client in &modules.clients {
         validate_identifier("client_id", &client.client_id)?;
         if client.client_id == "default" {
@@ -260,21 +261,26 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
             }
         }
         let protocol = client.protocol.trim().to_ascii_lowercase();
-        if !matches!(
-            protocol.as_str(),
-            "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
-        ) {
+        if !matches!(protocol.as_str(), "oidc" | "jwt") {
             return invalid(format!(
-                "client {} uses an unsupported protocol",
+                "client {} uses an unsupported client protocol; v3 clients must use oidc or jwt",
                 client.client_id
             ));
         }
-        if client.profiles.contains(&IntegrationProfile::LegacyProxy) && protocol != "forward_auth"
-        {
+        let legacy_proxy = client.profiles.contains(&IntegrationProfile::LegacyProxy);
+        if protocol == "jwt" && !legacy_proxy {
             return invalid(format!(
-                "legacy_proxy client {} must use forward_auth",
+                "JWT browser client {} must use the legacy_proxy profile",
                 client.client_id
             ));
+        }
+        if protocol == "jwt" {
+            jwt_browser_client_count += 1;
+            if jwt_browser_client_count > 1 {
+                return invalid(
+                    "an application can declare only one legacy_proxy JWT browser client",
+                );
+            }
         }
         if (client.profiles.contains(&IntegrationProfile::WebOidc)
             || client.profiles.contains(&IntegrationProfile::SpaOidc))
@@ -309,6 +315,40 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
                 client.client_id
             ));
         }
+        if legacy_proxy && protocol == "jwt" {
+            if auth_method != "none" {
+                return invalid(format!(
+                    "legacy_proxy JWT client {} must be a public PKCE client",
+                    client.client_id
+                ));
+            }
+            if !client
+                .grant_types
+                .iter()
+                .any(|value| value == "authorization_code")
+                || !client.response_types.iter().any(|value| value == "code")
+            {
+                return invalid(format!(
+                    "legacy_proxy JWT client {} must declare authorization_code and code",
+                    client.client_id
+                ));
+            }
+            if client.redirect_uris.is_empty() {
+                return invalid(format!(
+                    "legacy_proxy JWT client {} must declare redirect_uris",
+                    client.client_id
+                ));
+            }
+            if !client.require_pkce || !client.require_s256_pkce {
+                return invalid(format!(
+                    "legacy_proxy JWT client {} must require S256 PKCE",
+                    client.client_id
+                ));
+            }
+            for redirect_uri in &client.redirect_uris {
+                validate_redirect_uri(redirect_uri)?;
+            }
+        }
         if client.profiles.contains(&IntegrationProfile::WebOidc)
             || client.profiles.contains(&IntegrationProfile::SpaOidc)
         {
@@ -331,6 +371,63 @@ fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationE
             }
             for redirect_uri in &client.redirect_uris {
                 validate_redirect_uri(redirect_uri)?;
+            }
+        }
+        if legacy_proxy && protocol == "oidc" {
+            if auth_method != "none" {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must be public",
+                    client.client_id
+                ));
+            }
+            if !client
+                .grant_types
+                .iter()
+                .any(|value| value == "authorization_code")
+                || !client.response_types.iter().any(|value| value == "code")
+            {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must declare authorization_code and code",
+                    client.client_id
+                ));
+            }
+            if client.redirect_uris.is_empty() {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must declare redirect_uris",
+                    client.client_id
+                ));
+            }
+            for redirect_uri in &client.redirect_uris {
+                validate_redirect_uri(redirect_uri)?;
+            }
+            if !client.require_pkce || !client.require_s256_pkce {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must require S256 PKCE",
+                    client.client_id
+                ));
+            }
+            let scopes = client
+                .scopes
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if !scopes.contains("openid") || !scopes.contains("iap.assert") {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must declare openid and iap.assert scopes",
+                    client.client_id
+                ));
+            }
+            if scopes.contains("offline_access") {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must not request offline_access",
+                    client.client_id
+                ));
+            }
+            if !client.audiences.is_empty() {
+                return invalid(format!(
+                    "legacy_proxy OIDC edge client {} must use its client_id as the access-token audience",
+                    client.client_id
+                ));
             }
         }
         for redirect_uri in &client.post_logout_redirect_uris {
@@ -780,6 +877,101 @@ mod tests {
         value.modules.clients[0].profiles = vec![IntegrationProfile::SpaOidc];
         value.modules.clients[0].require_s256_pkce = false;
         assert!(value.validate(1_100).is_err());
+    }
+
+    #[test]
+    fn accepts_one_public_pkce_legacy_proxy_jwt_client() {
+        let mut value = contract();
+        let client = &mut value.modules.clients[0];
+        client.client_id = "legacy-jwt".to_string();
+        client.protocol = "jwt".to_string();
+        client.profiles = vec![IntegrationProfile::LegacyProxy];
+        client.redirect_uris = vec!["https://legacy.example.com/auth/callback".to_string()];
+        client.scopes = vec!["openid".to_string(), "profile".to_string()];
+        client.audiences = vec!["https://legacy.example.com".to_string()];
+        client.grant_types = vec!["authorization_code".to_string()];
+        client.response_types = vec!["code".to_string()];
+        client.token_endpoint_auth_method = "none".to_string();
+        client.require_pkce = true;
+        client.require_s256_pkce = true;
+
+        assert!(value.validate(1_100).is_ok());
+    }
+
+    #[test]
+    fn legacy_proxy_oidc_edge_requires_public_s256_and_short_lived_iap_scope() {
+        let mut value = contract();
+        let client = &mut value.modules.clients[0];
+        client.client_id = "legacy-edge".to_string();
+        client.protocol = "oidc".to_string();
+        client.profiles = vec![IntegrationProfile::LegacyProxy];
+        client.redirect_uris = vec!["https://legacy.example.net/_signet/callback".to_string()];
+        client.scopes = vec!["openid".to_string(), "iap.assert".to_string()];
+        client.grant_types = vec!["authorization_code".to_string()];
+        client.response_types = vec!["code".to_string()];
+        client.token_endpoint_auth_method = "none".to_string();
+        client.require_pkce = true;
+        client.require_s256_pkce = true;
+
+        assert!(value.validate(1_100).is_ok());
+
+        let mut missing_scope = value.clone();
+        missing_scope.modules.clients[0].scopes = vec!["openid".to_string()];
+        assert!(missing_scope.validate(1_100).is_err());
+
+        let mut offline = value.clone();
+        offline.modules.clients[0]
+            .scopes
+            .push("offline_access".to_string());
+        assert!(offline.validate(1_100).is_err());
+
+        let mut resource_audience = value.clone();
+        resource_audience.modules.clients[0].audiences =
+            vec!["https://api.example.net".to_string()];
+        assert!(resource_audience.validate(1_100).is_err());
+
+        let mut weak_pkce = value.clone();
+        weak_pkce.modules.clients[0].require_s256_pkce = false;
+        assert!(weak_pkce.validate(1_100).is_err());
+    }
+
+    #[test]
+    fn rejects_app_scoped_adapters_as_client_protocols() {
+        for protocol in ["saml", "cas", "iap", "forward_auth"] {
+            let mut value = contract();
+            let client = &mut value.modules.clients[0];
+            client.protocol = protocol.to_string();
+            client.profiles = vec![IntegrationProfile::LegacyProxy];
+
+            let error = value.validate(1_100).unwrap_err();
+            assert!(
+                error.to_string().contains("must use oidc or jwt"),
+                "unexpected validation error for protocol {protocol}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_legacy_proxy_jwt_clients_until_runtime_can_route_them() {
+        let mut value = contract();
+        let client = &mut value.modules.clients[0];
+        client.client_id = "legacy-jwt-a".to_string();
+        client.protocol = "jwt".to_string();
+        client.profiles = vec![IntegrationProfile::LegacyProxy];
+        client.redirect_uris = vec!["https://legacy.example.com/a/callback".to_string()];
+        client.grant_types = vec!["authorization_code".to_string()];
+        client.response_types = vec!["code".to_string()];
+        client.token_endpoint_auth_method = "none".to_string();
+        client.require_pkce = true;
+        client.require_s256_pkce = true;
+
+        let mut second = client.clone();
+        second.client_id = "legacy-jwt-b".to_string();
+        second.redirect_uris = vec!["https://legacy.example.com/b/callback".to_string()];
+        value.modules.clients.push(second);
+
+        let error = value.validate(1_100).unwrap_err();
+        assert!(error.to_string().contains("only one legacy_proxy JWT"));
     }
 
     #[test]

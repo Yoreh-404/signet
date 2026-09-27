@@ -619,7 +619,7 @@ mod tests {
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        (AppState { settings, db, jwt }, path)
+        (AppState::new(settings, db, jwt), path)
     }
 
     fn user(is_active: i32, archived_at: Option<i64>) -> UserRecord {

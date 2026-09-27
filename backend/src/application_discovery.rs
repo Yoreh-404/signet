@@ -43,6 +43,7 @@ use normalization::{
     normalize_contract_protocols, normalize_directory_sync, normalize_module,
     validate_protocol_client_bindings,
 };
+pub(crate) use pure::normalize_permission_key;
 use pure::{audience_contains, is_forbidden_ip, manifest_content_digest, validate_host};
 
 pub const FORMAT: &str = crate::application_contract::FORMAT;
@@ -1161,6 +1162,7 @@ fn normalize_application_contract(
     let authorization_mappings = normalize_authorization_bindings(&authorization, &profiles)?;
     let protocols = normalize_contract_protocols(
         &contract.modules.connections,
+        &contract.modules.clients,
         &client_protocols,
         expected_issuer,
     )?;
@@ -1755,6 +1757,7 @@ mod tests {
                 required: true,
                 settings: serde_json::Map::new(),
             }],
+            &[],
             &BTreeMap::new(),
             "https://axon.example",
         )

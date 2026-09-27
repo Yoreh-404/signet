@@ -68,6 +68,79 @@ use oidc_browser_interaction::{
     prompt_without_select_account, reauthentication_request,
 };
 use oidc_user::{load_active_user, load_oidc_user};
+
+pub(crate) async fn verify_iap_bearer_claims(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+) -> AppResult<crate::jwt::TokenClaims> {
+    let cache_enabled = state.settings.performance.iap_authorization_cache_millis > 0;
+    let token_key = util::sha256_base64url(token);
+    if cache_enabled && let Some(claims) = state.iap_bearer_claims_cache_entry(&token_key)? {
+        return Ok(claims);
+    }
+    let refresh_lock = if cache_enabled {
+        Some(state.iap_bearer_claims_refresh_lock(&token_key)?)
+    } else {
+        None
+    };
+    let _refresh = match refresh_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if cache_enabled && let Some(claims) = state.iap_bearer_claims_cache_entry(&token_key)? {
+        return Ok(claims);
+    }
+
+    let issuers = state.accepted_issuers(headers).await?;
+    let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
+    let claims = state
+        .jwt
+        .verify_access_token_for_generic_bearer(token, &issuer_refs)?;
+    // The cross-domain legacy edge profile is deliberately bearer-only. A
+    // cnf-bound token would require the edge to forward and validate a DPoP
+    // proof for this concrete endpoint; rejecting it is safer than silently
+    // weakening the sender-constrained token.
+    if claims.cnf.is_some() {
+        return Err(AppError::Unauthorized);
+    }
+    // Login-code tokens model account recovery/trial/admin bootstrap powers,
+    // not a durable browser login. Keep the same fail-closed boundary used by
+    // SCIM, Billing, and token exchange so an IAP edge cannot upgrade one of
+    // those temporary capabilities into a normal legacy-site session.
+    if claims.gpt_sso_login_code_level.is_some() {
+        return Err(AppError::Unauthorized);
+    }
+    // The reference edge authenticates the human directly. Delegated RFC
+    // 8693 tokens carry a different actor trust boundary and must not be
+    // upgraded into an interactive legacy-site session.
+    if claims.act.is_some() {
+        return Err(AppError::Unauthorized);
+    }
+    if cache_enabled {
+        state.store_iap_bearer_claims_cache_entry(token_key, claims.clone())?;
+    }
+    Ok(claims)
+}
+
+pub(crate) async fn live_iap_bearer_user_from_claims(
+    state: &AppState,
+    claims: &crate::jwt::TokenClaims,
+) -> AppResult<UserRecord> {
+    let source_client = state.db.find_client_by_client_id(&claims.client_id).await?;
+    if !oidc_token_liveness::introspected_access_token_is_live(
+        state,
+        source_client.as_ref(),
+        claims,
+    )
+    .await?
+    {
+        return Err(AppError::Unauthorized);
+    }
+    let user = load_active_user(state, &claims.sub).await?;
+    Ok(user)
+}
+
 pub(crate) use oidc_values::normalize_resource;
 use oidc_values::{merge_token_resource, resolve_client_credentials_audience};
 use serde::Deserialize;

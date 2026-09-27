@@ -1,7 +1,7 @@
 use super::{
     AppError, AppResult, ClientClaimMapperRecord, ClientRecord, CountRow, DatabaseKind, Db,
-    NewClientClaimMapper, SessionMetadata, SessionRecord, UserSessionSummary, bind_text_list,
-    blocking, ph, placeholders, select_client_claim_mapper_sql,
+    IapSessionPrincipalRow, NewClientClaimMapper, SessionMetadata, SessionRecord, UserRecord,
+    UserSessionSummary, bind_text_list, blocking, ph, placeholders, select_client_claim_mapper_sql,
 };
 use crate::util;
 use diesel::{
@@ -219,6 +219,72 @@ impl Db {
                 .bind::<BigInt, _>(now)
                 .get_result::<SessionRecord>(&mut conn)
                 .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    /// Resolve the only account/session shape IAP is allowed to accept in a
+    /// single database round trip. Restricted authorization-code sessions,
+    /// archived accounts and trial-enrollment identities deliberately do not
+    /// match this projection; callers can fall back to the general auth path
+    /// when they need the precise denial reason.
+    pub async fn find_standard_iap_session_by_credential(
+        &self,
+        credential_id: &str,
+    ) -> AppResult<Option<(SessionRecord, UserRecord)>> {
+        let credential_id = credential_id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT sessions.id AS session_id, sessions.user_id AS session_user_id, sessions.csrf_token AS session_csrf_token, sessions.ip_address AS session_ip_address, sessions.user_agent AS session_user_agent, sessions.login_method AS session_login_method, sessions.expires_at AS session_expires_at, sessions.created_at AS session_created_at, users.id AS user_id, users.email AS user_email, users.username AS user_username, users.display_name AS user_display_name, users.phone AS user_phone, users.password_hash AS user_password_hash, users.email_verified_at AS user_email_verified_at, users.phone_verified_at AS user_phone_verified_at, users.is_admin AS user_is_admin, users.is_active AS user_is_active, users.archived_at AS user_archived_at, users.registration_source AS user_registration_source, users.last_login_at AS user_last_login_at, users.last_login_ip AS user_last_login_ip, users.last_oidc_client_id AS user_last_oidc_client_id, users.last_login_method AS user_last_login_method, users.created_at AS user_created_at, users.updated_at AS user_updated_at FROM sessions INNER JOIN users ON users.id = sessions.user_id WHERE (sessions.id = {} OR sessions.id = (SELECT session_id FROM session_credentials WHERE credential_id = {} AND expires_at >= {})) AND sessions.expires_at >= {} AND users.is_active = 1 AND users.archived_at IS NULL AND COALESCE(sessions.login_method, '') <> 'authorization_code' AND NOT EXISTS (SELECT 1 FROM trial_enrollments WHERE trial_enrollments.user_id = users.id) LIMIT 1",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4),
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&credential_id)
+                .bind::<Text, _>(&credential_id)
+                .bind::<BigInt, _>(now)
+                .bind::<BigInt, _>(now)
+                .get_result::<IapSessionPrincipalRow>(&mut conn)
+                .optional()
+                .map(|row| {
+                    row.map(|row| {
+                        (
+                            SessionRecord {
+                                id: row.session_id,
+                                user_id: row.session_user_id,
+                                csrf_token: row.session_csrf_token,
+                                ip_address: row.session_ip_address,
+                                user_agent: row.session_user_agent,
+                                login_method: row.session_login_method,
+                                expires_at: row.session_expires_at,
+                                created_at: row.session_created_at,
+                            },
+                            UserRecord {
+                                id: row.user_id,
+                                email: row.user_email,
+                                username: row.user_username,
+                                display_name: row.user_display_name,
+                                phone: row.user_phone,
+                                password_hash: row.user_password_hash,
+                                email_verified_at: row.user_email_verified_at,
+                                phone_verified_at: row.user_phone_verified_at,
+                                is_admin: row.user_is_admin,
+                                is_active: row.user_is_active,
+                                archived_at: row.user_archived_at,
+                                registration_source: row.user_registration_source,
+                                last_login_at: row.user_last_login_at,
+                                last_login_ip: row.user_last_login_ip,
+                                last_oidc_client_id: row.user_last_oidc_client_id,
+                                last_login_method: row.user_last_login_method,
+                                created_at: row.user_created_at,
+                                updated_at: row.user_updated_at,
+                            },
+                        )
+                    })
+                })
                 .map_err(AppError::from)
         })
     }

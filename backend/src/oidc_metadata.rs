@@ -1,9 +1,11 @@
 use super::absolute;
-use crate::{
-    AppState, assurance, authorization_details, client_assertion, dpop, error::AppResult,
-    oidc_claims, subject,
+use crate::{AppState, assurance, client_assertion, dpop, error::AppResult, oidc_claims, subject};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
 };
-use axum::{Json, extract::State, http::HeaderMap};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -52,8 +54,7 @@ pub(super) async fn discovery(
     headers: HeaderMap,
 ) -> AppResult<Json<DiscoveryDocument>> {
     let issuer = state.effective_issuer(&headers).await?;
-    let authorization_details_types_supported =
-        authorization_details::supported_types_from_clients(&state.db.list_clients().await?)?;
+    let authorization_details_types_supported = state.oidc_authorization_details_types().await?;
     Ok(Json(DiscoveryDocument {
         issuer: issuer.clone(),
         authorization_endpoint: absolute(&issuer, &state.settings.oidc.authorization_endpoint),
@@ -112,6 +113,63 @@ pub(super) async fn discovery(
     }))
 }
 
-pub(super) async fn jwks(State(state): State<AppState>) -> Json<crate::jwt::Jwks> {
-    Json(state.jwt.jwks())
+pub(super) async fn jwks(
+    State(state): State<AppState>,
+    request_headers: HeaderMap,
+) -> AppResult<Response> {
+    let (jwks, etag) = state.jwt.jwks_snapshot()?;
+    let etag = format!("\"{etag}\"");
+    let cache_control = format!(
+        "public, max-age={}, must-revalidate",
+        state.settings.performance.public_jwks_cache_seconds
+    );
+    let mut response = if request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| if_none_match_matches(value, &etag))
+    {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Json(jwks).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).map_err(|_| {
+            crate::error::AppError::Internal("generated JWKS ETag is invalid".to_string())
+        })?,
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_str(&cache_control).map_err(|_| {
+            crate::error::AppError::Internal("generated JWKS cache policy is invalid".to_string())
+        })?,
+    );
+    Ok(response)
+}
+
+fn if_none_match_matches(value: &str, current: &str) -> bool {
+    let current = current.trim_start_matches("W/");
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::if_none_match_matches;
+
+    #[test]
+    fn jwks_if_none_match_uses_weak_comparison_and_lists() {
+        let current = "\"signet-jwks-abc\"";
+        assert!(if_none_match_matches(current, current));
+        assert!(if_none_match_matches("W/\"signet-jwks-abc\"", current));
+        assert!(if_none_match_matches(
+            "\"other\", W/\"signet-jwks-abc\"",
+            current
+        ));
+        assert!(if_none_match_matches("*", current));
+        assert!(!if_none_match_matches("\"other\"", current));
+    }
 }

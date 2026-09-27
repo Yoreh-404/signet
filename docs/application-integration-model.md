@@ -42,7 +42,25 @@ Signet 将接入分成四个相互独立的对象：
 - `X-Signet-Permissions`
 - `X-Signet-Assertion`
 
-上游不能只信任可由客户端伪造的普通 header。代理必须删除入站同名 header，并注入短期、受众限定的内部 assertion。上游若无法验证 assertion，应拒绝请求，而不是降级为匿名访问。
+浏览器直接携带的普通身份 header 一律不可信。代理必须删除入站同名 header，并注入短期、受众限定的内部 assertion。传统站有两种明确的信任终止方式，不能混用：
+
+- **端到端 assertion**：能修改旧站时，由旧站验证 assertion 的 signature、issuer、固定 expected audience、expiry 与 `token_use`，这是优先方案。
+- **代理终止兼容**：旧站完全无法修改时，受信反向代理本身就是身份执行点；业务 upstream 必须只在私网/Unix socket/受控服务网中可达，不能绕过代理，代理必须清除浏览器身份头、通过校验证书的 TLS 调用 Signet，再把 ForwardAuth 响应头注入旧站。此时旧站可以继续消费传统明文用户头，但信任的是“唯一可达的受信代理”，不是 header 本身。
+
+两种模式都必须 fail-closed；绝不能在 ForwardAuth/断言校验失败时把请求降级成匿名流量放行。
+
+`legacy_proxy` 的浏览器会话有两种部署边界，不能混淆：
+
+- **同 origin / 共享父域**：反向代理把 Signet 的 IAP 登录端点和登录 UI 暴露在受保护站点可持有 Cookie 的 origin 下，或部署明确且安全的共享 Cookie domain。此时可直接使用 Signet 原生 ForwardAuth，路径最短、延迟最低。共享父域模式会扩大浏览器发送 Session Cookie 的范围，因此业务 upstream 必须剥离 Signet Cookie，只允许应用自己的 Cookie 继续向后传。
+- **任意跨顶级域**：浏览器不会把 `sso.example.com` 的 host-only Cookie 发送给 `legacy.other-domain.com`。此时应在旧站前部署 OIDC-capable edge，由 edge 使用 Authorization Code + S256 PKCE 与中央 Signet 建立自己的站点会话，再向旧站注入可信身份。该 edge 可在 v3 contract 中继续使用 `legacy_proxy` profile，但 client `protocol=oidc`；Signet 会强制它是 public client、声明 `openid iap.assert`、禁止 `offline_access`。旧站代码仍然无需实现 OIDC。不要通过扩大 Cookie Domain、复制 Signet session cookie 或把长期 bearer token 暴露给浏览器来伪造“跨域共享会话”。
+
+跨域 edge 不需要复制 Signet 的 RBAC。它的 OIDC client 必须显式获授 `iap.assert` scope；edge 持有的短期 user access token 再调用 `/api/iap/bearer-auth`，Signet 会重新确认 token 对应 client/application lifecycle 仍然有效、token 的 `application_id` 与目标 IAP rule 属于同一个 application，并重新执行该 rule 的组织/角色/权限约束。成功后返回与原生 ForwardAuth 相同的 `X-Signet-Assertion` / identity header 集合。这样 edge 只承担浏览器协议和本地域会话，Identity/Policy authority 仍然只有 Signet 一份。
+
+仓库内正式实现是独立 `signet-edge` Rust sidecar；`scripts/oidc-edge-reference.mjs` 保留为可读的零第三方 Node 参考实现。两者都只提供 `/_signet/start`、`/_signet/callback`、`/_signet/auth`、`/_signet/logout`，**不代理业务流量**。Nginx 基线见 `docs/examples/nginx-oidc-edge.conf`。edge 使用 `__Host-` HttpOnly/Secure/SameSite=Lax 密封 Cookie 保存短期 access token，默认本地会话上限 600 秒且不会超过 Signet access token；业务 upstream 必须剥离该 Cookie。多个 edge 副本只需共享同一组轮换 Cookie keys 即可保持无状态水平扩展。
+
+因此 ForwardAuth 是高性能的**本地边缘适配器**，而不是跨 DNS 边界的 Cookie 传输协议；跨域 SSO 应通过标准授权协议跨边界。
+
+共享父域部署可直接从 [`examples/nginx-forward-auth.conf`](examples/nginx-forward-auth.conf) 起步。模板按“浏览器身份头全部不可信、ForwardAuth 响应头才可信”的方向配置，避免传统反向代理最常见的 header spoofing 误接入。
 
 ### `web_oidc`
 
@@ -119,7 +137,8 @@ Signet 将接入分成四个相互独立的对象：
 
 ### 客户端安全规则
 
-- 每个 Client 必须声明 `protocol`；当前支持 `oidc`、`saml`、`cas`、`jwt`、`iap` 和 `forward_auth`。
+- 每个 Client 必须声明 `protocol`；v3 website-managed Client 当前只支持 `oidc` 和 `jwt`。只有这两类协议拥有真实的 client lifecycle/binding 语义。
+- SAML 2.0、CAS、SCIM/LDAP 等应用级适配器放在 `modules.connections`；ForwardAuth/IAP 的代理路由和内部 assertion audience 属于 operator-managed 控制面，不伪装成可由网站声明的 Client。
 - `protocol` 决定运行时 Application Binding 使用的传输协议，`profiles` 只描述该 Client 的接入能力，不再隐式推断协议。
 - v3 不接受 `client_secret` 字段。
 - v3 当前只允许 `none` 和 `private_key_jwt` 两种 token endpoint authentication method。
@@ -127,6 +146,8 @@ Signet 将接入分成四个相互独立的对象：
   接受 RSA/RS256 公钥。应用私钥只留在 worker 或 Web 服务，不进入清单。
 - confidential client 只能由 Signet 运维侧预注册；application contract 不承载共享 secret，v3 的 `credential_ref` 字段在 resolver 完成前拒绝。
 - `spa_oidc` 必须声明 authorization code、code response type 和 S256 PKCE。
+- `legacy_proxy` 的同域默认接入方式仍是 operator-managed ForwardAuth；它不需要网站发布一个假的 `forward_auth` Client。跨顶级域时可声明 `protocol = oidc` 的 legacy edge client，必须是 public Authorization Code + S256 PKCE client，scope 至少包含 `openid iap.assert` 且不得包含 `offline_access`。确实只能消费旧式 signed JWT 的网站仍可声明 `protocol = jwt`；该兼容档同样使用一次性 Authorization Code + S256 PKCE，再由站点后端换取短期 JWT，JWT 不进入浏览器 URL。
+- application-scoped JWT adapter 当前每个应用只允许一个 browser client；`client_id`、精确 `redirect_uris` 和首个 audience 直接从签名 v3 client contract 物化到 runtime module，不能由旁路 connection setting 覆盖。public client 不接受 `client_secret`。
 - `machine_identity` 必须声明 `client_credentials`。
 - machine identity 只能获得显式 `policy.client_ids` 绑定的 permissions；未绑定的 policy 不会自动授予机器客户端。
 - redirect URI 不能使用 wildcard、fragment 或公网 HTTP；本地开发 HTTP 只允许 localhost 地址。
@@ -147,12 +168,14 @@ Browser
   -> Legacy Website
 ```
 
-传统网站只需验证内部 assertion，并将 claims 映射到自己的 session。它不需要实现 OIDC，但必须：
+可修改的传统网站只需验证内部 assertion，并将 claims 映射到自己的 session；完全不可修改的网站则由受信代理终止认证并注入兼容 header。两种模式都不需要旧站实现 OIDC，并且必须满足对应的网络/密码学边界：
 
-1. 只接受来自受信代理网络的 assertion。
-2. 校验 issuer、audience、expiry、signature 和 subject。
-3. 不从 URL、普通客户端 header 或未签名 cookie 读取身份。
-4. 对 logout 和 session expiry 采用 fail-closed 行为。
+1. 旧站后端不能存在可绕过受信代理的公网/旁路入口。
+2. 能验证 assertion 时，校验 issuer、固定 expected audience、expiry、signature、`token_use` 和 subject。
+3. 不能验证 assertion 时，只接受代理清洗并重新注入的身份 header；浏览器原始同名 header 必须在代理处被覆盖/删除。
+4. 不从 URL 或未签名 cookie 读取 Signet 身份，并对 logout、session expiry 和 ForwardAuth 故障采用 fail-closed 行为。
+
+当前 ForwardAuth 将该内部 assertion 放在 `X-Signet-Assertion`，使用 Signet 的 RS256/JWKS 签名体系，`token_use=iap_assertion`，audience 固定为 `signet:iap:<immutable-rule-id>`。人类可读的 rule slug 仍保存在 claim 中，但不会承担生命周期隔离：即使旧 rule 被删除后重新创建同名 slug，旧 assertion 也无法匹配新 rule 的 audience。assertion 只投影该 rule 声明并验证通过的权限，不暴露用户在 Signet 控制面的完整权限集合。兼容代理仍可读取 `X-Auth-Request-*` / `X-Forwarded-*`，但这些明文头只能由受信代理从 ForwardAuth 响应生成；外部请求中的同名头必须先删除。默认 assertion TTL 为 30 秒，而 Signet 内部 session+rule 授权微缓存更短（默认 250ms）；缓存到期后若同一 key 已有请求正在刷新，其他并发请求最多再复用 100ms 的旧决定以削平惊群尾延迟。这个 grace 只在主动刷新期间存在，不成为 stale-on-error 或长期授权事实源。
 
 SAML、CAS 和旧式 JWT SSO 仍作为 connection adapter 存在；它们是传输兼容层，不改变 Signet 内部的 Identity/Policy 模型。
 `legacy_proxy`/ForwardAuth 的代理路由和内部 assertion audience 属于 Signet 的运维配置，
@@ -166,7 +189,7 @@ SAML、CAS 和旧式 JWT SSO 仍作为 connection adapter 存在；它们是传�
 | Memory Atlas | `api_resource` | introspection/JWT + required scopes |
 | Axon Hub | `web_oidc` + `machine_identity` | 用户会话与 worker 身份分离 |
 | OCR/后台 worker | `machine_identity` | client credentials + 最小权限 |
-| 旧管理后台 | `legacy_proxy` | ForwardAuth/IAP + internal assertion |
+| 旧管理后台 | `legacy_proxy` | 同域 ForwardAuth 或跨域 OIDC edge + IAP internal assertion |
 
 项目不需要实现所有协议；只声明实际使用的 profile，Signet 按 profile 生成对应的 endpoint、client policy 和 claims。
 

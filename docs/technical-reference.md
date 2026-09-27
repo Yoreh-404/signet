@@ -539,6 +539,33 @@ IAP 用于保护不支持 OIDC 的内部应用。后台 `IAP 应用` 页可登�
 - 可选组织和组织角色要求。
 - 可选后台权限要求，例如 `users.read`；空列表表示只要求已登录的有效 SSO 会话。
 
+### Cookie / origin 部署边界
+
+原生 ForwardAuth 使用 Signet 浏览器 Session，因此反向代理调用 `/api/iap/forward-auth` 时，请求中必须确实携带 Signet 能识别的 Session Cookie。最常见的零额外组件部署方式，是把 IAP 登录端点和 Signet 登录 UI 通过受保护站点的同一 origin 反代出来；若所有站点确实位于一个受控父域，也可以经过安全评审后配置共享 Cookie domain。
+
+共享 Cookie domain 会扩大 Session Cookie 的浏览器发送范围：同一父域下的兄弟站点也会收到该 bearer credential。反向代理可以把完整 Cookie 仅转给 Signet 的 ForwardAuth 子请求，但**不能**把完整 `$http_cookie` 再转给旧应用 upstream；旧应用确实需要自己的 Cookie 时应按名称显式 allowlist。若无法可靠隔离 Cookie，宁可使用 OIDC edge，也不要为了“零组件”扩大凭据暴露面。
+
+**不同顶级域之间不能共享 host-only Cookie。** `https://sso.example.com` 上已有的登录 Cookie 不会因为 Nginx/Traefik 在服务器端调用 Signet，就自动出现在 `https://legacy.example.net` 的浏览器请求里。对这类任意跨域旧站，应在站点边缘使用 OIDC Authorization Code + PKCE 建立 edge 自己的 HttpOnly 会话，再由 edge 注入身份/assertion；业务网站仍无需修改。不要把 Signet Session Cookie 复制到不相关域名，也不要通过 URL 携带长期 bearer token。
+
+选择规则可以简化为：**同 origin/共享父域 → 原生 ForwardAuth；任意跨域 → OIDC edge；应用本身已支持协议 → 直接 OIDC/SAML/CAS。**
+
+跨域 edge 使用普通 OIDC public client（Authorization Code + S256 PKCE），并显式申请 `iap.assert` scope。edge 获得的 user access token 不应转发给旧应用，而是仅用于调用：
+
+```text
+GET /api/iap/bearer-auth?target=https%3A%2F%2Flegacy.example.net%2Fprivate
+Authorization: Bearer <short-lived edge access token>
+```
+
+该接口只接受 Signet 自签发的普通、直接用户 bearer access token，不接受 DPoP `cnf` token、授权码登录/试用/恢复产生的临时 `gpt_sso_login_code_level` token，也不接受带 RFC 8693 `act` actor chain 的 delegated token；每次请求先本地验证签名/issuer/expiry，然后要求 `iap.assert` 精确 scope、token 的 `application_id` 与命中的 IAP rule application 完全一致，并在短授权缓存 miss 时重新检查 client/application/binding/user/grant lifecycle 和该 rule 的组织/角色/权限。成功响应同样是 `204`，并返回与 `/api/iap/forward-auth` 相同的 `X-Auth-Request-*`、`X-Signet-*` 和短期 `X-Signet-Assertion`。因此任意其它合法 OIDC client 的 token 不能跨应用换取 assertion，也不能把临时/委托能力升级成浏览器旧站会话。
+
+bearer edge 与浏览器 Session ForwardAuth 共享同一套 250ms 授权微缓存、per-key single-flight、100ms stale-while-refresh 和 IAP routing generation；cache key 使用 access token `jti`（无 `jti` 时使用 token SHA-256）而不是原始 bearer。token signature/expiry 仍逐请求本地验证，DB liveness 仅在短缓存 miss 时执行。应用/IAP rule 本实例变更会递增 generation，使旧 in-flight refresh 即使晚到也只能写入旧代 key。
+
+正式 sidecar 是 workspace 内独立的 `signet-edge` Rust crate（Nix `packages.edge`，容器产物 `packages.edgeImage`）。它无数据库、无前端、无业务反代职责，只终止 OIDC/edge session 并调用 Signet IAP；`scripts/oidc-edge-reference.mjs` 保留为零第三方 Node 参考实现，便于审阅协议或在已有 Node 环境快速验证。Nginx 示例见 [`examples/nginx-oidc-edge.conf`](examples/nginx-oidc-edge.conf)，最小权限容器示例见 [`examples/compose-oidc-edge.yml`](examples/compose-oidc-edge.yml)。生产部署至少配置 `SIGNET_EDGE_PUBLIC_ORIGIN`、`SIGNET_EDGE_ISSUER`、`SIGNET_EDGE_CLIENT_ID`，并通过 `SIGNET_EDGE_COOKIE_KEYS_FILE`（推荐）或 `SIGNET_EDGE_COOKIE_KEYS` 提供 Cookie key ring；两者同时存在时 edge 会 fail closed。key material 是逗号分隔的 32-byte canonical unpadded base64url key 列表，首个 key 用于新 Cookie，加密解密使用 AES-256-GCM，旧 key 可在轮换窗口内继续解密。secret file 必须是普通文件且最大 16 KiB。edge Cookie 名强制使用 `__Host-` 前缀，并带 `Secure`、`HttpOnly`、`SameSite=Lax` 且无 Domain；业务 upstream 必须剥离它。`SIGNET_EDGE_MAX_SESSION_SECONDS` 默认 600 秒、硬上限 3600 秒，且实际会话始终进一步受 access token 剩余寿命约束。为保证 PKCE state Cookie 始终处于浏览器安全尺寸内，登录 `return_to` 规范化后最多 2048 bytes。
+
+reference edge 默认只请求 `openid iap.assert`，并拒绝 `offline_access`。因此旧站域只保存与短期 access token 同寿命的加密 HttpOnly 会话；access token 到期后依靠中央 Signet SSO Cookie 重新走 Authorization Code + S256 PKCE，而不是在旧站域持久保存 refresh token。
+
+website-managed v3 应把这个 edge 声明为 `profiles=["legacy_proxy"]`、`protocol="oidc"` 的 public client；Signet contract validator 会强制 Authorization Code、S256 PKCE、精确 HTTPS callback、`openid iap.assert`，拒绝 `offline_access`，并要求 access-token audience 保持为该 edge 的 `client_id`。专门发给其它 API resource 的 token 因此不能复用为 IAP credential。完整示例见 [`examples/application-v3-legacy-edge.json`](examples/application-v3-legacy-edge.json)。IAP host/path/rule 仍由 operator-managed 控制面创建，网站 contract 只能声明 edge client，不能自行扩大受保护路由或 assertion audience。
+
 反向代理把受保护请求转到：
 
 ```text
@@ -558,8 +585,27 @@ X-Auth-Request-User
 X-Auth-Request-Email
 X-Auth-Request-User-Id
 X-Auth-Request-Name
+X-Forwarded-User
+X-Forwarded-Email
 X-GPT-SSO-IAP-Application
+X-Signet-Subject
+X-Signet-Email
+X-Signet-Name
+X-Signet-Organization
+X-Signet-Roles
+X-Signet-Permissions
+X-Signet-Assertion
+X-Signet-Assertion-Audience
+X-Signet-Assertion-Expires-In
 ```
+
+`X-Auth-Request-*` 与 `X-Forwarded-*` 保留给现有 Nginx、Traefik、Apache 等传统接入方式；`X-Signet-*` 是新的强信任边界。`X-Signet-Assertion` 是使用 Signet 当前 RS256 signing key 签名的短期 JWT，公钥仍通过 `/oauth2/jwks` 发布。默认 audience 为 `signet:iap:<immutable-iap-rule-id>`，`token_use` 固定为 `iap_assertion`，并携带 subject、公开 session handle、IAP rule slug、host/path 边界、组织、角色以及 **该 IAP rule 显式要求且已验证通过的权限**。使用不可复用的 rule ID 作为 audience，可防止删除 rule 后复用相同 slug 时把旧 assertion 带入新的 rule 生命周期。默认有效期 30 秒，可通过 `security.iap_assertion_ttl_seconds` / `SSO_IAP_ASSERTION_TTL_SECONDS` 在 5–300 秒范围调整。
+
+受信反向代理必须删除浏览器请求中自带的 `X-Auth-Request-*`、`X-Forwarded-User`、`X-Forwarded-Email` 和 `X-Signet-*` 身份头，只把 ForwardAuth **响应**中的值重新注入上游。能修改旧应用时，应优先在应用内验证 `X-Signet-Assertion` 的 signature、issuer、audience、expiry 与 `token_use`，而不是单独信任明文用户头；expected audience 必须来自该旧应用自身的静态部署配置（例如固定的 `signet:iap:<rule-id>`），不能把请求同时携带的 `X-Signet-Assertion-Audience` 当作 expected audience，该 header 只用于观测和排障。对于完全不可修改、只能消费传统 header 的应用，可以让受信代理终止认证，但此时业务 upstream 必须不可被公网或旁路网络直接访问，且到 Signet 的 ForwardAuth HTTPS 连接必须验证服务端证书；明文身份头的可信度来自这个封闭代理边界，而不是 header 自身。ForwardAuth 响应带 `Cache-Control: no-store`；不要让 CDN 或共享 HTTP cache 缓存用户身份决策。
+
+共享父域 Cookie 的 Nginx 安全基线见 [`examples/nginx-forward-auth.conf`](examples/nginx-forward-auth.conf)。示例显式覆盖当前所有身份头、把 `401` 中由 Signet 生成的本地登录路径固定前缀为中央 SSO origin，并要求业务 upstream 只能经受信代理访问。跨顶级域不要套用该模板，应使用 OIDC Code + PKCE edge session。
+
+ForwardAuth 热路径使用两层有界运行时加速，而数据库仍是唯一事实源：IAP 路由表默认缓存 1 秒并预编译 exact-host 索引；路由 TTL 到期时由单个请求刷新，其他并发请求只在该刷新实际进行期间最多额外复用 100ms 的旧路由快照，避免整批资源请求排队等待同一次控制面数据库读取。这个路由 grace 不会在刷新失败后继续兜底，本实例通过管理接口修改 IAP 配置时也会立即清空路由与授权缓存。同一浏览器 session + IAP rule 的并发资源请求默认使用 250ms 授权微缓存和 per-key single-flight，避免一次页面加载为每个静态资源重复读取 session、用户和授权数据。授权软 TTL 到期时也只有一个请求回源刷新；若同一 key 已经在刷新，其余并发请求最多可在额外 100ms 的 `stale-while-refresh` 窗口内复用上一份仍未超过真实 session expiry 的决定，从而避免所有请求排在同一 mutex 后形成尾延迟尖峰。两个 grace 都**只在对应刷新正在进行时生效**，不存在 stale-on-error 降级。`performance.iap_routing_cache_millis`、`performance.iap_routing_stale_while_refresh_millis`、`performance.iap_authorization_cache_millis`、`performance.iap_authorization_stale_while_refresh_millis` 和相应环境变量可调；将对应 stale-while-refresh 设为 `0` 可关闭。默认情况下远端路由变更的跨副本传播窗口约为 1s + 100ms，远端权限变更/登出的最坏授权缓存传播窗口约为 250ms + 100ms，真实 session 到期时间绝不会被延长。
 
 未登录时返回 `401`，并通过 `Location` / `X-Auth-Request-Redirect` 指向 `/api/iap/start?return_to=...`。用户完成 `/login` 后会进入 `/api/iap/finish`，后端再次校验目标 URL 已配置且当前用户满足组织/权限要求，再跳回原应用，避免开放重定向。
 
@@ -588,7 +634,27 @@ GET /api/admin/signing-keys
 POST /api/admin/signing-keys
 ```
 
-管理 API 只返回 `id`、`kid`、active/retired 状态和时间戳，不返回私钥。轮换时后端会在一个事务里退役旧 active key 并创建新 active key，然后立即刷新内存签名器；`/oauth2/jwks` 会继续发布 active 和 retired 公钥，使旧 token 在过期前仍可验证。
+管理 API 只返回 `id`、`kid`、active/retired 状态和时间戳，不返回私钥。轮换时后端会在一个事务里退役旧 active key 并创建新 active key，然后立即刷新当前实例的内存签名器；其他 Signet 副本默认每 2 秒只读取一次 `kid + active` 元数据，发现变化后才读取私钥材料并原子替换内存 key-set。轮询间隔由 `performance.signing_key_sync_seconds` / `SSO_SIGNING_KEY_SYNC_SECONDS` 控制。
+
+`/oauth2/jwks` 会继续发布 active 和 retired 公钥，使旧 token 在过期前仍可验证。JWKS JSON 和 ETag 在 key-set 构建/轮换时预计算，普通请求不会重新解析私钥或重建公钥集合；端点支持 `If-None-Match`，匹配时返回 `304 Not Modified`。默认响应为 `Cache-Control: public, max-age=15, must-revalidate`，可通过 `performance.public_jwks_cache_seconds` / `SSO_PUBLIC_JWKS_CACHE_SECONDS` 在 1–300 秒范围调整。密钥集合发生变化时 ETag 立即变化。
+
+高并发 token 签发和验签只在选择当前 `Arc<KeyMaterial>` 快照时短暂持有 key-set `RwLock`；RSA sign/verify 在锁外执行，因此密钥轮换不会等待正在进行的密码学计算全部结束。
+
+## 运行时性能缓存
+
+`[performance]` 只缓存低频控制面投影，不引入第二套身份或授权事实源：
+
+- `runtime_settings_cache_millis`：公网 URL / issuer 等运行设置，默认 1000ms；本实例修改后立即失效。
+- `iap_routing_cache_millis`：IAP 规则预编译路由索引，默认 1000ms；exact host 使用哈希索引，wildcard 保留最长 path-prefix 语义。
+- `iap_authorization_cache_millis`：同一 session + IAP rule 的 ForwardAuth 授权微缓存，默认 250ms；不延长真实 session expiry，可设为 `0` 完全关闭。
+- `iap_authorization_stale_while_refresh_millis`：仅当同一 session + rule 已有请求正在回源刷新时允许复用上一决定的额外 grace，默认 100ms、最大 1000ms；可设为 `0` 关闭。它不在刷新失败后继续放行。
+- `iap_authorization_cache_max_entries`：授权微缓存容量，默认 8192；满载时淘汰最旧项。
+- `oidc_metadata_cache_millis`：OIDC discovery 中从 client 表派生的 `authorization_details_types_supported`，默认 1000ms，避免每次 discovery 加载整张 client 表。
+- `client_jwks_*`：远程 `private_key_jwt` / JAR JWKS 的 ETag、Cache-Control、容量和 bounded stale-if-error 策略；`no-store`、`no-cache`、`must-revalidate` 与 `Age` 都会参与缓存决策。
+- `public_jwks_cache_seconds`：Signet 自身 `/oauth2/jwks` 的公网缓存时间，默认 15 秒。
+- `signing_key_sync_seconds`：多副本 signing-key 元数据收敛轮询，默认 2 秒。
+
+上述短 TTL 同时给无 Redis 部署提供有界的跨副本收敛窗口。安全敏感事实仍从数据库、session 生命周期和签名 token 得出；缓存失效只影响性能与极短的配置传播延迟，不改变权限模型。
 
 ## 审计 Webhook
 
@@ -1062,6 +1128,48 @@ SCENARIO=lifecycle \
 ALLOW_DESTRUCTIVE_SMOKE=1 \
 node scripts/browser-smoke.mjs
 ```
+
+`scripts/perf-smoke.mjs` 使用 Node 内置 `fetch` 做轻量、可重复的 HTTP 性能基线，不依赖 `wrk`/`hey`。默认覆盖 readiness、OIDC discovery、JWKS 200 和支持 ETag 时的 JWKS 304；提供会话 Cookie 和目标 URL 后还会覆盖 ForwardAuth。它不是容量规划工具，主要用于升级前后快速发现明显的延迟、吞吐或缓存语义回归：
+
+```bash
+SIGNET_PERF_BASE_URL=http://127.0.0.1:18080 \
+SIGNET_PERF_REQUESTS=1000 \
+SIGNET_PERF_CONCURRENCY=32 \
+node scripts/perf-smoke.mjs
+
+# 可选：对已配置的 IAP rule 测试 ForwardAuth。Cookie 只通过环境变量传入，
+# 脚本不会打印其值。
+SIGNET_PERF_COOKIE='gpt_sso_session=...' \
+SIGNET_PERF_FORWARD_AUTH_TARGET=https://legacy.example.com/private \
+SIGNET_PERF_STRICT=1 \
+node scripts/perf-smoke.mjs
+```
+
+`SIGNET_PERF_WARMUP_REQUESTS` 控制每个场景的预热请求数，`SIGNET_PERF_TIMEOUT_MS` 控制单请求超时；`SIGNET_PERF_JSON=1` 可追加机器可读结果。`SIGNET_PERF_STRICT=1` 时任一测量请求返回非预期状态或网络错误都会令进程失败，适合 canary/CI 门禁。
+
+ForwardAuth 还有一个不走真实登录凭据的 SQLite A/B harness。它直接使用 Signet 的真实数据库、Session、IAP Router 和 JWT 代码创建一次性 fixture，并比较“全部关闭缓存”、“仅控制面缓存”和“完整微缓存”三种配置。测试默认 `ignore`，不会拖慢普通 CI：
+
+```bash
+SIGNET_PERF_REQUESTS=2000 \
+SIGNET_PERF_CONCURRENCY=32 \
+cargo test -p sso-backend --test performance_hot_paths -- --ignored --nocapture
+
+# 只持续压完整缓存路径，适合跨越多次 250ms 授权刷新周期观察尾延迟。
+SIGNET_PERF_PROFILE=full-cache \
+SIGNET_PERF_REQUESTS=100000 \
+SIGNET_PERF_CONCURRENCY=32 \
+cargo test -p sso-backend --test performance_hot_paths -- --ignored --nocapture
+```
+
+这个 harness 在 Debug profile 下也能验证同一 binary、同一数据库、只切缓存策略后的**相对差异**，但 Debug 的 RSA 性能和绝对 RPS 不能用于生产容量规划。正式容量数据应使用与部署相同的 release 镜像和外部负载发生器。
+
+`scripts/multireplica-key-smoke.sh` 会在独立 Linux network namespace 和一次性 SQLite 数据库中启动两个 Signet 进程，在主实例轮换 signing key，并确认第二实例通过轻量 signing-key metadata sync 自动刷新 JWKS、继续发布 retired key，同时支持 `If-None-Match` → `304`。它不会连接当前运行中的 Signet 数据库；默认使用 `target/release/sso-backend`，也可以用 `SIGNET_SMOKE_BINARY` 指定候选二进制：
+
+```bash
+bash scripts/multireplica-key-smoke.sh
+```
+
+IAP assertion 中的 `permissions`/`X-Signet-Permissions` 是 **IAP rule 显式要求并已验证通过的权限集合**，不是用户在 Signet 控制面里的全部全局权限。这样传统网站只收到其接入契约所需的最小权限投影；未配置组织约束的 rule 也不会为了构造响应去枚举用户的全部组织。
 
 ## 当前验证状态
 

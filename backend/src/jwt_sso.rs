@@ -137,6 +137,7 @@ async fn token(
 ) -> AppResult<Json<TokenResponse>> {
     let (application, config) = load_application(&state, &app_slug).await?;
     let client_id = configured_client_id(&application, &config)?;
+    ensure_jwt_client_is_active(&state, &application, &config, &client_id).await?;
     if request.grant_type.trim() != "authorization_code" {
         return Err(AppError::BadRequest(
             "grant_type must be authorization_code".to_string(),
@@ -250,7 +251,9 @@ async fn jwks(
     // boundary as authorization and token exchange.  The key material is
     // public, but an inactive or unconfigured website must not continue to
     // advertise a live JWT integration to relying parties.
-    let _ = load_application(&state, &app_slug).await?;
+    let (application, config) = load_application(&state, &app_slug).await?;
+    let client_id = configured_client_id(&application, &config)?;
+    ensure_jwt_client_is_active(&state, &application, &config, &client_id).await?;
     Ok(Json(state.jwt.jwks()))
 }
 
@@ -267,6 +270,19 @@ async fn ensure_jwt_client_is_active(
     config: &Map<String, Value>,
     client_id: &str,
 ) -> AppResult<()> {
+    // v3 website-managed JWT clients live in the ordinary client aggregate.
+    // Resolve that boundary first so client deactivation, application
+    // lifecycle changes, or a protocol rebinding immediately fail closed.
+    // The legacy application_jwt_clients table remains as a compatibility
+    // fallback only when no ordinary client with this public id exists.
+    if let Some(client) = state.db.find_client_by_client_id(client_id).await? {
+        let bound_application =
+            applications::authorize_application_client(state, &client, "jwt").await?;
+        if bound_application.id != application.id {
+            return Err(AppError::Forbidden);
+        }
+        return Ok(());
+    }
     if let Some(client) = state
         .db
         .find_application_jwt_client(&application.id, client_id)
@@ -472,6 +488,7 @@ mod tests {
         http::{HeaderValue, Request, StatusCode, header},
         response::Response,
     };
+    use std::collections::BTreeMap;
     use tower::ServiceExt;
 
     #[test]
@@ -538,7 +555,7 @@ mod tests {
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        (AppState { settings, db, jwt }, path)
+        (AppState::new(settings, db, jwt), path)
     }
 
     #[cfg(feature = "sqlite")]
@@ -577,6 +594,101 @@ mod tests {
                 "token_ttl_seconds": 300
             }
         })
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn website_jwt_client(organization_id: &str, active: bool) -> crate::db::NewClient {
+        crate::db::NewClient {
+            client_id: "jwt-v3-client".to_string(),
+            client_secret_hash: None,
+            client_name: "JWT v3 client".to_string(),
+            logo_uri: String::new(),
+            organization_id: Some(organization_id.to_string()),
+            redirect_uris: vec!["https://portal.example.test/callback".to_string()],
+            post_logout_redirect_uris: Vec::new(),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            audience: "https://portal.example.test".to_string(),
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: "none".to_string(),
+            require_pkce: true,
+            require_mfa: false,
+            require_pushed_authorization_requests: false,
+            require_s256_pkce: true,
+            require_confidential_client: false,
+            require_dpop: false,
+            require_account_selection: false,
+            trust_email_verified: false,
+            authorization_details_types: Vec::new(),
+            subject_type: "public".to_string(),
+            sector_identifier_uri: String::new(),
+            jwks_uri: String::new(),
+            jwks: String::new(),
+            backchannel_logout_uri: String::new(),
+            backchannel_logout_session_required: false,
+            frontchannel_logout_uri: String::new(),
+            frontchannel_logout_session_required: false,
+            service_account_enabled: false,
+            service_account_permissions: Vec::new(),
+            is_active: active,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn website_jwt_manifest(
+        client: crate::db::NewClient,
+        revision: i64,
+        protocol_enabled: bool,
+    ) -> crate::db::ApplicationDiscoveryManifest {
+        let client_id = client.client_id.clone();
+        let mut profiles = BTreeMap::new();
+        let profile = crate::db::ApplicationDiscoveryProfile {
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        };
+        profiles.insert("default".to_string(), profile.clone());
+        profiles.insert(client_id.clone(), profile);
+        crate::db::ApplicationDiscoveryManifest {
+            revision,
+            version: format!("v{revision}"),
+            digest: format!("jwt-v3-digest-{revision}"),
+            expires_at: util::now_ts() + 300,
+            revoke_removed_clients: true,
+            clients: vec![client],
+            client_protocols: [(client_id.clone(), "jwt".to_string())]
+                .into_iter()
+                .collect(),
+            protocols: serde_json::json!({
+                "website_url": "https://portal.example.test",
+                "jwt": {
+                    "enabled": protocol_enabled,
+                    "client_ids": [client_id],
+                    "client_id": "jwt-v3-client",
+                    "client_type": "public",
+                    "audience": "https://portal.example.test",
+                    "redirect_uris": ["https://portal.example.test/callback"]
+                }
+            }),
+            login_adapters: serde_json::json!({
+                "enabled": true,
+                "allow_signet_password": true,
+                "provider_ids": []
+            }),
+            directory_sync: serde_json::json!({
+                "enabled": false,
+                "scim_enabled": false,
+                "sync_groups": false
+            }),
+            authorization: serde_json::json!({
+                "inherit_enterprise_roles": true,
+                "permissions": [],
+                "denied_permissions": [],
+                "claims": []
+            }),
+            authorization_mappings: Default::default(),
+            profiles,
+            redacted_payload: serde_json::json!({"revision": revision}),
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -761,6 +873,151 @@ mod tests {
         )
         .await;
         assert_eq!(missing_protocol.status(), StatusCode::NOT_FOUND);
+
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn website_managed_jwt_client_uses_v3_binding_and_deactivation_fails_closed() {
+        let (state, path) = http_test_state().await;
+        let organization = state
+            .db
+            .insert_organization(crate::db::NewOrganization {
+                slug: "jwt-v3-org".to_string(),
+                name: "JWT v3 Org".to_string(),
+                kind: crate::organizations::ORGANIZATION_KIND_TENANT.to_string(),
+                description: None,
+                allowed_email_domains: Vec::new(),
+                is_active: true,
+            })
+            .await
+            .unwrap();
+        let application = state
+            .db
+            .insert_application(jwt_application(&organization.id))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_application_discovery(crate::db::NewApplicationDiscovery {
+                application_id: application.id.clone(),
+                management_mode: crate::application_discovery_contract::MANAGEMENT_MODE_WEBSITE
+                    .to_string(),
+                website_url: "https://portal.example.test".to_string(),
+                fetch_secret_ciphertext: "test-fetch-secret".to_string(),
+                signing_public_jwks: "{}".to_string(),
+                last_verified_revision: None,
+                last_verified_version: None,
+                last_verified_digest: None,
+                last_verified_expires_at: None,
+                sync_status: crate::application_discovery_contract::SYNC_PENDING.to_string(),
+                last_fetched_at: None,
+                last_success_at: None,
+                last_error: None,
+                snapshot_json: None,
+                operator_disabled: false,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .apply_application_contract(
+                &application.id,
+                website_jwt_manifest(website_jwt_client(&organization.id, true), 1, true),
+            )
+            .await
+            .unwrap();
+
+        let binding = state
+            .db
+            .find_application_client_binding_by_public_client_id("jwt-v3-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.application_id, application.id);
+        assert_eq!(binding.protocol, "jwt");
+
+        let user = state
+            .db
+            .insert_user(crate::db::NewUser {
+                email: "jwt-v3@example.test".to_string(),
+                username: "jwt-v3".to_string(),
+                display_name: Some("JWT v3".to_string()),
+                phone: None,
+                password_hash: "test-hash".to_string(),
+                email_verified_at: Some(util::now_ts()),
+                phone_verified_at: None,
+                is_admin: false,
+                is_active: true,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        let (_session, cookie_value) = state
+            .db
+            .insert_session(&user.id, 600, crate::db::SessionMetadata::default())
+            .await
+            .unwrap();
+        let cookie = format!("{}={cookie_value}", state.settings.security.cookie_name);
+        let verifier = "z".repeat(43);
+        let challenge = util::sha256_base64url(&verifier);
+        let authorize_uri = |slug: &str| {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query
+                .append_pair("client_id", "jwt-v3-client")
+                .append_pair("redirect_uri", "https://portal.example.test/callback")
+                .append_pair("response_type", "code")
+                .append_pair("state", "v3-state")
+                .append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256");
+            format!("/jwt/{slug}/authorize?{}", query.finish())
+        };
+
+        let active_response = jwt_http_request(
+            &routes().with_state(state.clone()),
+            Request::builder()
+                .uri(authorize_uri(&application.slug))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(active_response.status(), StatusCode::SEE_OTHER);
+
+        // Keep the protocol module deliberately enabled while deactivating
+        // the ordinary v3 client. This models stale/corrupt module state and
+        // proves the runtime boundary itself still fails closed rather than
+        // silently falling back to the legacy public-client behavior.
+        state
+            .db
+            .apply_application_contract(
+                &application.id,
+                website_jwt_manifest(website_jwt_client(&organization.id, false), 2, true),
+            )
+            .await
+            .unwrap();
+        let inactive_response = jwt_http_request(
+            &routes().with_state(state.clone()),
+            Request::builder()
+                .uri(authorize_uri(&application.slug))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(inactive_response.status(), StatusCode::FORBIDDEN);
+
+        let inactive_jwks = jwt_http_request(
+            &routes().with_state(state.clone()),
+            Request::builder()
+                .uri(format!("/jwt/{}/jwks", application.slug))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(inactive_jwks.status(), StatusCode::FORBIDDEN);
 
         drop(state);
         let _ = std::fs::remove_file(path);

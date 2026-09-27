@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 #[derive(Clone)]
 pub struct JwtManager {
@@ -24,10 +26,80 @@ pub struct JwtManager {
     key_set: Arc<RwLock<JwtKeySet>>,
 }
 
+pub struct SigningKeySyncWorker {
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl SigningKeySyncWorker {
+    pub async fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+pub fn spawn_signing_key_sync(
+    db: crate::db::Db,
+    jwt: JwtManager,
+    interval_seconds: u64,
+) -> SigningKeySyncWorker {
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let interval = Duration::from_secs(interval_seconds.max(1));
+    let task = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        timer.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = timer.tick() => {
+                    let database_state = match db.signing_key_state().await {
+                        Ok(state) => state,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "signing-key replica sync failed to read key metadata");
+                            continue;
+                        }
+                    };
+                    let in_memory_state = match jwt.key_state() {
+                        Ok(state) => state,
+                        Err(error) => {
+                            tracing::error!(error = %error, "signing-key replica sync failed to inspect in-memory key set");
+                            continue;
+                        }
+                    };
+                    if database_state == in_memory_state {
+                        continue;
+                    }
+                    let keys = match db.list_signing_keys().await {
+                        Ok(keys) => keys,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "signing-key replica sync failed to load changed key set");
+                            continue;
+                        }
+                    };
+                    if let Err(error) = jwt.reload(keys) {
+                        tracing::error!(error = %error, "signing-key replica sync rejected database key set");
+                    } else {
+                        tracing::info!(active_kid = %jwt.active_kid(), "signing-key replica state reloaded");
+                    }
+                }
+            }
+        }
+    });
+    SigningKeySyncWorker {
+        stop_tx: Some(stop_tx),
+        task,
+    }
+}
+
 struct JwtKeySet {
     active_key: Arc<KeyMaterial>,
     keys: Vec<Arc<KeyMaterial>>,
     keys_by_kid: HashMap<String, Arc<KeyMaterial>>,
+    jwks: Jwks,
+    jwks_etag: String,
 }
 
 struct KeyMaterial {
@@ -102,6 +174,36 @@ pub struct ConfirmationClaim {
     pub jkt: String,
 }
 
+/// Short-lived identity bridge emitted by IAP/ForwardAuth. It is deliberately
+/// separate from OAuth access tokens so a legacy edge assertion can never be
+/// confused with a resource bearer token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IapAssertionClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub exp: i64,
+    pub iat: i64,
+    pub jti: String,
+    pub token_use: String,
+    pub sid: String,
+    pub username: String,
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub iap_rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<String>,
+    pub host_pattern: String,
+    pub path_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenSubject<'a> {
     pub user: &'a UserRecord,
@@ -153,6 +255,21 @@ impl JwtManager {
         self.key_set.read().map(|set| set.keys.len()).unwrap_or(0)
     }
 
+    pub fn key_state(&self) -> AppResult<Vec<(String, i32)>> {
+        let key_set = self
+            .key_set
+            .read()
+            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
+        let active = key_set.active_key.kid.as_str();
+        let mut keys = key_set
+            .keys
+            .iter()
+            .map(|key| (key.kid.clone(), i32::from(key.kid == active)))
+            .collect::<Vec<_>>();
+        keys.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(keys)
+    }
+
     pub fn reload(&self, records: Vec<SigningKeyRecord>) -> AppResult<()> {
         let key_set = build_key_set(records)?;
         let mut guard = self
@@ -167,8 +284,37 @@ impl JwtManager {
         let Ok(guard) = self.key_set.read() else {
             return Jwks { keys: Vec::new() };
         };
-        Jwks {
-            keys: guard.keys.iter().map(|key| key.jwk.clone()).collect(),
+        guard.jwks.clone()
+    }
+
+    pub fn jwks_snapshot(&self) -> AppResult<(Jwks, String)> {
+        let guard = self
+            .key_set
+            .read()
+            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
+        Ok((guard.jwks.clone(), guard.jwks_etag.clone()))
+    }
+
+    fn active_key_snapshot(&self) -> AppResult<Arc<KeyMaterial>> {
+        self.key_set
+            .read()
+            .map(|key_set| key_set.active_key.clone())
+            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))
+    }
+
+    fn verification_key_snapshots(&self, kid: Option<&str>) -> AppResult<Vec<Arc<KeyMaterial>>> {
+        let key_set = self
+            .key_set
+            .read()
+            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
+        match kid {
+            Some(kid) => key_set
+                .keys_by_kid
+                .get(kid)
+                .cloned()
+                .map(|key| vec![key])
+                .ok_or(AppError::Unauthorized),
+            None => Ok(key_set.keys.clone()),
         }
     }
 }
@@ -201,10 +347,18 @@ fn build_key_set(records: Vec<SigningKeyRecord>) -> AppResult<JwtKeySet> {
     }
     let active_key = active_key
         .ok_or_else(|| AppError::Configuration("no active signing key is available".to_string()))?;
+    let jwks = Jwks {
+        keys: keys.iter().map(|key| key.jwk.clone()).collect(),
+    };
+    let jwks_json = serde_json::to_string(&jwks)
+        .map_err(|err| AppError::Internal(format!("failed to encode JWKS: {err}")))?;
+    let jwks_etag = format!("signet-jwks-{}", util::sha256_base64url(&jwks_json));
     Ok(JwtKeySet {
         active_key,
         keys,
         keys_by_kid,
+        jwks,
+        jwks_etag,
     })
 }
 
@@ -252,6 +406,86 @@ impl KeyMaterial {
 }
 
 impl JwtManager {
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_iap_assertion(
+        &self,
+        issuer: &str,
+        audience: &str,
+        subject: &str,
+        sid: &str,
+        username: &str,
+        email: &str,
+        name: Option<&str>,
+        iap_rule: &str,
+        application_id: Option<&str>,
+        host_pattern: &str,
+        path_prefix: &str,
+        organization: Option<&str>,
+        roles: Vec<String>,
+        permissions: Vec<String>,
+        ttl_seconds: i64,
+    ) -> AppResult<String> {
+        let now = util::now_ts();
+        let claims = IapAssertionClaims {
+            iss: issuer.trim_end_matches('/').to_string(),
+            sub: subject.to_string(),
+            aud: audience.to_string(),
+            exp: now + ttl_seconds,
+            iat: now,
+            jti: util::random_token(24),
+            token_use: "iap_assertion".to_string(),
+            sid: sid.to_string(),
+            username: username.to_string(),
+            email: email.to_string(),
+            name: name.map(ToOwned::to_owned),
+            iap_rule: iap_rule.to_string(),
+            application_id: application_id.map(ToOwned::to_owned),
+            host_pattern: host_pattern.to_string(),
+            path_prefix: path_prefix.to_string(),
+            organization: organization.map(ToOwned::to_owned),
+            roles,
+            permissions,
+        };
+        let active_key = self.active_key_snapshot()?;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(active_key.kid.clone());
+        encode(&header, &claims, &active_key.encoding_key)
+            .map_err(|err| AppError::Internal(format!("failed to sign IAP assertion: {err}")))
+    }
+
+    pub fn verify_iap_assertion(
+        &self,
+        token: &str,
+        issuers: &[&str],
+        audiences: &[String],
+    ) -> AppResult<IapAssertionClaims> {
+        if audiences.is_empty() {
+            return Err(AppError::Unauthorized);
+        }
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(issuers);
+        validation.set_audience(audiences);
+        let header = decode_header(token).map_err(|_| AppError::Unauthorized)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(AppError::Unauthorized);
+        }
+        let keys = self.verification_key_snapshots(header.kid.as_deref())?;
+        let token = keys
+            .iter()
+            .find_map(|key| {
+                decode::<IapAssertionClaims>(token, &key.decoding_key, &validation).ok()
+            })
+            .ok_or(AppError::Unauthorized)?;
+        let now = util::now_ts();
+        if token.claims.iat > now + 60
+            || token.claims.exp < token.claims.iat
+            || token.claims.token_use != "iap_assertion"
+        {
+            return Err(AppError::Unauthorized);
+        }
+        Ok(token.claims)
+    }
+
     pub fn sign_authorization_response(
         &self,
         issuer: &str,
@@ -267,13 +501,10 @@ impl JwtManager {
         claims.insert("aud".to_string(), Value::String(audience.to_string()));
         claims.insert("exp".to_string(), Value::Number((now + ttl_seconds).into()));
         claims.insert("iat".to_string(), Value::Number(now.into()));
-        let key_set = self
-            .key_set
-            .read()
-            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
+        let active_key = self.active_key_snapshot()?;
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key_set.active_key.kid.clone());
-        encode(&header, &claims, &key_set.active_key.encoding_key).map_err(|err| {
+        header.kid = Some(active_key.kid.clone());
+        encode(&header, &claims, &active_key.encoding_key).map_err(|err| {
             AppError::Internal(format!("failed to sign authorization response: {err}"))
         })
     }
@@ -306,13 +537,10 @@ impl JwtManager {
             Value::Object(Map::new()),
         );
         claims.insert("events".to_string(), Value::Object(events));
-        let key_set = self
-            .key_set
-            .read()
-            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
+        let active_key = self.active_key_snapshot()?;
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key_set.active_key.kid.clone());
-        encode(&header, &claims, &key_set.active_key.encoding_key)
+        header.kid = Some(active_key.kid.clone());
+        encode(&header, &claims, &active_key.encoding_key)
             .map_err(|err| AppError::Internal(format!("failed to sign logout token: {err}")))
     }
 
@@ -427,10 +655,6 @@ impl JwtManager {
     ) -> AppResult<String> {
         let now = util::now_ts();
         let jti = util::random_token(24);
-        let key_set = self
-            .key_set
-            .read()
-            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
         let claims = TokenClaims {
             iss: issuer.trim_end_matches('/').to_string(),
             sub: client.client_id.clone(),
@@ -468,9 +692,10 @@ impl JwtManager {
             AppError::Internal("token claims did not encode as object".to_string())
         })?;
         claims_object.extend(extra_claims);
+        let active_key = self.active_key_snapshot()?;
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key_set.active_key.kid.clone());
-        encode(&header, &claims_value, &key_set.active_key.encoding_key)
+        header.kid = Some(active_key.kid.clone());
+        encode(&header, &claims_value, &active_key.encoding_key)
             .map_err(|err| AppError::Internal(format!("failed to sign token: {err}")))
     }
 
@@ -584,21 +809,11 @@ impl JwtManager {
         if header.alg != Algorithm::RS256 {
             return Err(AppError::Unauthorized);
         }
-        let key_set = self
-            .key_set
-            .read()
-            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
-        let token = if let Some(kid) = header.kid.as_deref() {
-            let key = key_set.keys_by_kid.get(kid).ok_or(AppError::Unauthorized)?;
-            decode::<TokenClaims>(token, &key.decoding_key, &validation)
-                .map_err(|_| AppError::Unauthorized)?
-        } else {
-            key_set
-                .keys
-                .iter()
-                .find_map(|key| decode::<TokenClaims>(token, &key.decoding_key, &validation).ok())
-                .ok_or(AppError::Unauthorized)?
-        };
+        let keys = self.verification_key_snapshots(header.kid.as_deref())?;
+        let token = keys
+            .iter()
+            .find_map(|key| decode::<TokenClaims>(token, &key.decoding_key, &validation).ok())
+            .ok_or(AppError::Unauthorized)?;
         let now = util::now_ts();
         if token.claims.iat > now + 60 || token.claims.exp < token.claims.iat {
             return Err(AppError::Unauthorized);
@@ -630,10 +845,6 @@ impl JwtManager {
     ) -> AppResult<String> {
         let now = util::now_ts();
         let jti = util::random_token(24);
-        let key_set = self
-            .key_set
-            .read()
-            .map_err(|_| AppError::Internal("signing key set lock poisoned".to_string()))?;
         let claims = TokenClaims {
             iss: issuer.trim_end_matches('/').to_string(),
             sub: subject_identifier
@@ -677,9 +888,10 @@ impl JwtManager {
             AppError::Internal("token claims did not encode as object".to_string())
         })?;
         claims_object.extend(extra_claims);
+        let active_key = self.active_key_snapshot()?;
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key_set.active_key.kid.clone());
-        encode(&header, &claims_value, &key_set.active_key.encoding_key)
+        header.kid = Some(active_key.kid.clone());
+        encode(&header, &claims_value, &active_key.encoding_key)
             .map_err(|err| AppError::Internal(format!("failed to sign token: {err}")))
     }
 }
@@ -776,6 +988,7 @@ mod tests {
         let old_pem = util::generate_rsa_private_key_pem().unwrap();
         let new_pem = util::generate_rsa_private_key_pem().unwrap();
         let manager = manager_with_keys(vec![signing_key("key-old", &old_pem, 1)]);
+        let (_, old_jwks_etag) = manager.jwks_snapshot().unwrap();
         let old_token = signed_test_token(Some("key-old"), &old_pem);
 
         manager
@@ -786,6 +999,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.active_kid(), "key-new");
+        let (rotated_jwks, rotated_jwks_etag) = manager.jwks_snapshot().unwrap();
+        assert_ne!(old_jwks_etag, rotated_jwks_etag);
+        assert_eq!(rotated_jwks.keys.len(), 2);
         assert!(
             manager
                 .verify_access_token_with_issuers(&old_token, &["https://issuer.example"])
@@ -797,6 +1013,46 @@ mod tests {
             manager
                 .verify_access_token_with_issuers(&new_token, &["https://issuer.example"])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn iap_assertion_is_short_lived_and_audience_bound() {
+        let pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![signing_key("key-a", &pem, 1)]);
+        let token = manager
+            .sign_iap_assertion(
+                "https://sso.example",
+                "signet:iap:docs",
+                "user-id",
+                "session-id",
+                "user",
+                "user@example.test",
+                Some("User"),
+                "docs",
+                Some("docs-app"),
+                "docs.example.test",
+                "/admin",
+                Some("org-id"),
+                vec!["admin".to_string()],
+                vec!["users.read".to_string()],
+                30,
+            )
+            .unwrap();
+        let issuers = ["https://sso.example"];
+        let audience = ["signet:iap:docs".to_string()];
+        let claims = manager
+            .verify_iap_assertion(&token, &issuers, &audience)
+            .unwrap();
+        assert_eq!(claims.token_use, "iap_assertion");
+        assert_eq!(claims.sub, "user-id");
+        assert_eq!(claims.sid, "session-id");
+        assert_eq!(claims.iap_rule, "docs");
+        assert_eq!(claims.path_prefix, "/admin");
+        assert!(
+            manager
+                .verify_iap_assertion(&token, &issuers, &["signet:iap:other".to_string()])
+                .is_err()
         );
     }
 

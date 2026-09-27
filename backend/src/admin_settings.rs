@@ -392,6 +392,7 @@ pub(super) async fn update_runtime_settings(
             trust_proxy_headers: payload.trust_proxy_headers,
         })
         .await?;
+    state.invalidate_runtime_settings_cache();
     state
         .db
         .record_audit_event(audit::management_event(

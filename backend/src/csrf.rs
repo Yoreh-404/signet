@@ -248,7 +248,7 @@ async fn is_trusted_origin(state: &AppState, candidate: &str) -> Result<bool, Ap
     let Some(candidate) = origin_tuple(candidate) else {
         return Ok(false);
     };
-    let runtime = state.db.runtime_settings().await?;
+    let runtime = state.runtime_settings().await?;
     Ok(std::iter::once(runtime.public_base_url.as_str())
         .chain(std::iter::once(runtime.issuer.as_str()))
         .chain(
@@ -654,7 +654,7 @@ mod tests {
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        let state = AppState { settings, db, jwt };
+        let state = AppState::new(settings, db, jwt);
         let user = state
             .db
             .insert_user(NewUser {

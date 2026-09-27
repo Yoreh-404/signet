@@ -349,7 +349,7 @@ mod tests {
         db.migrate().await.unwrap();
         db.seed(&settings).await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        let state = AppState { settings, db, jwt };
+        let state = AppState::new(settings, db, jwt);
         let user = state
             .db
             .insert_user(NewUser {

@@ -1,5 +1,8 @@
 use sso_backend::{
-    AppState, Settings, application_discovery, billing, db::Db, jwt::JwtManager, server, webhooks,
+    AppState, Settings, application_discovery, billing,
+    db::Db,
+    jwt::{JwtManager, spawn_signing_key_sync},
+    server, webhooks,
 };
 
 #[tokio::main]
@@ -24,11 +27,12 @@ async fn main() -> anyhow::Result<()> {
     db.seed(&settings).await?;
     let signing_keys = db.ensure_signing_key_seed(&settings).await?;
     let jwt = JwtManager::from_signing_keys(&settings, signing_keys)?;
-    let state = AppState {
-        settings: settings.clone(),
-        db,
-        jwt,
-    };
+    let state = AppState::new(settings.clone(), db, jwt);
+    let signing_key_worker = spawn_signing_key_sync(
+        state.db.clone(),
+        state.jwt.clone(),
+        settings.performance.signing_key_sync_seconds,
+    );
     let audit_webhook_worker = webhooks::spawn_audit_webhook_worker(state.db.clone());
 
     // A website-managed application stays unavailable until this initial
@@ -46,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(worker) = billing_worker {
         worker.stop().await;
     }
+    signing_key_worker.stop().await;
     audit_webhook_worker.stop().await;
     result
 }

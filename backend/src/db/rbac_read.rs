@@ -6,8 +6,11 @@ use crate::{
     config::DatabaseKind,
     error::{AppError, AppResult},
 };
-use diesel::{OptionalExtension, RunQueryDsl, sql_query, sql_types::Text};
-use std::collections::BTreeMap;
+use diesel::{
+    OptionalExtension, RunQueryDsl, sql_query,
+    sql_types::{BigInt, Text},
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, diesel::QueryableByName)]
 struct PermissionPresenceRow {
@@ -15,7 +18,51 @@ struct PermissionPresenceRow {
     present: i32,
 }
 
+#[derive(Debug, diesel::QueryableByName)]
+struct PermissionCountRow {
+    #[diesel(sql_type = BigInt)]
+    matched: i64,
+}
+
 impl Db {
+    /// Check a complete permission set in one query. Hot paths that only need
+    /// a declared capability set should not materialize the user's entire
+    /// global permission catalog.
+    pub async fn has_all_effective_permissions(
+        &self,
+        user_id: &str,
+        permissions: &[&str],
+    ) -> AppResult<bool> {
+        let permission_values = permissions
+            .iter()
+            .map(|permission| permission.trim())
+            .filter(|permission| !permission.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<String>>();
+        if permission_values.is_empty() {
+            return Ok(true);
+        }
+        let permission_count = permission_values.len();
+        let user_id = user_id.to_string();
+        let mut values = permission_values;
+        values.push(user_id.clone());
+        values.push(user_id);
+        with_conn!(self, |conn, kind| {
+            let permission_placeholders = placeholders(kind, 1, permission_count);
+            let user_placeholder = ph(kind, permission_count + 1);
+            let group_user_placeholder = ph(kind, permission_count + 2);
+            let sql = format!(
+                "SELECT COUNT(DISTINCT permission) AS matched FROM role_permissions WHERE permission IN ({permission_placeholders}) AND (role_id IN (SELECT role_id FROM user_roles WHERE user_id = {user_placeholder}) OR role_id IN (SELECT group_roles.role_id FROM group_roles INNER JOIN group_members ON group_roles.group_id = group_members.group_id WHERE group_members.user_id = {group_user_placeholder}))"
+            );
+            bind_text_list(&mut conn, sql_query(sql), &values)
+                .get_result::<PermissionCountRow>(&mut conn)
+                .map(|row| row.matched == permission_count as i64)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn has_any_effective_permission(
         &self,
         user_id: &str,

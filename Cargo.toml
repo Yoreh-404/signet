@@ -1,6 +1,6 @@
 [workspace]
-members = ["backend"]
-default-members = ["backend"]
+members = ["backend", "edge"]
+default-members = ["backend", "edge"]
 resolver = "2"
 
 [workspace.package]

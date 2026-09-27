@@ -184,8 +184,14 @@ pub(super) async fn token_from_client_credentials(
     dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
     authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
     let service_account_permissions = if client.service_account_enabled() {
-        let service_claims = client.service_account_claims()?;
-        let permissions = client.service_account_permissions()?;
+        let permissions = client.service_account_permissions_for_source(
+            runtime
+                .policy
+                .profile
+                .as_ref()
+                .map(|profile| profile.source_mode.as_str()),
+        )?;
+        let service_claims = client.service_account_claims_with_permissions(&permissions);
         access_claims.extend(service_claims);
         access_claims.insert(
             "sub".to_string(),

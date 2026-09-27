@@ -8,8 +8,10 @@ use crate::{
     util,
 };
 use axum::http::StatusCode;
+#[cfg(feature = "sqlite")]
+use diesel::Connection;
 use diesel::{
-    Connection, OptionalExtension, RunQueryDsl,
+    OptionalExtension, RunQueryDsl,
     connection::SimpleConnection,
     r2d2::{ConnectionManager, Pool},
     sql_query,
@@ -190,10 +192,6 @@ mod client_security;
 mod client_types;
 mod database_bootstrap;
 mod database_connection;
-#[cfg(feature = "mysql")]
-use database_connection::connect_mysql;
-#[cfg(feature = "postgres")]
-use database_connection::connect_postgres;
 #[cfg(test)]
 use database_connection::connect_sqlite;
 mod database_lifecycle;
@@ -206,8 +204,8 @@ pub(super) use migration_sql::{is_ignorable_migration_error, migration_sql};
 mod query_types;
 pub(super) use query_types::{
     ApplicationDiscoveryMigrationRow, BrowserContextAccountOptionRow, CountRow, GroupMemberIdRow,
-    GroupMemberLifecycleRow, PermissionRow, StringIdRow, TotalRow, UpdatedAtRow, UserEmailIdRow,
-    UserIdentityConflictRow,
+    GroupMemberLifecycleRow, IapSessionPrincipalRow, PermissionRow, StringIdRow, TotalRow,
+    UpdatedAtRow, UserEmailIdRow, UserIdentityConflictRow,
 };
 mod value_normalization;
 use value_normalization::{

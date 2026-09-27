@@ -897,7 +897,7 @@ mod tests {
         let db = crate::db::Db::connect(&settings).unwrap();
         db.migrate().await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-        (AppState { settings, db, jwt }, path)
+        (AppState::new(settings, db, jwt), path)
     }
 
     #[cfg(feature = "sqlite")]

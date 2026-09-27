@@ -11,6 +11,16 @@ use diesel::{
     Connection, OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Nullable, Text},
 };
+use std::sync::atomic::{AtomicI64, Ordering};
+
+// Replay reclamation for the key being claimed belongs to the atomic claim
+// statement itself. Full-table expiry cleanup is maintenance only, so keep it
+// off the authentication hot path and let at most one call per process/minute
+// attempt it. Multi-replica deployments may run one cleanup per replica; the
+// expiry index keeps that bounded and cleanup failure never changes the replay
+// decision that has already been made.
+static SAML_REPLAY_LAST_PURGE_AT: AtomicI64 = AtomicI64::new(0);
+const SAML_REPLAY_PURGE_INTERVAL_SECONDS: i64 = 60;
 
 impl Db {
     pub async fn claim_application_saml_replay(
@@ -23,38 +33,82 @@ impl Db {
         let application_id = application_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let cleanup_sql = format!(
-                "DELETE FROM application_saml_replays WHERE expires_at <= {}",
-                ph(kind, 1)
-            );
-            sql_query(cleanup_sql)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let sql = match kind {
-                DatabaseKind::Mysql => format!(
-                    "INSERT IGNORE INTO application_saml_replays (replay_key, application_id, expires_at, created_at) VALUES ({}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                ),
-                _ => format!(
-                    "INSERT INTO application_saml_replays (replay_key, application_id, expires_at, created_at) VALUES ({}, {}, {}, {}) ON CONFLICT (replay_key) DO NOTHING",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                ),
+            let claimed = match kind {
+                DatabaseKind::Mysql => {
+                    let insert_sql = format!(
+                        "INSERT IGNORE INTO application_saml_replays (replay_key, application_id, expires_at, created_at) VALUES ({}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                    );
+                    let inserted = sql_query(insert_sql)
+                        .bind::<Text, _>(&replay_key)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<BigInt, _>(expires_at)
+                        .bind::<BigInt, _>(now)
+                        .execute(&mut conn)
+                        .map_err(AppError::from)?;
+                    if inserted == 1 {
+                        true
+                    } else {
+                        // MySQL lacks PostgreSQL/SQLite's conflict-WHERE form.
+                        // Reclaim only this expired key; concurrent contenders
+                        // serialize on the primary-key row and exactly one can
+                        // move it back to a future expiry.
+                        let reclaim_sql = format!(
+                            "UPDATE application_saml_replays SET application_id = {}, expires_at = {}, created_at = {} WHERE replay_key = {} AND expires_at <= {}",
+                            ph(kind, 1),
+                            ph(kind, 2),
+                            ph(kind, 3),
+                            ph(kind, 4),
+                            ph(kind, 5),
+                        );
+                        sql_query(reclaim_sql)
+                            .bind::<Text, _>(&application_id)
+                            .bind::<BigInt, _>(expires_at)
+                            .bind::<BigInt, _>(now)
+                            .bind::<Text, _>(&replay_key)
+                            .bind::<BigInt, _>(now)
+                            .execute(&mut conn)
+                            .map_err(AppError::from)?
+                            == 1
+                    }
+                }
+                DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                    let sql = format!(
+                        "INSERT INTO application_saml_replays (replay_key, application_id, expires_at, created_at) VALUES ({}, {}, {}, {}) ON CONFLICT (replay_key) DO UPDATE SET application_id = excluded.application_id, expires_at = excluded.expires_at, created_at = excluded.created_at WHERE application_saml_replays.expires_at <= {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&replay_key)
+                        .bind::<Text, _>(&application_id)
+                        .bind::<BigInt, _>(expires_at)
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(&mut conn)
+                        .map_err(AppError::from)?
+                        == 1
+                }
             };
-            sql_query(sql)
-                .bind::<Text, _>(&replay_key)
-                .bind::<Text, _>(&application_id)
-                .bind::<BigInt, _>(expires_at)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map(|affected| affected == 1)
-                .map_err(AppError::from)
+
+            if saml_replay_purge_due(now) {
+                let cleanup_sql = format!(
+                    "DELETE FROM application_saml_replays WHERE expires_at <= {}",
+                    ph(kind, 1)
+                );
+                if let Err(error) = sql_query(cleanup_sql)
+                    .bind::<BigInt, _>(now)
+                    .execute(&mut conn)
+                {
+                    tracing::warn!(error = %error, "expired SAML replay cleanup failed");
+                }
+            }
+            Ok(claimed)
         })
     }
 
@@ -272,4 +326,23 @@ impl Db {
                 .map_err(AppError::from)
         })
     }
+}
+
+fn saml_replay_purge_due(now: i64) -> bool {
+    let last = SAML_REPLAY_LAST_PURGE_AT.load(Ordering::Relaxed);
+    if last == 0 {
+        let _ = SAML_REPLAY_LAST_PURGE_AT.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        return false;
+    }
+    if now.saturating_sub(last) < SAML_REPLAY_PURGE_INTERVAL_SECONDS {
+        return false;
+    }
+    SAML_REPLAY_LAST_PURGE_AT
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }

@@ -64,11 +64,7 @@ impl TestContext {
             .unwrap();
         let cookie = format!("{}={cookie_value}", settings.security.cookie_name);
         let jwt = JwtManager::new(&settings).unwrap();
-        let state = AppState {
-            settings,
-            db: db.clone(),
-            jwt,
-        };
+        let state = AppState::new(settings, db.clone(), jwt);
         let app = admin::routes().with_state(state);
 
         Self {

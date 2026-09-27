@@ -69,7 +69,7 @@ pub(super) async fn require_scim_permission(
     {
         return Ok(principal);
     }
-    let runtime = state.db.runtime_settings().await?;
+    let runtime = state.runtime_settings().await?;
     let expected_audience = format!("{}/scim/v2", runtime.public_base_url.trim_end_matches('/'));
     let audiences = [expected_audience.clone()];
     let claims = state

@@ -5,11 +5,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
-      url = "tarball+https://codeload.github.com/oxalica/rust-overlay/tar.gz/refs/heads/stable";
+      # Pin the codeload archive to an immutable commit. Using the mutable
+      # `stable` branch URL makes the lockfile's narHash drift whenever the
+      # branch advances, which breaks `nix develop` before evaluation starts.
+      url = "tarball+https://codeload.github.com/oxalica/rust-overlay/tar.gz/4748ec2f5ed4a881474ed4c98aa71a5308cdac8d";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     cargo2nix = {
-      url = "tarball+https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/refs/heads/release-0.12";
+      # Same rule for cargo2nix: release branches are mutable even when their
+      # API is intentionally stable.
+      url = "tarball+https://codeload.github.com/cargo2nix/cargo2nix/tar.gz/a709c74619e1a2b68ed12bb398e12fbe29d69657";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
       inputs.rust-overlay.follows = "rust-overlay";
@@ -24,9 +29,18 @@
           overlays = [ cargo2nix.overlays.default ];
         };
         lib = pkgs.lib;
+        # Conductor local builds intentionally consume dirty working trees.
+        # A normal flake path is projected from Git and therefore drops
+        # untracked workspace members such as the in-development `edge/`
+        # crate. Prefer the explicit live checkout when Conductor supplies it.
+        workspaceRoot = builtins.getEnv "OPENSPONGE_NIX_WORKSPACE_ROOT";
+        sourceRoot =
+          if workspaceRoot == ""
+          then ./.
+          else builtins.toPath workspaceRoot;
         source = builtins.path {
           name = "signet-source";
-          path = ./.;
+          path = sourceRoot;
           filter = path: type:
             let name = lib.baseNameOf path;
             in name != ".git"
@@ -36,7 +50,7 @@
         };
         frontendSource = builtins.path {
           name = "signet-frontend-source";
-          path = ./frontend;
+          path = sourceRoot + "/frontend";
           filter = path: type:
             let name = lib.baseNameOf path;
             in name != "node_modules" && name != "dist";
@@ -196,6 +210,14 @@
             CXX_x86_64_unknown_linux_gnu = "${pkgs.llvmPackages_21.clang}/bin/clang++";
             AR_x86_64_unknown_linux_gnu = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ar";
             RANLIB_x86_64_unknown_linux_gnu = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
+          } else if pkgs.stdenv.hostPlatform.rust.rustcTarget == "aarch64-unknown-linux-gnu" then {
+            RUSTFLAGS = "-C linker=${pkgs.llvmPackages_21.clang}/bin/clang -C link-arg=-fuse-ld=lld";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.llvmPackages_21.clang}/bin/clang";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-fuse-ld=lld";
+            CC_aarch64_unknown_linux_gnu = "${pkgs.llvmPackages_21.clang}/bin/clang";
+            CXX_aarch64_unknown_linux_gnu = "${pkgs.llvmPackages_21.clang}/bin/clang++";
+            AR_aarch64_unknown_linux_gnu = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ar";
+            RANLIB_aarch64_unknown_linux_gnu = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
           } else {};
 
         signetBinary = (rustPkgs.workspace.sso-backend {}).overrideAttrs (old: {
@@ -220,6 +242,18 @@
           ln -s ${signetBinary}/bin/sso-backend $out/bin/signet
         '';
 
+        edgeBinary = (rustPkgs.workspace.signet-edge {}).overrideAttrs (old: {
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ (with pkgs; [
+            llvmPackages_21.clang
+            llvmPackages_21.lld
+            llvmPackages_21.llvm
+          ]);
+        } // rustNativeEnv);
+        edge = pkgs.runCommand "signet-edge-runtime" {} ''
+          mkdir -p $out/bin
+          ln -s ${edgeBinary}/bin/signet-edge $out/bin/signet-edge
+        '';
+
         # Keep the compiler closure out of the image.  cargo2nix embeds
         # references to Rust source/toolchain paths in the release binary;
         # these are not needed to start Signet and would otherwise pull the
@@ -237,6 +271,17 @@
             -e ${pkgs.postgresql} \
             -e ${pkgs.mariadb-connector-c} \
             $out/bin/signet
+        '';
+
+        edgeRuntime = pkgs.runCommand "signet-edge-runtime-binary" {
+          nativeBuildInputs = [ pkgs.nukeReferences ];
+        } ''
+          mkdir -p $out/bin
+          cp -L ${edgeBinary}/bin/signet-edge $out/bin/signet-edge
+          nuke-refs \
+            -e ${pkgs.glibc} \
+            -e ${pkgs.stdenv.cc.cc.lib} \
+            $out/bin/signet-edge
         '';
 
         runtimeConfig = pkgs.runCommand "signet-runtime-config" {} ''
@@ -278,9 +323,27 @@
             Volumes = { "/app/data" = {}; };
           };
         };
+
+        edgeImage = pkgs.dockerTools.buildLayeredImage {
+          name = "signet-edge";
+          tag = "local";
+          contents = [
+            edgeRuntime
+            pkgs.cacert
+            pkgs.fakeNss
+          ];
+          config = {
+            Cmd = [ "${edgeRuntime}/bin/signet-edge" ];
+            User = "65532:65532";
+            Env = [
+              "SIGNET_EDGE_BIND_HOST=0.0.0.0"
+            ];
+            ExposedPorts = { "4180/tcp" = {}; };
+          };
+        };
       in {
         packages = {
-          inherit signet frontend image;
+          inherit signet edge frontend image edgeImage;
           default = image;
         };
 
@@ -305,6 +368,15 @@
           LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
           shellHook = ''
             export LD_LIBRARY_PATH="${lib.makeLibraryPath [ pkgs.openssl pkgs.sqlite pkgs.postgresql pkgs.mariadb-connector-c ]}:${pkgs.mariadb-connector-c}/lib/mariadb:$LD_LIBRARY_PATH"
+            export RUSTFLAGS="''${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=lld"
+            export CC_x86_64_unknown_linux_gnu="${pkgs.llvmPackages_21.clang}/bin/clang"
+            export CXX_x86_64_unknown_linux_gnu="${pkgs.llvmPackages_21.clang}/bin/clang++"
+            export AR_x86_64_unknown_linux_gnu="${pkgs.llvmPackages_21.llvm}/bin/llvm-ar"
+            export RANLIB_x86_64_unknown_linux_gnu="${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib"
+            export CC_aarch64_unknown_linux_gnu="${pkgs.llvmPackages_21.clang}/bin/clang"
+            export CXX_aarch64_unknown_linux_gnu="${pkgs.llvmPackages_21.clang}/bin/clang++"
+            export AR_aarch64_unknown_linux_gnu="${pkgs.llvmPackages_21.llvm}/bin/llvm-ar"
+            export RANLIB_aarch64_unknown_linux_gnu="${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib"
             source ${./scripts/opensponge-cargo-cache.sh}
           '';
         };

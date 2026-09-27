@@ -2517,7 +2517,7 @@ async fn test_app_state() -> (AppState, PathBuf) {
     db.migrate().await.unwrap();
     db.seed(&settings).await.unwrap();
     let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
-    (AppState { settings, db, jwt }, path)
+    (AppState::new(settings, db, jwt), path)
 }
 
 fn test_client() -> ClientRecord {

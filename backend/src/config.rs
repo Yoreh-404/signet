@@ -7,6 +7,8 @@ use url::Url;
 pub struct Settings {
     pub server: ServerSettings,
     pub database: DatabaseSettings,
+    #[serde(default)]
+    pub performance: PerformanceSettings,
     pub oidc: OidcSettings,
     pub security: SecuritySettings,
     pub registration: RegistrationSettings,
@@ -20,6 +22,140 @@ pub struct Settings {
     pub external_oidc_providers: Vec<ExternalOidcProviderSettings>,
     pub cors: CorsSettings,
     pub bootstrap: BootstrapSettings,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerformanceSettings {
+    /// Process-local cache for very low-churn runtime settings. A short TTL
+    /// also acts as bounded cross-replica invalidation when another Signet
+    /// instance changes the database row.
+    #[serde(default = "default_runtime_settings_cache_millis")]
+    pub runtime_settings_cache_millis: u64,
+    /// Active IAP routing rules are control-plane data. Cache them briefly so
+    /// ForwardAuth does not scan the database on every protected asset.
+    #[serde(default = "default_iap_routing_cache_millis")]
+    pub iap_routing_cache_millis: u64,
+    /// Brief grace used only when another request is already refreshing an
+    /// expired IAP routing snapshot. This avoids queueing an entire asset burst
+    /// behind one control-plane database read without becoming stale-on-error.
+    #[serde(default = "default_iap_routing_stale_while_refresh_millis")]
+    pub iap_routing_stale_while_refresh_millis: u64,
+    /// Tiny ForwardAuth decision cache used to collapse a burst of asset
+    /// requests from the same browser session and IAP rule. This is bounded
+    /// and deliberately much shorter than the signed assertion lifetime so
+    /// logout and permission changes converge quickly.
+    #[serde(default = "default_iap_authorization_cache_millis")]
+    pub iap_authorization_cache_millis: u64,
+    /// Brief grace window used only while another request is actively
+    /// refreshing an expired ForwardAuth decision. This prevents a page-load
+    /// burst from queueing behind one database refresh without turning stale
+    /// authorization into a general fallback path.
+    #[serde(default = "default_iap_authorization_stale_while_refresh_millis")]
+    pub iap_authorization_stale_while_refresh_millis: u64,
+    #[serde(default = "default_iap_authorization_cache_max_entries")]
+    pub iap_authorization_cache_max_entries: usize,
+    /// Derived OIDC discovery metadata changes only with client control-plane
+    /// updates. Cache it briefly instead of loading the whole client table on
+    /// every well-known metadata request.
+    #[serde(default = "default_oidc_metadata_cache_millis")]
+    pub oidc_metadata_cache_millis: u64,
+    /// Fallback freshness for remote client JWKS when the origin does not
+    /// publish an explicit Cache-Control max-age.
+    #[serde(default = "default_client_jwks_cache_seconds")]
+    pub client_jwks_cache_seconds: u64,
+    /// Hard upper bound for a remote Cache-Control max-age. Key rotation must
+    /// not become invisible for an unbounded period.
+    #[serde(default = "default_client_jwks_max_cache_seconds")]
+    pub client_jwks_max_cache_seconds: u64,
+    /// Bounded stale-if-error window. A transient JWKS origin outage should
+    /// not take down an otherwise valid confidential client immediately.
+    #[serde(default = "default_client_jwks_stale_if_error_seconds")]
+    pub client_jwks_stale_if_error_seconds: u64,
+    #[serde(default = "default_client_jwks_max_entries")]
+    pub client_jwks_max_entries: usize,
+    /// Browser/proxy freshness for Signet's own public JWKS endpoint. Keep it
+    /// short so a newly-active signing key becomes visible quickly while
+    /// allowing traditional verifier stacks to use conditional GETs.
+    #[serde(default = "default_public_jwks_cache_seconds")]
+    pub public_jwks_cache_seconds: u64,
+    /// Poll interval for signing-key metadata so horizontally scaled Signet
+    /// replicas converge after a rotation performed on a peer.
+    #[serde(default = "default_signing_key_sync_seconds")]
+    pub signing_key_sync_seconds: u64,
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            runtime_settings_cache_millis: default_runtime_settings_cache_millis(),
+            iap_routing_cache_millis: default_iap_routing_cache_millis(),
+            iap_routing_stale_while_refresh_millis: default_iap_routing_stale_while_refresh_millis(
+            ),
+            iap_authorization_cache_millis: default_iap_authorization_cache_millis(),
+            iap_authorization_stale_while_refresh_millis:
+                default_iap_authorization_stale_while_refresh_millis(),
+            iap_authorization_cache_max_entries: default_iap_authorization_cache_max_entries(),
+            oidc_metadata_cache_millis: default_oidc_metadata_cache_millis(),
+            client_jwks_cache_seconds: default_client_jwks_cache_seconds(),
+            client_jwks_max_cache_seconds: default_client_jwks_max_cache_seconds(),
+            client_jwks_stale_if_error_seconds: default_client_jwks_stale_if_error_seconds(),
+            client_jwks_max_entries: default_client_jwks_max_entries(),
+            public_jwks_cache_seconds: default_public_jwks_cache_seconds(),
+            signing_key_sync_seconds: default_signing_key_sync_seconds(),
+        }
+    }
+}
+
+fn default_runtime_settings_cache_millis() -> u64 {
+    1_000
+}
+
+fn default_iap_routing_cache_millis() -> u64 {
+    1_000
+}
+
+fn default_iap_routing_stale_while_refresh_millis() -> u64 {
+    100
+}
+
+fn default_iap_authorization_cache_millis() -> u64 {
+    250
+}
+
+fn default_iap_authorization_stale_while_refresh_millis() -> u64 {
+    100
+}
+
+fn default_iap_authorization_cache_max_entries() -> usize {
+    8_192
+}
+
+fn default_oidc_metadata_cache_millis() -> u64 {
+    1_000
+}
+
+fn default_client_jwks_cache_seconds() -> u64 {
+    300
+}
+
+fn default_client_jwks_max_cache_seconds() -> u64 {
+    3_600
+}
+
+fn default_client_jwks_stale_if_error_seconds() -> u64 {
+    300
+}
+
+fn default_client_jwks_max_entries() -> usize {
+    1_024
+}
+
+fn default_public_jwks_cache_seconds() -> u64 {
+    15
+}
+
+fn default_signing_key_sync_seconds() -> u64 {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -361,7 +497,16 @@ pub struct SecuritySettings {
     /// active JWT signing key when that field is empty).
     #[serde(default)]
     pub saml_signing_certificate_pem: String,
+    /// Lifetime of the signed identity assertion returned by IAP/ForwardAuth.
+    /// Keep this short: it is meant to bridge a trusted edge to a legacy
+    /// upstream, not become another long-lived bearer token.
+    #[serde(default = "default_iap_assertion_ttl_seconds")]
+    pub iap_assertion_ttl_seconds: i64,
     pub admin_api_prefix: String,
+}
+
+fn default_iap_assertion_ttl_seconds() -> i64 {
+    30
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -579,6 +724,11 @@ impl Settings {
                 "1" | "true" | "yes" | "on"
             );
         }
+        if let Ok(value) = env::var("SSO_IAP_ASSERTION_TTL_SECONDS") {
+            self.security.iap_assertion_ttl_seconds = value
+                .parse()
+                .with_context(|| "SSO_IAP_ASSERTION_TTL_SECONDS must be an integer")?;
+        }
         if let Ok(value) = env::var("SSO_DATABASE_KIND") {
             self.database.kind = match value.to_ascii_lowercase().as_str() {
                 "postgres" | "postgresql" => DatabaseKind::Postgres,
@@ -588,6 +738,72 @@ impl Settings {
         }
         if let Ok(value) = env::var("SSO_DATABASE_URL") {
             self.database.url = value;
+        }
+        if let Ok(value) = env::var("SSO_RUNTIME_SETTINGS_CACHE_MILLIS") {
+            self.performance.runtime_settings_cache_millis = value
+                .parse()
+                .with_context(|| "SSO_RUNTIME_SETTINGS_CACHE_MILLIS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_IAP_ROUTING_CACHE_MILLIS") {
+            self.performance.iap_routing_cache_millis = value
+                .parse()
+                .with_context(|| "SSO_IAP_ROUTING_CACHE_MILLIS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_IAP_ROUTING_STALE_WHILE_REFRESH_MILLIS") {
+            self.performance.iap_routing_stale_while_refresh_millis = value
+                .parse()
+                .with_context(|| "SSO_IAP_ROUTING_STALE_WHILE_REFRESH_MILLIS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_IAP_AUTHORIZATION_CACHE_MILLIS") {
+            self.performance.iap_authorization_cache_millis = value
+                .parse()
+                .with_context(|| "SSO_IAP_AUTHORIZATION_CACHE_MILLIS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_IAP_AUTHORIZATION_STALE_WHILE_REFRESH_MILLIS") {
+            self.performance
+                .iap_authorization_stale_while_refresh_millis = value.parse().with_context(
+                || "SSO_IAP_AUTHORIZATION_STALE_WHILE_REFRESH_MILLIS must be an integer",
+            )?;
+        }
+        if let Ok(value) = env::var("SSO_IAP_AUTHORIZATION_CACHE_MAX_ENTRIES") {
+            self.performance.iap_authorization_cache_max_entries = value
+                .parse()
+                .with_context(|| "SSO_IAP_AUTHORIZATION_CACHE_MAX_ENTRIES must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_OIDC_METADATA_CACHE_MILLIS") {
+            self.performance.oidc_metadata_cache_millis = value
+                .parse()
+                .with_context(|| "SSO_OIDC_METADATA_CACHE_MILLIS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_CLIENT_JWKS_CACHE_SECONDS") {
+            self.performance.client_jwks_cache_seconds = value
+                .parse()
+                .with_context(|| "SSO_CLIENT_JWKS_CACHE_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_CLIENT_JWKS_MAX_CACHE_SECONDS") {
+            self.performance.client_jwks_max_cache_seconds = value
+                .parse()
+                .with_context(|| "SSO_CLIENT_JWKS_MAX_CACHE_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_CLIENT_JWKS_STALE_IF_ERROR_SECONDS") {
+            self.performance.client_jwks_stale_if_error_seconds = value
+                .parse()
+                .with_context(|| "SSO_CLIENT_JWKS_STALE_IF_ERROR_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_CLIENT_JWKS_MAX_ENTRIES") {
+            self.performance.client_jwks_max_entries = value
+                .parse()
+                .with_context(|| "SSO_CLIENT_JWKS_MAX_ENTRIES must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_PUBLIC_JWKS_CACHE_SECONDS") {
+            self.performance.public_jwks_cache_seconds = value
+                .parse()
+                .with_context(|| "SSO_PUBLIC_JWKS_CACHE_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SSO_SIGNING_KEY_SYNC_SECONDS") {
+            self.performance.signing_key_sync_seconds = value
+                .parse()
+                .with_context(|| "SSO_SIGNING_KEY_SYNC_SECONDS must be an integer")?;
         }
         if let Ok(value) = env::var("SSO_BILLING_RECONCILE_INTERVAL_SECONDS") {
             self.billing.reconcile_interval_seconds = value
@@ -744,6 +960,73 @@ impl Settings {
             anyhow::bail!("oidc.supported_scopes must include openid");
         }
         validate_billing_settings(&self.billing)?;
+        if self.performance.runtime_settings_cache_millis > 60_000 {
+            anyhow::bail!("performance.runtime_settings_cache_millis must not exceed 60000");
+        }
+        if self.performance.iap_routing_cache_millis > 60_000 {
+            anyhow::bail!("performance.iap_routing_cache_millis must not exceed 60000");
+        }
+        if self.performance.iap_routing_stale_while_refresh_millis > 1_000 {
+            anyhow::bail!(
+                "performance.iap_routing_stale_while_refresh_millis must not exceed 1000"
+            );
+        }
+        if self.performance.iap_authorization_cache_millis > 5_000 {
+            anyhow::bail!("performance.iap_authorization_cache_millis must not exceed 5000");
+        }
+        if self
+            .performance
+            .iap_authorization_stale_while_refresh_millis
+            > 1_000
+        {
+            anyhow::bail!(
+                "performance.iap_authorization_stale_while_refresh_millis must not exceed 1000"
+            );
+        }
+        if self.performance.iap_authorization_cache_max_entries == 0
+            || self.performance.iap_authorization_cache_max_entries > 131_072
+        {
+            anyhow::bail!(
+                "performance.iap_authorization_cache_max_entries must be between 1 and 131072"
+            );
+        }
+        if self.performance.oidc_metadata_cache_millis > 60_000 {
+            anyhow::bail!("performance.oidc_metadata_cache_millis must not exceed 60000");
+        }
+        if self.performance.client_jwks_cache_seconds == 0
+            || self.performance.client_jwks_cache_seconds
+                > self.performance.client_jwks_max_cache_seconds
+        {
+            anyhow::bail!(
+                "performance.client_jwks_cache_seconds must be positive and not exceed client_jwks_max_cache_seconds"
+            );
+        }
+        if self.performance.client_jwks_max_cache_seconds == 0
+            || self.performance.client_jwks_max_cache_seconds > 86_400
+        {
+            anyhow::bail!("performance.client_jwks_max_cache_seconds must be between 1 and 86400");
+        }
+        if self.performance.client_jwks_stale_if_error_seconds > 86_400 {
+            anyhow::bail!("performance.client_jwks_stale_if_error_seconds must not exceed 86400");
+        }
+        if self.performance.client_jwks_max_entries == 0
+            || self.performance.client_jwks_max_entries > 16_384
+        {
+            anyhow::bail!("performance.client_jwks_max_entries must be between 1 and 16384");
+        }
+        if self.performance.public_jwks_cache_seconds == 0
+            || self.performance.public_jwks_cache_seconds > 300
+        {
+            anyhow::bail!("performance.public_jwks_cache_seconds must be between 1 and 300");
+        }
+        if self.performance.signing_key_sync_seconds == 0
+            || self.performance.signing_key_sync_seconds > 300
+        {
+            anyhow::bail!("performance.signing_key_sync_seconds must be between 1 and 300");
+        }
+        if !(5..=300).contains(&self.security.iap_assertion_ttl_seconds) {
+            anyhow::bail!("security.iap_assertion_ttl_seconds must be between 5 and 300");
+        }
         if self.discovery.sync_interval_seconds < 30 {
             anyhow::bail!("discovery.sync_interval_seconds must be at least 30");
         }

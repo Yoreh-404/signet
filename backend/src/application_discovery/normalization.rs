@@ -144,12 +144,10 @@ pub(super) fn normalize_contract_client(
 
 pub(super) fn normalize_client_protocol(value: &str) -> AppResult<String> {
     let protocol = visible_text(value, 64, "client protocol")?.to_ascii_lowercase();
-    if !matches!(
-        protocol.as_str(),
-        "oidc" | "saml" | "cas" | "jwt" | "iap" | "forward_auth"
-    ) {
+    if !matches!(protocol.as_str(), "oidc" | "jwt") {
         return Err(AppError::BadRequest(
-            "v3 client protocol is unsupported".to_string(),
+            "v3 client protocol must be oidc or jwt; application-scoped adapters belong in connections"
+                .to_string(),
         ));
     }
     Ok(protocol)
@@ -267,6 +265,7 @@ pub(super) fn contract_authorization_module(
 
 pub(super) fn normalize_contract_protocols(
     connections: &[crate::application_contract::ConnectionContract],
+    clients: &[ClientContract],
     client_protocols: &BTreeMap<String, String>,
     expected_issuer: &str,
 ) -> AppResult<Value> {
@@ -314,6 +313,69 @@ pub(super) fn normalize_contract_protocols(
         };
         for (field, field_value) in value {
             protocol.insert(field, field_value);
+        }
+    }
+
+    // The application-scoped JWT adapter has one browser endpoint namespace
+    // (`/jwt/{app}/...`) and therefore one authoritative browser client per
+    // application today. Materialize the fields that adapter actually reads
+    // from the v3 client contract instead of leaving a misleading
+    // `client_ids`-only module that would fall back to the application slug
+    // and website root at runtime. Client-declared values win over generic
+    // connection settings so the signed contract has a single authority for
+    // identity and redirect boundaries.
+    let mut jwt_clients = clients.iter().filter(|client| {
+        client_protocols
+            .get(&client.client_id)
+            .is_some_and(|protocol| protocol == "jwt")
+    });
+    if let Some(client) = jwt_clients.next() {
+        if jwt_clients.next().is_some() {
+            return Err(AppError::BadRequest(
+                "v3 application JWT adapter supports only one browser client".to_string(),
+            ));
+        }
+        let jwt = protocols
+            .entry("jwt".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(jwt) = jwt.as_object_mut() else {
+            return Err(AppError::Internal(
+                "JWT protocol module entry is not an object".to_string(),
+            ));
+        };
+        jwt.insert("enabled".to_string(), Value::Bool(client.active));
+        jwt.insert(
+            "client_ids".to_string(),
+            Value::Array(vec![Value::String(client.client_id.clone())]),
+        );
+        jwt.insert(
+            "client_id".to_string(),
+            Value::String(visible_text(
+                &client.client_id,
+                MAX_CLIENT_ID_LENGTH,
+                "client_id",
+            )?),
+        );
+        jwt.insert(
+            "client_type".to_string(),
+            Value::String("public".to_string()),
+        );
+        jwt.insert(
+            "redirect_uris".to_string(),
+            Value::Array(
+                normalize_url_list(&client.redirect_uris, "redirect_uri")?
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        if let Some(audience) = normalize_string_list(&client.audiences, 2048, "audience")?
+            .into_iter()
+            .next()
+        {
+            jwt.insert("audience".to_string(), Value::String(audience));
+        } else {
+            jwt.remove("audience");
         }
     }
     normalize_module("protocols", &protocols, expected_issuer)

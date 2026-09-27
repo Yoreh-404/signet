@@ -1450,11 +1450,8 @@ mod tests {
         settings.bootstrap.clients.clear();
         let db = crate::db::Db::connect(&settings).unwrap();
         db.migrate().await.unwrap();
-        let state = crate::AppState {
-            jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
-            settings,
-            db,
-        };
+        let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+        let state = crate::AppState::new(settings, db, jwt);
 
         let organization_a = state
             .db
@@ -1813,11 +1810,8 @@ mod tests {
         settings.bootstrap.clients.clear();
         let db = crate::db::Db::connect(&settings).unwrap();
         db.migrate().await.unwrap();
-        let state = crate::AppState {
-            jwt: crate::jwt::JwtManager::new(&settings).unwrap(),
-            settings,
-            db,
-        };
+        let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
+        let state = crate::AppState::new(settings, db, jwt);
 
         let organization_a = state
             .db

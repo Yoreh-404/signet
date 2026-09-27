@@ -3,7 +3,30 @@ use crate::{config::Settings, util};
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl, sql_query};
 
+#[derive(Debug, diesel::QueryableByName)]
+struct SigningKeyStateRow {
+    #[diesel(sql_type = Text)]
+    kid: String,
+    #[diesel(sql_type = Integer)]
+    is_active: i32,
+}
+
 impl Db {
+    /// Cheap replica-poll metadata snapshot that deliberately excludes private key
+    /// material. Replicas only load PEMs when the key set or active key has
+    /// actually changed.
+    pub async fn signing_key_state(&self) -> AppResult<Vec<(String, i32)>> {
+        with_conn!(self, |conn, _kind| {
+            let rows = sql_query("SELECT kid, is_active FROM signing_keys ORDER BY kid ASC")
+                .load::<SigningKeyStateRow>(&mut conn)
+                .map_err(AppError::from)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| (row.kid, row.is_active))
+                .collect::<Vec<_>>())
+        })
+    }
+
     pub async fn list_signing_keys(&self) -> AppResult<Vec<SigningKeyRecord>> {
         with_conn!(self, |conn, _kind| {
             sql_query("SELECT id, kid, private_key_pem, is_active, created_at, activated_at, retired_at FROM signing_keys ORDER BY is_active DESC, created_at DESC")

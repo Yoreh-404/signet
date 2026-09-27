@@ -234,9 +234,81 @@ async fn effective_permission_queries_include_direct_and_group_roles() {
             .await
             .unwrap()
     );
+    assert!(
+        db.has_all_effective_permissions(&user.id, &["account.read", "group.read"])
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.has_all_effective_permissions(&user.id, &["shared.read", "shared.read"])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.has_all_effective_permissions(&user.id, &["account.read", "missing"])
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.has_all_effective_permissions(&user.id, &[])
+            .await
+            .unwrap()
+    );
     assert_eq!(
         db.list_effective_permissions(&user.id).await.unwrap(),
         vec!["account.read", "group.read", "shared.read"]
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn iap_session_principal_fast_path_accepts_only_standard_sessions() {
+    let (db, path) = sqlite_test_db().await;
+    let user = db
+        .insert_user(test_user("iap-principal@example.test", "iap-principal"))
+        .await
+        .unwrap();
+
+    let (standard_session, standard_cookie) = db
+        .insert_session(
+            &user.id,
+            3_600,
+            SessionMetadata {
+                login_method: Some("password".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let standard_credential = crate::util::session_id_from_cookie(&standard_cookie).unwrap();
+    let (resolved_session, resolved_user) = db
+        .find_standard_iap_session_by_credential(&standard_credential)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved_session.id, standard_session.id);
+    assert_eq!(resolved_user.id, user.id);
+
+    let (_, restricted_cookie) = db
+        .insert_session(
+            &user.id,
+            3_600,
+            SessionMetadata {
+                login_method: Some("authorization_code".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let restricted_credential = crate::util::session_id_from_cookie(&restricted_cookie).unwrap();
+    assert!(
+        db.find_standard_iap_session_by_credential(&restricted_credential)
+            .await
+            .unwrap()
+            .is_none()
     );
 
     drop(db);
