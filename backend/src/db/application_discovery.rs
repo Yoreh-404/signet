@@ -797,17 +797,30 @@ impl Db {
                             ph(kind, 1),
                             ph(kind, 2)
                         );
-                        let owned_elsewhere = sql_query(owner_sql)
+                        let foreign_owner_count = sql_query(owner_sql)
                             .bind::<Text, _>(&existing.id)
                             .bind::<Text, _>(&application_id)
                             .get_result::<CountRow>(conn)
                             .map_err(AppError::from)?
-                            .count
-                            > 0;
-                        if owned_elsewhere {
-                            return Err(AppError::BadRequest(
-                                "website-managed client belongs to another application".to_string(),
-                            ));
+                            .count;
+                        if foreign_owner_count > 0 {
+                            let active_owner_sql = format!(
+                                "SELECT COUNT(*) AS count FROM application_client_bindings INNER JOIN applications ON applications.id = application_client_bindings.application_id WHERE application_client_bindings.client_db_id = {} AND application_client_bindings.application_id <> {} AND applications.is_active = 1",
+                                ph(kind, 1),
+                                ph(kind, 2)
+                            );
+                            let active_owner_count = sql_query(active_owner_sql)
+                                .bind::<Text, _>(&existing.id)
+                                .bind::<Text, _>(&application_id)
+                                .get_result::<CountRow>(conn)
+                                .map_err(AppError::from)?
+                                .count;
+                            if active_owner_count > 0 {
+                                return Err(AppError::BadRequest(
+                                    "website-managed client belongs to another application"
+                                        .to_string(),
+                                ));
+                            }
                         }
                         if existing.organization_id.as_deref()
                             != Some(application_organization_id.as_str())
@@ -816,6 +829,48 @@ impl Db {
                                 "website-managed client belongs to another organization"
                                     .to_string(),
                             ));
+                        }
+                        if foreign_owner_count > 0 {
+                            let foreign_organization_sql = format!(
+                                "SELECT COUNT(*) AS count FROM application_client_bindings INNER JOIN applications ON applications.id = application_client_bindings.application_id WHERE application_client_bindings.client_db_id = {} AND application_client_bindings.application_id <> {} AND applications.organization_id <> {}",
+                                ph(kind, 1),
+                                ph(kind, 2),
+                                ph(kind, 3)
+                            );
+                            let foreign_organization_count = sql_query(foreign_organization_sql)
+                                .bind::<Text, _>(&existing.id)
+                                .bind::<Text, _>(&application_id)
+                                .bind::<Text, _>(&application_organization_id)
+                                .get_result::<CountRow>(conn)
+                                .map_err(AppError::from)?
+                                .count;
+                            if foreign_organization_count > 0 {
+                                return Err(AppError::BadRequest(
+                                    "website-managed client belongs to another organization"
+                                        .to_string(),
+                                ));
+                            }
+
+                            // Legacy managed clients may still be attached to
+                            // a compatibility application that has since been
+                            // disabled. The client binding is globally unique,
+                            // so a verified website contract cannot claim the
+                            // client until that stale inactive ownership row is
+                            // removed. Never transfer ownership away from an
+                            // active application, and never cross an
+                            // organization boundary.
+                            let release_inactive_owner_sql = format!(
+                                "DELETE FROM application_client_bindings WHERE client_db_id = {} AND application_id <> {} AND application_id IN (SELECT id FROM applications WHERE is_active = 0 AND organization_id = {})",
+                                ph(kind, 1),
+                                ph(kind, 2),
+                                ph(kind, 3)
+                            );
+                            sql_query(release_inactive_owner_sql)
+                                .bind::<Text, _>(&existing.id)
+                                .bind::<Text, _>(&application_id)
+                                .bind::<Text, _>(&application_organization_id)
+                                .execute(conn)
+                                .map_err(AppError::from)?;
                         }
                         conn.website_discovery_update_client(kind, &existing.id, client)?;
                         existing.id

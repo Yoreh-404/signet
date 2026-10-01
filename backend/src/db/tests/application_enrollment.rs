@@ -123,6 +123,149 @@ async fn managed_client_starts_with_a_locked_explicit_application() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn website_manifest_can_rebind_client_from_inactive_same_org_compatibility_application() {
+    let (db, path) = sqlite_test_db().await;
+    let organization = db
+        .insert_organization(test_organization("website-rebind", "Website Rebind"))
+        .await
+        .unwrap();
+    let application = db
+        .insert_application(test_application(
+            &organization.id,
+            "website-rebind-target",
+            crate::applications::ACCESS_ALL_SIGNET_USERS,
+        ))
+        .await
+        .unwrap();
+    db.upsert_application_discovery(NewApplicationDiscovery {
+        application_id: application.id.clone(),
+        management_mode: crate::application_discovery_contract::MANAGEMENT_MODE_WEBSITE.to_string(),
+        website_url: "https://website.example".to_string(),
+        fetch_secret_ciphertext: "encrypted-fetch-secret".to_string(),
+        signing_public_jwks: "{}".to_string(),
+        last_verified_revision: None,
+        last_verified_version: None,
+        last_verified_digest: None,
+        last_verified_expires_at: None,
+        sync_status: crate::application_discovery_contract::SYNC_PENDING.to_string(),
+        last_fetched_at: None,
+        last_success_at: None,
+        last_error: None,
+        snapshot_json: None,
+        operator_disabled: false,
+    })
+    .await
+    .unwrap();
+
+    let client_id = "website-rebind-client";
+    let client = db
+        .insert_client(test_client(client_id, &organization.id))
+        .await
+        .unwrap();
+    let compatibility = db
+        .find_application_for_client(&client.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(compatibility.id, application.id);
+    assert_eq!(compatibility.is_active, 1);
+
+    let profile = ApplicationDiscoveryProfile {
+        permissions: vec![ApplicationDiscoveryPermission {
+            key: "website.read".to_string(),
+            label: "Website read".to_string(),
+            description: None,
+        }],
+        roles: vec![ApplicationDiscoveryRole {
+            key: "member".to_string(),
+            name: "Member".to_string(),
+            description: None,
+            permissions: vec!["website.read".to_string()],
+            is_default: true,
+        }],
+    };
+    let manifest = ApplicationDiscoveryManifest {
+        revision: 1,
+        version: "v1".to_string(),
+        digest: "digest-rebind".to_string(),
+        expires_at: util::now_ts() + 300,
+        revoke_removed_clients: true,
+        clients: vec![test_client(client_id, &organization.id)],
+        client_protocols: [(client_id.to_string(), "oidc".to_string())]
+            .into_iter()
+            .collect(),
+        protocols: serde_json::json!({
+            "website_url": "https://website.example",
+            "oauth2_oidc": {"enabled": true, "client_ids": [client_id]}
+        }),
+        login_adapters: serde_json::json!({
+            "enabled": true,
+            "allow_signet_password": true,
+            "provider_ids": []
+        }),
+        directory_sync: serde_json::json!({
+            "enabled": false,
+            "scim_enabled": false,
+            "sync_groups": false
+        }),
+        authorization: serde_json::json!({
+            "inherit_enterprise_roles": true,
+            "default_role": "member",
+            "claims": []
+        }),
+        authorization_mappings: Default::default(),
+        profiles: [("default".to_string(), profile)].into_iter().collect(),
+        redacted_payload: serde_json::json!({}),
+    };
+
+    assert!(matches!(
+        db.apply_application_contract(&application.id, manifest.clone())
+            .await,
+        Err(AppError::BadRequest(message))
+            if message == "website-managed client belongs to another application"
+    ));
+
+    db.update_application(
+        &compatibility.id,
+        NewApplication {
+            organization_id: compatibility.organization_id.clone(),
+            slug: compatibility.slug.clone(),
+            name: compatibility.name.clone(),
+            description: compatibility.description.clone(),
+            access_mode: compatibility.access_mode.clone(),
+            registration_mode: compatibility.registration_mode.clone(),
+            account_selection_mode: compatibility.account_selection_mode.clone(),
+            unique_identity_factors: Vec::new(),
+            is_active: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    db.apply_application_contract(&application.id, manifest)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.find_application_for_client(&client.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        application.id
+    );
+    assert!(
+        db.list_application_client_bindings(&compatibility.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn website_manifest_removes_profiles_and_client_links_from_the_snapshot() {
     let (db, path) = sqlite_test_db().await;
     let organization = db
