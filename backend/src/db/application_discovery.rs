@@ -2,15 +2,17 @@
 
 use super::applications::cached_profile_role_id;
 use super::{
-    APPLICATION_DISCOVERY_LEASE_TTL_SECONDS, AppError, AppResult,
-    ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
+    bind_text_list, blocking, ph, placeholders, select_application_authorization_profile_sql,
+    select_application_client_binding_sql, select_application_discovery_sql, select_client_sql,
+    AppError, AppResult, ApplicationAuthorizationProfileRecord, ApplicationClientBindingRecord,
     ApplicationDiscoveryIdempotencyClaim, ApplicationDiscoveryIdempotencyRecord,
     ApplicationDiscoveryLease, ApplicationDiscoveryRecord, ClientRecord, CountRow, DatabaseKind,
     Db, NewApplicationDiscovery, WebsiteDiscoveryConnection, WebsiteDiscoveryProfileInput,
-    bind_text_list, blocking, ph, placeholders, select_application_authorization_profile_sql,
-    select_application_client_binding_sql, select_application_discovery_sql, select_client_sql,
+    APPLICATION_DISCOVERY_LEASE_TTL_SECONDS,
 };
-use crate::application_discovery_contract::{MANAGEMENT_MODE_WEBSITE, SYNC_SYNCED};
+use crate::application_discovery_contract::{
+    MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE, SYNC_DISABLED, SYNC_SYNCED,
+};
 use crate::util;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
@@ -73,6 +75,104 @@ pub struct ApplicationDiscoveryRole {
     pub description: Option<String>,
     pub permissions: Vec<String>,
     pub is_default: bool,
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct ClientOwnerApplicationRow {
+    #[diesel(sql_type = Text)]
+    application_id: String,
+    #[diesel(sql_type = Text)]
+    organization_id: String,
+    #[diesel(sql_type = Text)]
+    registration_mode: String,
+    #[diesel(sql_type = Text)]
+    access_mode: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    description: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    binding_count: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    management_mode: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    sync_status: Option<String>,
+}
+
+macro_rules! release_generated_compatibility_owner {
+    ($conn:expr, $kind:expr, $client:expr, $application_id:expr, $organization_id:expr $(,)?) => {{
+        let conn = &mut *$conn;
+        let owner_sql = format!(
+            "SELECT applications.id AS application_id, applications.organization_id AS organization_id, applications.registration_mode AS registration_mode, applications.access_mode AS access_mode, applications.description AS description, (SELECT COUNT(*) FROM application_client_bindings owner_bindings WHERE owner_bindings.application_id = applications.id) AS binding_count, application_discovery.management_mode AS management_mode, application_discovery.sync_status AS sync_status FROM application_client_bindings bindings INNER JOIN applications ON applications.id = bindings.application_id LEFT JOIN application_discovery ON application_discovery.application_id = applications.id WHERE bindings.client_db_id = {} AND bindings.application_id <> {}",
+            ph($kind, 1),
+            ph($kind, 2)
+        );
+        let owners = sql_query(owner_sql)
+            .bind::<Text, _>(&$client.id)
+            .bind::<Text, _>($application_id)
+            .load::<ClientOwnerApplicationRow>(conn)
+            .map_err(AppError::from)?;
+        let generated_descriptions = [
+            format!(
+                "Locked compatibility application for OIDC client {}.",
+                $client.client_id
+            ),
+            format!(
+                "Website application migrated from OIDC client {}.",
+                $client.client_id
+            ),
+            format!(
+                "Website application created for OIDC client {}.",
+                $client.client_id
+            ),
+        ];
+        let generated_owner = owners.first().filter(|owner| {
+            owners.len() == 1
+                && owner.organization_id == $organization_id
+                && owner.registration_mode == crate::applications::REGISTRATION_DISABLED
+                && owner.access_mode == crate::applications::ACCESS_ALL_SIGNET_USERS
+                && owner.binding_count == 1
+                && owner
+                    .description
+                    .as_ref()
+                    .is_some_and(|description| generated_descriptions.contains(description))
+                && match owner.management_mode.as_deref() {
+                    None => true,
+                    Some(MANAGEMENT_MODE_SIGNET) => {
+                        owner.sync_status.as_deref() == Some(SYNC_DISABLED)
+                    }
+                    _ => false,
+                }
+        });
+        if let Some(owner) = generated_owner {
+            // Adoption and canonical binding creation happen inside the same
+            // contract transaction. A failure rolls this deletion back, so a
+            // client is never durably left without an owner.
+            let delete_binding_sql = format!(
+                "DELETE FROM application_client_bindings WHERE application_id = {} AND client_db_id = {}",
+                ph($kind, 1),
+                ph($kind, 2)
+            );
+            sql_query(delete_binding_sql)
+                .bind::<Text, _>(&owner.application_id)
+                .bind::<Text, _>(&$client.id)
+                .execute(conn)
+                .map_err(AppError::from)?;
+            let retire_application_sql = format!(
+                "UPDATE applications SET is_active = {}, updated_at = {} WHERE id = {}",
+                ph($kind, 1),
+                ph($kind, 2),
+                ph($kind, 3)
+            );
+            sql_query(retire_application_sql)
+                .bind::<Integer, _>(0)
+                .bind::<BigInt, _>(util::now_ts())
+                .bind::<Text, _>(&owner.application_id)
+                .execute(conn)
+                .map_err(AppError::from)?;
+            true
+        } else {
+            false
+        }
+    }};
 }
 
 impl Db {
@@ -792,6 +892,20 @@ impl Db {
                         .optional()
                         .map_err(AppError::from)?;
                     let client_db_id = if let Some(existing) = existing {
+                        let adopted_generated_owner = release_generated_compatibility_owner!(
+                            conn,
+                            kind,
+                            existing,
+                            &application_id,
+                            &application_organization_id,
+                        );
+                        if adopted_generated_owner {
+                            tracing::info!(
+                                client_id = %existing.client_id,
+                                application_id = %application_id,
+                                "website application adopted generated compatibility client owner"
+                            );
+                        }
                         let owner_sql = format!(
                             "SELECT COUNT(*) AS count FROM application_client_bindings WHERE client_db_id = {} AND application_id <> {}",
                             ph(kind, 1),

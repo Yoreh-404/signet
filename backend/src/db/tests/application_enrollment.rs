@@ -121,6 +121,162 @@ async fn managed_client_starts_with_a_locked_explicit_application() {
     let _ = std::fs::remove_file(path);
 }
 
+fn single_client_website_manifest(
+    client: NewClient,
+    revision: i64,
+) -> ApplicationDiscoveryManifest {
+    let client_id = client.client_id.clone();
+    let mut profiles = BTreeMap::new();
+    profiles.insert(
+        "default".to_string(),
+        ApplicationDiscoveryProfile {
+            permissions: Vec::new(),
+            roles: Vec::new(),
+        },
+    );
+    ApplicationDiscoveryManifest {
+        revision,
+        version: format!("v{revision}"),
+        digest: format!("digest-{revision}"),
+        expires_at: util::now_ts() + 300,
+        revoke_removed_clients: true,
+        clients: vec![client],
+        client_protocols: [(client_id.clone(), "oidc".to_string())]
+            .into_iter()
+            .collect(),
+        protocols: serde_json::json!({
+            "website_url": "https://website.example",
+            "oauth2_oidc": {"enabled": true, "client_ids": [client_id]}
+        }),
+        login_adapters: serde_json::json!({
+            "enabled": true,
+            "allow_signet_password": true,
+            "provider_ids": []
+        }),
+        directory_sync: serde_json::json!({
+            "enabled": false,
+            "scim_enabled": false,
+            "sync_groups": false
+        }),
+        authorization: serde_json::json!({
+            "inherit_enterprise_roles": true,
+            "claims": []
+        }),
+        authorization_mappings: Default::default(),
+        profiles,
+        redacted_payload: serde_json::json!({}),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn website_manifest_adopts_generated_compatibility_owner_but_not_real_application() {
+    let (db, path) = sqlite_test_db().await;
+    let organization = db
+        .insert_organization(test_organization("website-adopt", "Website Adopt"))
+        .await
+        .unwrap();
+    let website = db
+        .insert_application(test_application(
+            &organization.id,
+            "website-adopt",
+            crate::applications::ACCESS_ALL_SIGNET_USERS,
+        ))
+        .await
+        .unwrap();
+    db.upsert_application_discovery(NewApplicationDiscovery {
+        application_id: website.id.clone(),
+        management_mode: crate::application_discovery_contract::MANAGEMENT_MODE_WEBSITE.to_string(),
+        website_url: "https://website.example".to_string(),
+        fetch_secret_ciphertext: "encrypted-fetch-secret".to_string(),
+        signing_public_jwks: "{}".to_string(),
+        last_verified_revision: None,
+        last_verified_version: None,
+        last_verified_digest: None,
+        last_verified_expires_at: None,
+        sync_status: crate::application_discovery_contract::SYNC_PENDING.to_string(),
+        last_fetched_at: None,
+        last_success_at: None,
+        last_error: None,
+        snapshot_json: None,
+        operator_disabled: false,
+    })
+    .await
+    .unwrap();
+
+    let generated_input = test_client("website-adopt-client", &organization.id);
+    let generated = db.insert_client(generated_input.clone()).await.unwrap();
+    let generated_owner = db
+        .find_application_for_client(&generated.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        generated_owner.registration_mode,
+        crate::applications::REGISTRATION_DISABLED
+    );
+
+    db.apply_application_contract(
+        &website.id,
+        single_client_website_manifest(generated_input, 1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.find_application_for_client(&generated.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        website.id
+    );
+    assert_eq!(
+        db.list_applications(Some(&organization.id))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|application| application.id == generated_owner.id)
+            .unwrap()
+            .is_active,
+        0
+    );
+
+    let real_owner = db
+        .insert_application(test_application(
+            &organization.id,
+            "real-owner",
+            crate::applications::ACCESS_ALL_SIGNET_USERS,
+        ))
+        .await
+        .unwrap();
+    let protected_input = test_client("website-protected-client", &organization.id);
+    let protected = db
+        .insert_client_for_application(&real_owner.id, protected_input.clone())
+        .await
+        .unwrap();
+    let error = db
+        .apply_application_contract(
+            &website.id,
+            single_client_website_manifest(protected_input, 2),
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("website-managed client belongs to another application"));
+    assert_eq!(
+        db.find_application_for_client(&protected.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        real_owner.id
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn website_manifest_can_rebind_client_from_inactive_same_org_compatibility_application() {
