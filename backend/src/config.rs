@@ -1694,8 +1694,8 @@ mod tests {
                 "missing canonical Loom scope {scope}"
             );
         }
-        for scope in ["anchordocs.service", "anchordocs.read", "anchordocs.write"] { // loom-rename-compat: assert legacy scope aliases remain available during migration
-            // loom-rename-compat: regression coverage for legacy scope aliases
+        for scope in ["anchordocs.service", "anchordocs.read", "anchordocs.write"] {
+            // loom-rename-compat: regression coverage for legacy scope aliases.
             assert!(
                 settings
                     .oidc
@@ -1733,13 +1733,16 @@ mod tests {
             loom_application.signing_public_jwks_env.as_deref(),
             Some("SIGNET_LOOM_DISCOVERY_SIGNING_PUBLIC_JWKS")
         );
-        assert!(
-            settings
-                .bootstrap
-                .applications
-                .iter()
-                .any(|application| application.application_id == "anchordocs")
-        );
+        let anchordocs_application = settings
+            .bootstrap
+            .applications
+            .iter()
+            .find(|application| application.application_id == "anchordocs")
+            .expect("AnchorDocs compatibility application");
+        assert_eq!(anchordocs_application.management_mode, "signet_managed");
+        assert!(!anchordocs_application.is_active);
+        assert!(anchordocs_application.fetch_secret_env.is_none());
+        assert!(anchordocs_application.signing_public_jwks_env.is_none());
     }
 
     fn verification_channel(delivery: VerificationDelivery) -> VerificationChannelSettings {

@@ -24,6 +24,60 @@ use diesel::{
 };
 use std::collections::BTreeSet;
 
+fn resolve_bootstrap_discovery_fetch_secret(
+    existing_ciphertext: Option<&str>,
+    configured_secret: &str,
+    encryption_key: &str,
+) -> AppResult<(String, bool)> {
+    let configured_secret = configured_secret.trim();
+    if configured_secret.is_empty() {
+        return Ok((existing_ciphertext.unwrap_or_default().to_string(), false));
+    }
+    if encryption_key.trim().is_empty() {
+        return Err(AppError::Configuration(
+            "discovery encryption key is required to enroll a fetch secret".to_string(),
+        ));
+    }
+
+    if let Some(existing_ciphertext) = existing_ciphertext.filter(|value| !value.trim().is_empty())
+        && util::decrypt_discovery_secret(encryption_key, existing_ciphertext)
+            .ok()
+            .as_deref()
+            == Some(configured_secret)
+    {
+        // AES-GCM encryption uses a random nonce. Re-encrypting the same
+        // plaintext on every startup would produce a different ciphertext and
+        // incorrectly invalidate an otherwise verified Discovery snapshot.
+        return Ok((existing_ciphertext.to_string(), false));
+    }
+
+    Ok((
+        util::encrypt_discovery_secret(encryption_key, configured_secret)?,
+        true,
+    ))
+}
+
+fn bootstrap_management_mode_change_requires_admin(
+    existing_mode: &str,
+    desired_mode: &str,
+    existing_verified_snapshot: bool,
+    desired_application_active: bool,
+) -> bool {
+    if existing_mode == desired_mode || !existing_verified_snapshot {
+        return false;
+    }
+
+    // The AnchorDocs -> Loom cutover deliberately leaves the old application
+    // as an inactive Signet-managed tombstone. Once the application is being
+    // disabled, preserving the website-managed runtime snapshot has no safety
+    // value and would prevent the canonical Loom application from rebinding
+    // the stable legacy client ids. Keep every other verified mode transition
+    // behind the operator/admin API.
+    !(existing_mode == MANAGEMENT_MODE_WEBSITE
+        && desired_mode == MANAGEMENT_MODE_SIGNET
+        && !desired_application_active)
+}
+
 impl Db {
     /// Older installations treated phone as an identity key. Phone is now a
     /// verification contact and may legitimately be shared across accounts.
@@ -719,30 +773,26 @@ impl Db {
             .find_application_discovery(&application_record.id)
             .await?;
         if let Some(existing_discovery) = existing_discovery.as_ref()
-            && existing_discovery.management_mode != application.management_mode
-            && existing_discovery.last_verified_revision.is_some()
+            && bootstrap_management_mode_change_requires_admin(
+                &existing_discovery.management_mode,
+                &application.management_mode,
+                existing_discovery.last_verified_revision.is_some(),
+                application.is_active,
+            )
         {
             return Err(AppError::Configuration(format!(
                 "bootstrap application {} changes management_mode after a verified Discovery snapshot; switch it through the admin API",
                 application.application_id
             )));
         }
-        let fetch_secret_ciphertext = if application.fetch_secret.trim().is_empty() {
-            existing_discovery
-                .as_ref()
-                .map(|value| value.fetch_secret_ciphertext.clone())
-                .unwrap_or_default()
-        } else {
-            if settings.discovery.encryption_key.trim().is_empty() {
-                return Err(AppError::Configuration(
-                    "discovery encryption key is required to enroll a fetch secret".to_string(),
-                ));
-            }
-            util::encrypt_discovery_secret(
+        let (fetch_secret_ciphertext, fetch_secret_changed) =
+            resolve_bootstrap_discovery_fetch_secret(
+                existing_discovery
+                    .as_ref()
+                    .map(|value| value.fetch_secret_ciphertext.as_str()),
+                &application.fetch_secret,
                 &settings.discovery.encryption_key,
-                application.fetch_secret.trim(),
-            )?
-        };
+            )?;
         let signing_public_jwks = if application.signing_public_jwks.trim().is_empty() {
             existing_discovery
                 .as_ref()
@@ -759,7 +809,7 @@ impl Db {
         let reset_snapshot = existing_discovery.as_ref().is_some_and(|value| {
             value.management_mode != application.management_mode
                 || value.website_url != website_url
-                || value.fetch_secret_ciphertext != fetch_secret_ciphertext
+                || fetch_secret_changed
                 || value.signing_public_jwks != signing_public_jwks
         });
         let sync_status = if application.management_mode == MANAGEMENT_MODE_WEBSITE {
@@ -950,5 +1000,81 @@ impl Db {
         // for a restart.
         self.migrate_tenant_application_model().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bootstrap_management_mode_change_requires_admin, resolve_bootstrap_discovery_fetch_secret,
+    };
+    use crate::application_discovery_contract::{MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE};
+    use crate::util;
+
+    const DISCOVERY_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn unchanged_bootstrap_discovery_secret_preserves_ciphertext_and_snapshot() {
+        let existing = util::encrypt_discovery_secret(DISCOVERY_KEY, "stable-secret").unwrap();
+        let (resolved, changed) = resolve_bootstrap_discovery_fetch_secret(
+            Some(&existing),
+            "stable-secret",
+            DISCOVERY_KEY,
+        )
+        .unwrap();
+
+        assert!(!changed);
+        assert_eq!(resolved, existing);
+    }
+
+    #[test]
+    fn changed_bootstrap_discovery_secret_rotates_ciphertext_and_snapshot() {
+        let existing = util::encrypt_discovery_secret(DISCOVERY_KEY, "old-secret").unwrap();
+        let (resolved, changed) =
+            resolve_bootstrap_discovery_fetch_secret(Some(&existing), "new-secret", DISCOVERY_KEY)
+                .unwrap();
+
+        assert!(changed);
+        assert_ne!(resolved, existing);
+        assert_eq!(
+            util::decrypt_discovery_secret(DISCOVERY_KEY, &resolved).unwrap(),
+            "new-secret"
+        );
+    }
+
+    #[test]
+    fn omitted_bootstrap_discovery_secret_keeps_existing_ciphertext() {
+        let existing = util::encrypt_discovery_secret(DISCOVERY_KEY, "stable-secret").unwrap();
+        let (resolved, changed) =
+            resolve_bootstrap_discovery_fetch_secret(Some(&existing), "", DISCOVERY_KEY).unwrap();
+
+        assert!(!changed);
+        assert_eq!(resolved, existing);
+    }
+
+    #[test]
+    fn inactive_compatibility_tombstone_can_leave_verified_website_management() {
+        assert!(!bootstrap_management_mode_change_requires_admin(
+            MANAGEMENT_MODE_WEBSITE,
+            MANAGEMENT_MODE_SIGNET,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn active_verified_application_mode_change_still_requires_admin() {
+        assert!(bootstrap_management_mode_change_requires_admin(
+            MANAGEMENT_MODE_WEBSITE,
+            MANAGEMENT_MODE_SIGNET,
+            true,
+            true,
+        ));
+        assert!(bootstrap_management_mode_change_requires_admin(
+            MANAGEMENT_MODE_SIGNET,
+            MANAGEMENT_MODE_WEBSITE,
+            true,
+            false,
+        ));
     }
 }

@@ -352,10 +352,8 @@ signing_public_jwks_env = "SIGNET_LOOM_DISCOVERY_SIGNING_PUBLIC_JWKS"
 application_id = "anchordocs" # loom-rename-compat: legacy Signet application alias
 name = "AnchorDocs"
 website_url = "https://docs.test.com"
-management_mode = "website_managed"
-is_active = true
-fetch_secret_env = "SIGNET_ANCHORDOCS_DISCOVERY_FETCH_SECRET" # loom-rename-compat: legacy discovery enrollment alias
-signing_public_jwks_env = "SIGNET_ANCHORDOCS_DISCOVERY_SIGNING_PUBLIC_JWKS" # loom-rename-compat: legacy discovery verification alias
+management_mode = "signet_managed" # loom-rename-compat: inactive tombstone so Loom discovery can rebind legacy clients
+is_active = false # loom-rename-compat: canonical runtime owner is the Loom application above
 
 [[bootstrap.applications]]
 application_id = "ocr"
