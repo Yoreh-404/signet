@@ -1681,6 +1681,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_config_exposes_canonical_loom_auth_contract_with_anchordocs_aliases() {
+        let settings = default_settings();
+        for scope in ["loom.service", "loom.read", "loom.write"] {
+            assert!(
+                settings
+                    .oidc
+                    .supported_scopes
+                    .iter()
+                    .any(|value| value == scope),
+                "missing canonical Loom scope {scope}"
+            );
+        }
+        for scope in ["anchordocs.service", "anchordocs.read", "anchordocs.write"] {
+            // loom-rename-compat: regression coverage for legacy scope aliases
+            assert!(
+                settings
+                    .oidc
+                    .supported_scopes
+                    .iter()
+                    .any(|value| value == scope),
+                "missing AnchorDocs compatibility scope {scope}"
+            );
+        }
+
+        let loom_delegation = settings
+            .oidc
+            .delegated_allowlist
+            .iter()
+            .find(|entry| entry.audience.as_deref() == Some("loom"))
+            .expect("canonical Loom delegated allowlist");
+        assert_eq!(loom_delegation.client_id.as_deref(), Some("axon"));
+        assert_eq!(
+            loom_delegation.normalized_scopes(),
+            vec!["loom.read".to_string(), "loom.write".to_string()]
+        );
+
+        let loom_application = settings
+            .bootstrap
+            .applications
+            .iter()
+            .find(|application| application.application_id == "loom")
+            .expect("canonical Loom bootstrap application");
+        assert_eq!(loom_application.name, "Loom");
+        assert_eq!(
+            loom_application.fetch_secret_env.as_deref(),
+            Some("SIGNET_LOOM_DISCOVERY_FETCH_SECRET")
+        );
+        assert_eq!(
+            loom_application.signing_public_jwks_env.as_deref(),
+            Some("SIGNET_LOOM_DISCOVERY_SIGNING_PUBLIC_JWKS")
+        );
+        assert!(
+            settings
+                .bootstrap
+                .applications
+                .iter()
+                .any(|application| application.application_id == "anchordocs")
+        );
+    }
+
     fn verification_channel(delivery: VerificationDelivery) -> VerificationChannelSettings {
         VerificationChannelSettings {
             enabled: true,
