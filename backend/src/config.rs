@@ -1694,7 +1694,7 @@ mod tests {
                 "missing canonical Loom scope {scope}"
             );
         }
-        for scope in ["anchordocs.service", "anchordocs.read", "anchordocs.write"] {
+        for scope in ["anchordocs.service", "anchordocs.read", "anchordocs.write"] { // loom-rename-compat: assert legacy scope aliases remain available during migration
             // loom-rename-compat: regression coverage for legacy scope aliases
             assert!(
                 settings
