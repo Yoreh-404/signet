@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # Initialise the shared Cargo/sccache cache used by the OpenSponge Rust
-# projects. The target directory is shared only by compatible compilation
-# identities; Cargo still keeps package, feature, profile, and fingerprint
-# boundaries inside the directory.
+# projects. Cargo target directories stay project/worktree-local by default;
+# only compiler outputs are shared through sccache. Shared targets remain an
+# explicit opt-in via OPENSPONGE_SHARED_CARGO_TARGET=1.
 
 opensponge_cargo_cache_init() {
   if ! command -v rustc >/dev/null 2>&1; then
@@ -11,8 +11,15 @@ opensponge_cargo_cache_init() {
   fi
 
   local cache_root rustc_identity target_triple cache_material cache_variant
+  local repo_root repo_parent code_root
   local native_cc native_cxx native_ar native_ranlib native_linker
-  cache_root="${OPENSPONGE_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/opensponge}"
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  repo_parent="$(dirname "$repo_root")"
+  case "$(basename "$repo_parent")" in
+    OpenSponge|.worktrees) code_root="$(dirname "$repo_parent")" ;;
+    *) code_root="$repo_root" ;;
+  esac
+  cache_root="${OPENSPONGE_CACHE_ROOT:-$code_root/.cache/opensponge}"
   rustc_identity="$(rustc -vV 2>/dev/null || true)"
   target_triple="${CARGO_BUILD_TARGET:-$(printf '%s\n' "$rustc_identity" | sed -n 's/^host: //p')}"
   target_triple="$(printf '%s' "$target_triple" | tr -c '[:alnum:]_.-' '_')"
@@ -70,11 +77,16 @@ opensponge_cargo_cache_init() {
   export CARGO_NET_RETRY="${CARGO_NET_RETRY:-5}"
   export CARGO_HTTP_TIMEOUT="${CARGO_HTTP_TIMEOUT:-120}"
   export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
-  if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "${OPENSPONGE_DISABLE_SHARED_CARGO_TARGET:-0}" != "1" ]; then
+  export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+  if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "${OPENSPONGE_SHARED_CARGO_TARGET:-0}" = "1" ]; then
     export CARGO_TARGET_DIR="$cache_root/cargo-target/$cache_variant"
   fi
   if [ -z "${SCCACHE_DIR:-}" ]; then
     export SCCACHE_DIR="$cache_root/sccache"
+  fi
+  export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}"
+  if [ -z "${SCCACHE_BASEDIRS:-}" ]; then
+    export SCCACHE_BASEDIRS="$code_root"
   fi
   if [ -z "${RUSTC_WRAPPER:-}" ] && command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
@@ -91,7 +103,7 @@ opensponge_cargo_cache_init() {
   fi
 
   if [ -n "${GITHUB_ENV:-}" ]; then
-    for variable in CARGO_HOME CARGO_TARGET_DIR SCCACHE_DIR CARGO_REGISTRIES_CRATES_IO_PROTOCOL CARGO_NET_RETRY CARGO_HTTP_TIMEOUT CARGO_HTTP_MULTIPLEXING RUSTC_WRAPPER; do
+    for variable in CARGO_HOME CARGO_TARGET_DIR CARGO_INCREMENTAL SCCACHE_DIR SCCACHE_BASEDIRS SCCACHE_CACHE_SIZE CARGO_REGISTRIES_CRATES_IO_PROTOCOL CARGO_NET_RETRY CARGO_HTTP_TIMEOUT CARGO_HTTP_MULTIPLEXING RUSTC_WRAPPER; do
       printf '%s=%s\n' "$variable" "${!variable:-}" >> "$GITHUB_ENV"
     done
   fi
