@@ -257,13 +257,53 @@ async fn website_manifest_adopts_generated_compatibility_owner_but_not_real_appl
     let error = db
         .apply_application_contract(
             &website.id,
-            single_client_website_manifest(protected_input, 2),
+            single_client_website_manifest(protected_input.clone(), 2),
         )
         .await
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("website-managed client belongs to another application"));
+    assert!(
+        error
+            .to_string()
+            .contains("website-managed client belongs to another application")
+    );
+    assert_eq!(
+        db.find_application_for_client(&protected.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        real_owner.id
+    );
+
+    db.update_application(
+        &real_owner.id,
+        NewApplication {
+            organization_id: real_owner.organization_id.clone(),
+            slug: real_owner.slug.clone(),
+            name: real_owner.name.clone(),
+            description: real_owner.description.clone(),
+            access_mode: real_owner.access_mode.clone(),
+            registration_mode: real_owner.registration_mode.clone(),
+            account_selection_mode: real_owner.account_selection_mode.clone(),
+            unique_identity_factors: Vec::new(),
+            is_active: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = db
+        .apply_application_contract(
+            &website.id,
+            single_client_website_manifest(protected_input, 3),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("website-managed client belongs to another application")
+    );
     assert_eq!(
         db.find_application_for_client(&protected.id)
             .await
