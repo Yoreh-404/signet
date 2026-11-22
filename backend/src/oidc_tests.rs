@@ -1829,6 +1829,118 @@ fn authorization_code_tokens_preserve_login_code_provenance() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() {
+    use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+    use diesel::{RunQueryDsl, connection::SimpleConnection, sql_query, sql_types::Text};
+    use serde_json::{Value, json};
+    let (mut state, path) = test_app_state().await;
+    let user = insert_refresh_test_user(&state, "axon-v2").await;
+    let demo = test_refresh_client(&state).await;
+    let binding = state.db.find_application_client_binding_by_public_client_id(&demo.client_id)
+        .await.unwrap().unwrap();
+    let app = state.db.find_application_by_id(&binding.application_id).await.unwrap().unwrap();
+    let verifier = insert_test_oidc_client(&state, "v2-confidential-fixture", "https://verifier.test/callback", "").await;
+    let origin = "https://axon.test";
+    let resource = "https://axon.test/resource";
+    let redirect = format!("{origin}/admin/api/auth/signet/callback");
+    let now = util::now_ts();
+    let issuer = state.settings.oidc.issuer.trim_end_matches('/').to_owned();
+    let jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519","x":"demo","kid":"fixture"}]}).to_string();
+    let pin = crate::application_discovery::axon_signer_pin(&jwks).unwrap();
+    let permissions: Vec<String> = serde_json::from_str(include_str!(
+        "../tests/fixtures/axon-admin-v2-catalog.json"
+    )).unwrap();
+    let mapping = json!({"version":2,"source":"signet.is_admin","claim":"axon_admin_authority",
+        "output":"access_token","client_id":demo.client_id,"audience":resource,"permissions":permissions});
+    let durable = json!({"application_id":app.slug,"revision":3,
+        "_signet_axon_verified_signer":pin,"modules":{"axon_admin_mapping":mapping}}).to_string();
+    state.settings.discovery.axon_admin_trust = Some(crate::config::AxonAdminTrust {
+        origin: origin.into(), organization_id: app.organization_id.clone(),
+        application_id: app.slug.clone(), client_id: demo.client_id.clone(),
+        audience: resource.into(), signing_public_jwks: jwks.clone(),
+    });
+    state.settings.discovery.axon_admin_v2 = Some(crate::config::AxonAdminV2Policy {
+        enrollment_id: "fixture-enrollment".into(), revision: 3, digest: "a".repeat(43),
+        permissions: permissions.clone(), issuer: issuer.clone(),
+        introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
+    });
+    state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
+        application_id: app.id.clone(), management_mode: "website".into(),
+        website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: jwks,
+        last_verified_revision: None, last_verified_version: None, last_verified_digest: None,
+        last_verified_expires_at: None, sync_status: "pending".into(),
+        last_fetched_at: None, last_success_at: None, last_error: None, snapshot_json: None,
+        operator_disabled: false,
+    }).await.unwrap();
+    let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
+    let pool = pool.clone();
+    let secret = "local-fixture-not-a-deployed-secret";
+    {
+        let mut conn = pool.get().unwrap();
+        conn.batch_execute(include_str!("../../scripts/axon-admin-v2-tombstone.sql")).unwrap();
+        sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
+        sql_query("UPDATE clients SET organization_id=?, audience=?, redirect_uris=?, scopes='[\"openid\"]',
+            grant_types='[\"authorization_code\"]', require_pkce=1, require_s256_pkce=1 WHERE id=?")
+            .bind::<Text,_>(&app.organization_id).bind::<Text,_>(resource)
+            .bind::<Text,_>(json!([redirect]).to_string()).bind::<Text,_>(&demo.id).execute(&mut conn).unwrap();
+        sql_query("UPDATE clients SET organization_id=?, audience=?, token_endpoint_auth_method='client_secret_basic',
+            client_secret_hash=? WHERE id=?")
+            .bind::<Text,_>(&app.organization_id).bind::<Text,_>(resource)
+            .bind::<Text,_>(util::hash_password(secret).unwrap()).bind::<Text,_>(&verifier.id).execute(&mut conn).unwrap();
+        sql_query("INSERT INTO axon_admin_authority_state
+            (organization_id,application_slug,enrollment_id,revision,digest,generation,withdrawn,snapshot_json,expires_at)
+            VALUES (?,?,'fixture-enrollment',3,?,1,0,?,?)")
+            .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug)
+            .bind::<Text,_>("a".repeat(43)).bind::<Text,_>(&durable)
+            .bind::<diesel::sql_types::BigInt,_>(now+300).execute(&mut conn).unwrap();
+    }
+    let client = test_refresh_client(&state).await;
+    let jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
+        None, &user, "password", auth::LoginEventContext::default()).await.unwrap();
+    let signed_in = auth::require_current_user(&state, &jar).await.unwrap();
+    let code = "synthetic-axon-admin-code";
+    let challenge_verifier = "fixture-verifier-for-s256-challenge-000000000";
+    state.db.insert_authorization_code(NewAuthorizationCode {
+        code: code.into(), client_id: client.client_id.clone(), user_id: user.id.clone(),
+        application_id: Some(app.id.clone()), authorization_profile_id: Some(binding.authorization_profile_id),
+        auth_context_id: None, session_id: Some(util::session_public_id(&signed_in.session_id)),
+        redirect_uri: redirect.clone(), scope: "openid".into(), resource: Some(resource.into()),
+        authorization_details: None, nonce: None,
+        code_challenge: Some(util::sha256_base64url(challenge_verifier)), code_challenge_method: Some("S256".into()),
+        auth_time: now, acr: assurance::ACR_PASSWORD.into(), amr: vec!["pwd".into()], expires_at: now+120,
+    }).await.unwrap();
+    let mut req = test_authorization_code_token_request(code);
+    req.redirect_uri = Some(redirect);
+    req.code_verifier = Some(challenge_verifier.into());
+    let Json(tokens) = token_from_authorization_code(state.clone(), client, req, issuer, None).await.unwrap();
+    let read = |value: &str| -> Value {
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(value.split('.').nth(1).unwrap()).unwrap()).unwrap()
+    };
+    let expected = json!({"version":2,"application_id":app.slug,"revision":3,"permissions":permissions});
+    let claim = "axon_admin_authority";
+    assert_eq!(read(&tokens.access_token)[claim], expected);
+    assert!(read(tokens.id_token.as_deref().unwrap()).get(claim).is_none());
+    assert!(tokens.refresh_token.is_none());
+    let router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
+        super::oidc_resource::introspect)).with_state(state.clone());
+    let request = || Request::post("/oauth2/introspect")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, format!("Basic {}", STANDARD.encode(format!("{}:{secret}", verifier.client_id))))
+        .body(Body::from(format!("token_type_hint=axon_admin_authority&token={}", tokens.access_token))).unwrap();
+    let before = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
+    assert_eq!(before, json!({"active":true,"axon_admin_authority":expected}));
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("UPDATE users SET is_admin=0 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
+    }
+    let after = oidc_http_body_json(router.oneshot(request()).await.unwrap()).await;
+    assert_eq!(after, json!({"active":false}));
+    drop(state);
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn login_code_tokens_are_marked_and_never_receive_refresh_tokens() {
     let (state, path) = test_app_state().await;
