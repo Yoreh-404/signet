@@ -8,6 +8,10 @@ rollback marker does not log per-account changes.
 
 Before making a restored Signet database available, retain the independent
 operator-owned rollback marker and keep the exact Axon enrollment halted.
+Configure `rollback_marker_owner_uid` from the independent operator identity,
+not the Signet service UID. The hardened Linux runtime opens the file relative
+to a verified non-writable directory and requires a read-only mount. An old
+configuration without verified ownership does not activate Axon v2 authority.
 Reconcile account roles against trustworthy evidence that was not rolled back.
 Do not reopen the enrollment based on the restored role table alone. If the
 original roles cannot be reconciled, leave the enrollment halted. Reopening
@@ -53,6 +57,8 @@ halted for v2 projection until independently reconciled.
 
 Keep both evidence and its reviewed config pin independently of database
 backups, in an operator-owned location that the service cannot replace.
+The account file uses the same verified owner and mount requirements as the
+enrollment floor; signatures do not bypass descriptor checks.
 An older valid file at the same generation fails the digest pin.
 Installing a new list is a reviewed operator procedure: halt the enrollment
 and stop serving old-config replicas, atomically replace the evidence, and

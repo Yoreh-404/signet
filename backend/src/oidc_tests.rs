@@ -1834,6 +1834,7 @@ fn authorization_code_tokens_preserve_login_code_provenance() {
 async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() {
     use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
     use diesel::{RunQueryDsl, connection::SimpleConnection, sql_query, sql_types::Text};
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     let (mut state, path) = test_app_state().await;
@@ -1849,7 +1850,9 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     let redirect = format!("{origin}/admin/api/auth/signet/callback");
     let now = util::now_ts();
     let issuer = state.settings.oidc.issuer.trim_end_matches('/').to_owned();
-    let jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519","x":"demo","kid":"fixture"}]}).to_string();
+    let signing = SigningKey::from_bytes(&[81; 32]);
+    let jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519","alg":"EdDSA",
+        "x":URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes()),"kid":"fixture"}]}).to_string();
     let pin = crate::application_discovery::axon_signer_pin(&jwks).unwrap();
     let permissions: Vec<String> = serde_json::from_str(include_str!(
         "../tests/fixtures/axon-admin-v2-catalog.json"
@@ -1857,8 +1860,34 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     assert_eq!(permissions.len(), 171);
     let mapping = json!({"version":2,"source":"signet.is_admin","claim":"axon_admin_authority",
         "output":"access_token","client_id":demo.client_id,"audience":resource,"permissions":permissions});
-    let durable = json!({"application_id":app.slug,"revision":3,
-        "_signet_axon_verified_signer":pin,"modules":{"axon_admin_mapping":mapping}}).to_string();
+    let body = json!({
+        "format": "signet-application/v3", "application_id": app.slug, "revision": 3,
+        "version": "fixture", "iss": origin, "aud": [issuer, format!("signet:application:{}", app.slug)],
+        "iat": now, "exp": now+180,
+        "modules": {"axon_admin_mapping":mapping, "clients":[{
+            "client_id":demo.client_id,"protocol":"oidc","profiles":["web_oidc"],
+            "redirect_uris":[redirect],"scopes":["openid"],"audiences":[resource],
+            "grant_types":["authorization_code"],"response_types":["code"],
+            "require_pkce":true,"require_s256_pkce":true
+        }]}
+    });
+    let approved = crate::application_discovery::ApprovedAxonDeclaration {
+        organization_id: &app.organization_id, application_id: &app.slug, revision: 3,
+        website_origin: origin, discovery_issuer: origin, discovery_audience: &issuer,
+        client_id: &demo.client_id, resource_audience: resource, pinned_jwks: &jwks,
+        catalog: &permissions,
+    };
+    let verify_signed = |payload: &Value| {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","kid":"fixture"}"#);
+        let data = format!("{header}.{}", URL_SAFE_NO_PAD.encode(payload.to_string()));
+        let signature = URL_SAFE_NO_PAD.encode(signing.sign(data.as_bytes()).to_bytes());
+        crate::application_discovery::verify_approved_axon_v2(
+            format!("{data}.{signature}").as_bytes(), &app.organization_id, origin, &approved,
+        )
+    };
+    let baseline = verify_signed(&body).expect("signed v2 baseline verified");
+    let digest = baseline.manifest().digest.clone();
+    let durable = baseline.manifest().redacted_payload.to_string();
     let anchor_dir = std::env::temp_dir().join(format!("signet-axon-floor-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&anchor_dir).unwrap();
     let marker = anchor_dir.join("authority-floor.json");
@@ -1868,7 +1897,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         std::fs::write(&pending, json!({
             "organization_id": app.organization_id, "application_id": app.slug,
             "enrollment_id": "fixture-enrollment", "minimum_generation": generation,
-            "revision": 3, "digest": "a".repeat(43), "halted": halted,
+            "revision": 3, "digest": digest, "halted": halted,
         }).to_string()).unwrap();
         let mut permissions = std::fs::metadata(&pending).unwrap().permissions();
         permissions.set_readonly(true);
@@ -1883,7 +1912,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         audience: resource.into(), signing_public_jwks: jwks.clone(),
     });
     state.settings.discovery.axon_admin_v2 = Some(crate::config::AxonAdminV2Policy {
-        enrollment_id: "fixture-enrollment".into(), revision: 3, digest: "a".repeat(43),
+        enrollment_id: "fixture-enrollment".into(), revision: 3, digest: digest.clone(),
         permissions: permissions.clone(), issuer: issuer.clone(),
         introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
         signed_withdrawal: false,
@@ -1893,9 +1922,9 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     });
     state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
         application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
-        website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: jwks,
+        website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: jwks.clone(),
         last_verified_revision: Some(3), last_verified_version: Some("fixture".into()),
-        last_verified_digest: Some("a".repeat(43)), last_verified_expires_at: Some(now+300),
+        last_verified_digest: Some(digest.clone()), last_verified_expires_at: Some(now+180),
         sync_status: crate::application_discovery_contract::SYNC_STATUS_SYNCED.into(),
         last_fetched_at: Some(now), last_success_at: Some(now), last_error: None,
         snapshot_json: Some(r#"{"modules":{}}"#.into()),
@@ -1921,8 +1950,8 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
             (organization_id,application_slug,enrollment_id,revision,digest,generation,withdrawn,snapshot_json,expires_at)
             VALUES (?,?,'fixture-enrollment',3,?,1,0,?,?)")
             .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug)
-            .bind::<Text,_>("a".repeat(43)).bind::<Text,_>(&durable)
-            .bind::<diesel::sql_types::BigInt,_>(now+300).execute(&mut conn).unwrap();
+            .bind::<Text,_>(&digest).bind::<Text,_>(&durable)
+            .bind::<diesel::sql_types::BigInt,_>(now+180).execute(&mut conn).unwrap();
     }
     let client = test_refresh_client(&state).await;
     let jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
@@ -1934,7 +1963,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         application_slug: app.slug.clone(), enrollment_id: "fixture-enrollment".into(),
         website_origin: origin.into(), signer_pin: pin.clone(),
     };
-    assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, "a".repeat(43), 1)
+    assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, digest.clone(), 1)
         .await.unwrap().is_some(), "v2 enrolled current snapshot was not visible");
     let authz = crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &user).await.unwrap();
     assert!(matches!(authz.binding.as_ref().unwrap().protocol.as_str(), "oidc" | "oauth2_oidc"));
@@ -1977,6 +2006,51 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         .body(Body::from(format!("token_type_hint=axon_admin_authority&token={}", tokens.access_token))).unwrap();
     let before = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
     assert!(before == json!({"active":true,"axon_admin_authority":expected}), "confidential live-authority assertion did not match");
+    let commit = |verified| {
+        let db = state.db.clone();
+        let app_id = app.id.clone();
+        let policy = state.settings.discovery.axon_admin_v2.clone().unwrap();
+        let trust = state.settings.discovery.axon_admin_trust.clone().unwrap();
+        async move {
+            let owner = format!("test-renewal-{}", uuid::Uuid::new_v4());
+            let lease = db.claim_application_discovery_lease(&app_id, &owner).await.unwrap().unwrap();
+            let result = db.commit_axon_v2_discovery_if_owner(
+                &app_id, &owner, lease.lease_generation, verified, policy, trust,
+            ).await;
+            db.release_application_discovery_lease(&app_id, &owner, lease.lease_generation).await.unwrap();
+            result
+        }
+    };
+    // Expire authority while retaining the same signed bearer and session.
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("UPDATE axon_admin_authority_state SET expires_at=?")
+            .bind::<diesel::sql_types::BigInt,_>(util::now_ts()-1)
+            .execute(&mut conn).unwrap();
+    }
+    assert_eq!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await,
+        json!({"active":false}));
+    let mut renewed = body.clone();
+    renewed["iat"] = Value::from(now+1);
+    renewed["exp"] = Value::from(now+400);
+    let renewed_verified = verify_signed(&renewed).unwrap();
+    assert_eq!(renewed_verified.manifest().digest, digest);
+    let reconciled = commit(renewed_verified).await.unwrap();
+    assert_eq!(reconciled.last_verified_revision, Some(3));
+    assert_eq!(reconciled.last_verified_expires_at, Some(now+400));
+    assert!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await == before);
+    let mut modified = renewed.clone();
+    modified["modules"]["clients"][0]["require_mfa"] = Value::Bool(true);
+    let changed = verify_signed(&modified).unwrap();
+    assert_ne!(changed.manifest().digest, digest);
+    assert!(commit(changed).await.is_err(), "same revision changed client authorization");
+    let mut shorter = renewed.clone();
+    shorter["exp"] = Value::from(now+300);
+    assert!(commit(verify_signed(&shorter).unwrap()).await.is_err(), "same revision shortened trust");
+    let mut expired = renewed.clone();
+    expired["iat"] = Value::from(now-120);
+    expired["exp"] = Value::from(now-1);
+    assert!(verify_signed(&expired).is_err(), "expired signed renewal was accepted");
     let backup = std::env::temp_dir().join(format!("signet-axon-restore-{}.sqlite", uuid::Uuid::new_v4()));
     {
         let mut conn = pool.get().unwrap();
@@ -2018,6 +2092,13 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     // Negative control: the old role itself was in the backup. An unchanged
     // application floor does not independently remember account demotions.
     assert_eq!(oidc_http_body_json(restored_router.clone().oneshot(request()).await.unwrap()).await["active"], true);
+    let mut prior_settings = restored.settings.clone();
+    prior_settings.discovery.axon_admin_v2.as_mut().unwrap().rollback_marker_owner_uid = None;
+    let prior = AppState::new(prior_settings, restored.db.clone(), state.jwt.clone());
+    let prior_router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
+        super::oidc_resource::introspect)).with_state(prior.clone());
+    assert_eq!(oidc_http_body_json(prior_router.oneshot(request()).await.unwrap()).await, json!({"active":false}));
+    ordinary(&exchange(&prior, "synthetic-restored-without-verified-owner").await);
     {
         use ed25519_dalek::{Signer, SigningKey};
         let key = SigningKey::from_bytes(&[13; 32]);
@@ -2027,7 +2108,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
                 "format":"signet-axon-account-revocations/v1",
                 "organization_id":app.organization_id,"application_id":app.slug,
                 "enrollment_id":"fixture-enrollment","minimum_generation":1,"revision":3,
-                "digest":"a".repeat(43),"revoked_account_ids":ids,
+                "digest":digest,"revoked_account_ids":ids,
             }).to_string();
             let digest = util::sha256_base64url(&payload);
             let signature = key.sign(payload.as_bytes());
@@ -2102,6 +2183,8 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     // intentionally not part of it. Even clearing halt leaves generation 2
     // as a floor, making the backup's previously live generation 1 inert.
     set_floor(2, false);
+    assert!(commit(verify_signed(&renewed).unwrap()).await.is_err(),
+        "normal same-revision sync must not reactivate a withdrawn enrollment");
     assert_eq!(
         oidc_http_body_json(restored_router.oneshot(request()).await.unwrap()).await,
         json!({"active":false}),
