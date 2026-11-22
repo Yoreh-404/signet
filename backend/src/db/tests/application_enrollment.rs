@@ -170,6 +170,46 @@ fn single_client_website_manifest(
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn application_discovery_metadata_cannot_restore_removed_axon_mapping() {
+    use crate::application_discovery_contract::{MANAGEMENT_MODE_WEBSITE, SYNC_PENDING, SYNC_SYNCED};
+    let (db, path) = sqlite_test_db().await;
+    let org = db.insert_organization(test_organization("discovery-race", "Discovery Race")).await.unwrap();
+    let app = db.insert_application(test_application(&org.id, "race-app", crate::applications::ACCESS_ALL_SIGNET_USERS)).await.unwrap();
+    let input = |revision, has_mapping, signer: &str, disabled| NewApplicationDiscovery {
+        application_id: app.id.clone(), management_mode: MANAGEMENT_MODE_WEBSITE.into(),
+        website_url: "https://website.example".into(), fetch_secret_ciphertext: String::new(),
+        signing_public_jwks: signer.into(), last_verified_revision: Some(revision),
+        last_verified_version: Some(format!("v{revision}")), last_verified_digest: Some(format!("digest-{revision}")),
+        last_verified_expires_at: Some(1000 + revision), sync_status: SYNC_SYNCED.into(),
+        last_fetched_at: Some(revision), last_success_at: Some(revision), last_error: None,
+        snapshot_json: Some(serde_json::json!({"has_mapping":has_mapping}).to_string()),
+        operator_disabled: disabled,
+    };
+    let original = db.upsert_application_discovery(input(1, true, "key-a", false)).await.unwrap();
+    let stale = input(1, true, "key-a", false);
+    let fresh = db.upsert_application_discovery(input(2, false, "key-a", true)).await.unwrap();
+    let preserved = db.update_application_discovery_metadata(stale, None, Some(&original)).await.unwrap();
+    assert_eq!(preserved.last_verified_revision, Some(2));
+    assert_eq!(preserved.last_verified_digest, fresh.last_verified_digest);
+    assert_eq!(preserved.last_verified_expires_at, fresh.last_verified_expires_at);
+    assert_eq!(preserved.snapshot_json, fresh.snapshot_json);
+    assert_eq!(preserved.sync_status, SYNC_SYNCED);
+    assert_eq!(preserved.operator_disabled, 1);
+    let mut new_trust = input(1, true, "key-b", false);
+    new_trust.sync_status = SYNC_PENDING.into();
+    let reset = db.update_application_discovery_metadata(new_trust, Some(false), Some(&preserved)).await.unwrap();
+    assert_eq!(reset.last_verified_revision, None);
+    assert_eq!(reset.snapshot_json, None);
+    assert_eq!(reset.sync_status, SYNC_PENDING);
+    assert!(reset.lease_generation > preserved.lease_generation);
+    assert_eq!(reset.operator_disabled, 0);
+    assert!(db.update_application_discovery_metadata(input(1, true, "key-a", false), None, Some(&original)).await.is_err());
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn website_manifest_adopts_generated_compatibility_owner_but_not_real_application() {
     let (db, path) = sqlite_test_db().await;
     let organization = db

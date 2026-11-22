@@ -1368,6 +1368,15 @@ pub async fn sync_application(
         }
     }
 
+    // Read trust after acquiring the lease; a reset before acquisition must
+    // not let a new lease verify a snapshot under stale configuration.
+    let discovery = match current_discovery_record(state, application_id).await {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            let _ = lease.release(state).await;
+            return Err(error);
+        }
+    };
     match sync_application_once(state, &discovery).await {
         Ok(manifest) => match lease.apply_if_owner(state, manifest).await {
             Ok(Some(record)) => {

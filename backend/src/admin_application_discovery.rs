@@ -211,7 +211,7 @@ pub(super) async fn update(
             .is_none_or(|record| record.management_mode != management_mode);
     let record = state
         .db
-        .upsert_application_discovery(NewApplicationDiscovery {
+        .update_application_discovery_metadata(NewApplicationDiscovery {
             application_id: id.clone(),
             management_mode: management_mode.clone(),
             website_url,
@@ -267,7 +267,7 @@ pub(super) async fn update(
                 })
                 .flatten(),
             operator_disabled,
-        })
+        }, payload.operator_disabled, existing.as_ref())
         .await?;
     state
         .db

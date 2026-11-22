@@ -862,7 +862,7 @@ impl Db {
         } else {
             SYNC_DISABLED.to_string()
         };
-        self.upsert_application_discovery(NewApplicationDiscovery {
+        self.update_application_discovery_metadata(NewApplicationDiscovery {
             application_id: application_record.id.clone(),
             management_mode: application.management_mode.clone(),
             website_url,
@@ -900,8 +900,8 @@ impl Db {
                 .as_ref()
                 .filter(|_| !reset_snapshot)
                 .and_then(|value| value.snapshot_json.clone()),
-            operator_disabled: existing_discovery.is_some_and(|value| value.operator_disabled == 1),
-        })
+            operator_disabled: existing_discovery.as_ref().is_some_and(|value| value.operator_disabled == 1),
+        }, None, existing_discovery.as_ref())
         .await?;
         Ok(application_record)
     }

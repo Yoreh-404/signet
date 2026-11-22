@@ -19,6 +19,12 @@ use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl};
 use std::collections::{BTreeMap, HashSet};
 
+type DiscoveryTrust = (String, String, String, String);
+
+fn discovery_trust(r: &ApplicationDiscoveryRecord) -> DiscoveryTrust {
+    (r.management_mode.clone(), r.website_url.clone(), r.fetch_secret_ciphertext.clone(), r.signing_public_jwks.clone())
+}
+
 #[derive(Debug, Clone)]
 pub struct ApplicationDiscoveryManifest {
     pub revision: i64,
@@ -186,108 +192,152 @@ impl Db {
         &self,
         discovery: NewApplicationDiscovery,
     ) -> AppResult<ApplicationDiscoveryRecord> {
+        self.write_application_discovery(discovery, None).await
+    }
+
+    pub async fn update_application_discovery_metadata(
+        &self,
+        discovery: NewApplicationDiscovery,
+        operator_disabled: Option<bool>,
+        expected: Option<&ApplicationDiscoveryRecord>,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
+        self.write_application_discovery(discovery, Some((operator_disabled, expected.map(discovery_trust)))).await
+    }
+
+    async fn write_application_discovery(
+        &self,
+        mut discovery: NewApplicationDiscovery,
+        metadata: Option<(Option<bool>, Option<DiscoveryTrust>)>,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
-            let existing = format!(
-                "SELECT COUNT(*) AS count FROM application_discovery WHERE application_id = {}",
-                ph(kind, 1)
-            );
-            let exists = sql_query(existing)
-                .bind::<Text, _>(&discovery.application_id)
-                .get_result::<CountRow>(&mut conn)
-                .map_err(AppError::from)?
-                .count
-                > 0;
-            if exists {
+            conn.transaction::<ApplicationDiscoveryRecord, AppError, _>(|conn| {
+                let lock_sql = format!("UPDATE applications SET updated_at = updated_at WHERE id = {}", ph(kind, 1));
+                sql_query(lock_sql).bind::<Text, _>(&discovery.application_id).execute(conn).map_err(AppError::from)?;
+                let current_sql = format!("{} WHERE application_id = {}", select_application_discovery_sql(), ph(kind, 1));
+                let current = sql_query(current_sql).bind::<Text, _>(&discovery.application_id)
+                    .get_result::<ApplicationDiscoveryRecord>(conn).optional().map_err(AppError::from)?;
+                let exists = current.is_some();
+                if metadata.as_ref().is_some_and(|(_, expected)| *expected != current.as_ref().map(discovery_trust)) {
+                    return Err(AppError::BadRequest("application discovery trust changed; retry the update".into()));
+                }
+                if let (Some(current), Some((operator_disabled, _))) = (current, metadata) {
+                    discovery.operator_disabled = operator_disabled.unwrap_or(current.operator_disabled != 0);
+                    let same_trust = current.management_mode == discovery.management_mode
+                        && current.website_url == discovery.website_url
+                        && current.fetch_secret_ciphertext == discovery.fetch_secret_ciphertext
+                        && current.signing_public_jwks == discovery.signing_public_jwks;
+                    if same_trust {
+                        discovery.last_verified_revision = current.last_verified_revision;
+                        discovery.last_verified_version = current.last_verified_version;
+                        discovery.last_verified_digest = current.last_verified_digest;
+                        discovery.last_verified_expires_at = current.last_verified_expires_at;
+                        discovery.last_fetched_at = current.last_fetched_at;
+                        discovery.last_success_at = current.last_success_at;
+                        discovery.last_error = current.last_error;
+                        discovery.snapshot_json = current.snapshot_json;
+                        discovery.sync_status = current.sync_status;
+                    } else {
+                        discovery.last_verified_revision = None;
+                        discovery.last_verified_version = None;
+                        discovery.last_verified_digest = None;
+                        discovery.last_verified_expires_at = None;
+                        discovery.snapshot_json = None;
+                        let fence = format!("UPDATE application_discovery SET lease_owner = NULL, lease_expires_at = NULL, lease_generation = lease_generation + 1 WHERE application_id = {}", ph(kind, 1));
+                        sql_query(fence).bind::<Text, _>(&discovery.application_id).execute(conn).map_err(AppError::from)?;
+                    }
+                }
+                if exists {
+                    let sql = format!(
+                        "UPDATE application_discovery SET management_mode = {}, website_url = {}, fetch_secret_ciphertext = {}, signing_public_jwks = {}, last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, operator_disabled = {}, updated_at = {} WHERE application_id = {}",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6),
+                        ph(kind, 7),
+                        ph(kind, 8),
+                        ph(kind, 9),
+                        ph(kind, 10),
+                        ph(kind, 11),
+                        ph(kind, 12),
+                        ph(kind, 13),
+                        ph(kind, 14),
+                        ph(kind, 15),
+                        ph(kind, 16)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&discovery.management_mode)
+                        .bind::<Text, _>(&discovery.website_url)
+                        .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
+                        .bind::<Text, _>(&discovery.signing_public_jwks)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
+                        .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
+                        .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
+                        .bind::<Text, _>(&discovery.sync_status)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
+                        .bind::<Nullable<Text>, _>(&discovery.last_error)
+                        .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
+                        .bind::<Integer, _>(i32::from(discovery.operator_disabled))
+                        .bind::<BigInt, _>(now)
+                        .bind::<Text, _>(&discovery.application_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                } else {
+                    let sql = format!(
+                        "INSERT INTO application_discovery (application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                        ph(kind, 1),
+                        ph(kind, 2),
+                        ph(kind, 3),
+                        ph(kind, 4),
+                        ph(kind, 5),
+                        ph(kind, 6),
+                        ph(kind, 7),
+                        ph(kind, 8),
+                        ph(kind, 9),
+                        ph(kind, 10),
+                        ph(kind, 11),
+                        ph(kind, 12),
+                        ph(kind, 13),
+                        ph(kind, 14),
+                        ph(kind, 15),
+                        ph(kind, 16),
+                        ph(kind, 17)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(&discovery.application_id)
+                        .bind::<Text, _>(&discovery.management_mode)
+                        .bind::<Text, _>(&discovery.website_url)
+                        .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
+                        .bind::<Text, _>(&discovery.signing_public_jwks)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
+                        .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
+                        .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
+                        .bind::<Text, _>(&discovery.sync_status)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
+                        .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
+                        .bind::<Nullable<Text>, _>(&discovery.last_error)
+                        .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
+                        .bind::<Integer, _>(i32::from(discovery.operator_disabled))
+                        .bind::<BigInt, _>(now)
+                        .bind::<BigInt, _>(now)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
                 let sql = format!(
-                    "UPDATE application_discovery SET management_mode = {}, website_url = {}, fetch_secret_ciphertext = {}, signing_public_jwks = {}, last_verified_revision = {}, last_verified_version = {}, last_verified_digest = {}, last_verified_expires_at = {}, sync_status = {}, last_fetched_at = {}, last_success_at = {}, last_error = {}, snapshot_json = {}, operator_disabled = {}, updated_at = {} WHERE application_id = {}",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16)
+                    "{} WHERE application_id = {}",
+                    select_application_discovery_sql(),
+                    ph(kind, 1)
                 );
                 sql_query(sql)
-                    .bind::<Text, _>(&discovery.management_mode)
-                    .bind::<Text, _>(&discovery.website_url)
-                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
-                    .bind::<Text, _>(&discovery.signing_public_jwks)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
-                    .bind::<Text, _>(&discovery.sync_status)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
-                    .bind::<Nullable<Text>, _>(&discovery.last_error)
-                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
-                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
-                    .bind::<BigInt, _>(now)
                     .bind::<Text, _>(&discovery.application_id)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            } else {
-                let sql = format!(
-                    "INSERT INTO application_discovery (application_id, management_mode, website_url, fetch_secret_ciphertext, signing_public_jwks, last_verified_revision, last_verified_version, last_verified_digest, last_verified_expires_at, sync_status, last_fetched_at, last_success_at, last_error, snapshot_json, operator_disabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    ph(kind, 1),
-                    ph(kind, 2),
-                    ph(kind, 3),
-                    ph(kind, 4),
-                    ph(kind, 5),
-                    ph(kind, 6),
-                    ph(kind, 7),
-                    ph(kind, 8),
-                    ph(kind, 9),
-                    ph(kind, 10),
-                    ph(kind, 11),
-                    ph(kind, 12),
-                    ph(kind, 13),
-                    ph(kind, 14),
-                    ph(kind, 15),
-                    ph(kind, 16),
-                    ph(kind, 17)
-                );
-                sql_query(sql)
-                    .bind::<Text, _>(&discovery.application_id)
-                    .bind::<Text, _>(&discovery.management_mode)
-                    .bind::<Text, _>(&discovery.website_url)
-                    .bind::<Text, _>(&discovery.fetch_secret_ciphertext)
-                    .bind::<Text, _>(&discovery.signing_public_jwks)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_revision)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_version)
-                    .bind::<Nullable<Text>, _>(&discovery.last_verified_digest)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_verified_expires_at)
-                    .bind::<Text, _>(&discovery.sync_status)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_fetched_at)
-                    .bind::<Nullable<BigInt>, _>(discovery.last_success_at)
-                    .bind::<Nullable<Text>, _>(&discovery.last_error)
-                    .bind::<Nullable<Text>, _>(&discovery.snapshot_json)
-                    .bind::<Integer, _>(i32::from(discovery.operator_disabled))
-                    .bind::<BigInt, _>(now)
-                    .bind::<BigInt, _>(now)
-                    .execute(&mut conn)
-                    .map_err(AppError::from)?;
-            }
-            let sql = format!(
-                "{} WHERE application_id = {}",
-                select_application_discovery_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&discovery.application_id)
-                .get_result::<ApplicationDiscoveryRecord>(&mut conn)
-                .map_err(AppError::from)
+                    .get_result::<ApplicationDiscoveryRecord>(conn)
+                    .map_err(AppError::from)
+            })
         })
     }
     /// Claims a durable discovery lease. `None` means another process still
