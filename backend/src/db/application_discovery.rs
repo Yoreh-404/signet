@@ -931,9 +931,10 @@ impl Db {
                              revision = {}, digest = {}, withdrawn = {}, snapshot_json = {}, expires_at = {}
                          WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
                            AND ((revision < {} AND withdrawn = 0)
-                              OR (revision = {} AND digest = {} AND withdrawn = {}))",
+                              OR (revision = {} AND digest = {} AND withdrawn = {}
+                                  AND (expires_at IS NULL OR expires_at <= {})))",
                         ph(kind,1),ph(kind,2),ph(kind,3),ph(kind,4),ph(kind,5),ph(kind,6),ph(kind,7),
-                        ph(kind,8),ph(kind,9),ph(kind,10),ph(kind,11),ph(kind,12),ph(kind,13),
+                        ph(kind,8),ph(kind,9),ph(kind,10),ph(kind,11),ph(kind,12),ph(kind,13),ph(kind,14),
                     );
                     if sql_query(publish)
                         .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
@@ -943,6 +944,7 @@ impl Db {
                         .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug).bind::<Text,_>(enrollment)
                         .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
                         .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
+                        .bind::<BigInt,_>(manifest.expires_at)
                         .execute(conn).map_err(AppError::from)? != 1
                     {
                         return Err(AppError::Forbidden);

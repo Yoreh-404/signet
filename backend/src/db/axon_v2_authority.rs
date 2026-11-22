@@ -158,6 +158,7 @@ impl Db {
                    AND s.enrollment_id = {} AND s.revision = {} AND s.digest = {}
                    AND s.withdrawn = 0 AND s.snapshot_json IS NOT NULL AND s.expires_at > {}
                    AND a.is_active = 1 AND d.operator_disabled = 0 AND d.management_mode = {}
+                   AND d.last_verified_revision = s.revision AND d.last_verified_digest = s.digest
                    AND u.is_admin = 1 AND u.is_active = 1 AND u.archived_at IS NULL",
                 ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
                 ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9),
