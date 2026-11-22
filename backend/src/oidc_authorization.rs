@@ -217,8 +217,7 @@ pub(crate) async fn project_axon_admin_v2(
     let Some(floor) = crate::application_discovery::read_axon_rollback_floor(policy, trust) else {
         return Ok(None);
     };
-    if floor.halted || policy.revision < floor.revision
-        || (policy.revision == floor.revision && policy.digest != floor.digest)
+    if floor.halted || policy.revision != floor.revision || policy.digest != floor.digest
     {
         return Ok(None);
     }
@@ -283,6 +282,7 @@ mod axon_mapping_tests {
             activation_epoch: 1,
             signed_withdrawal: false,
             rollback_marker_path: None,
+            rollback_marker_owner_uid: None,
         };
         let mut current = json!({
             "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",

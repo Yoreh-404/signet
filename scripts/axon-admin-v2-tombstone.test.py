@@ -7,6 +7,37 @@ import unittest
 
 
 class AuthorityStateTest(unittest.TestCase):
+    def test_signed_reduction_requires_pre_advanced_halted_marker(self):
+        with sqlite3.connect(":memory:") as current, sqlite3.connect(":memory:") as old_backup:
+            current.executescript(Path(__file__).with_name("axon-admin-v2-tombstone.sql").read_text())
+            old_digest, withdrawal_digest = "a" * 43, "b" * 43
+            current.execute("""INSERT INTO axon_admin_authority_state
+                (organization_id,application_slug,enrollment_id,revision,digest,generation,withdrawn,snapshot_json,expires_at)
+                VALUES ('tenant','axon','enrollment',3,?,1,0,'{}',100)""", (old_digest,))
+            current.commit()
+            current.backup(old_backup)
+
+            def withdraw(floor_generation, floor_revision, floor_digest, halted):
+                if not halted or floor_revision != 4 or floor_digest != withdrawal_digest:
+                    return False
+                return current.execute("""UPDATE axon_admin_authority_state
+                    SET revision=4, digest=?, withdrawn=1, generation=generation+1,
+                        snapshot_json=NULL, expires_at=NULL
+                    WHERE revision<4 AND withdrawn=0 AND generation=?""",
+                    (withdrawal_digest, floor_generation-1)).rowcount == 1
+
+            self.assertFalse(withdraw(1, 3, old_digest, False))
+            self.assertFalse(withdraw(2, 4, withdrawal_digest, False))
+            self.assertFalse(withdraw(3, 4, withdrawal_digest, True))
+            self.assertTrue(withdraw(2, 4, withdrawal_digest, True))
+            self.assertEqual(current.execute("SELECT revision,generation,withdrawn FROM axon_admin_authority_state").fetchone(),
+                             (4, 2, 1))
+            # Old config's revision 3/digest fails external revision 4/digest
+            # equality, and even a mistaken unhalt cannot match the restored row.
+            self.assertIsNone(old_backup.execute("""SELECT 1 FROM axon_admin_authority_state
+                WHERE revision=4 AND digest=? AND generation>=2 AND withdrawn=0""",
+                (withdrawal_digest,)).fetchone())
+
     def test_sqlite_restore_cannot_clear_independent_generation_floor(self):
         with tempfile.TemporaryDirectory() as anchor_dir, \
                 tempfile.TemporaryDirectory() as backup_dir, \

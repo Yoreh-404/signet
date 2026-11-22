@@ -1829,12 +1829,13 @@ fn authorization_code_tokens_preserve_login_code_provenance() {
     );
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", target_os = "linux"))]
 #[tokio::test]
 async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() {
     use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
     use diesel::{RunQueryDsl, connection::SimpleConnection, sql_query, sql_types::Text};
     use serde_json::{Value, json};
+    use std::os::unix::fs::PermissionsExt;
     let (mut state, path) = test_app_state().await;
     let user = insert_refresh_test_user(&state, "axon-v2").await;
     let demo = test_refresh_client(&state).await;
@@ -1860,6 +1861,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     std::fs::create_dir(&anchor_dir).unwrap();
     let marker = anchor_dir.join("authority-floor.json");
     let set_floor = |generation: i64, halted: bool| {
+        std::fs::set_permissions(&anchor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let pending = anchor_dir.join("next.json");
         std::fs::write(&pending, json!({
             "organization_id": app.organization_id, "application_id": app.slug,
@@ -1870,6 +1872,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         permissions.set_readonly(true);
         std::fs::set_permissions(&pending, permissions).unwrap();
         std::fs::rename(pending, &marker).unwrap();
+        std::fs::set_permissions(&anchor_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     };
     set_floor(1, false);
     state.settings.discovery.axon_admin_trust = Some(crate::config::AxonAdminTrust {
@@ -1883,6 +1886,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
         signed_withdrawal: false,
         rollback_marker_path: Some(marker.to_string_lossy().into_owned()),
+        rollback_marker_owner_uid: Some(rustix::process::geteuid().as_raw()),
     });
     state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
         application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
@@ -2013,6 +2017,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     );
     drop(state);
     let _ = std::fs::remove_file(backup);
+    let _ = std::fs::set_permissions(&anchor_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::remove_dir_all(anchor_dir);
     let _ = std::fs::remove_file(path);
 }
