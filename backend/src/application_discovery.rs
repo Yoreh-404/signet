@@ -87,7 +87,17 @@ pub async fn run_axon_v2_operator_command(
             let generation = generation.parse::<i64>().map_err(|_| AppError::Forbidden)?;
             db.disable_axon_v2_reservation(scope, generation).await
         }
-        _ => Err(AppError::BadRequest("usage: axon-v2 prepare <prior-revision> <prior-digest> | axon-v2 disable <generation>".into())),
+        [command, generation] if command == "reapprove" && !policy.signed_withdrawal => {
+            let generation = generation.parse::<i64>().map_err(|_| AppError::Forbidden)?;
+            db.reopen_axon_v2_reservation(scope, generation, policy.revision).await
+        }
+        [command] if command == "status" => {
+            let status = db.axon_v2_reservation_status(scope).await?;
+            println!("revision={} digest={} generation={} withdrawn={}",
+                status.revision, status.digest, status.generation, status.withdrawn != 0);
+            Ok(())
+        }
+        _ => Err(AppError::BadRequest("usage: axon-v2 prepare <prior-revision> <prior-digest> | status | disable <generation> | reapprove <generation>".into())),
     }
 }
 pub use crate::application_discovery_contract::{

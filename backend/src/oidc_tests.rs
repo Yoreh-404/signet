@@ -1903,12 +1903,25 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     let jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
         None, &user, "password", auth::LoginEventContext::default()).await.unwrap();
     let signed_in = auth::require_current_user(&state, &jar).await.unwrap();
+    let sid = util::session_public_id(&signed_in.session_id);
+    let enrollment = crate::db::AxonV2Enrollment {
+        application_db_id: app.id.clone(), organization_id: app.organization_id.clone(),
+        application_slug: app.slug.clone(), enrollment_id: "fixture-enrollment".into(),
+        website_origin: origin.into(), signer_pin: pin.clone(),
+    };
+    assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, "a".repeat(43))
+        .await.unwrap().is_some(), "v2 enrolled current snapshot was not visible");
+    let authz = crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &user).await.unwrap();
+    assert_eq!(authz.binding.as_ref().unwrap().protocol, "oidc");
+    assert!(crate::oidc_authorization::project_axon_admin_v2(
+        &state, &authz, &client, &user, Some(resource), &sid, "openid", &issuer,
+    ).await.unwrap().is_some(), "v2 candidate projection prerequisites did not match");
     let code = "synthetic-axon-admin-code";
     let challenge_verifier = "fixture-verifier-for-s256-challenge-000000000";
     state.db.insert_authorization_code(NewAuthorizationCode {
         code: code.into(), client_id: client.client_id.clone(), user_id: user.id.clone(),
         application_id: Some(app.id.clone()), authorization_profile_id: Some(binding.authorization_profile_id),
-        auth_context_id: None, session_id: Some(util::session_public_id(&signed_in.session_id)),
+        auth_context_id: None, session_id: Some(sid),
         redirect_uri: redirect.clone(), scope: "openid".into(), resource: Some(resource.into()),
         authorization_details: None, nonce: None,
         code_challenge: Some(util::sha256_base64url(challenge_verifier)), code_challenge_method: Some("S256".into()),

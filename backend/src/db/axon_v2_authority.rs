@@ -42,6 +42,54 @@ struct LiveAxonV2Snapshot {
 
 #[allow(dead_code)] // Future guarded reconciliation caller.
 impl Db {
+    pub(crate) async fn axon_v2_reservation_status(
+        &self, scope: AxonV2Enrollment,
+    ) -> AppResult<AxonV2Reservation> {
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT revision, digest, generation, withdrawn FROM axon_admin_authority_state
+                 WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}",
+                ph(kind,1), ph(kind,2), ph(kind,3),
+            );
+            sql_query(sql).bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.application_slug)
+                .bind::<Text,_>(&scope.enrollment_id).get_result::<AxonV2Reservation>(&mut conn)
+                .optional().map_err(AppError::from)?.ok_or(AppError::Forbidden)
+        })
+    }
+
+    /// Reopening only clears the local stop. There is no snapshot to issue
+    /// from until a separately verified higher approved revision reconciles.
+    pub(crate) async fn reopen_axon_v2_reservation(
+        &self, scope: AxonV2Enrollment, generation: i64, approved_revision: i64,
+    ) -> AppResult<()> {
+        if generation <= 0 || approved_revision <= 0 || scope.enrollment_id.is_empty() {
+            return Err(AppError::Forbidden);
+        }
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let lock = format!(
+                    "UPDATE applications SET updated_at = updated_at WHERE id = {} AND organization_id = {} AND slug = {} AND is_active = 1",
+                    ph(kind,1), ph(kind,2), ph(kind,3),
+                );
+                if sql_query(lock).bind::<Text,_>(&scope.application_db_id)
+                    .bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.application_slug)
+                    .execute(conn).map_err(AppError::from)? != 1
+                { return Err(AppError::Forbidden); }
+                let reopen = format!(
+                    "UPDATE axon_admin_authority_state SET withdrawn = 0, generation = generation + 1
+                     WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
+                       AND generation = {} AND revision < {} AND withdrawn = 1 AND snapshot_json IS NULL",
+                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
+                );
+                if sql_query(reopen).bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.application_slug)
+                    .bind::<Text,_>(&scope.enrollment_id).bind::<BigInt,_>(generation)
+                    .bind::<BigInt,_>(approved_revision).execute(conn).map_err(AppError::from)? != 1
+                { return Err(AppError::Forbidden); }
+                Ok(())
+            })
+        })
+    }
+
     /// First enrollment only. Require the explicit operator-supplied baseline
     /// to equal the incumbent accepted discovery record; never replace a row.
     pub(crate) async fn prepare_axon_v2_reservation(
