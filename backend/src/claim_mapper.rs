@@ -62,6 +62,10 @@ pub fn mapped_claims(
 ) -> AppResult<Map<String, Value>> {
     let mut claims = Map::new();
     for record in records {
+        // This claim is issued only by the pinned Axon declaration path.
+        if record.claim_name() == "axon_admin" {
+            continue;
+        }
         validate_mapper_record(record)?;
         if !record.is_active() || !record.includes_target(target) {
             continue;

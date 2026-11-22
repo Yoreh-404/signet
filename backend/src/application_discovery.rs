@@ -875,14 +875,16 @@ pub async fn fetch_and_verify_challenge(
         request.challenge,
         request.max_contract_ttl_seconds,
     )?;
-    normalize_application_contract(
+    let mut verified = normalize_application_contract(
         &contract,
         &payload,
         request.expected_issuer,
         request.expected_application_id,
         request.expected_audience,
         request.organization_id,
-    )
+    )?;
+    stamp_axon_signer(&mut verified, request.signing_public_jwks);
+    Ok(verified)
 }
 
 /// Performs the first fetch for an allowlisted application. Its signing key
@@ -916,7 +918,7 @@ pub async fn fetch_and_verify_auto_registration(
     )?;
     let pinned_jwks = serde_json::to_string(&PinnedJwks { keys: vec![key] })
         .map_err(|_| AppError::Internal("failed to encode discovery signing key".to_string()))?;
-    let verified = normalize_application_contract(
+    let mut verified = normalize_application_contract(
         &contract,
         &payload,
         request.expected_issuer,
@@ -924,6 +926,10 @@ pub async fn fetch_and_verify_auto_registration(
         request.expected_audience,
         request.organization_id,
     )?;
+    // TOFU can enroll an ordinary application, but cannot establish privilege.
+    if let Some(modules) = verified.redacted_payload["modules"].as_object_mut() {
+        modules.remove("axon_admin_mapping");
+    }
     Ok((verified, pinned_jwks))
 }
 
@@ -1140,6 +1146,17 @@ fn normalize_application_contract(
         return Err(AppError::Unauthorized);
     }
     let policy_effects = index_policy_effects(&contract.modules.policies);
+    if let Some(mapping) = &contract.modules.axon_admin_mapping
+        && (mapping.source != "signet.is_admin" || mapping.claim != "axon_admin"
+            || mapping.output != "access_token" || mapping.audience.is_empty()
+            || !contract.modules.clients.iter().any(|client| {
+                client.active && client.protocol == "oidc"
+                    && client.client_id == mapping.client_id
+                    && client.audiences == [mapping.audience.clone()]
+            }))
+    {
+        return Err(AppError::BadRequest("invalid Axon admin declaration".into()));
+    }
     let clients = contract
         .modules
         .clients
@@ -1235,14 +1252,33 @@ pub fn verify_and_normalize(
     let contract = serde_json::from_value::<ApplicationContract>(payload_value).map_err(|_| {
         AppError::BadRequest("application v3 contract schema is invalid".to_string())
     })?;
-    normalize_application_contract(
+    let mut verified = normalize_application_contract(
         &contract,
         &payload,
         expected_issuer,
         expected_application_id,
         expected_audience,
         organization_id,
-    )
+    )?;
+    stamp_axon_signer(&mut verified, pinned_jwks);
+    Ok(verified)
+}
+
+pub(crate) fn axon_signer_pin(jwks: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let keys = serde_json::from_str::<Value>(jwks).ok()?;
+    if keys.get("keys")?.as_array()?.len() != 1 {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(serde_json::to_vec(&keys).ok()?)))
+}
+
+fn stamp_axon_signer(verified: &mut VerifiedApplicationManifest, jwks: &str) {
+    if !verified.redacted_payload["modules"]["axon_admin_mapping"].is_null()
+        && let Some(pin) = axon_signer_pin(jwks)
+    {
+        verified.redacted_payload["_signet_axon_verified_signer"] = Value::String(pin);
+    }
 }
 
 async fn current_discovery_record(

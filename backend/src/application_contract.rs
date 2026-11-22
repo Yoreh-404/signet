@@ -56,6 +56,18 @@ pub struct ContractModules {
     /// workspace operator may independently disable discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<WebsiteDirectoryContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axon_admin_mapping: Option<AxonAdminMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AxonAdminMapping {
+    pub source: String,
+    pub claim: String,
+    pub output: String,
+    pub client_id: String,
+    pub audience: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

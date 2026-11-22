@@ -252,6 +252,19 @@ pub struct DiscoverySettings {
     /// add itself to this list through the discovery document.
     #[serde(default)]
     pub auto_registration: AutoRegistrationSettings,
+    #[serde(default)]
+    pub axon_admin_trust: Option<AxonAdminTrust>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AxonAdminTrust {
+    pub origin: String,
+    pub organization_id: String,
+    pub application_id: String,
+    pub client_id: String,
+    pub audience: String,
+    pub signing_public_jwks: String,
 }
 
 impl Default for DiscoverySettings {
@@ -263,6 +276,7 @@ impl Default for DiscoverySettings {
             encryption_key: String::new(),
             challenge_secret: String::new(),
             auto_registration: AutoRegistrationSettings::default(),
+            axon_admin_trust: None,
         }
     }
 }
@@ -1225,6 +1239,16 @@ impl Settings {
             if unique_scopes.len() != program.scopes.len() {
                 anyhow::bail!("wechat_mini.programs scopes contain duplicates");
             }
+        }
+        if let Some(trust) = &self.discovery.axon_admin_trust
+            && (!trust.origin.starts_with("https://")
+                || crate::application_discovery::website_origin(&trust.origin).ok().as_deref() != Some(trust.origin.as_str())
+                || [&trust.application_id, &trust.organization_id, &trust.client_id, &trust.audience]
+                    .iter().any(|value| value.is_empty() || value.trim() != value.as_str())
+                || crate::dcr::is_website_client_id(&trust.client_id)
+                || crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks).is_none())
+        {
+            anyhow::bail!("discovery.axon_admin_trust requires exact binding fields and one pinned signing key");
         }
         validate_billing_settings(&self.billing)?;
         if self.performance.runtime_settings_cache_millis > 60_000 {

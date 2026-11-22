@@ -18,6 +18,111 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
+pub(crate) async fn apply_axon_admin_claim(
+    state: &AppState,
+    snapshot: &AuthorizationSnapshot,
+    client: &ClientRecord,
+    user: &UserRecord,
+    audience: Option<&str>,
+    claims: &mut Map<String, Value>,
+) -> AppResult<()> {
+    let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref() else {
+        return Ok(());
+    };
+    let (Some(app), Some(binding), Some(pin)) = (
+        &snapshot.application,
+        &snapshot.binding,
+        crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks),
+    ) else { return Ok(()) };
+    if crate::dcr::is_website_client_id(&client.client_id)
+        || client.client_id != trust.client_id || audience != Some(trust.audience.as_str())
+        || trust.audience.is_empty() || !trust.origin.starts_with("https://")
+        || client.audience != trust.audience
+        || client.is_active != 1 || app.is_active != 1 || binding.is_active != 1
+        || binding.protocol != "oidc" || binding.client_db_id != client.id
+        || binding.application_id != app.id || app.slug != trust.application_id
+        || app.organization_id != trust.organization_id
+        || client.organization_id.as_deref() != Some(trust.organization_id.as_str())
+    {
+        return Ok(());
+    }
+    if !client.grant_types()?.iter().all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token")) {
+        return Ok(());
+    }
+    let redirects = client.redirect_uris()?;
+    if redirects.is_empty() || !redirects.iter().all(|redirect| {
+        url::Url::parse(redirect).is_ok_and(|url| {
+            url.username().is_empty() && url.password().is_none()
+                && url.origin().ascii_serialization() == trust.origin
+        })
+    }) {
+        return Ok(());
+    }
+    let Some(row) = state.db.find_application_discovery(&app.id).await? else {
+        return Ok(());
+    };
+    if row.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+        || row.operator_disabled != 0
+        || row.sync_status != crate::application_discovery_contract::SYNC_STATUS_SYNCED
+        || row.last_verified_digest.is_none()
+        || row.last_verified_expires_at.is_none_or(|exp| exp <= crate::util::now_ts())
+        || crate::application_discovery::website_origin(&row.website_url).ok().as_deref() != Some(trust.origin.as_str())
+        || crate::application_discovery::axon_signer_pin(&row.signing_public_jwks).as_deref() != Some(pin.as_str())
+    {
+        return Ok(());
+    }
+    let Some(contract) = row.snapshot_json.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) else {
+        return Ok(());
+    };
+    if let Some(value) = verified_axon_admin(&contract, trust, &pin, user.is_admin) {
+        claims.insert("axon_admin".into(), value);
+    }
+    Ok(())
+}
+
+fn verified_axon_admin(
+    contract: &Value, trust: &crate::config::AxonAdminTrust, pin: &str, is_admin: i32,
+) -> Option<Value> {
+    let modules = &contract["modules"];
+    let mapping = &modules["axon_admin_mapping"];
+    (contract["_signet_axon_verified_signer"].as_str() == Some(pin)
+        && contract["application_id"].as_str() == Some(trust.application_id.as_str())
+        && mapping == &serde_json::json!({"source":"signet.is_admin","claim":"axon_admin","output":"access_token","client_id":trust.client_id,"audience":trust.audience})
+        && modules["clients"].as_array().is_some_and(|clients| clients.iter().any(|declared| {
+            declared["client_id"].as_str() == Some(trust.client_id.as_str())
+                && declared["protocol"].as_str() == Some("oidc")
+                && declared["audiences"] == serde_json::json!([trust.audience])
+        }))).then_some(Value::Bool(is_admin == 1))
+}
+
+#[cfg(test)]
+mod axon_mapping_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn axon_mapping_requires_exact_signer_and_resource_and_uses_current_admin_bit() {
+        let trust = crate::config::AxonAdminTrust {
+            origin: "https://axon.test".into(), organization_id: "org".into(),
+            application_id: "axon".into(), client_id: "axon-next".into(),
+            audience: "https://axon.test/resource".into(), signing_public_jwks: String::new(),
+        };
+        let mut contract = json!({
+            "_signet_axon_verified_signer": "verified",
+            "application_id": "axon",
+            "modules": {
+                "clients": [{"client_id": "axon-next", "protocol": "oidc", "audiences": ["https://axon.test/resource"]}],
+                "axon_admin_mapping": {"client_id":"axon-next","audience":"https://axon.test/resource","source":"signet.is_admin","claim":"axon_admin","output":"access_token"}
+            }
+        });
+        assert_eq!(verified_axon_admin(&contract, &trust, "verified", 1), Some(json!(true)));
+        assert_eq!(verified_axon_admin(&contract, &trust, "verified", 0), Some(json!(false)));
+        assert_eq!(verified_axon_admin(&contract, &trust, "other", 1), None);
+        contract["modules"]["axon_admin_mapping"]["audience"] = json!("https://other.test");
+        assert_eq!(verified_axon_admin(&contract, &trust, "verified", 1), None);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthorizationSnapshot {
     pub(crate) policy: authorization::AuthorizationPolicySnapshot,
