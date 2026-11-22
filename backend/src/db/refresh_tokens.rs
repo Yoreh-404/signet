@@ -324,7 +324,9 @@ impl Db {
             crate::dcr::is_website_client_id(&client_id).then(|| util::random_token(32));
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE client_grants SET revoked_at = {}, updated_at = {}, website_generation = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default' AND revoked_at IS NULL",
+                // One-shot consent may use the current website generation even
+                // after remembered consent was revoked. Fence it on every revoke.
+                "UPDATE client_grants SET revoked_at = COALESCE(revoked_at, {}), updated_at = {}, website_generation = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default' AND (revoked_at IS NULL OR website_generation IS NOT NULL)",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),

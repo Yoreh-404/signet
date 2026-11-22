@@ -283,6 +283,12 @@ async fn website_login_tokens_disclose_only_a_pairwise_identity() {
             .await
             .unwrap()
     );
+    let revoked = state.db.find_client_grant(&user.id, &site.client_id).await.unwrap().unwrap();
+    assert!(revoked.revoked_at.is_some());
+    assert!(state.db.revoke_client_grant(&user.id, &site.client_id).await.unwrap());
+    let revoked_again = state.db.find_client_grant(&user.id, &site.client_id).await.unwrap().unwrap();
+    assert_eq!(revoked_again.revoked_at, revoked.revoked_at);
+    assert_ne!(revoked_again.website_generation, revoked.website_generation);
     let restored = state
         .db
         .upsert_client_grant(&user.id, &site.client_id, "openid".into())
