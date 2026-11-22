@@ -150,10 +150,11 @@ pub(crate) async fn application_response(
     application: ApplicationRecord,
 ) -> AppResult<ApplicationResponse> {
     let graph = state.db.read_application_graph(&application.id).await?;
-    application_response_from_graph(application, graph)
+    application_response_from_graph(state, application, graph).await
 }
 
-pub(crate) fn application_response_from_graph(
+pub(crate) async fn application_response_from_graph(
+    state: &AppState,
     application: ApplicationRecord,
     graph: ApplicationGraphRecordSet,
 ) -> AppResult<ApplicationResponse> {

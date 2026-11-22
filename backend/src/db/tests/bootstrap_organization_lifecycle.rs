@@ -1,4 +1,44 @@
 use super::*;
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn bootstrap_scoped_axon_requires_pinned_bearer_and_never_reparents() {
+    let (db, path) = sqlite_test_db().await;
+    let target = db.insert_organization(test_organization("scoped-axon", "Scoped Axon")).await.unwrap();
+    let foreign = db.insert_organization(test_organization("scoped-foreign", "Foreign")).await.unwrap();
+    let mut settings: Settings = toml::from_str(include_str!("../../../../config/default.toml")).unwrap();
+    settings.bootstrap.admin.create_on_startup = false;
+    settings.bootstrap.clients.clear();
+    settings.discovery.encryption_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+    let jwks = r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}"#;
+    settings.discovery.axon_admin_trust = Some(crate::config::AxonAdminTrust {
+        organization_id: target.id.clone(), application_id: "scoped-axon-admin".into(),
+        client_id: "scoped-axon-client".into(), origin: "https://axon.example".into(),
+        audience: "https://axon.example/resource".into(), signing_public_jwks: jwks.into(),
+    });
+    settings.bootstrap.applications = vec![crate::config::BootstrapApplication {
+        organization_id: Some(target.id.clone()), application_id: "scoped-axon-admin".into(),
+        name: "Scoped Axon".into(), website_url: "https://axon.example".into(),
+        management_mode: "website_managed".into(), is_active: true,
+        fetch_secret_env: None, fetch_secret_file: None, signing_public_jwks_env: None,
+        fetch_secret: String::new(), signing_public_jwks: String::new(),
+    }];
+    assert!(db.seed(&settings).await.is_err());
+    assert!(db.find_application_by_slug_in_organization(&target.id, "scoped-axon-admin").await.unwrap().is_none());
+    settings.bootstrap.applications[0].fetch_secret = "synthetic-bearer-fixture".into();
+    db.seed(&settings).await.unwrap();
+    let app = db.find_application_by_slug_in_organization(&target.id, "scoped-axon-admin").await.unwrap().unwrap();
+    let row = db.find_application_discovery(&app.id).await.unwrap().unwrap();
+    assert_eq!(row.signing_public_jwks, jwks);
+    assert!(!row.fetch_secret_ciphertext.is_empty());
+    assert!(!row.fetch_secret_ciphertext.contains("synthetic-bearer-fixture"));
+    settings.discovery.axon_admin_trust.as_mut().unwrap().organization_id = foreign.id.clone();
+    settings.bootstrap.applications[0].organization_id = Some(foreign.id.clone());
+    assert!(db.seed(&settings).await.is_err());
+    assert!(db.find_application_by_slug_in_organization(&foreign.id, "scoped-axon-admin").await.unwrap().is_none());
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn bootstrap_client_ensure_is_idempotent_and_secret_safe() {

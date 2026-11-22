@@ -767,9 +767,35 @@ impl Db {
         system_organization_id: &str,
         settings: &Settings,
     ) -> AppResult<ApplicationRecord> {
+        let (organization_id, scoped_pin) = if let Some(id) = application.organization_id.as_deref() {
+            let trust = settings.discovery.axon_admin_trust.as_ref().filter(|trust| {
+                trust.organization_id == id && trust.application_id == application.application_id
+                    && application.website_url == trust.origin
+                    && application.management_mode == MANAGEMENT_MODE_WEBSITE
+                    && !application.fetch_secret.trim().is_empty()
+                    && !settings.discovery.encryption_key.trim().is_empty()
+                    && (application.signing_public_jwks.is_empty()
+                        || crate::application_discovery::axon_signer_pin(&application.signing_public_jwks)
+                            == crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks))
+                    && crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks).is_some()
+            }).ok_or_else(|| AppError::Configuration("scoped bootstrap requires exact pinned Axon bearer trust".into()))?;
+            if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
+                || self.find_organization_by_id(id).await?.is_none_or(|org| org.is_active != 1)
+            {
+                return Err(AppError::Configuration("scoped bootstrap organization must be an existing active UUID".into()));
+            }
+            if self.list_applications(None).await?.iter().any(|app| {
+                app.slug == application.application_id && app.organization_id != id
+            }) {
+                return Err(AppError::Configuration("scoped bootstrap application slug is owned by another organization".into()));
+            }
+            (id, Some(trust.signing_public_jwks.as_str()))
+        } else {
+            (system_organization_id, None)
+        };
         let existing = self
             .find_application_by_slug_in_organization(
-                system_organization_id,
+                organization_id,
                 application.application_id.trim(),
             )
             .await?;
@@ -791,7 +817,7 @@ impl Db {
             .await?
         } else {
             self.insert_application(NewApplication {
-                organization_id: system_organization_id.to_string(),
+                organization_id: organization_id.to_string(),
                 slug: application.application_id.trim().to_string(),
                 name: application.name.trim().to_string(),
                 description: Some(
@@ -829,7 +855,9 @@ impl Db {
                 &application.fetch_secret,
                 &settings.discovery.encryption_key,
             )?;
-        let signing_public_jwks = if application.signing_public_jwks.trim().is_empty() {
+        let signing_public_jwks = if let Some(pin) = scoped_pin {
+            pin.to_owned()
+        } else if application.signing_public_jwks.trim().is_empty() {
             existing_discovery
                 .as_ref()
                 .map(|value| value.signing_public_jwks.clone())

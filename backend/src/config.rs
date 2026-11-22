@@ -754,6 +754,8 @@ pub struct BootstrapApplication {
     /// Public stable application identifier. This maps to applications.slug;
     /// the database UUID remains an internal foreign key.
     pub application_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     pub name: String,
     pub website_url: String,
     #[serde(default = "default_management_mode")]
@@ -766,6 +768,8 @@ pub struct BootstrapApplication {
     /// root for a website-managed application.
     #[serde(default)]
     pub fetch_secret_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_secret_file: Option<String>,
     #[serde(default)]
     pub signing_public_jwks_env: Option<String>,
     #[serde(skip)]
@@ -1089,6 +1093,11 @@ impl Settings {
             resolve_bootstrap_client_secret(client, env::var(&env_name))?;
         }
         for application in &mut self.bootstrap.applications {
+            if let Some(path) = application.fetch_secret_file.as_deref() {
+                anyhow::ensure!(application.organization_id.is_some() && application.fetch_secret_env.is_none(),
+                    "scoped bootstrap fetch_secret_file cannot be combined with fetch_secret_env");
+                application.fetch_secret = read_bootstrap_discovery_secret(path)?;
+            }
             if let Some(env_name) = application
                 .fetch_secret_env
                 .as_deref()
@@ -1687,6 +1696,25 @@ fn validate_bootstrap_application(application: &BootstrapApplication) -> Result<
         );
     }
     Ok(())
+}
+
+fn read_bootstrap_discovery_secret(raw: &str) -> Result<String> {
+    use std::{io::Read, os::unix::fs::PermissionsExt, path::Path};
+    let path = Path::new(raw);
+    let valid = path.strip_prefix("/run/secrets").is_ok_and(|name| {
+        name.components().count() == 1 && name.file_name().is_some()
+    });
+    anyhow::ensure!(valid, "scoped discovery secret must be directly under /run/secrets");
+    let metadata = std::fs::symlink_metadata(path).context("could not inspect scoped discovery secret")?;
+    anyhow::ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+        "scoped discovery secret must be a private regular file");
+    let mut value = String::new();
+    std::fs::File::open(path).context("could not open scoped discovery secret")?
+        .take(4097).read_to_string(&mut value).context("could not read scoped discovery secret")?;
+    let secret = value.trim();
+    anyhow::ensure!(!secret.is_empty() && value.len() <= 4096 && !secret.chars().any(char::is_whitespace),
+        "scoped discovery secret is empty, too long, or malformed");
+    Ok(secret.to_owned())
 }
 
 fn validate_discovery_encryption_key(value: &str) -> Result<()> {

@@ -131,18 +131,16 @@ pub(super) async fn list_applications(
         .db
         .read_application_graph_batch(&application_ids)
         .await?;
-    let result = applications
-        .into_iter()
-        .map(|application| {
+    let mut result = Vec::with_capacity(applications.len());
+    for application in applications {
             let graph = graphs.remove(&application.id).ok_or_else(|| {
                 AppError::Internal(format!(
                     "application graph is missing for {}",
                     application.id
                 ))
             })?;
-            application_response_from_graph(application, graph)
-        })
-        .collect::<AppResult<Vec<_>>>()?;
+        result.push(application_response_from_graph(&state, application, graph).await?);
+    }
     Ok(Json(result))
 }
 
