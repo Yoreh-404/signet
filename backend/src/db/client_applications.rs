@@ -258,6 +258,45 @@ impl Db {
             .ok_or(AppError::NotFound)
     }
 
+    /// Website self-management can change callback paths, not operator policy or
+    /// activation. Checking is_active in the write also respects a concurrent disable.
+    pub async fn update_website_callbacks(
+        &self,
+        id: &str,
+        redirect_uris: &[String],
+        post_logout_redirect_uris: &[String],
+    ) -> AppResult<ClientRecord> {
+        let id = id.to_owned();
+        let redirects = util::to_json(&redirect_uris)?;
+        let logout = util::to_json(&post_logout_redirect_uris)?;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE clients SET redirect_uris = {}, post_logout_redirect_uris = {}, updated_at = {} WHERE id = {} AND is_active = 1",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3),
+                ph(kind, 4)
+            );
+            let changed = sql_query(sql)
+                .bind::<Text, _>(redirects)
+                .bind::<Text, _>(logout)
+                .bind::<BigInt, _>(util::now_ts())
+                .bind::<Text, _>(&id)
+                .execute(&mut conn)?;
+            if changed == 0 {
+                return Err(AppError::Forbidden);
+            }
+            sql_query(format!(
+                "{} WHERE id = {}",
+                select_client_sql(),
+                ph(kind, 1)
+            ))
+            .bind::<Text, _>(id)
+            .get_result::<ClientRecord>(&mut conn)
+            .map_err(AppError::from)
+        })
+    }
+
     pub async fn update_client(&self, id: &str, client: NewClient) -> AppResult<ClientRecord> {
         let id = id.to_string();
         let now = util::now_ts();

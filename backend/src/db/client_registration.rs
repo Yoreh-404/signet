@@ -1,11 +1,39 @@
-use super::{AppError, AppResult, ClientRegistrationRecord, DatabaseKind, Db, blocking, ph};
+use super::{
+    AppError, AppResult, ClientRegistrationRecord, DatabaseKind, Db, bind_text_list, blocking, ph,
+    placeholders,
+};
 use crate::util;
 use diesel::{
     OptionalExtension, RunQueryDsl, sql_query,
     sql_types::{BigInt, Text},
 };
 
+#[derive(diesel::QueryableByName)]
+pub(crate) struct RegisteredPeer {
+    #[diesel(sql_type = Text)]
+    pub id: String,
+    #[diesel(sql_type = Text)]
+    pub client_id: String,
+    #[diesel(sql_type = Text)]
+    pub redirect_uris: String,
+}
+
 impl Db {
+    pub(crate) async fn registered_peers(&self, ids: &[String]) -> AppResult<Vec<RegisteredPeer>> {
+        let ids = ids.to_vec();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT c.id, c.client_id, c.redirect_uris FROM clients c
+                 JOIN client_registrations r ON r.client_db_id = c.id
+                 WHERE c.is_active = 1 AND c.client_id IN ({})",
+                placeholders(kind, 1, ids.len()),
+            );
+            bind_text_list(&mut conn, sql_query(sql), &ids)
+                .load::<RegisteredPeer>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn upsert_client_registration(
         &self,
         client_db_id: &str,

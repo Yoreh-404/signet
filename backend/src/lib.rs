@@ -56,6 +56,7 @@ pub(crate) mod oidc_logout;
 pub mod organizations;
 pub mod par;
 pub mod passkeys;
+pub(crate) mod peer_discovery;
 pub mod project_directory;
 pub(crate) mod pkce;
 pub mod redirects;

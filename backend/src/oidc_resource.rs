@@ -46,6 +46,17 @@ pub(super) async fn userinfo(
 ) -> AppResult<Json<serde_json::Value>> {
     let (auth_scheme, token) = authorization_token(&headers)?;
     let issuers = state.accepted_issuers(&headers).await?;
+    if token.starts_with(super::website_token::PREFIX) {
+        return super::website_token::userinfo(
+            &state,
+            &method,
+            &headers,
+            auth_scheme,
+            token,
+            &issuers,
+        )
+        .await;
+    }
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
     // The access token identifies the client connection first. UserInfo is a
     // concrete OIDC resource endpoint, so the second verification must bind
@@ -55,6 +66,10 @@ pub(super) async fn userinfo(
     let bootstrap_claims = state
         .jwt
         .verify_access_token_for_generic_bearer(token, &issuer_refs)?;
+    if crate::dcr::is_website_client_id(&bootstrap_claims.client_id) {
+        // Website access tokens use the dedicated opaque-token path above.
+        return Err(AppError::Unauthorized);
+    }
     let client = state
         .db
         .find_client_by_client_id(&bootstrap_claims.client_id)

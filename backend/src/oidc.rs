@@ -55,6 +55,8 @@ mod oidc_token_liveness;
 mod oidc_user;
 #[path = "oidc_values.rs"]
 mod oidc_values;
+#[path = "oidc_website_token.rs"]
+mod website_token;
 use oidc_authorization_flow::{
     AuthorizationHttpContext, AuthorizationSessionFreshness, authorization_mfa_decision,
     find_or_create_application_auth_context, requires_authorization_consent,
@@ -250,6 +252,10 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth2/userinfo", get(userinfo).post(userinfo))
         .route("/oauth2/logout", get(logout_get).post(logout_post))
         .route("/connect/register", post(crate::dcr::register_client))
+        .route(
+            "/connect/register/{client_id}/namespaces/{namespace_id}/peers",
+            get(crate::peer_discovery::list),
+        )
         .route(
             "/connect/register/{client_id}",
             get(crate::dcr::read_client)
@@ -1159,6 +1165,16 @@ pub(crate) fn validate_authorize_request_for_client(
     }
     if request.client_id != client.client_id {
         return Err(AppError::Oidc("client_id mismatch".to_string()));
+    }
+    if crate::dcr::is_website_client_id(&client.client_id)
+        && (request.claims.is_some()
+            || request.acr_values.is_some()
+            || request.resource.is_some()
+            || request.authorization_details.is_some())
+    {
+        return Err(AppError::Oidc(
+            "public websites cannot request additional claims, assurance, resources or authorization details".into(),
+        ));
     }
     crate::jarm::validate_response_mode(request.response_mode.as_deref())?;
     if client.is_active != 1 {

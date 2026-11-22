@@ -144,9 +144,12 @@ pub struct TokenClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_profile_id: Option<String>,
     pub scope: String,
+    #[serde(default)]
     pub email: String,
+    #[serde(default)]
     pub email_verified: bool,
     pub name: Option<String>,
+    #[serde(default)]
     pub preferred_username: String,
     pub nonce: Option<String>,
     pub auth_time: Option<i64>,
@@ -844,6 +847,26 @@ impl JwtManager {
         subject_identifier: Option<&str>,
     ) -> AppResult<String> {
         let now = util::now_ts();
+        if token_use == "id_token" && crate::dcr::is_website_client_id(subject.client_id) {
+            // Build this projection independently of ordinary user and mapper
+            // claims. In particular a browser session ID links otherwise
+            // independent sites even when the subject itself is pairwise.
+            let sub = subject_identifier.ok_or_else(|| {
+                AppError::Internal("website ID token requires a pairwise subject".into())
+            })?;
+            let mut claims = serde_json::json!({
+                "iss": issuer.trim_end_matches('/'), "sub": sub, "aud": subject.client_id,
+                "exp": now + ttl_seconds, "iat": now, "token_use": "id_token",
+                "client_id": subject.client_id, "scope": "openid"
+            });
+            if let Some(nonce) = subject.nonce {
+                claims["nonce"] = Value::from(nonce);
+            }
+            if let Some(auth_time) = subject.auth_time {
+                claims["auth_time"] = Value::from(auth_time);
+            }
+            return self.sign_user_claims(&claims);
+        }
         let jti = util::random_token(24);
         let claims = TokenClaims {
             iss: issuer.trim_end_matches('/').to_string(),
@@ -888,10 +911,14 @@ impl JwtManager {
             AppError::Internal("token claims did not encode as object".to_string())
         })?;
         claims_object.extend(extra_claims);
+        self.sign_user_claims(&claims_value)
+    }
+
+    fn sign_user_claims(&self, claims: &Value) -> AppResult<String> {
         let active_key = self.active_key_snapshot()?;
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(active_key.kid.clone());
-        encode(&header, &claims_value, &active_key.encoding_key)
+        encode(&header, claims, &active_key.encoding_key)
             .map_err(|err| AppError::Internal(format!("failed to sign token: {err}")))
     }
 }
@@ -1056,11 +1083,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_verification_enforces_audience_and_unknown_kid_is_rejected() {
-        let pem = util::generate_rsa_private_key_pem().unwrap();
-        let manager = manager_with_keys(vec![signing_key("key-a", &pem, 1)]);
-        let user = crate::db::UserRecord {
+    fn test_user() -> crate::db::UserRecord {
+        crate::db::UserRecord {
             id: "user-id".to_string(),
             email: "user@example.test".to_string(),
             username: "user".to_string(),
@@ -1079,7 +1103,63 @@ mod tests {
             last_login_method: None,
             created_at: 1,
             updated_at: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn website_id_tokens_are_pairwise_and_do_not_project_mapped_identity() {
+        use base64::Engine as _;
+        let pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![signing_key("key-a", &pem, 1)]);
+        let issuer = "https://issuer.example";
+        let client = "dcr.website.sample";
+        let token = manager.sign_id_token_with_subject_and_claims(
+            issuer,
+            super::TokenSubject { user: &test_user(), client_id: client, audience: None,
+                scope: "openid", nonce: Some("rp-nonce"), auth_time: Some(42) },
+            "pairwise-subject",
+            300,
+            serde_json::from_value(serde_json::json!({"sub": "global-user-id", "sid": "global-session", "role": "admin"})).unwrap(),
+        ).unwrap();
+        let hint = manager
+            .verify_id_token_hint_with_issuers_and_audiences(&token, &[issuer], &[client.into()])
+            .unwrap();
+        assert_eq!(hint.sub, "pairwise-subject");
+        assert_eq!(hint.nonce.as_deref(), Some("rp-nonce"));
+        let payload = super::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let keys = claims
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "iss",
+                "sub",
+                "aud",
+                "exp",
+                "iat",
+                "token_use",
+                "client_id",
+                "scope",
+                "nonce",
+                "auth_time"
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn token_verification_enforces_audience_and_unknown_kid_is_rejected() {
+        let pem = util::generate_rsa_private_key_pem().unwrap();
+        let manager = manager_with_keys(vec![signing_key("key-a", &pem, 1)]);
+        let user = test_user();
         let token = manager
             .sign_access_token_with_issuer(
                 "https://issuer.example",

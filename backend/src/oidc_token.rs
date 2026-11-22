@@ -112,6 +112,16 @@ pub(super) async fn token(
     DefaultClientSecurityPolicy.validate_token_binding(&client, dpop.is_some())?;
     let client_id = client.client_id.clone();
     let result = match payload.grant_type.as_str() {
+        _ if crate::dcr::is_website_client_id(&client_id)
+            && (payload.grant_type != "authorization_code"
+                || payload.resource.is_some()
+                || payload.authorization_details.is_some()
+                || payload.audience.is_some()) =>
+        {
+            Err(AppError::Oidc(
+                "website clients support only the basic authorization code flow".into(),
+            ))
+        }
         "authorization_code" => {
             token_from_authorization_code(state, client, payload, issuer, dpop).await
         }
@@ -278,6 +288,7 @@ pub(super) async fn token_from_authorization_code(
         &client,
         &issuer,
         IssueUserTokensInput {
+            code_created_at: Some(record.created_at),
             user_id: record.user_id,
             scope: record.scope,
             resource: merge_token_resource(record.resource, payload.resource)?,
@@ -351,6 +362,7 @@ pub(super) async fn token_from_device_code(
         &client,
         &issuer,
         IssueUserTokensInput {
+            code_created_at: None,
             user_id,
             scope: record.scope,
             resource: merge_token_resource(record.resource, payload.resource)?,
@@ -605,6 +617,7 @@ fn invalid_refresh_token_grant() -> AppError {
 }
 
 pub(super) struct IssueUserTokensInput {
+    code_created_at: Option<i64>,
     user_id: String,
     scope: String,
     resource: Option<String>,
@@ -628,6 +641,7 @@ pub(super) async fn issue_tokens_for_user(
     input: IssueUserTokensInput,
 ) -> AppResult<Json<TokenResponse>> {
     let IssueUserTokensInput {
+        code_created_at,
         user_id,
         scope,
         resource,
@@ -683,61 +697,84 @@ pub(super) async fn issue_tokens_for_user(
         issuer,
         "issuing OIDC tokens"
     );
-    let mut access_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
-        snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+    let access_token = if crate::dcr::is_website_client_id(&client.client_id) {
+        if scope != "openid"
+            || resource.is_some()
+            || authorization_details.is_some()
+            || login_code_level.is_some()
+        {
+            return Err(AppError::Forbidden);
+        }
+        let binding = binding.ok_or(AppError::Forbidden)?;
+        super::website_token::issue(
+            state,
+            issuer,
+            client,
+            &user,
+            binding,
+            dpop.as_ref(),
+            code_created_at.ok_or(AppError::Forbidden)?,
+        )
+        .await?
     } else {
-        client_claims_snapshot
-            .as_ref()
-            .ok_or(AppError::Forbidden)?
-            .claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+        let mut access_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
+            snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+        } else {
+            client_claims_snapshot
+                .as_ref()
+                .ok_or(AppError::Forbidden)?
+                .claims_for_user(client, &user, &scope, ClaimOutputTarget::AccessToken)?
+        };
+        if let Some(application_id) = application_id.as_deref() {
+            access_claims.insert(
+                "application_id".to_string(),
+                serde_json::Value::String(application_id.to_string()),
+            );
+        } else if let Some(binding) = binding {
+            access_claims.insert(
+                "application_id".to_string(),
+                serde_json::Value::String(binding.application_id.clone()),
+            );
+        }
+        if let Some(profile_id) = authorization_profile_id.as_deref() {
+            access_claims.insert(
+                "authorization_profile_id".to_string(),
+                serde_json::Value::String(profile_id.to_string()),
+            );
+        } else if let Some(binding) = binding {
+            access_claims.insert(
+                "authorization_profile_id".to_string(),
+                serde_json::Value::String(binding.authorization_profile_id.clone()),
+            );
+        }
+        dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
+        authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
+        if let Some(level) = login_code_level {
+            access_claims.insert(
+                "gpt_sso_login_code_level".to_string(),
+                serde_json::Value::String(level.as_str().to_string()),
+            );
+        }
+        let token_audience = resource
+            .as_deref()
+            .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
+        state.jwt.sign_access_token_with_issuer_and_claims(
+            issuer,
+            TokenSubject {
+                user: &user,
+                client_id: &client.client_id,
+                audience: token_audience,
+                scope: &scope,
+                nonce: None,
+                auth_time,
+            },
+            state.settings.oidc.access_token_ttl_seconds,
+            access_claims,
+        )?
     };
-    if let Some(application_id) = application_id.as_deref() {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(application_id.to_string()),
-        );
-    } else if let Some(binding) = binding {
-        access_claims.insert(
-            "application_id".to_string(),
-            serde_json::Value::String(binding.application_id.clone()),
-        );
-    }
-    if let Some(profile_id) = authorization_profile_id.as_deref() {
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(profile_id.to_string()),
-        );
-    } else if let Some(binding) = binding {
-        access_claims.insert(
-            "authorization_profile_id".to_string(),
-            serde_json::Value::String(binding.authorization_profile_id.clone()),
-        );
-    }
-    dpop::add_cnf_claim(&mut access_claims, dpop.as_ref());
-    authorization_details::insert_claim(&mut access_claims, authorization_details.as_deref())?;
-    if let Some(level) = login_code_level {
-        access_claims.insert(
-            "gpt_sso_login_code_level".to_string(),
-            serde_json::Value::String(level.as_str().to_string()),
-        );
-    }
-    let token_audience = resource
-        .as_deref()
-        .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
-    let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
-        issuer,
-        TokenSubject {
-            user: &user,
-            client_id: &client.client_id,
-            audience: token_audience,
-            scope: &scope,
-            nonce: None,
-            auth_time,
-        },
-        state.settings.oidc.access_token_ttl_seconds,
-        access_claims,
-    )?;
-    let mut id_claims = if let Some(snapshot) = authorization_snapshot.as_ref() {
+    let mut id_claims = if crate::dcr::is_website_client_id(&client.client_id) {
+        serde_json::Map::new()
+    } else if let Some(snapshot) = authorization_snapshot.as_ref() {
         snapshot.claims_for_user(client, &user, &scope, ClaimOutputTarget::IdToken)?
     } else {
         client_claims_snapshot

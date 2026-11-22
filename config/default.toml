@@ -81,6 +81,7 @@ supported_scopes = [
 # If false, users see a consent page before a new client/scope set is authorized.
 skip_consent = false
 allow_dynamic_client_registration = false
+allow_public_website_registration = false
 
 [wechat_mini]
 # Server-to-server WeChat Mini Program login. AppSecret and the Axon bridge
@@ -103,6 +104,19 @@ session_endpoint = "https://api.weixin.qq.com/sns/jscode2session"
 sync_interval_seconds = 300
 allow_private_networks = false
 encryption_key = ""
+
+# Private website directory. Operators approve the exact registration client ID
+# and the canonical HTTPS origin shared by all its registered callbacks. Only
+# active registered clients can participate (up to 64 members per namespace).
+# Use the actual server-issued client ID, not the site name. No URLs are fetched and no
+# OAuth scopes, organization membership or access to other sites are granted.
+# Remove a member and restart Signet to revoke its directory membership.
+# [[discovery.namespaces]]
+# id = "partners"
+# members = [
+#   { client_id = "dcr_REPLACE_A", origin = "https://a.example" },
+#   { client_id = "dcr_REPLACE_B", origin = "https://b.example" },
+# ]
 
 # Automatic registration is inert until an origin is explicitly listed below.
 # It performs machine verification (HTTPS, whitelist, challenge and JWS); no

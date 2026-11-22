@@ -21,6 +21,13 @@ const DEFAULT_SCOPES: &[&str] = &["openid", "profile", "email"];
 const DEFAULT_GRANT_TYPES: &[&str] = &["authorization_code"];
 const DEFAULT_RESPONSE_TYPES: &[&str] = &["code"];
 const DEFAULT_TOKEN_AUTH_METHOD: &str = "client_secret_basic";
+// Distinct from the legacy dcr_<base64url> ID space even when the operator
+// later disables website registration or switches to legacy DCR.
+const WEBSITE_CLIENT_PREFIX: &str = "dcr.website.";
+
+pub(crate) fn is_website_client_id(client_id: &str) -> bool {
+    client_id.starts_with(WEBSITE_CLIENT_PREFIX)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientMetadata {
@@ -48,6 +55,8 @@ pub struct ClientMetadata {
     pub backchannel_logout_session_required: Option<bool>,
     pub frontchannel_logout_uri: Option<String>,
     pub frontchannel_logout_session_required: Option<bool>,
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -410,6 +419,108 @@ impl ClientMetadataValidator for DynamicClientRegistrar {
     }
 }
 
+fn website_origin(uri: &str) -> AppResult<String> {
+    let invalid = || AppError::BadRequest("expected an absolute HTTPS callback URI".into());
+    let url = Url::parse(uri).map_err(|_| invalid())?;
+    if !uri.to_ascii_lowercase().starts_with("https://")
+        || uri.contains(|c: char| c.is_whitespace() || c.is_control() || c == '\\')
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+impl ClientMetadata {
+    fn website_profile(mut self, existing: Option<&ClientRecord>) -> AppResult<Self> {
+        let callbacks = self.redirect_uris.as_deref().unwrap_or_default();
+        let origin = website_origin(
+            callbacks
+                .first()
+                .ok_or_else(|| AppError::BadRequest("redirect_uris is required".into()))?,
+        )?;
+        for uri in callbacks
+            .iter()
+            .skip(1)
+            .chain(self.post_logout_redirect_uris.iter().flatten())
+        {
+            if website_origin(uri)? != origin {
+                return Err(AppError::BadRequest(
+                    "website callbacks must share an origin".into(),
+                ));
+            }
+        }
+        if let Some(client) = existing {
+            let old = client.redirect_uris()?;
+            if old
+                .first()
+                .map(|uri| website_origin(uri))
+                .transpose()?
+                .as_ref()
+                != Some(&origin)
+            {
+                return Err(AppError::BadRequest("website origin cannot change".into()));
+            }
+        }
+        if self
+            .client_name
+            .as_ref()
+            .is_some_and(|name| name != &origin)
+            || self
+                .grant_types
+                .as_ref()
+                .is_some_and(|v| v.as_slice() != DEFAULT_GRANT_TYPES)
+            || self
+                .response_types
+                .as_ref()
+                .is_some_and(|v| v.as_slice() != DEFAULT_RESPONSE_TYPES)
+            || self.scope.as_deref().is_some_and(|v| v != "openid")
+            || self
+                .token_endpoint_auth_method
+                .as_deref()
+                .is_some_and(|v| v != "none")
+            || self
+                .subject_type
+                .as_deref()
+                .is_some_and(|v| v != subject::SUBJECT_TYPE_PAIRWISE)
+            || self.require_pkce == Some(false)
+            || self.require_s256_pkce == Some(false)
+            || self.require_account_selection == Some(true)
+            || self.trust_email_verified == Some(true)
+            || self.require_confidential_client == Some(true)
+            || self.require_dpop == Some(true)
+            || self.require_pushed_authorization_requests == Some(true)
+            || self
+                .authorization_details_types
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            || self.logo_uri.is_some()
+            || self.sector_identifier_uri.is_some()
+            || self.jwks.is_some()
+            || self.jwks_uri.is_some()
+            || self.backchannel_logout_uri.is_some()
+            || self.frontchannel_logout_uri.is_some()
+            || self.backchannel_logout_session_required == Some(true)
+            || self.frontchannel_logout_session_required == Some(true)
+            || !self.other.is_empty()
+        {
+            return Err(AppError::BadRequest(
+                "unsupported metadata for a public website".into(),
+            ));
+        }
+        self.client_name = Some(origin);
+        self.scope = Some("openid".into());
+        self.token_endpoint_auth_method = Some("none".into());
+        self.subject_type = Some(subject::SUBJECT_TYPE_PAIRWISE.into());
+        self.require_pkce = Some(true);
+        self.require_s256_pkce = Some(true);
+        Ok(self)
+    }
+}
+
 pub async fn register_client(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -417,7 +528,16 @@ pub async fn register_client(
 ) -> AppResult<Json<ClientRegistrationResponse>> {
     ensure_dcr_enabled(&state)?;
     let registrar = DynamicClientRegistrar::new(state.settings.oidc.supported_scopes.clone());
-    let (client, client_secret) = registrar.new_client(payload, None)?;
+    let website = state.settings.oidc.allow_public_website_registration;
+    let metadata = if website {
+        payload.website_profile(None)?
+    } else {
+        payload
+    };
+    let (mut client, client_secret) = registrar.new_client(metadata, None)?;
+    if website {
+        client.client_id = format!("{WEBSITE_CLIENT_PREFIX}{}", util::random_token(18));
+    }
     let registration_access_token = util::random_token(32);
     // Dynamic registration is one aggregate command. A client without its
     // application/profile/binding/registration record is not a usable OIDC
@@ -468,8 +588,28 @@ pub async fn update_client(
     ensure_dcr_enabled(&state)?;
     let existing = authenticated_registration_client(&state, &headers, &client_id).await?;
     let registrar = DynamicClientRegistrar::new(state.settings.oidc.supported_scopes.clone());
-    let (client, client_secret) = registrar.updated_client(&existing, payload)?;
-    let client = state.db.update_client(&existing.id, client).await?;
+    let website = is_website_client_id(&existing.client_id);
+    if website && existing.is_active == 0 {
+        return Err(AppError::Forbidden);
+    }
+    let metadata = if website {
+        payload.website_profile(Some(&existing))?
+    } else {
+        payload
+    };
+    let (client, client_secret) = registrar.updated_client(&existing, metadata)?;
+    let client = if website {
+        state
+            .db
+            .update_website_callbacks(
+                &existing.id,
+                &client.redirect_uris,
+                &client.post_logout_redirect_uris,
+            )
+            .await?
+    } else {
+        state.db.update_client(&existing.id, client).await?
+    };
     state
         .db
         .record_audit_event(audit::oauth_event(
@@ -502,6 +642,18 @@ pub async fn delete_client(
         ))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn authenticate_active_registration(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_id: &str,
+) -> AppResult<String> {
+    let client = authenticated_registration_client(state, headers, client_id).await?;
+    if client.is_active == 0 {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(client.id)
 }
 
 async fn authenticated_registration_client(
@@ -589,7 +741,9 @@ async fn client_response(
 }
 
 fn ensure_dcr_enabled(state: &AppState) -> AppResult<()> {
-    if state.settings.oidc.allow_dynamic_client_registration {
+    if state.settings.oidc.allow_dynamic_client_registration
+        || state.settings.oidc.allow_public_website_registration
+    {
         Ok(())
     } else {
         Err(AppError::Forbidden)
@@ -724,6 +878,95 @@ mod tests {
         ] {
             assert!(normalize_logo_uri(Some(logo_uri)).is_err());
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn website_registration_pins_identity_and_origin_even_after_switching_modes() {
+        let (mut state, path) = test_state().await;
+        state.settings.oidc.allow_dynamic_client_registration = false;
+        state.settings.oidc.allow_public_website_registration = true;
+        let metadata = |uri: &str| {
+            serde_json::from_value(serde_json::json!({ "redirect_uris": [uri] })).unwrap()
+        };
+        let response = register_client(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(metadata("https://app.test/start")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.client_name, "https://app.test");
+        assert_eq!(response.scope, "openid");
+        assert_eq!(response.subject_type, "pairwise");
+        assert_eq!(response.token_endpoint_auth_method, "none");
+        assert!(response.require_pkce && response.require_s256_pkce);
+        assert!(response.client_secret.is_none());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", response.registration_access_token.unwrap())
+                .parse()
+                .unwrap(),
+        );
+        state.settings.oidc.allow_public_website_registration = false;
+        state.settings.oidc.allow_dynamic_client_registration = true;
+        for (uri, allowed) in [
+            ("https://other.test/end", false),
+            ("https://app.test/end", true),
+        ] {
+            assert_eq!(
+                update_client(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path(response.client_id.clone()),
+                    Json(metadata(uri))
+                )
+                .await
+                .is_ok(),
+                allowed
+            );
+        }
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn website_mode_takes_precedence_and_rejects_broader_metadata() {
+        let (mut state, path) = test_state().await;
+        state.settings.oidc.allow_public_website_registration = true;
+        for (key, value) in [
+            ("scope", serde_json::json!("openid email")),
+            ("redirect_uris", serde_json::json!(["http://app.test/cb"])),
+            (
+                "post_logout_redirect_uris",
+                serde_json::json!(["https://other.test/end"]),
+            ),
+            ("grant_types", serde_json::json!(["client_credentials"])),
+            ("require_s256_pkce", serde_json::json!(false)),
+            ("jwks_uri", serde_json::json!("https://app.test/keys")),
+            ("client_name", serde_json::json!("Signet Administrator")),
+            ("service_account_enabled", serde_json::json!(true)),
+        ] {
+            let mut metadata = serde_json::json!({"redirect_uris": ["https://app.test/cb"]});
+            metadata[key] = value;
+            assert!(
+                matches!(
+                    register_client(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Json(serde_json::from_value(metadata).unwrap())
+                    )
+                    .await,
+                    Err(AppError::BadRequest(_))
+                ),
+                "{key}"
+            );
+        }
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]

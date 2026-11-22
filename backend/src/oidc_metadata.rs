@@ -67,10 +67,8 @@ pub(super) async fn discovery(
         resource_parameter_supported: true,
         authorization_details_parameter_supported: true,
         authorization_details_types_supported,
-        registration_endpoint: state
-            .settings
-            .oidc
-            .allow_dynamic_client_registration
+        registration_endpoint: (state.settings.oidc.allow_dynamic_client_registration
+            || state.settings.oidc.allow_public_website_registration)
             .then(|| absolute(&issuer, "/connect/register")),
         userinfo_endpoint: absolute(&issuer, &state.settings.oidc.userinfo_endpoint),
         jwks_uri: absolute(&issuer, &state.settings.oidc.jwks_uri),

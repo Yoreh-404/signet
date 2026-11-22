@@ -225,6 +225,9 @@ fn default_signing_key_sync_seconds() -> u64 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscoverySettings {
+    /// Operator-approved peer directories, independent of application enrollment.
+    #[serde(default)]
+    pub namespaces: Vec<PeerNamespace>,
     #[serde(default = "default_discovery_sync_interval_seconds")]
     pub sync_interval_seconds: i64,
     /// Development-only escape hatch for a Compose edge whose DNS name
@@ -254,6 +257,7 @@ pub struct DiscoverySettings {
 impl Default for DiscoverySettings {
     fn default() -> Self {
         Self {
+            namespaces: Vec::new(),
             sync_interval_seconds: default_discovery_sync_interval_seconds(),
             allow_private_networks: false,
             encryption_key: String::new(),
@@ -261,6 +265,58 @@ impl Default for DiscoverySettings {
             auto_registration: AutoRegistrationSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerNamespace {
+    pub id: String,
+    pub members: Vec<PeerMember>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerMember {
+    pub client_id: String,
+    pub origin: String,
+}
+
+fn validate_peer_namespaces(namespaces: &[PeerNamespace]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for ns in namespaces {
+        anyhow::ensure!(
+            !ns.id.is_empty()
+                && ns.id.len() <= 64
+                && ns
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && ids.insert(&ns.id),
+            "discovery namespace IDs must be unique URL-safe identifiers"
+        );
+        anyhow::ensure!(
+            ns.members.len() <= 64,
+            "discovery namespace {} exceeds 64 members",
+            ns.id
+        );
+        let mut clients = BTreeSet::new();
+        for member in &ns.members {
+            anyhow::ensure!(
+                !member.client_id.is_empty()
+                    && member.client_id.trim() == member.client_id
+                    && clients.insert(&member.client_id),
+                "discovery namespace {} contains an empty, padded or duplicate client ID",
+                ns.id
+            );
+            let url = Url::parse(&member.origin).context("invalid namespace member origin")?;
+            anyhow::ensure!(
+                url.scheme() == "https" && url.origin().ascii_serialization() == member.origin,
+                "discovery namespace {} requires canonical HTTPS origins without a trailing slash",
+                ns.id
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -529,6 +585,9 @@ pub struct OidcSettings {
     pub supported_scopes: Vec<String>,
     pub skip_consent: bool,
     pub allow_dynamic_client_registration: bool,
+    /// Prefer the restricted website profile for all new registrations.
+    #[serde(default)]
+    pub allow_public_website_registration: bool,
     /// Explicit resource-owner delegation policy for RFC 8693 token
     /// exchange.  This is intentionally separate from a client's ordinary
     /// scope list: a user token can only be delegated where an operator has
@@ -1064,6 +1123,7 @@ impl Settings {
     }
 
     fn validate(&self) -> Result<()> {
+        validate_peer_namespaces(&self.discovery.namespaces)?;
         validate_public_origin(&self.server.public_base_url, "server.public_base_url")?;
         validate_public_origin(&self.oidc.issuer, "oidc.issuer")?;
         if self.oidc.issuer.trim().is_empty() {
@@ -1861,6 +1921,36 @@ fn validate_billing_settings(settings: &BillingSettings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_namespace_origins_and_ids_are_unambiguous() {
+        let ns = PeerNamespace {
+            id: "partners".into(),
+            members: vec![PeerMember {
+                client_id: "website_issued".into(),
+                origin: "https://example.test:8443".into(),
+            }],
+        };
+        let mut configured = vec![ns.clone()];
+        assert!(validate_peer_namespaces(&configured).is_ok());
+        configured.push(ns.clone());
+        assert!(validate_peer_namespaces(&configured).is_err());
+        configured.pop();
+        configured[0].members.push(ns.members[0].clone());
+        assert!(validate_peer_namespaces(&configured).is_err());
+        configured[0].members.pop();
+        for origin in [
+            "http://example.test",
+            "https://example.test/",
+            "https://example.test/callback",
+            "https://user@example.test",
+            "https://example.test?query",
+            "https://example.test#fragment",
+        ] {
+            configured[0].members[0].origin = origin.into();
+            assert!(validate_peer_namespaces(&configured).is_err(), "{origin}");
+        }
+    }
 
     fn default_settings() -> Settings {
         toml::from_str(include_str!("../../config/default.toml")).unwrap()

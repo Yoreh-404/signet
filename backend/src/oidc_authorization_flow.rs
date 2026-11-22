@@ -54,8 +54,9 @@ pub(super) async fn requires_authorization_consent(
         .db
         .find_client_grant(&user.id, &client.client_id)
         .await?;
-    Ok(OidcConsentPolicy::new(state.settings.oidc.skip_consent)
-        .requires_prompt(existing.as_ref(), requested_scopes))
+    let skip =
+        state.settings.oidc.skip_consent && !crate::dcr::is_website_client_id(&client.client_id);
+    Ok(OidcConsentPolicy::new(skip).requires_prompt(existing.as_ref(), requested_scopes))
 }
 
 pub(super) async fn authorization_mfa_decision(
