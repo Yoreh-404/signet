@@ -51,6 +51,45 @@ use pure::{audience_contains, is_forbidden_ip, manifest_content_digest, validate
 
 pub const FORMAT: &str = crate::application_contract::FORMAT;
 pub const DISCOVERY_PATH: &str = "/.well-known/signet-authorization.json";
+
+/// Foreground operator entrypoint. Not exposed as a browser/API action.
+pub async fn run_axon_v2_operator_command(
+    settings: &crate::Settings,
+    db: &crate::db::Db,
+    args: &[String],
+) -> AppResult<()> {
+    if matches!(settings.database.kind, crate::config::DatabaseKind::Mysql) {
+        return Err(AppError::Configuration("Axon v2 enrollment supports SQLite and PostgreSQL only".into()));
+    }
+    let (Some(policy), Some(trust)) = (
+        settings.discovery.axon_admin_v2.as_ref(), settings.discovery.axon_admin_trust.as_ref(),
+    ) else { return Err(AppError::Forbidden); };
+    let pin = axon_signer_pin(&trust.signing_public_jwks).ok_or(AppError::Forbidden)?;
+    let app = db.find_application_by_slug_in_organization(&trust.organization_id, &trust.application_id)
+        .await?.ok_or(AppError::Forbidden)?;
+    let scope = crate::db::AxonV2Enrollment {
+        organization_id: trust.organization_id.clone(),
+        application_db_id: app.id,
+        application_slug: trust.application_id.clone(),
+        enrollment_id: policy.enrollment_id.clone(),
+        website_origin: trust.origin.clone(),
+        signer_pin: pin,
+    };
+    match args {
+        [command, prior_revision, prior_digest] if command == "prepare" => {
+            let revision = prior_revision.parse::<i64>().map_err(|_| AppError::Forbidden)?;
+            if policy.revision <= revision || policy.signed_withdrawal {
+                return Err(AppError::Forbidden);
+            }
+            db.prepare_axon_v2_reservation(scope, revision, prior_digest.clone()).await
+        }
+        [command, generation] if command == "disable" => {
+            let generation = generation.parse::<i64>().map_err(|_| AppError::Forbidden)?;
+            db.disable_axon_v2_reservation(scope, generation).await
+        }
+        _ => Err(AppError::BadRequest("usage: axon-v2 prepare <prior-revision> <prior-digest> | axon-v2 disable <generation>".into())),
+    }
+}
 pub use crate::application_discovery_contract::{
     MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE, SOURCE_MANUAL, SOURCE_MODE_DISCOVERY,
     SOURCE_MODE_MANUAL, SOURCE_WEBSITE, SYNC_ACCEPTED, SYNC_DISABLED, SYNC_ERROR, SYNC_PENDING,

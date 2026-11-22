@@ -6,6 +6,7 @@ use super::{
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl};
+use diesel::connection::SimpleConnection;
 use crate::application_discovery::VerifiedAxonDeclaration;
 
 pub(crate) struct AxonV2Enrollment {
@@ -41,6 +42,55 @@ struct LiveAxonV2Snapshot {
 
 #[allow(dead_code)] // Future guarded reconciliation caller.
 impl Db {
+    /// First enrollment only. Require the explicit operator-supplied baseline
+    /// to equal the incumbent accepted discovery record; never replace a row.
+    pub(crate) async fn prepare_axon_v2_reservation(
+        &self, scope: AxonV2Enrollment, prior_revision: i64, prior_digest: String,
+    ) -> AppResult<()> {
+        if scope.enrollment_id.is_empty() || prior_revision <= 0 || prior_digest.len() != 43 {
+            return Err(AppError::Forbidden);
+        }
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let lock = format!(
+                    "UPDATE applications SET updated_at = updated_at WHERE id = {} AND organization_id = {} AND slug = {} AND is_active = 1",
+                    ph(kind,1), ph(kind,2), ph(kind,3),
+                );
+                if sql_query(lock).bind::<Text,_>(&scope.application_db_id)
+                    .bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.application_slug)
+                    .execute(conn).map_err(AppError::from)? != 1
+                { return Err(AppError::Forbidden); }
+                let select = format!("{} WHERE application_id = {}", select_application_discovery_sql(), ph(kind,1));
+                let current = sql_query(select).bind::<Text,_>(&scope.application_db_id)
+                    .get_result::<super::ApplicationDiscoveryRecord>(conn).optional()
+                    .map_err(AppError::from)?.ok_or(AppError::Forbidden)?;
+                if current.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE
+                    || current.operator_disabled != 0
+                    || current.last_verified_revision != Some(prior_revision)
+                    || current.last_verified_digest.as_deref() != Some(prior_digest.as_str())
+                    || current.last_verified_expires_at.is_none_or(|exp| exp <= crate::util::now_ts())
+                    || crate::application_discovery::website_origin(&current.website_url).ok().as_deref()
+                        != Some(scope.website_origin.as_str())
+                    || crate::application_discovery::axon_signer_pin(&current.signing_public_jwks).as_deref()
+                        != Some(scope.signer_pin.as_str())
+                { return Err(AppError::Forbidden); }
+                let schema = include_str!("../../../scripts/axon-admin-v2-tombstone.sql")
+                    .replace("CREATE TABLE axon_admin_authority_state", "CREATE TABLE IF NOT EXISTS axon_admin_authority_state");
+                conn.batch_execute(&schema).map_err(AppError::from)?;
+                let write = format!(
+                    "INSERT INTO axon_admin_authority_state (organization_id, application_slug, enrollment_id, revision, digest, generation, withdrawn)
+                     VALUES ({}, {}, {}, {}, {}, 1, 0)",
+                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
+                );
+                sql_query(write).bind::<Text,_>(&scope.organization_id)
+                    .bind::<Text,_>(&scope.application_slug).bind::<Text,_>(&scope.enrollment_id)
+                    .bind::<BigInt,_>(prior_revision).bind::<Text,_>(&prior_digest)
+                    .execute(conn).map_err(AppError::from)?;
+                Ok(())
+            })
+        })
+    }
+
     /// One consistent statement snapshot of the fenced authority and global user.
     pub(crate) async fn live_axon_v2_snapshot(
         &self,
