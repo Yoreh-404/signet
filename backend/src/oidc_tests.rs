@@ -1937,6 +1937,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     let expected = json!({"version":2,"application_id":app.slug,"revision":3,"permissions":permissions});
     let claim = "axon_admin_authority";
     assert!(read(&tokens.access_token)[claim] == expected, "full v2 access claim did not match");
+    assert!(tokens.access_token.len() < 32_768);
     assert!(read(tokens.id_token.as_deref().unwrap()).get(claim).is_none());
     assert!(tokens.refresh_token.is_none());
     let router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
@@ -1951,8 +1952,22 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         let mut conn = pool.get().unwrap();
         sql_query("UPDATE users SET is_admin=0 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
     }
-    let after = oidc_http_body_json(router.oneshot(request()).await.unwrap()).await;
+    let after = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
     assert_eq!(after, json!({"active":false}));
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
+    }
+    assert!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await["active"] == true);
+    let control = crate::application_discovery::run_axon_v2_operator_command(
+        &state.settings, &state.db, &["disable".into(), "1".into()],
+    ).await;
+    assert!(control.is_ok(), "fixture's explicit scoped disable did not commit");
+    let after_disable = oidc_http_body_json(router.oneshot(request()).await.unwrap()).await;
+    assert_eq!(after_disable, json!({"active":false}));
+    assert!(crate::application_discovery::run_axon_v2_operator_command(
+        &state.settings, &state.db, &["reapprove".into(), "2".into()],
+    ).await.is_err(), "same signed revision cannot reopen a disabled enrollment");
     drop(state);
     let _ = std::fs::remove_file(path);
 }
