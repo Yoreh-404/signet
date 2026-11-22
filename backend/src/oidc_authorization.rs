@@ -50,6 +50,28 @@ async fn trusted_axon_client<'a>(
     app: &ApplicationRecord,
     binding: &ApplicationClientBindingRecord,
 ) -> AppResult<Option<(&'a crate::config::AxonAdminTrust, String, Value)>> {
+    let Some((trust, pin, row)) = trusted_axon_enrollment(state, client, app, binding).await? else {
+        return Ok(None);
+    };
+    if row.sync_status != crate::application_discovery_contract::SYNC_STATUS_SYNCED
+        || row.last_verified_digest.is_none()
+        || row.last_verified_expires_at.is_none_or(|exp| exp <= crate::util::now_ts())
+    {
+        return Ok(None);
+    }
+    let Some(contract) = row.snapshot_json.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) else {
+        return Ok(None);
+    };
+    Ok(verified_axon_admin(&contract, trust, &pin, 0)
+        .is_some().then_some((trust, pin, contract)))
+}
+
+async fn trusted_axon_enrollment<'a>(
+    state: &'a AppState,
+    client: &ClientRecord,
+    app: &ApplicationRecord,
+    binding: &ApplicationClientBindingRecord,
+) -> AppResult<Option<(&'a crate::config::AxonAdminTrust, String, crate::db::ApplicationDiscoveryRecord)>> {
     let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref() else {
         return Ok(None);
     };
@@ -78,19 +100,12 @@ async fn trusted_axon_client<'a>(
     };
     if row.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE
         || row.operator_disabled != 0
-        || row.sync_status != crate::application_discovery_contract::SYNC_STATUS_SYNCED
-        || row.last_verified_digest.is_none()
-        || row.last_verified_expires_at.is_none_or(|exp| exp <= crate::util::now_ts())
         || crate::application_discovery::website_origin(&row.website_url).ok().as_deref() != Some(trust.origin.as_str())
         || crate::application_discovery::axon_signer_pin(&row.signing_public_jwks).as_deref() != Some(pin.as_str())
     {
         return Ok(None);
     }
-    let Some(contract) = row.snapshot_json.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) else {
-        return Ok(None);
-    };
-    Ok(verified_axon_admin(&contract, trust, &pin, 0)
-        .is_some().then_some((trust, pin, contract)))
+    Ok(Some((trust, pin, row)))
 }
 
 pub(crate) async fn governed_axon_logout_uri(
@@ -108,6 +123,11 @@ pub(crate) async fn governed_axon_logout_uri(
     let Some(app) = state.db.find_application_by_id(&binding.application_id).await? else {
         return Ok(None);
     };
+    if state.settings.discovery.axon_admin_v2.is_some()
+        && let Some((trust, _, _)) = trusted_axon_enrollment(state, client, &app, &binding).await?
+    {
+        return Ok(Some(format!("{}/admin/api/auth/signet/backchannel-logout", trust.origin)));
+    }
     Ok(trusted_axon_client(state, client, &app, &binding).await?.map(|(trust, _, _)|
         format!("{}/admin/api/auth/signet/backchannel-logout", trust.origin)
     ))
@@ -161,7 +181,7 @@ pub(crate) async fn project_axon_admin_v2(
     {
         return Ok(None);
     }
-    let Some((trust, pin, _)) = trusted_axon_client(state, client, app, binding).await? else {
+    let Some((trust, pin, _)) = trusted_axon_enrollment(state, client, app, binding).await? else {
         return Ok(None);
     };
     if audience != Some(trust.audience.as_str())
