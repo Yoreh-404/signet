@@ -153,6 +153,14 @@ async fn oidc_client_binding_is_exclusive_and_detach_delete_are_safe() {
         .await
         .unwrap();
     assert_eq!(
+        db.find_application_client_binding(&client.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .protocol,
+        "oauth2_oidc"
+    );
+    assert_eq!(
         db.list_application_client_ids(&first.id).await.unwrap(),
         vec![client.id.clone()]
     );

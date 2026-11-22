@@ -203,6 +203,16 @@ impl Db {
             };
             conn.batch_execute(auth_domain_insert)
                 .map_err(AppError::from)?;
+            // `oidc` was the legacy application-binding spelling.  The
+            // canonical protocol key is `oauth2_oidc`; normalize persisted
+            // rows during startup as well as accepting the alias at read
+            // time.  This keeps older Signet runtimes and newer protocol
+            // module checks from disagreeing on an otherwise identical
+            // interactive OIDC boundary.
+            conn.batch_execute(
+                "UPDATE application_client_bindings SET protocol = 'oauth2_oidc' WHERE protocol = 'oidc'",
+            )
+            .map_err(AppError::from)?;
             let legacy_table_exists = match kind {
                 DatabaseKind::Sqlite => sql_query(
                     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'application_oidc_clients'",
@@ -277,10 +287,10 @@ impl Db {
             }
             let binding_insert = match kind {
                 DatabaseKind::Sqlite | DatabaseKind::Postgres => {
-                    "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oidc', 'default', 'auth-domain:' || links.application_id, clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL ON CONFLICT DO NOTHING"
+                    "INSERT INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oauth2_oidc', 'default', 'auth-domain:' || links.application_id, clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL ON CONFLICT DO NOTHING"
                 }
                 DatabaseKind::Mysql => {
-                    "INSERT IGNORE INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oidc', 'default', CONCAT('auth-domain:', links.application_id), clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL"
+                    "INSERT IGNORE INTO application_client_bindings (application_id, client_db_id, protocol, authorization_profile_id, auth_domain_id, is_active, created_at, updated_at) SELECT links.application_id, links.client_db_id, 'oauth2_oidc', 'default', CONCAT('auth-domain:', links.application_id), clients.is_active, links.created_at, clients.updated_at FROM application_oidc_clients links INNER JOIN clients ON clients.id = links.client_db_id LEFT JOIN application_client_bindings bindings ON bindings.application_id = links.application_id AND bindings.client_db_id = links.client_db_id WHERE bindings.client_db_id IS NULL"
                 }
             };
             conn.batch_execute(binding_insert).map_err(AppError::from)?;
@@ -658,6 +668,27 @@ impl Db {
             .as_ref()
             .and_then(|record| record.organization_id.clone())
             .or_else(|| Some(system_organization_id.to_string()));
+        // Never erase an endpoint configured through the admin API merely
+        // because a legacy bootstrap client omitted the optional field.
+        let backchannel_logout_uri = if !client.backchannel_logout_uri.trim().is_empty() {
+            crate::backchannel_logout::validate_backchannel_logout_config(
+                &client.backchannel_logout_uri,
+                client.backchannel_logout_session_required,
+            )?
+        } else {
+            existing
+                .as_ref()
+                .map(|record| record.backchannel_logout_uri.clone())
+                .unwrap_or_default()
+        };
+        let backchannel_logout_session_required = if client.backchannel_logout_uri.trim().is_empty()
+        {
+            existing
+                .as_ref()
+                .is_some_and(|record| record.backchannel_logout_session_required == 1)
+        } else {
+            client.backchannel_logout_session_required
+        };
         let desired = NewClient {
             client_id: client.client_id.clone(),
             client_secret_hash,
@@ -689,10 +720,15 @@ impl Db {
             sector_identifier_uri: String::new(),
             jwks_uri: String::new(),
             jwks: String::new(),
-            backchannel_logout_uri: String::new(),
-            backchannel_logout_session_required: false,
-            frontchannel_logout_uri: String::new(),
-            frontchannel_logout_session_required: false,
+            backchannel_logout_uri,
+            backchannel_logout_session_required,
+            frontchannel_logout_uri: existing
+                .as_ref()
+                .map(|record| record.frontchannel_logout_uri.clone())
+                .unwrap_or_default(),
+            frontchannel_logout_session_required: existing
+                .as_ref()
+                .is_some_and(|record| record.frontchannel_logout_session_required == 1),
             service_account_enabled: client.service_account_enabled,
             service_account_permissions: permissions,
             is_active: true,

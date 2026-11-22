@@ -416,6 +416,8 @@ pub(crate) fn bootstrap_client(secret: &str) -> BootstrapClient {
         client_secret_env: None,
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
+        backchannel_logout_uri: String::new(),
+        backchannel_logout_session_required: false,
         scopes: vec!["memory.service".to_string()],
         grant_types: vec!["client_credentials".to_string()],
         response_types: Vec::new(),

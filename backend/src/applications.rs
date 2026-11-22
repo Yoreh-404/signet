@@ -27,6 +27,9 @@ pub const ACCESS_ALL_SIGNET_USERS: &str = "all_users";
 pub const ACCESS_LEGACY_ALL_USERS: &str = "legacy_all_users";
 
 pub const REGISTRATION_DISABLED: &str = "disabled";
+/// A site's explicit opt-in to new-account creation. All other sites remain
+/// closed unless their own application registration mode permits enrollment.
+pub const REGISTRATION_OPEN: &str = "open";
 pub const REGISTRATION_INVITATION: &str = "invitation";
 pub const REGISTRATION_ORGANIZATION_MEMBERS: &str = "organization_members";
 pub const REGISTRATION_LEGACY: &str = "legacy";
@@ -64,6 +67,16 @@ pub fn normalize_module_config(module_key: &str, value: Value) -> AppResult<Valu
     match module_key {
         "protocols" => {
             validate_string_field(object, "website_url")?;
+            if let Some(days) = object.get("login_validity_days") {
+                let days = days.as_u64().ok_or_else(|| AppError::BadRequest(
+                    "login_validity_days must be a positive integer".into()
+                ))?;
+                if !(1..=30).contains(&days) {
+                    return Err(AppError::BadRequest(
+                        "login_validity_days must be between 1 and 30".into()
+                    ));
+                }
+            }
             validate_protocol_config(object, "oauth2_oidc", &["client_ids"])?;
             validate_protocol_config(object, "saml2", &[])?;
             validate_saml_protocol_config(object)?;
@@ -88,6 +101,32 @@ pub fn normalize_module_config(module_key: &str, value: Value) -> AppResult<Valu
             validate_string_list_field(object, "ldap_provider_ids")?;
             validate_directory_sync_config(object)?;
             validate_scim_config(object)?;
+        }
+        "directory" => {
+            // Public visibility is a per-application opt-in, independent of
+            // automatic SSO application registration.
+            validate_bool_field(object, "listed")?;
+            validate_string_field(object, "website_url")?;
+            if object.keys().any(|key| key != "listed" && key != "website_url") {
+                return Err(AppError::BadRequest(
+                    "directory accepts only listed and website_url".into(),
+                ));
+            }
+            if object.get("listed").and_then(Value::as_bool) == Some(true) {
+                let website_url = object.get("website_url").and_then(Value::as_str)
+                    .ok_or_else(|| AppError::BadRequest("public directory website_url is required".into()))?;
+                let url = url::Url::parse(website_url)
+                    .map_err(|_| AppError::BadRequest("public directory website_url is invalid".into()))?;
+                if website_url.len() > 2048 || url.scheme() != "https"
+                    || url.host_str().is_none() || !url.username().is_empty()
+                    || url.password().is_some() || url.query().is_some()
+                    || url.fragment().is_some() || website_url.trim() != website_url
+                {
+                    return Err(AppError::BadRequest(
+                        "public directory requires a credential-free HTTPS URL".into(),
+                    ));
+                }
+            }
         }
         "authorization" => {
             validate_bool_field(object, "inherit_enterprise_roles")?;
@@ -884,7 +923,7 @@ pub async fn validate_module_bindings(
                 }
             }
         }
-        "authorization" => {}
+        "authorization" | "directory" => {}
         _ => {
             return Err(AppError::BadRequest(format!(
                 "unsupported application module: {module_key}"
@@ -892,6 +931,24 @@ pub async fn validate_module_bindings(
         }
     }
     Ok(())
+}
+
+/// Per-application maximum age for passwordless SSO reuse.
+pub async fn application_login_validity_seconds(
+    state: &AppState,
+    application_id: &str,
+) -> AppResult<i64> {
+    const DEFAULT_DAYS: i64 = 30;
+    let Some(module) = application_module(state, application_id, "protocols").await? else {
+        return Ok(DEFAULT_DAYS * 86_400);
+    };
+    let config = module_config(&module)?;
+    let days = config.get("login_validity_days")
+        .and_then(Value::as_i64).unwrap_or(DEFAULT_DAYS);
+    if !(1..=30).contains(&days) {
+        return Err(AppError::Configuration("invalid application login validity".into()));
+    }
+    Ok(days * 86_400)
 }
 
 pub async fn application_website_url(
@@ -1114,7 +1171,7 @@ pub fn normalize_access_mode(value: &str, allow_legacy: bool) -> AppResult<Strin
 
 pub fn normalize_registration_mode(value: &str, allow_legacy: bool) -> AppResult<String> {
     match value.trim() {
-        REGISTRATION_DISABLED | REGISTRATION_INVITATION | REGISTRATION_ORGANIZATION_MEMBERS => {
+        REGISTRATION_DISABLED | REGISTRATION_OPEN | REGISTRATION_INVITATION | REGISTRATION_ORGANIZATION_MEMBERS => {
             Ok(value.trim().to_string())
         }
         REGISTRATION_LEGACY if allow_legacy => Ok(REGISTRATION_LEGACY.to_string()),
@@ -1356,6 +1413,14 @@ mod tests {
 
     #[test]
     fn module_config_accepts_known_shapes_and_rejects_malformed_fields() {
+        assert!(normalize_module_config(
+            "protocols", serde_json::json!({"login_validity_days": 30})
+        ).is_ok());
+        for invalid in [serde_json::json!(0), serde_json::json!(31), serde_json::json!("30")] {
+            assert!(normalize_module_config(
+                "protocols", serde_json::json!({"login_validity_days": invalid})
+            ).is_err());
+        }
         let config = serde_json::json!({
             "website_url": "https://app.example.test",
             "oauth2_oidc": {

@@ -4,7 +4,7 @@ use super::{
     admin_application_authorization_write, admin_application_auto_discovery,
     admin_application_billing, admin_application_crud, admin_application_directory_sync,
     admin_application_discovery, admin_application_enrollment, admin_application_iap,
-    admin_application_jwt, admin_application_modules, admin_application_oidc,
+    admin_application_jwt, admin_application_modules, admin_application_wechat_mini, admin_application_oidc,
     admin_application_scim, admin_audit, admin_auth, admin_authorization_code_read,
     admin_authorization_code_write, admin_client_response, admin_organizations, admin_providers,
     admin_security, admin_settings, admin_user_access, admin_user_directory, admin_user_import,
@@ -151,6 +151,11 @@ pub(super) fn routes() -> Router<AppState> {
                 .delete(admin_application_crud::delete_application),
         )
         .route(
+            "/api/admin/applications/{id}/anonymous-sub-identity-policy",
+            get(admin_application_crud::anonymous_sub_identity_policy)
+                .put(admin_application_crud::update_anonymous_sub_identity_policy),
+        )
+        .route(
             "/api/admin/applications/{id}/discovery",
             get(admin_application_discovery::get).put(admin_application_discovery::update),
         )
@@ -181,6 +186,15 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/api/admin/applications/{id}/modules/{module_key}",
             put(admin_application_modules::update).delete(admin_application_modules::delete),
+        )
+        .route(
+            "/api/admin/applications/{id}/wechat-mini-programs",
+            get(admin_application_wechat_mini::list),
+        )
+        .route(
+            "/api/admin/applications/{id}/wechat-mini-programs/{app_id}",
+            put(admin_application_wechat_mini::upsert)
+                .delete(admin_application_wechat_mini::delete),
         )
         .route(
             "/api/admin/applications/{id}/billing-settings",

@@ -17,10 +17,30 @@ impl Db {
                     }
                 }
             }
+            // Typed, application-owned authentication integrations. User
+            // identity ownership remains in sub_identities and linked
+            // external identities; providers such as WeChat, OAuth2 and
+            // future passkey brokers do not get bespoke credential tables.
+            conn.batch_execute(
+                "CREATE TABLE IF NOT EXISTS application_auth_credentials (
+                    credential_type VARCHAR(64) NOT NULL,
+                    external_id VARCHAR(255) NOT NULL,
+                    application_id VARCHAR(255) NOT NULL,
+                    secret_ciphertext TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    is_active INTEGER NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    PRIMARY KEY (credential_type, external_id)
+                )"
+            ).map_err(|err| AppError::Database(err.to_string()))?;
             Ok(())
         })?;
         self.remove_legacy_phone_uniqueness().await?;
         self.migrate_tenant_application_model().await?;
+        // Transfer legacy credentials only after the application ownership
+        // migration has settled, to preserve the final application IDs.
+        self.migrate_legacy_wechat_application_credentials().await?;
         with_conn!(self, |conn, kind| {
             sql_query(authorization_code_registration_source_backfill_sql(kind))
                 .bind::<Text, _>(UserRegistrationSource::AuthorizationCode.as_str())

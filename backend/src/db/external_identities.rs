@@ -664,6 +664,39 @@ impl Db {
         organization_id: Option<String>,
         expected_first_user: bool,
     ) -> AppResult<UserRecord> {
+        self.insert_external_oidc_user_internal(
+            user, provider_slug, external_subject, external_email, organization_id,
+            expected_first_user, None,
+        ).await
+    }
+
+    pub async fn insert_external_oidc_anonymous_sub_identity(
+        &self,
+        user: NewUser,
+        provider_slug: &str,
+        external_subject: &str,
+        external_email: Option<String>,
+        application_id: &str,
+    ) -> AppResult<UserRecord> {
+        if user.is_admin {
+            return Err(AppError::Forbidden);
+        }
+        self.insert_external_oidc_user_internal(
+            user, provider_slug, external_subject, external_email, None, false,
+            Some(application_id.to_string()),
+        ).await
+    }
+
+    async fn insert_external_oidc_user_internal(
+        &self,
+        user: NewUser,
+        provider_slug: &str,
+        external_subject: &str,
+        external_email: Option<String>,
+        organization_id: Option<String>,
+        expected_first_user: bool,
+        anonymous_sub_application_id: Option<String>,
+    ) -> AppResult<UserRecord> {
         let user_id = uuid::Uuid::new_v4().to_string();
         let linked_identity_id = uuid::Uuid::new_v4().to_string();
         let provider_slug = provider_slug.to_string();
@@ -691,6 +724,22 @@ impl Db {
                     return Err(AppError::BadRequest(
                         "external OIDC identity is already linked".to_string(),
                     ));
+                }
+
+                if let Some(application_id) = anonymous_sub_application_id.as_deref() {
+                    let allowed = sql_query(format!(
+                        "SELECT COUNT(*) AS count FROM application_anonymous_identity_policies p \
+                         JOIN applications a ON a.id = p.application_id \
+                         WHERE p.application_id = {} AND p.allow_auto_create = 1 AND a.is_active = 1",
+                        ph(kind, 1)
+                    ))
+                    .bind::<Text, _>(application_id)
+                    .get_result::<CountRow>(conn)
+                    .map_err(AppError::from)?
+                    .count > 0;
+                    if !allowed || user.is_admin {
+                        return Err(AppError::Forbidden);
+                    }
                 }
 
                 sql_query(insert_user_sql(kind, UserRegistrationSource::Local))
@@ -734,6 +783,21 @@ impl Db {
                     .bind::<BigInt, _>(now)
                     .execute(conn)
                     .map_err(AppError::from)?;
+
+                if let Some(application_id) = anonymous_sub_application_id.as_deref() {
+                    sql_query(format!(
+                        "INSERT INTO sub_identities (user_id, primary_user_id, origin_application_id, created_via, created_at, updated_at) \
+                         VALUES ({}, NULL, {}, {}, {}, {})",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3), ph(kind, 4), ph(kind, 5)
+                    ))
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(application_id)
+                    .bind::<Text, _>("external_provider")
+                    .bind::<BigInt, _>(now)
+                    .bind::<BigInt, _>(now)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+                }
 
                 if let Some(organization_id) = organization_id.as_deref() {
                     let sql = format!("{} WHERE id = {}", select_organization_sql(), ph(kind, 1));

@@ -554,7 +554,11 @@ pub(super) async fn token_from_refresh_token(
                 authorization_details: authorization_details.clone(),
                 dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
                 auth_context_id: record.auth_context_id.clone(),
-                expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
+                // Refresh rotation cannot extend the original login lifetime.
+                expires_at: bounded_refresh_expiry(
+                    util::now_ts(), state.settings.oidc.refresh_token_ttl_seconds,
+                    record.expires_at,
+                ),
             },
         )
         .await?;
@@ -571,6 +575,25 @@ pub(super) async fn token_from_refresh_token(
         scope,
         authorization_details: response_authorization_details,
     }))
+}
+
+/// Rotating a refresh token must never extend the original login deadline.
+fn bounded_refresh_expiry(now: i64, ttl: i64, login_deadline: i64) -> i64 {
+    now.saturating_add(ttl).min(login_deadline)
+}
+
+#[cfg(test)]
+mod login_validity_tests {
+    use super::bounded_refresh_expiry;
+
+    #[test]
+    fn refresh_rotation_does_not_extend_login_deadline() {
+        let now = 1_000_000;
+        let deadline = now + 30 * 86_400;
+        assert_eq!(bounded_refresh_expiry(now, 90 * 86_400, deadline), deadline);
+        assert_eq!(bounded_refresh_expiry(now + 29 * 86_400, 90 * 86_400, deadline), deadline);
+        assert_eq!(bounded_refresh_expiry(now + 31 * 86_400, 90 * 86_400, deadline), deadline);
+    }
 }
 
 fn invalid_refresh_token_grant() -> AppError {
@@ -761,7 +784,18 @@ pub(super) async fn issue_tokens_for_user(
         state.settings.oidc.id_token_ttl_seconds,
         id_claims,
     )?;
+    let application_validity = if let Some(application_id) = application_id
+        .as_deref()
+        .or_else(|| binding.map(|binding| binding.application_id.as_str()))
+    {
+        applications::application_login_validity_seconds(state, application_id).await?
+    } else {
+        30 * 86_400
+    };
+    let now = util::now_ts();
+    let login_deadline = auth_time.unwrap_or(now).saturating_add(application_validity);
     let refresh_token = if allow_refresh_token
+        && now < login_deadline
         && user.archived_at.is_none()
         && scope
             .split_whitespace()
@@ -784,7 +818,9 @@ pub(super) async fn issue_tokens_for_user(
                     authorization_details: authorization_details.clone(),
                     dpop_jkt: dpop.as_ref().map(|binding| binding.jkt.clone()),
                     auth_context_id: auth_context_id.clone(),
-                    expires_at: util::now_ts() + state.settings.oidc.refresh_token_ttl_seconds,
+                    expires_at: bounded_refresh_expiry(
+                        now, state.settings.oidc.refresh_token_ttl_seconds, login_deadline,
+                    ),
                 },
             )
             .await?;

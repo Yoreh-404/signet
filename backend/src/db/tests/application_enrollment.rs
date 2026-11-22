@@ -216,6 +216,25 @@ async fn website_manifest_adopts_generated_compatibility_owner_but_not_real_appl
         crate::applications::REGISTRATION_DISABLED
     );
 
+    // An active compatibility owner is not a free-standing registration
+    // capability. Retire it explicitly before the signed website takes over.
+    db.update_application(
+        &generated_owner.id,
+        NewApplication {
+            organization_id: generated_owner.organization_id.clone(),
+            slug: generated_owner.slug.clone(),
+            name: generated_owner.name.clone(),
+            description: generated_owner.description.clone(),
+            access_mode: generated_owner.access_mode.clone(),
+            registration_mode: generated_owner.registration_mode.clone(),
+            account_selection_mode: generated_owner.account_selection_mode.clone(),
+            unique_identity_factors: Vec::new(),
+            is_active: false,
+        },
+    )
+    .await
+    .unwrap();
+
     db.apply_application_contract(
         &website.id,
         single_client_website_manifest(generated_input, 1),
@@ -414,12 +433,12 @@ async fn website_manifest_can_rebind_client_from_inactive_same_org_compatibility
         redacted_payload: serde_json::json!({}),
     };
 
+    let first_attempt = db.apply_application_contract(&application.id, manifest.clone()).await;
     assert!(matches!(
-        db.apply_application_contract(&application.id, manifest.clone())
-            .await,
-        Err(AppError::BadRequest(message))
+        first_attempt,
+        Err(AppError::BadRequest(ref message))
             if message == "website-managed client belongs to another application"
-    ));
+    ), "first attempt expected locked-ownership error, got {first_attempt:?}");
 
     db.update_application(
         &compatibility.id,

@@ -15,6 +15,8 @@ async fn bootstrap_client_ensure_is_idempotent_and_secret_safe() {
         client_secret_env: None,
         redirect_uris: Vec::new(),
         post_logout_redirect_uris: Vec::new(),
+        backchannel_logout_uri: String::new(),
+        backchannel_logout_session_required: false,
         scopes: vec!["memory.service".to_string()],
         grant_types: vec!["client_credentials".to_string()],
         response_types: Vec::new(),
@@ -75,6 +77,36 @@ async fn bootstrap_client_ensure_is_idempotent_and_secret_safe() {
         rotated.client_secret_hash.as_deref().unwrap(),
         "second-secret"
     ));
+
+    // Back-channel endpoints may be configured once by a deployment and then
+    // omitted by older bootstrap files. Re-seeding must never erase them.
+    settings.bootstrap.clients[0].backchannel_logout_uri =
+        "https://1.1.1.1/oidc/backchannel-logout".into();
+    settings.bootstrap.clients[0].backchannel_logout_session_required = true;
+    db.seed(&settings).await.unwrap();
+    let configured = db
+        .find_client_by_client_id("ensure-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        configured.backchannel_logout_uri,
+        "https://1.1.1.1/oidc/backchannel-logout"
+    );
+    assert_eq!(configured.backchannel_logout_session_required, 1);
+    settings.bootstrap.clients[0].backchannel_logout_uri.clear();
+    settings.bootstrap.clients[0].backchannel_logout_session_required = false;
+    db.seed(&settings).await.unwrap();
+    let preserved_logout = db
+        .find_client_by_client_id("ensure-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preserved_logout.backchannel_logout_uri,
+        configured.backchannel_logout_uri
+    );
+    assert_eq!(preserved_logout.backchannel_logout_session_required, 1);
 
     drop(db);
     let _ = std::fs::remove_file(path);

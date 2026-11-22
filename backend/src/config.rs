@@ -10,6 +10,8 @@ pub struct Settings {
     #[serde(default)]
     pub performance: PerformanceSettings,
     pub oidc: OidcSettings,
+    #[serde(default)]
+    pub wechat_mini: WechatMiniSettings,
     pub security: SecuritySettings,
     pub registration: RegistrationSettings,
     pub verification: VerificationSettings,
@@ -22,6 +24,69 @@ pub struct Settings {
     pub external_oidc_providers: Vec<ExternalOidcProviderSettings>,
     pub cors: CorsSettings,
     pub bootstrap: BootstrapSettings,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WechatMiniSettings {
+    /// Legacy single-program adapter. Existing installations continue to work
+    /// while new Mini Programs are bound to their own workspace/application.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret_file: String,
+    #[serde(default)]
+    pub bridge_secret_file: String,
+    #[serde(default = "default_wechat_mini_application_slug")]
+    pub application_slug: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub allow_registration: bool,
+    #[serde(default = "default_wechat_mini_session_endpoint")]
+    pub session_endpoint: String,
+    /// Each entry belongs to one website application in one workspace.
+    #[serde(default)]
+    pub programs: Vec<WechatMiniProgramSettings>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WechatMiniProgramSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    pub app_id: String,
+    pub app_secret_file: String,
+    pub workspace: String,
+    pub application: String,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub allow_registration: bool,
+}
+
+impl Default for WechatMiniSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: String::new(),
+            app_secret_file: String::new(),
+            bridge_secret_file: String::new(),
+            application_slug: default_wechat_mini_application_slug(),
+            scopes: Vec::new(),
+            allow_registration: false,
+            session_endpoint: default_wechat_mini_session_endpoint(),
+            programs: Vec::new(),
+        }
+    }
+}
+
+fn default_wechat_mini_session_endpoint() -> String {
+    "https://api.weixin.qq.com/sns/jscode2session".to_string()
+}
+
+fn default_wechat_mini_application_slug() -> String {
+    "axon".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -663,6 +728,12 @@ pub struct BootstrapClient {
     pub redirect_uris: Vec<String>,
     #[serde(default)]
     pub post_logout_redirect_uris: Vec<String>,
+    /// A public endpoint for signed OIDC Back-Channel Logout notifications.
+    /// An omitted endpoint preserves the value configured by administrators.
+    #[serde(default)]
+    pub backchannel_logout_uri: String,
+    #[serde(default)]
+    pub backchannel_logout_session_required: bool,
     pub scopes: Vec<String>,
     pub grant_types: Vec<String>,
     #[serde(default)]
@@ -804,6 +875,53 @@ impl Settings {
             self.performance.signing_key_sync_seconds = value
                 .parse()
                 .with_context(|| "SSO_SIGNING_KEY_SYNC_SECONDS must be an integer")?;
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_ENABLED") {
+            self.wechat_mini.enabled = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_APP_ID") {
+            self.wechat_mini.app_id = value;
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_APP_SECRET_FILE") {
+            self.wechat_mini.app_secret_file = value;
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_BRIDGE_SECRET_FILE") {
+            self.wechat_mini.bridge_secret_file = value;
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_APPLICATION_SLUG") {
+            self.wechat_mini.application_slug = value;
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_SCOPES") {
+            self.wechat_mini.scopes = value
+                .split_whitespace()
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_ALLOW_REGISTRATION") {
+            self.wechat_mini.allow_registration = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(value) = env::var("SIGNET_WECHAT_MINI_SESSION_ENDPOINT") {
+            self.wechat_mini.session_endpoint = value;
+        }
+        if let Ok(path) = env::var("SIGNET_WECHAT_MINI_PROGRAMS_FILE") {
+            let path = path.trim();
+            if !path.is_empty() {
+                let metadata = fs::metadata(path)
+                    .with_context(|| "SIGNET_WECHAT_MINI_PROGRAMS_FILE cannot be read")?;
+                if metadata.len() > 256 * 1024 {
+                    anyhow::bail!("SIGNET_WECHAT_MINI_PROGRAMS_FILE exceeds size limit");
+                }
+                self.wechat_mini.programs = serde_json::from_str(
+                    &fs::read_to_string(path).with_context(|| "SIGNET_WECHAT_MINI_PROGRAMS_FILE cannot be read")?
+                ).with_context(|| "SIGNET_WECHAT_MINI_PROGRAMS_FILE is invalid JSON")?;
+            }
         }
         if let Ok(value) = env::var("SSO_BILLING_RECONCILE_INTERVAL_SECONDS") {
             self.billing.reconcile_interval_seconds = value
@@ -958,6 +1076,95 @@ impl Settings {
             .any(|scope| scope == "openid")
         {
             anyhow::bail!("oidc.supported_scopes must include openid");
+        }
+        if self.wechat_mini.enabled || self.wechat_mini.programs.iter().any(|program| program.enabled) {
+            if self.wechat_mini.bridge_secret_file.trim().is_empty() {
+                anyhow::bail!("wechat_mini.bridge_secret_file is required when any program is enabled");
+            }
+        }
+        if self.wechat_mini.enabled {
+            let app_id = self.wechat_mini.app_id.trim();
+            if app_id.len() < 8
+                || app_id.len() > 64
+                || !app_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || character == '-' || character == '_'
+                })
+            {
+                anyhow::bail!("wechat_mini.app_id is invalid");
+            }
+            if self.wechat_mini.app_secret_file.trim().is_empty() {
+                anyhow::bail!("wechat_mini.app_secret_file is required when enabled");
+            }
+            if self.wechat_mini.bridge_secret_file.trim().is_empty() {
+                anyhow::bail!("wechat_mini.bridge_secret_file is required when enabled");
+            }
+            if self.wechat_mini.application_slug.trim().is_empty() {
+                anyhow::bail!("wechat_mini.application_slug is required when enabled");
+            }
+            if self.wechat_mini.scopes.is_empty() {
+                anyhow::bail!("wechat_mini.scopes cannot be empty when enabled");
+            }
+            let supported_scopes = self
+                .oidc
+                .supported_scopes
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let mut mini_scopes = BTreeSet::new();
+            for scope in &self.wechat_mini.scopes {
+                if !scope.starts_with("axon-next:")
+                    || !supported_scopes.contains(scope.as_str())
+                    || !mini_scopes.insert(scope.as_str())
+                {
+                    anyhow::bail!("wechat_mini.scopes contains an invalid or duplicate scope");
+                }
+            }
+            let endpoint = Url::parse(self.wechat_mini.session_endpoint.trim())
+                .with_context(|| "wechat_mini.session_endpoint must be an absolute URL")?;
+            if endpoint.scheme() != "https"
+                || endpoint.host_str() != Some("api.weixin.qq.com")
+                || endpoint.port().is_some()
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.path() != "/sns/jscode2session"
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+            {
+                anyhow::bail!(
+                    "wechat_mini.session_endpoint must be the official WeChat jscode2session endpoint"
+                );
+            }
+        }
+        let supported_scopes = self.oidc.supported_scopes.iter().map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut app_ids = BTreeSet::new();
+        if self.wechat_mini.enabled {
+            app_ids.insert(self.wechat_mini.app_id.as_str());
+        }
+        for program in &self.wechat_mini.programs {
+            if !program.enabled {
+                continue;
+            }
+            if program.app_id.len() < 8 || program.app_id.len() > 64
+                || !program.app_id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                || !app_ids.insert(program.app_id.as_str())
+            {
+                anyhow::bail!("wechat_mini.programs has an invalid or duplicate app_id");
+            }
+            if program.app_secret_file.trim().is_empty() || program.app_secret_file.trim() != program.app_secret_file {
+                anyhow::bail!("wechat_mini.programs app_secret_file is required");
+            }
+            crate::organizations::normalize_slug(&program.workspace)
+                .map_err(|_| anyhow::anyhow!("wechat_mini.programs workspace is invalid"))?;
+            crate::applications::normalize_application_slug(&program.application)
+                .map_err(|_| anyhow::anyhow!("wechat_mini.programs application short name is invalid"))?;
+            if program.scopes.is_empty() || program.scopes.iter().any(|scope| !supported_scopes.contains(scope.as_str())) {
+                anyhow::bail!("wechat_mini.programs scopes must be registered Signet scopes");
+            }
+            let unique_scopes = program.scopes.iter().collect::<BTreeSet<_>>();
+            if unique_scopes.len() != program.scopes.len() {
+                anyhow::bail!("wechat_mini.programs scopes contain duplicates");
+            }
         }
         validate_billing_settings(&self.billing)?;
         if self.performance.runtime_settings_cache_millis > 60_000 {
@@ -1668,6 +1875,8 @@ mod tests {
             client_secret_env: None,
             redirect_uris: vec!["https://example.test/callback".to_string()],
             post_logout_redirect_uris: Vec::new(),
+            backchannel_logout_uri: String::new(),
+            backchannel_logout_session_required: false,
             scopes: vec!["openid".to_string()],
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],

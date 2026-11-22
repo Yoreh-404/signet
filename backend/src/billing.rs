@@ -428,6 +428,7 @@ pub fn normalize_application_billing_input(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/me/billing/wallets", get(list_wallets))
+        .route("/api/internal/axon/profile", post(axon_account_profile))
         .route("/api/me/billing/providers", get(list_provider_catalog))
         .route("/api/me/billing/transactions", get(list_transactions))
         .route(
@@ -648,6 +649,43 @@ async fn list_wallets(
             .map(|wallet| wallet_view(&state.settings, wallet))
             .collect::<AppResult<Vec<_>>>()?,
     ))
+}
+
+/// Axon-only, server-to-server account lookup. The caller must authenticate the
+/// session and derive user_id before making this request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AxonAccountProfileRequest {
+    user_id: String,
+}
+
+async fn axon_account_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AxonAccountProfileRequest>,
+) -> AppResult<Json<Value>> {
+    crate::wechat_mini::authorize_bridge(
+        &state.settings.wechat_mini.bridge_secret_file,
+        &headers,
+    )?;
+    if request.user_id.trim().is_empty() || request.user_id.len() > 200 {
+        return Err(AppError::BadRequest("invalid user id".to_string()));
+    }
+    let user = state.db.find_user_by_id(&request.user_id).await?
+        .filter(|user| user.is_active == 1 && user.archived_at.is_none())
+        .ok_or(AppError::Unauthorized)?;
+    billing_enabled(&state.settings)?;
+    let currency = normalize_currency(&state.settings.billing.default_currency)?;
+    let wallet = state.db.ensure_user_wallet_account(&user.id, &currency).await?;
+    Ok(Json(json!({
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "email": user.email,
+        },
+        "wallet": wallet_view(&state.settings, wallet)?,
+    })))
 }
 
 async fn list_provider_catalog(

@@ -1296,6 +1296,27 @@ pub(crate) const SQLITE_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
+    "CREATE TABLE IF NOT EXISTS sub_identities (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        primary_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        origin_application_id TEXT REFERENCES applications(id) ON DELETE SET NULL,
+        created_via TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (primary_user_id IS NULL OR primary_user_id <> user_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_sub_identities_primary ON sub_identities(primary_user_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS sub_identity_link_claims (
+        user_id TEXT PRIMARY KEY REFERENCES sub_identities(user_id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS application_anonymous_identity_policies (
+        application_id TEXT PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE,
+        allow_auto_create INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+    )",
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
@@ -2575,6 +2596,27 @@ pub(crate) const POSTGRES_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
+    "CREATE TABLE IF NOT EXISTS sub_identities (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        primary_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        origin_application_id TEXT REFERENCES applications(id) ON DELETE SET NULL,
+        created_via TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        CHECK (primary_user_id IS NULL OR primary_user_id <> user_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_sub_identities_primary ON sub_identities(primary_user_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS sub_identity_link_claims (
+        user_id TEXT PRIMARY KEY REFERENCES sub_identities(user_id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS application_anonymous_identity_policies (
+        application_id TEXT PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE,
+        allow_auto_create INTEGER NOT NULL DEFAULT 0,
+        updated_at BIGINT NOT NULL
+    )",
 ];
 
 pub(crate) const MYSQL_MIGRATIONS: &[&str] = &[
@@ -3856,4 +3898,30 @@ pub(crate) const MYSQL_MIGRATIONS: &[&str] = &[
     "CREATE INDEX idx_application_saml_replays_application ON application_saml_replays(application_id, expires_at)",
     "CREATE INDEX idx_application_saml_interactions_application ON application_saml_interactions(application_id, expires_at)",
     "CREATE INDEX idx_application_discovery_idempotency_application ON application_discovery_idempotency(organization_id, application_id)",
+    "CREATE TABLE IF NOT EXISTS sub_identities (
+        user_id VARCHAR(64) PRIMARY KEY,
+        primary_user_id VARCHAR(64) NULL,
+        origin_application_id VARCHAR(64) NULL,
+        created_via VARCHAR(32) NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        CONSTRAINT fk_sub_identity_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        CONSTRAINT fk_sub_identity_primary FOREIGN KEY (primary_user_id) REFERENCES users(id) ON DELETE SET NULL,
+        CONSTRAINT fk_sub_identity_application FOREIGN KEY (origin_application_id) REFERENCES applications(id) ON DELETE SET NULL,
+        CONSTRAINT chk_sub_identity_not_self CHECK (primary_user_id IS NULL OR primary_user_id <> user_id)
+    )",
+    "CREATE INDEX idx_sub_identities_primary ON sub_identities(primary_user_id, created_at)",
+    "CREATE TABLE IF NOT EXISTS sub_identity_link_claims (
+        user_id VARCHAR(64) PRIMARY KEY,
+        token_hash VARCHAR(128) NOT NULL UNIQUE,
+        expires_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        CONSTRAINT fk_sub_identity_link_claim_user FOREIGN KEY (user_id) REFERENCES sub_identities(user_id) ON DELETE CASCADE
+    )",
+    "CREATE TABLE IF NOT EXISTS application_anonymous_identity_policies (
+        application_id VARCHAR(64) PRIMARY KEY,
+        allow_auto_create INTEGER NOT NULL DEFAULT 0,
+        updated_at BIGINT NOT NULL,
+        CONSTRAINT fk_anonymous_sub_identity_application FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+    )",
 ];

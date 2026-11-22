@@ -216,6 +216,7 @@ pub(crate) async fn login(
                 auth::LoginEventContext {
                     external_provider: external_provider.clone(),
                     account_flow: payload.account_flow.clone(),
+                    password_confirmed: true,
                     ..Default::default()
                 },
             )
@@ -248,6 +249,7 @@ pub(crate) async fn login(
         auth::LoginEventContext {
             external_provider,
             account_flow: payload.account_flow,
+            password_confirmed: true,
             ..Default::default()
         },
     )

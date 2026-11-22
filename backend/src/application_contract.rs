@@ -47,6 +47,54 @@ pub struct ContractModules {
     pub roles: Vec<RoleContract>,
     #[serde(default)]
     pub lifecycle: LifecycleContract,
+    /// Authentication policy declared by the website and downloaded as part
+    /// of its signed, organization-pinned discovery document. Credentials
+    /// and platform-wide identity providers are owned by Signet, not here.
+    #[serde(default)]
+    pub authentication: WebsiteAuthenticationContract,
+    /// Public directory publication is website-owned and opt-in. The
+    /// workspace operator may independently disable discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<WebsiteDirectoryContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WebsiteDirectoryContract {
+    #[serde(default)]
+    pub listed: bool,
+    #[serde(default)]
+    pub website_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WebsiteAuthenticationContract {
+    /// Optional for backward compatibility; absence preserves the existing
+    /// application registration policy at reconciliation time.
+    #[serde(default)]
+    pub registration_mode: Option<String>,
+    #[serde(default)]
+    pub allow_signet_password: Option<bool>,
+    /// Shared or workspace-owned provider IDs provisioned by Signet. Only
+    /// provider IDs belonging to this workspace (or platform-shared ones)
+    /// can be attached at reconciliation time.
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
+    #[serde(default)]
+    pub wechat_mini: Vec<WebsiteWechatMiniContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebsiteWechatMiniContract {
+    pub app_id: String,
+    pub scopes: Vec<String>,
+    /// An opt-in *in addition to* Signet's per-application anonymous identity
+    /// permission and its credential registration. Does not create a primary
+    /// Signet identity or grant privileges in another application.
+    #[serde(default)]
+    pub allow_anonymous_sub_identity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +261,55 @@ impl ApplicationContract {
 }
 
 fn validate_modules(modules: &ContractModules) -> Result<(), ContractValidationError> {
+    if let Some(directory) = &modules.directory {
+        if let Some(website_url) = directory.website_url.as_deref() {
+            let url = Url::parse(website_url)
+                .map_err(|_| ContractValidationError::Invalid("directory.website_url is invalid".into()))?;
+            if website_url.len() > 2048 || website_url.trim() != website_url
+                || url.scheme() != "https" || url.host_str().is_none()
+                || !url.username().is_empty() || url.password().is_some()
+                || url.query().is_some() || url.fragment().is_some()
+            {
+                return invalid("directory.website_url must be a credential-free HTTPS URL");
+            }
+        } else if directory.listed {
+            return invalid("directory.website_url is required for listed projects");
+        }
+    }
+    if let Some(mode) = modules.authentication.registration_mode.as_deref()
+        && !matches!(mode, "disabled" | "open" | "invitation" | "organization_members")
+    {
+        return invalid("authentication.registration_mode is invalid");
+    }
+    if modules.authentication.provider_ids.len() > 64
+        || modules.authentication.wechat_mini.len() > 32
+    {
+        return invalid("authentication exceeds the allowed provider or Mini Program count");
+    }
+    validate_unique_ids(
+        modules.authentication.provider_ids.iter().map(String::as_str),
+        "authentication provider_id",
+    )?;
+    for provider_id in &modules.authentication.provider_ids {
+        validate_identifier("authentication provider_id", provider_id)?;
+    }
+    let mut mini_ids = BTreeSet::new();
+    for mini in &modules.authentication.wechat_mini {
+        if mini.app_id.len() < 8 || mini.app_id.len() > 64
+            || !mini.app_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || !mini_ids.insert(mini.app_id.as_str())
+            || mini.scopes.is_empty() || mini.scopes.len() > 64
+        {
+            return invalid("authentication.wechat_mini contains invalid or duplicate AppIDs/scopes");
+        }
+        let mut scopes = BTreeSet::new();
+        for scope in &mini.scopes {
+            validate_identifier("authentication Mini Program scope", scope)?;
+            if !scopes.insert(scope.as_str()) {
+                return invalid("authentication Mini Program scopes must be unique");
+            }
+        }
+    }
     if modules.clients.len() > MAX_CLIENTS {
         return invalid("too many clients");
     }
@@ -756,6 +853,49 @@ mod tests {
     #[test]
     fn accepts_legacy_and_modern_profiles_in_one_contract() {
         assert!(contract().validate(1_100).is_ok());
+    }
+
+    #[test]
+    fn signed_website_can_declare_registration_and_reusable_auth_without_secrets() {
+        let mut value = contract();
+        value.modules.authentication = WebsiteAuthenticationContract {
+            registration_mode: Some("open".to_owned()),
+            allow_signet_password: Some(false),
+            provider_ids: vec!["shared-provider-1".to_owned()],
+            wechat_mini: vec![WebsiteWechatMiniContract {
+                app_id: "wx1234567890abcdef".to_owned(),
+                scopes: vec!["axon-next:chat".to_owned()],
+                allow_anonymous_sub_identity: false,
+            }],
+        };
+        assert!(value.validate(1_100).is_ok());
+        let serialized = serde_json::to_value(&value).unwrap();
+        assert!(serialized["modules"]["authentication"].get("app_secret").is_none());
+
+        let mut invalid = serialized.clone();
+        invalid["modules"]["authentication"]["wechat_mini"][0]["app_secret"] =
+            serde_json::json!("never-publish-a-secret");
+        assert!(serde_json::from_value::<ApplicationContract>(invalid).is_err());
+        value.modules.authentication.registration_mode = Some("not_supported".into());
+        assert!(value.validate(1_100).is_err());
+    }
+
+    #[test]
+    fn signed_website_rejects_duplicate_minis_and_provider_references() {
+        let mut value = contract();
+        let mini = WebsiteWechatMiniContract {
+            app_id: "wx1234567890abcdef".into(),
+            scopes: vec!["axon-next:chat".into()],
+            allow_anonymous_sub_identity: true,
+        };
+        value.modules.authentication.wechat_mini = vec![mini.clone(), mini];
+        assert!(value.validate(1_100).is_err());
+        value.modules.authentication.wechat_mini.truncate(1);
+        value.modules.authentication.provider_ids = vec!["provider-a".into(), "provider-a".into()];
+        assert!(value.validate(1_100).is_err());
+        value.modules.authentication.provider_ids.truncate(1);
+        value.modules.authentication.wechat_mini[0].scopes.push("axon-next:chat".into());
+        assert!(value.validate(1_100).is_err());
     }
 
     #[test]

@@ -82,6 +82,19 @@ supported_scopes = [
 skip_consent = false
 allow_dynamic_client_registration = false
 
+[wechat_mini]
+# Server-to-server WeChat Mini Program login. AppSecret and the Axon bridge
+# credential are file-backed deployment secrets and must never be rendered
+# into this config or shipped to the mini-program bundle.
+enabled = false
+app_id = ""
+app_secret_file = ""
+bridge_secret_file = ""
+application_slug = "axon"
+scopes = []
+allow_registration = false
+session_endpoint = "https://api.weixin.qq.com/sns/jscode2session"
+
 [discovery]
 # Website-managed application trust is configured from deployment secrets. The
 # fetch secret is encrypted before persistence; the website signing key is
@@ -205,7 +218,7 @@ cookie_same_site = "Lax"
 # Local-only escape hatch for development when the browser origin cannot be configured.
 # Keep false outside a loopback test environment; CSRF tokens remain required for session writes.
 disable_csrf_origin_check = false
-session_ttl_seconds = 28800
+session_ttl_seconds = 2592000
 password_min_length = 10
 # Optional RS256 private key. If empty, the server generates a key and persists it in the database.
 rsa_private_key_pem = ""

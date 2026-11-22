@@ -568,7 +568,7 @@ fn ensure_target_application_allows_new_registration(
         return Err(AppError::Forbidden);
     }
     match application.registration_mode.as_str() {
-        crate::applications::REGISTRATION_LEGACY => Ok(()),
+        crate::applications::REGISTRATION_LEGACY | crate::applications::REGISTRATION_OPEN => Ok(()),
         crate::applications::REGISTRATION_DISABLED => Err(AppError::Forbidden),
         crate::applications::REGISTRATION_INVITATION => {
             if enrollment_application.is_some_and(|candidate| candidate.id == application.id) {
@@ -614,7 +614,7 @@ fn ensure_target_application_allows_external_oidc_registration(
         return Err(AppError::Forbidden);
     }
     match application.registration_mode.as_str() {
-        crate::applications::REGISTRATION_LEGACY => Ok(()),
+        crate::applications::REGISTRATION_LEGACY | crate::applications::REGISTRATION_OPEN => Ok(()),
         crate::applications::REGISTRATION_ORGANIZATION_MEMBERS
             if provider.organization_id.as_deref()
                 == Some(application.organization_id.as_str()) =>
@@ -1497,10 +1497,21 @@ async fn external_oidc_start(
         return Err(AppError::Forbidden);
     }
     if mode == ExternalOidcStartMode::Register {
-        ensure_target_application_allows_external_oidc_registration(
-            target_application.as_ref(),
-            &provider,
-        )?;
+        // A website may explicitly admit a new, unparented sub-identity
+        // through a trusted external login adapter, even if ordinary
+        // primary-account registration is disabled.
+        let anonymous_sub_allowed = if let Some(application) = target_application.as_ref() {
+            application.access_mode == crate::applications::ACCESS_ALL_SIGNET_USERS
+                && state.db.anonymous_sub_identity_creation_allowed(&application.id).await?
+        } else {
+            false
+        };
+        if !anonymous_sub_allowed {
+            ensure_target_application_allows_external_oidc_registration(
+                target_application.as_ref(),
+                &provider,
+            )?;
+        }
     }
     let state_token = util::random_token(32);
     let nonce = util::random_token(24);
@@ -1626,10 +1637,27 @@ async fn external_oidc_callback(
         ) {
             return Err(AppError::Forbidden);
         }
-        ensure_target_application_allows_external_oidc_registration(
-            target_application.as_ref(),
-            &provider,
-        )?;
+        let anonymous_sub_application = if !first_user {
+            if let Some(application) = target_application.as_ref() {
+                if application.access_mode == crate::applications::ACCESS_ALL_SIGNET_USERS
+                    && state.db.anonymous_sub_identity_creation_allowed(&application.id).await?
+                {
+                    Some(application.id.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if anonymous_sub_application.is_none() {
+            ensure_target_application_allows_external_oidc_registration(
+                target_application.as_ref(),
+                &provider,
+            )?;
+        }
         let (email, email_verified) =
             external_oidc_email_with_verification(&claims, &provider.slug, &sub)?;
         auth::assert_registration_allowed(&state, Some(&email), request_ip.as_deref()).await?;
@@ -1645,28 +1673,28 @@ async fn external_oidc_callback(
             .get("name")
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned);
-        state
-            .db
-            .insert_external_oidc_user(
-                NewUser {
-                    email: email.clone(),
-                    username: unique_username(&username, &sub),
-                    display_name,
-                    phone: None,
-                    password_hash: util::hash_password(&util::random_token(32))?,
-                    email_verified_at: email_verified.then_some(util::now_ts()),
-                    phone_verified_at: None,
-                    is_admin: crate::db::registered_user_is_admin(first_user),
-                    is_active: registration.default_user_active || first_user,
-                    archived_at: None,
-                },
-                &slug,
-                &sub,
-                Some(email),
-                provider.organization_id.clone(),
-                first_user,
-            )
-            .await?
+        let new_user = NewUser {
+            email: email.clone(),
+            username: unique_username(&username, &sub),
+            display_name,
+            phone: None,
+            password_hash: util::hash_password(&util::random_token(32))?,
+            email_verified_at: email_verified.then_some(util::now_ts()),
+            phone_verified_at: None,
+            is_admin: anonymous_sub_application.is_none() && crate::db::registered_user_is_admin(first_user),
+            is_active: registration.default_user_active || first_user,
+            archived_at: None,
+        };
+        if let Some(application_id) = anonymous_sub_application {
+            state.db.insert_external_oidc_anonymous_sub_identity(
+                new_user, &slug, &sub, Some(email), application_id,
+            ).await?
+        } else {
+            state.db.insert_external_oidc_user(
+                new_user, &slug, &sub, Some(email),
+                provider.organization_id.clone(), first_user,
+            ).await?
+        }
     };
     if user.is_active != 1 || user.archived_at.is_some() {
         return Err(AppError::Unauthorized);

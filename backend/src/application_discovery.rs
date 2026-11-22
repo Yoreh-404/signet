@@ -1168,7 +1168,11 @@ fn normalize_application_contract(
     )?;
     let login_adapters = normalize_module(
         "login_adapters",
-        &serde_json::json!({"enabled": true, "allow_signet_password": true})
+        &serde_json::json!({
+            "enabled": true,
+            "allow_signet_password": contract.modules.authentication.allow_signet_password.unwrap_or(true),
+            "provider_ids": contract.modules.authentication.provider_ids,
+        })
             .as_object()
             .cloned()
             .ok_or_else(|| AppError::Internal("failed to build login adapters".to_string()))?,

@@ -84,7 +84,8 @@ pub async fn session_from_cookie(
         return Ok(None);
     };
     if session.expires_at < util::now_ts() {
-        state.db.delete_session(&session.id).await?;
+        // Expiry invalidates authentication without erasing the remembered
+        // identity. Explicit logout still revokes and removes the session.
         return Ok(None);
     }
     Ok(Some(session))
@@ -183,6 +184,8 @@ pub struct LoginEventContext {
     pub external_provider: Option<String>,
     pub account_flow: Option<String>,
     pub session_ttl_seconds: Option<i64>,
+    /// Set only by the password-login handler after a password was verified.
+    pub password_confirmed: bool,
 }
 
 pub async fn issue_session(
@@ -248,6 +251,13 @@ pub async fn issue_session_with_login_event(
     } else {
         None
     };
+    // A remembered browser identity is not an authentication factor.
+    // Selecting it for reactivation must prove the password again.
+    if account_login_flow.as_ref().is_some_and(|flow| flow.expected_user_id.is_some())
+        && method != "password" && !login_event.password_confirmed
+    {
+        return Err(AppError::Unauthorized);
+    }
     let session_ttl_seconds = login_event
         .session_ttl_seconds
         .unwrap_or(state.settings.security.session_ttl_seconds)
@@ -279,7 +289,13 @@ pub async fn issue_session_with_login_event(
                     return Err(err);
                 }
             };
-        if flow.expected_user_id.is_some() && !reauthentication_completed {
+        // Ordinary Signet account activation does not have an OIDC interaction.
+        // However, an OIDC reauthentication flow must fail closed if its
+        // pending interaction disappeared or could not bind the fresh session.
+        if flow.expected_user_id.is_some()
+            && flow.return_to.starts_with("/oauth2/authorize")
+            && !reauthentication_completed
+        {
             state.db.delete_session(&session.id).await?;
             return Err(AppError::Unauthorized);
         }
@@ -345,7 +361,7 @@ pub async fn issue_session_with_login_event(
         )
         .await?;
     let cookie = session_cookie(state, cookie_value, session_ttl_seconds);
-    Ok(next_jar.add(cookie))
+    refresh_browser_context_cookie(state, next_jar.add(cookie)).await
 }
 
 pub async fn assert_login_not_locked(state: &AppState, subject: &str) -> AppResult<()> {
@@ -504,6 +520,9 @@ pub fn expired_session_cookie(state: &AppState) -> Cookie<'static> {
 
 const BROWSER_CONTEXT_COOKIE_PREFIX: &str = "bc1.";
 const BROWSER_CONTEXT_ID_PREFIX: &str = "bc1id.";
+// Browser account remembrance outlives the active SSO session. A remembered
+// account is not itself sufficient evidence of a valid authentication.
+const BROWSER_CONTEXT_REMEMBER_SECONDS: i64 = 90 * 24 * 60 * 60;
 
 pub fn browser_context_cookie_name(state: &AppState) -> String {
     format!("{}_accounts", state.settings.security.cookie_name)
@@ -551,6 +570,21 @@ pub fn expired_browser_context_cookie(state: &AppState) -> Cookie<'static> {
     browser_context_cookie(state, String::new(), 0)
 }
 
+async fn refresh_browser_context_cookie(state: &AppState, jar: CookieJar) -> AppResult<CookieJar> {
+    let cookie_name = browser_context_cookie_name(state);
+    let Some(existing) = jar.get(&cookie_name) else {
+        return Ok(jar);
+    };
+    let cookie_value = existing.value().to_owned();
+    let Some(context_id) = browser_context_id_from_cookie(&cookie_value) else {
+        return Ok(jar);
+    };
+    state.db.extend_browser_context(&context_id, BROWSER_CONTEXT_REMEMBER_SECONDS).await?;
+    Ok(jar.add(browser_context_cookie(
+        state, cookie_value, BROWSER_CONTEXT_REMEMBER_SECONDS,
+    )))
+}
+
 pub async fn create_browser_context(state: &AppState) -> AppResult<(String, Cookie<'static>)> {
     let secret = util::random_token(32);
     let cookie_value = format!("{BROWSER_CONTEXT_COOKIE_PREFIX}{secret}");
@@ -561,7 +595,7 @@ pub async fn create_browser_context(state: &AppState) -> AppResult<(String, Cook
         .insert_browser_context(
             &context_id,
             &util::random_token(32),
-            state.settings.security.session_ttl_seconds,
+            BROWSER_CONTEXT_REMEMBER_SECONDS,
         )
         .await?;
     Ok((
@@ -569,7 +603,7 @@ pub async fn create_browser_context(state: &AppState) -> AppResult<(String, Cook
         browser_context_cookie(
             state,
             cookie_value,
-            state.settings.security.session_ttl_seconds,
+            BROWSER_CONTEXT_REMEMBER_SECONDS,
         ),
     ))
 }

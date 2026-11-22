@@ -176,7 +176,10 @@ pub(super) async fn application_scim_principal(
     let binding = &context.binding;
     if binding.application_id != application.id
         || binding.is_active != 1
-        || binding.protocol != "oidc"
+        // New application bindings store the canonical protocol name, while
+        // older rows still use its legacy alias. Both are strictly OIDC;
+        // never accept JWT, SAML, or another protocol here.
+        || !matches!(binding.protocol.as_str(), "oidc" | "oauth2_oidc")
     {
         return Err(ScimError::bearer_invalid(
             "SCIM client is not bound to the OIDC application protocol",

@@ -79,6 +79,8 @@ use admin_application_scope::ensure_website_application_modules_editable;
 mod admin_application_billing;
 #[path = "admin_application_modules.rs"]
 mod admin_application_modules;
+#[path = "admin_application_wechat_mini.rs"]
+mod admin_application_wechat_mini;
 #[path = "admin_application_oidc.rs"]
 mod admin_application_oidc;
 #[path = "admin_authorization_code_policy.rs"]

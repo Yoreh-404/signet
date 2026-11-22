@@ -20,6 +20,7 @@ const APPLICATION_MODULE_KEYS: &[&str] = &[
     "login_adapters",
     "directory_sync",
     "authorization",
+    "directory",
 ];
 
 fn normalize_application_module_key(value: &str) -> AppResult<String> {
@@ -55,9 +56,25 @@ pub(super) async fn update(
     Json(payload): Json<ApplicationModuleInput>,
 ) -> AppResult<Json<ApplicationModuleResponse>> {
     let (current, application) = managed_application(&state, &jar, &id).await?;
-    ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
+    if module_key != "directory" {
+        ensure_website_application_modules_editable(&state, &application).await?;
+    }
     let config = applications::normalize_module_config(&module_key, payload.config)?;
+    if module_key == "directory"
+        && super::admin_application_scope::application_is_website_managed(&state, &application).await?
+    {
+        let existing = state.db.find_application_module(&id, "directory").await?
+            .ok_or_else(|| AppError::BadRequest(
+                "website-managed directory listing must be declared in its signed website manifest".into()))?;
+        let pinned: serde_json::Value = serde_json::from_str(&existing.config_json)
+            .map_err(|_| AppError::Internal("invalid stored website directory declaration".into()))?;
+        if config != pinned {
+            return Err(AppError::BadRequest(
+                "website-managed directory metadata must be changed in the signed website manifest; operators may only enable or disable publication".into(),
+            ));
+        }
+    }
     applications::validate_module_bindings(
         &state,
         &application,
@@ -104,8 +121,16 @@ pub(super) async fn delete(
     Path((id, module_key)): Path<(String, String)>,
 ) -> AppResult<Json<serde_json::Value>> {
     let (current, application) = managed_application(&state, &jar, &id).await?;
-    ensure_website_application_modules_editable(&state, &application).await?;
     let module_key = normalize_application_module_key(&module_key)?;
+    if module_key == "directory"
+        && super::admin_application_scope::application_is_website_managed(&state, &application).await?
+    {
+        return Err(AppError::BadRequest(
+            "website-managed directory listing must be disabled, not deleted, to preserve the operator's publication veto".into(),
+        ));
+    } else if module_key != "directory" {
+        ensure_website_application_modules_editable(&state, &application).await?;
+    }
     state.db.delete_application_module(&id, &module_key).await?;
     state
         .db

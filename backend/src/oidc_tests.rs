@@ -59,6 +59,60 @@ fn prompt_none_is_exclusive() {
     assert!(prompt_behavior(Some("none login")).is_err());
 }
 
+#[tokio::test]
+async fn one_signet_browser_session_authenticates_distinct_website_origins() {
+    let (state, path) = test_app_state().await;
+    let user = insert_refresh_test_user(&state, "cross-domain-sso").await;
+    let jar = auth::issue_session(
+        &state,
+        CookieJar::new(),
+        &HeaderMap::new(),
+        None,
+        &user,
+        "password",
+    )
+    .await
+    .unwrap();
+    let signet_cookie = jar.get(&state.settings.security.cookie_name).unwrap();
+    assert!(
+        signet_cookie.domain().is_none(),
+        "central Signet cookie must remain host-only"
+    );
+    assert_eq!(signet_cookie.same_site(), Some(SameSite::Lax));
+    for (index, origin) in ["https://site-a.example", "https://site-b.other"]
+        .iter()
+        .enumerate()
+    {
+        let client_id = format!("sso-client-{index}");
+        let redirect_uri = format!("{origin}/auth/callback");
+        insert_test_oidc_client(&state, &client_id, &redirect_uri, "").await;
+        let request: AuthorizeRequest = serde_urlencoded::from_str(&serde_urlencode(&[
+            ("response_type", "code".to_string()),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri.clone()),
+            ("scope", "openid profile".to_string()),
+        ]))
+        .unwrap();
+        let response = authorize(
+            State(state.clone()),
+            jar.clone(),
+            HeaderMap::new(),
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            Query(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a valid central login should not redirect to a password form"
+        );
+        assert!(redirect_url(&response).as_str().starts_with(&redirect_uri));
+    }
+    drop(state);
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn account_selection_client_preserves_non_interactive_prompt_none() {
     let request = test_authorize_request(Some("none"), None);
@@ -2492,6 +2546,8 @@ async fn test_app_state() -> (AppState, PathBuf) {
                 "http://localhost:5173/callback".to_string(),
             ],
             post_logout_redirect_uris: vec!["http://localhost:3000/".to_string()],
+            backchannel_logout_uri: String::new(),
+            backchannel_logout_session_required: false,
             scopes: vec![
                 "openid".to_string(),
                 "profile".to_string(),

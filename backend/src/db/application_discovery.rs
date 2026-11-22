@@ -91,6 +91,8 @@ struct ClientOwnerApplicationRow {
     description: Option<String>,
     #[diesel(sql_type = BigInt)]
     binding_count: i64,
+    #[diesel(sql_type = Integer)]
+    is_active: i32,
     #[diesel(sql_type = Nullable<Text>)]
     management_mode: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
@@ -101,7 +103,7 @@ macro_rules! release_generated_compatibility_owner {
     ($conn:expr, $kind:expr, $client:expr, $application_id:expr, $organization_id:expr $(,)?) => {{
         let conn = &mut *$conn;
         let owner_sql = format!(
-            "SELECT applications.id AS application_id, applications.organization_id AS organization_id, applications.registration_mode AS registration_mode, applications.access_mode AS access_mode, applications.description AS description, (SELECT COUNT(*) FROM application_client_bindings owner_bindings WHERE owner_bindings.application_id = applications.id) AS binding_count, application_discovery.management_mode AS management_mode, application_discovery.sync_status AS sync_status FROM application_client_bindings bindings INNER JOIN applications ON applications.id = bindings.application_id LEFT JOIN application_discovery ON application_discovery.application_id = applications.id WHERE bindings.client_db_id = {} AND bindings.application_id <> {}",
+            "SELECT applications.id AS application_id, applications.organization_id AS organization_id, applications.registration_mode AS registration_mode, applications.access_mode AS access_mode, applications.description AS description, (SELECT COUNT(*) FROM application_client_bindings owner_bindings WHERE owner_bindings.application_id = applications.id) AS binding_count, applications.is_active AS is_active, application_discovery.management_mode AS management_mode, application_discovery.sync_status AS sync_status FROM application_client_bindings bindings INNER JOIN applications ON applications.id = bindings.application_id LEFT JOIN application_discovery ON application_discovery.application_id = applications.id WHERE bindings.client_db_id = {} AND bindings.application_id <> {}",
             ph($kind, 1),
             ph($kind, 2)
         );
@@ -126,6 +128,10 @@ macro_rules! release_generated_compatibility_owner {
         ];
         let generated_owner = owners.first().filter(|owner| {
             owners.len() == 1
+                // Never silently take over a live application, even when its
+                // name resembles a generated compatibility owner. Its owner
+                // must retire it before a signed website may adopt the client.
+                && owner.is_active == 0
                 && owner.organization_id == $organization_id
                 && owner.registration_mode == crate::applications::REGISTRATION_DISABLED
                 && owner.access_mode == crate::applications::ACCESS_ALL_SIGNET_USERS
@@ -862,6 +868,112 @@ impl Db {
                         return Err(AppError::BadRequest(
                             "application discovery revision was reused with different content".to_string(),
                         ));
+                    }
+                }
+
+                // Website-signed policy may select only platform-shared
+                // authentication providers or providers owned by its own
+                // workspace. Verify under the same database transaction as
+                // the module update, never just in the management UI.
+                #[derive(diesel::QueryableByName)]
+                struct ProviderBindingOwnerRow {
+                    #[diesel(sql_type = Nullable<Text>)]
+                    organization_id: Option<String>,
+                    #[diesel(sql_type = Integer)]
+                    is_active: i32,
+                    #[diesel(sql_type = Integer)]
+                    allow_login: i32,
+                }
+                if let Some(provider_ids) = manifest.login_adapters.get("provider_ids")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for provider_id in provider_ids.iter().filter_map(serde_json::Value::as_str) {
+                        let sql = format!(
+                            "SELECT organization_id, is_active, allow_login FROM external_oidc_providers WHERE id = {}",
+                            ph(kind, 1)
+                        );
+                        let provider = sql_query(sql)
+                            .bind::<Text, _>(provider_id)
+                            .get_result::<ProviderBindingOwnerRow>(conn)
+                            .optional()
+                            .map_err(AppError::from)?
+                            .ok_or_else(|| AppError::BadRequest(
+                                "website declares an unknown authentication provider".into()
+                            ))?;
+                        if provider.is_active != 1 || provider.allow_login != 1
+                            || provider.organization_id.as_deref()
+                                .is_some_and(|owner| owner != application_organization_id)
+                        {
+                            return Err(AppError::Forbidden);
+                        }
+                    }
+                }
+
+                // Identity self-registration belongs to each site. Absence
+                // preserves the previous setting for old signed contracts;
+                // an explicit value participates atomically in reconciliation.
+                if let Some(registration_mode) = manifest.redacted_payload
+                    .pointer("/modules/authentication/registration_mode")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let sql = format!(
+                        "UPDATE applications SET registration_mode = {}, updated_at = {} WHERE id = {}",
+                        ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                    );
+                    sql_query(sql)
+                        .bind::<Text, _>(registration_mode)
+                        .bind::<BigInt, _>(util::now_ts())
+                        .bind::<Text, _>(&application_id)
+                        .execute(conn)
+                        .map_err(AppError::from)?;
+                }
+
+                // A site's signed manifest owns its public directory
+                // declaration, while the workspace operator independently
+                // owns the module's enabled kill switch. Removing a listing
+                // declaration clears visibility, never leaves a stale entry.
+                #[derive(diesel::QueryableByName)]
+                struct DirectoryEnabledRow {
+                    #[diesel(sql_type = Integer)]
+                    is_enabled: i32,
+                }
+                let directory_sql = format!(
+                    "SELECT is_enabled FROM application_modules WHERE application_id = {} AND module_key = 'directory'",
+                    ph(kind, 1)
+                );
+                let existing_directory = sql_query(directory_sql)
+                    .bind::<Text, _>(&application_id)
+                    .get_result::<DirectoryEnabledRow>(conn)
+                    .optional().map_err(AppError::from)?;
+                let site_directory = manifest.redacted_payload.pointer("/modules/directory");
+                if site_directory.is_some() || existing_directory.is_some() {
+                    let proposed = site_directory.cloned().unwrap_or_else(||
+                        serde_json::json!({"listed": false})
+                    );
+                    let normalized = crate::applications::normalize_module_config("directory", proposed)?;
+                    let config_json = util::to_json(&normalized)?;
+                    let now = util::now_ts();
+                    if existing_directory.is_some() {
+                        let sql = format!(
+                            "UPDATE application_modules SET config_json = {}, updated_at = {} WHERE application_id = {} AND module_key = 'directory'",
+                            ph(kind, 1), ph(kind, 2), ph(kind, 3)
+                        );
+                        sql_query(sql).bind::<Text, _>(&config_json)
+                            .bind::<BigInt, _>(now)
+                            .bind::<Text, _>(&application_id)
+                            .execute(conn).map_err(AppError::from)?;
+                    } else {
+                        let sql = format!(
+                            "INSERT INTO application_modules (application_id, module_key, config_json, is_enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {})",
+                            ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6)
+                        );
+                        sql_query(sql).bind::<Text, _>(&application_id)
+                            .bind::<Text, _>("directory")
+                            .bind::<Text, _>(&config_json)
+                            .bind::<Integer, _>(1)
+                            .bind::<BigInt, _>(now)
+                            .bind::<BigInt, _>(now)
+                            .execute(conn).map_err(AppError::from)?;
                     }
                 }
 

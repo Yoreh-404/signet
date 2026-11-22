@@ -47,6 +47,7 @@ struct BrowserAccountResponse {
     user: PublicUser,
     session_kind: auth::AccountSessionKind,
     current: bool,
+    reauthentication_required: bool,
     /// The creation time of this browser-context session. Unlike
     /// `last_selected_at`, it only changes after a successful sign-in.
     last_login_at: i64,
@@ -92,11 +93,14 @@ async fn list_accounts(
         .db
         .list_browser_context_account_options(&context.id)
         .await?;
+    let remembered = state.db
+        .list_remembered_browser_context_accounts(&context.id).await?;
     let interaction_allowed_user_ids = if interaction.is_some() && interaction_protocol_enabled {
         if let Some(application) = interaction_application.as_ref() {
             let user_ids = options
                 .iter()
                 .map(|option| option.user.id.clone())
+                .chain(remembered.iter().map(|account| account.user_id.clone()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -113,6 +117,11 @@ async fn list_accounts(
         None
     };
     let mut accounts = Vec::new();
+    let validity = if let Some(application) = interaction_application.as_ref() {
+        applications::application_login_validity_seconds(&state, &application.id).await?
+    } else {
+        30 * 86_400
+    };
     for option in options {
         let BrowserContextAccountOption {
             account,
@@ -162,8 +171,38 @@ async fn list_accounts(
             current: current
                 .as_ref()
                 .is_some_and(|current| current.session_id == account.session_id),
+            reauthentication_required: util::now_ts().saturating_sub(session.created_at) >= validity,
             user: user.public(),
             last_login_at: session.created_at,
+            last_selected_at: account.last_selected_at,
+        });
+    }
+    // Preserve account choice after the session has expired or been cleaned
+    // up, but never grant a session from this remembered identity alone.
+    for account in remembered {
+        if accounts.iter().any(|entry| entry.account_ref == account.id) {
+            continue;
+        }
+        let Some(user) = state.db.find_user_by_id(&account.user_id).await? else {
+            continue;
+        };
+        if user.is_active != 1 || user.archived_at.is_some()
+            || state.db.find_trial_enrollment_for_user(&user.id).await?.is_some()
+        {
+            continue;
+        }
+        if interaction.is_some() && !interaction_allowed_user_ids.as_ref()
+            .is_some_and(|ids| ids.contains(&user.id))
+        {
+            continue;
+        }
+        accounts.push(BrowserAccountResponse {
+            account_ref: account.id,
+            user: user.public(),
+            session_kind: auth::AccountSessionKind::Standard,
+            current: false,
+            reauthentication_required: true,
+            last_login_at: account.last_selected_at.unwrap_or(account.added_at),
             last_selected_at: account.last_selected_at,
         });
     }
@@ -273,8 +312,36 @@ async fn select_account(
     Json(payload): Json<SelectAccountRequest>,
 ) -> AppResult<(CookieJar, Json<SelectAccountResponse>)> {
     let context = require_browser_context(&state, &jar).await?;
-    let active = active_browser_account(&state, &context.id, &payload.account_ref).await?;
     let return_to = redirects::local_return_to(payload.return_to.as_deref());
+    let remembered = state.db.find_browser_context_account(&context.id, &payload.account_ref)
+        .await?.ok_or(AppError::NotFound)?;
+    let session = state.db.find_session(&remembered.session_id).await?;
+    let validity = if let Some(interaction) =
+        crate::oidc::browser_account_interaction_context(&state, &return_to).await?
+    {
+        if let Some(client) = state.db.find_client_by_client_id(&interaction.client_id).await? {
+            if let Some(application) = state.db.find_application_for_client(&client.id).await? {
+                applications::application_login_validity_seconds(&state, &application.id).await?
+            } else { 30 * 86_400 }
+        } else { 30 * 86_400 }
+    } else { 30 * 86_400 };
+    if session.as_ref().is_none_or(|session|
+        session.expires_at < util::now_ts()
+            || util::now_ts().saturating_sub(session.created_at) >= validity
+    ) {
+        let user = state.db.find_user_by_id(&remembered.user_id).await?
+            .filter(|user| user.is_active == 1 && user.archived_at.is_none())
+            .ok_or(AppError::Unauthorized)?;
+        let account_flow = create_account_login_flow(
+            &state, &context.id, &return_to, Some(&user.id)
+        ).await?;
+        return Ok((jar, Json(SelectAccountResponse {
+            continue_to: selected_account_reauthentication_url(
+                &return_to, &user.email, &account_flow
+            ),
+        })));
+    }
+    let active = active_browser_account(&state, &context.id, &payload.account_ref).await?;
     let continuation = crate::oidc::complete_browser_account_selection(
         &state,
         &return_to,
@@ -341,6 +408,24 @@ async fn activate_account(
     Json(payload): Json<ActivateAccountRequest>,
 ) -> AppResult<(CookieJar, Json<ActivateAccountResponse>)> {
     let context = require_browser_context(&state, &jar).await?;
+    let remembered = state.db.find_browser_context_account(&context.id, &payload.account_ref)
+        .await?.ok_or(AppError::NotFound)?;
+    let session = state.db.find_session(&remembered.session_id).await?;
+    if session.as_ref().is_none_or(|session|
+        session.expires_at < util::now_ts()
+            || util::now_ts().saturating_sub(session.created_at) >= 30 * 86_400
+    ) {
+        let user = state.db.find_user_by_id(&remembered.user_id).await?
+            .filter(|user| user.is_active == 1 && user.archived_at.is_none())
+            .ok_or(AppError::Unauthorized)?;
+        let return_to = redirects::local_return_to(payload.return_to.as_deref());
+        let account_flow = create_account_login_flow(&state, &context.id, &return_to, Some(&user.id)).await?;
+        return Ok((jar, Json(ActivateAccountResponse {
+            continue_to: selected_account_reauthentication_url(
+                &return_to, &user.email, &account_flow
+            ),
+        })));
+    }
     let active = active_browser_account(&state, &context.id, &payload.account_ref).await?;
     let (session, cookie_value) = state
         .db
@@ -556,6 +641,42 @@ mod tests {
         db.migrate().await.unwrap();
         let jwt = crate::jwt::JwtManager::new(&settings).unwrap();
         (AppState::new(settings, db, jwt), path)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn expired_session_remains_remembered_but_needs_password_confirmation() {
+        let (state, path) = test_state().await;
+        let user = state.db.insert_user(
+            test_user("remembered@example.com", "remembered", true, None)
+        ).await.unwrap();
+        let (session, _) = state.db.insert_session(
+            &user.id, -1, SessionMetadata::default()
+        ).await.unwrap();
+        let (context_id, context_cookie) = auth::create_browser_context(&state).await.unwrap();
+        let account = state.db.attach_browser_context_account(
+            &context_id, &user.id, &session.id
+        ).await.unwrap();
+        let jar = CookieJar::new().add(context_cookie);
+        let (_, Json(list)) = list_accounts(
+            State(state.clone()), jar.clone(),
+            Query(AccountContextQuery { return_to: None }),
+        ).await.unwrap();
+        assert_eq!(list.accounts.len(), 1);
+        assert!(list.accounts[0].reauthentication_required);
+        assert!(!list.accounts[0].current);
+        let (_, Json(activation)) = activate_account(
+            State(state.clone()), jar,
+            Json(ActivateAccountRequest {
+                account_ref: account.id,
+                return_to: Some("/".to_owned()),
+            }),
+        ).await.unwrap();
+        assert!(activation.continue_to.contains("force_login=1"));
+        assert!(activation.continue_to.contains("account_flow="));
+        assert!(activation.continue_to.contains("remembered%40example.com"));
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]

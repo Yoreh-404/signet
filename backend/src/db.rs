@@ -150,6 +150,9 @@ mod application_graph_sql;
 mod application_graph;
 mod application_graph_read;
 mod application_modules;
+pub(crate) mod public_directory;
+mod application_auth_credentials;
+pub use application_auth_credentials::{ApplicationAuthCredentialRecord, WECHAT_MINI_TYPE};
 mod application_protocol_types;
 mod application_sql;
 pub(super) use application_sql::{
@@ -221,6 +224,10 @@ mod directory_sync_membership;
 mod directory_sync_sql;
 mod external_identities;
 mod external_identity_types;
+mod sub_identities;
+pub use sub_identities::{
+    SUB_IDENTITY_LINK_TTL_SECONDS, SubIdentityChildRecord, SubIdentityRecord,
+};
 mod iap_types;
 mod invitation_persistence;
 mod invitation_types;
@@ -876,6 +883,8 @@ mod tests {
 
     #[path = "user_lifecycle.rs"]
     mod user_lifecycle;
+    #[path = "sub_identity_lifecycle.rs"]
+    mod sub_identity_lifecycle;
 
     #[path = "captcha_challenges.rs"]
     mod captcha_challenges;
@@ -912,6 +921,9 @@ mod tests {
 
     #[path = "application_modules.rs"]
     mod application_modules;
+
+    #[path = "application_auth_credentials.rs"]
+    mod application_auth_credentials;
 
     #[path = "security_mutation_lifecycle.rs"]
     mod security_mutation_lifecycle;

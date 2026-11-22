@@ -1189,6 +1189,17 @@ impl Db {
                     .execute(conn)
                     .map_err(AppError::from)?;
 
+                // Revoke all types of application-owned authentication
+                // credentials in the same transaction as website deletion.
+                let auth_credentials_sql = format!(
+                    "DELETE FROM application_auth_credentials WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                sql_query(auth_credentials_sql)
+                    .bind::<Text, _>(&id)
+                    .execute(conn)
+                    .map_err(AppError::from)?;
+
                 let binding_sql = format!(
                     "DELETE FROM application_client_bindings WHERE application_id = {}",
                     ph(kind, 1)
@@ -1342,7 +1353,11 @@ impl Db {
     ) -> AppResult<()> {
         let application_id = application_id.to_string();
         let client_db_id = client_db_id.to_string();
-        let protocol = protocol.to_string();
+        // Persist protocol aliases using the canonical module key.  Readers
+        // accept legacy spellings for compatibility, but storing `oidc`
+        // allowed older Signet runtimes to reject an otherwise valid
+        // `oauth2_oidc` application boundary after deployment/restart.
+        let protocol = super::authorization_policy::protocol_key(protocol).to_string();
         let authorization_profile_id = authorization_profile_id.to_string();
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {

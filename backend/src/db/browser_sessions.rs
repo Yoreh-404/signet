@@ -66,6 +66,45 @@ impl Db {
         })
     }
 
+    pub async fn extend_browser_context(&self, id: &str, ttl_seconds: i64) -> AppResult<()> {
+        let id = id.to_string();
+        let now = util::now_ts();
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "UPDATE browser_contexts SET expires_at = {}, updated_at = {} WHERE id = {}",
+                ph(kind, 1), ph(kind, 2), ph(kind, 3)
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(now + ttl_seconds)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(id)
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(AppError::from)
+        })
+    }
+
+    /// The remembered identity list is deliberately independent of live
+    /// sessions: an expired or purged session must not erase account choice.
+    pub async fn list_remembered_browser_context_accounts(
+        &self,
+        browser_context_id: &str,
+    ) -> AppResult<Vec<BrowserContextAccountRecord>> {
+        let browser_context_id = browser_context_id.to_string();
+        let oldest = util::now_ts() - 90 * 86_400;
+        with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT id, browser_context_id, user_id, session_id, added_at, last_selected_at FROM browser_context_accounts WHERE browser_context_id = {} AND COALESCE(last_selected_at, added_at) >= {} ORDER BY last_selected_at DESC, added_at DESC, id",
+                ph(kind, 1), ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(browser_context_id)
+                .bind::<BigInt, _>(oldest)
+                .load::<BrowserContextAccountRecord>(&mut conn)
+                .map_err(AppError::from)
+        })
+    }
+
     pub async fn list_browser_context_accounts(
         &self,
         browser_context_id: &str,

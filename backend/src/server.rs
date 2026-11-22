@@ -1,6 +1,6 @@
 use crate::{
     AppState, Settings, admin, billing, browser_accounts, cas_sso, csrf, frontend, health, iap,
-    jwt_sso, mutations, oidc, passkeys, registration, saml_sso, scim,
+    jwt_sso, mutations, oidc, passkeys, project_directory, registration, saml_sso, scim, sub_identities, wechat_mini,
 };
 use anyhow::Context;
 use axum::{
@@ -28,10 +28,13 @@ pub fn router(state: AppState, settings: &Settings) -> anyhow::Result<Router> {
         .merge(admin::routes())
         .merge(billing::routes())
         .merge(browser_accounts::routes())
+        .merge(sub_identities::routes())
         .merge(oidc::routes())
         .merge(iap::routes())
         .merge(passkeys::routes())
         .merge(registration::routes())
+        .merge(wechat_mini::routes())
+        .merge(project_directory::routes())
         .merge(scim::routes())
         .merge(jwt_sso::routes())
         .merge(saml_sso::routes())

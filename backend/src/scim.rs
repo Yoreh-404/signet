@@ -2295,6 +2295,16 @@ mod tests {
             .expect("OAuth client must have an application aggregate");
         add_scim_module(&state, &application.id).await;
 
+        // The service-account verifier requires an active OIDC binding,
+        // not just a client row and an unrelated application.
+        let context = state.db.find_scim_service_account_context(&client.client_id)
+            .await.unwrap().expect("SCIM fixture must have a client binding");
+        assert!(matches!(context.binding.protocol.as_str(), "oidc" | "oauth2_oidc"),
+            "SCIM fixture must bind an OIDC protocol");
+        assert_eq!(context.binding.application_id, context.application.application.id,
+            "SCIM fixture application ownership");
+        assert_eq!(context.binding.is_active, 1, "SCIM fixture binding must be active");
+
         // Use the real OAuth client-credentials endpoint. The application
         // aggregate created for the client is the resource boundary used by
         // the SCIM verifier below.

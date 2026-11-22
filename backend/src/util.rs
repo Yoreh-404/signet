@@ -185,6 +185,95 @@ pub fn decrypt_discovery_secret(key: &str, ciphertext: &str) -> AppResult<String
     })
 }
 
+/// AEAD for any application authentication integration credential. The AAD
+/// binds the ciphertext to its exact application, credential type, and public
+/// identifier. Credentials of another application or provider cannot decrypt
+/// the same value, even if someone copies a database row between owners.
+pub fn encrypt_application_auth_secret(
+    key: &str, application_id: &str, credential_type: &str,
+    external_id: &str, secret: &str,
+) -> AppResult<String> {
+    if secret.len() < 16 || secret.len() > 4096 || secret.chars().any(char::is_control) {
+        return Err(AppError::BadRequest("authentication credential secret is invalid".into()));
+    }
+    let key = decode_discovery_key(key)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| AppError::Configuration("credential encryption key is invalid".into()))?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce_ref = Nonce::try_from(&nonce[..])
+        .map_err(|_| AppError::Internal("invalid authentication credential nonce".into()))?;
+    let aad = serde_json::to_vec(&["signet:application-auth:v1", application_id, credential_type, external_id])
+        .map_err(|_| AppError::Internal("invalid authentication credential context".into()))?;
+    let encrypted = cipher.encrypt(
+        &nonce_ref,
+        aes_gcm::aead::Payload { msg: secret.as_bytes(), aad: &aad },
+    ).map_err(|_| AppError::Internal("failed to encrypt authentication credential".into()))?;
+    Ok(format!("signet-application-auth:v1.{}.{}",
+        URL_SAFE_NO_PAD.encode(nonce), URL_SAFE_NO_PAD.encode(encrypted)))
+}
+
+pub fn decrypt_application_auth_secret(
+    key: &str, application_id: &str, credential_type: &str,
+    external_id: &str, encrypted: &str,
+) -> AppResult<String> {
+    // An old WeChat-only table briefly existed in development. Its secrets
+    // remain readable after the schema migration without exposing plaintext;
+    // every new write uses application-bound AAD above.
+    if credential_type == "wechat_mini" && encrypted.starts_with("signet-wechat-secret:v1.") {
+        return decrypt_legacy_wechat_mini_secret(key, external_id, encrypted);
+    }
+    let mut parts = encrypted.split('.');
+    if parts.next() != Some("signet-application-auth:v1") {
+        return Err(AppError::Configuration("stored authentication credential is invalid".into()));
+    }
+    let nonce = URL_SAFE_NO_PAD.decode(parts.next().unwrap_or_default())
+        .map_err(|_| AppError::Configuration("stored authentication credential is invalid".into()))?;
+    let ciphertext = URL_SAFE_NO_PAD.decode(parts.next().unwrap_or_default())
+        .map_err(|_| AppError::Configuration("stored authentication credential is invalid".into()))?;
+    if parts.next().is_some() || nonce.len() != 12 {
+        return Err(AppError::Configuration("stored authentication credential is invalid".into()));
+    }
+    let key = decode_discovery_key(key)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| AppError::Configuration("credential encryption key is invalid".into()))?;
+    let nonce_ref = Nonce::try_from(nonce.as_slice())
+        .map_err(|_| AppError::Configuration("stored authentication credential is invalid".into()))?;
+    let aad = serde_json::to_vec(&["signet:application-auth:v1", application_id, credential_type, external_id])
+        .map_err(|_| AppError::Configuration("invalid authentication credential context".into()))?;
+    let plaintext = cipher.decrypt(
+        &nonce_ref,
+        aes_gcm::aead::Payload { msg: &ciphertext, aad: &aad },
+    ).map_err(|_| AppError::Configuration("stored authentication credential is invalid".into()))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| AppError::Configuration("stored authentication credential is invalid".into()))
+}
+
+fn decrypt_legacy_wechat_mini_secret(key: &str, app_id: &str, encrypted: &str) -> AppResult<String> {
+    let mut parts = encrypted.split('.');
+    if parts.next() != Some("signet-wechat-secret:v1") {
+        return Err(AppError::Configuration("stored legacy WeChat credential is invalid".into()));
+    }
+    let nonce = URL_SAFE_NO_PAD.decode(parts.next().unwrap_or_default())
+        .map_err(|_| AppError::Configuration("stored legacy WeChat credential is invalid".into()))?;
+    let ciphertext = URL_SAFE_NO_PAD.decode(parts.next().unwrap_or_default())
+        .map_err(|_| AppError::Configuration("stored legacy WeChat credential is invalid".into()))?;
+    if parts.next().is_some() || nonce.len() != 12 {
+        return Err(AppError::Configuration("stored legacy WeChat credential is invalid".into()));
+    }
+    let cipher = Aes256Gcm::new_from_slice(&decode_discovery_key(key)?)
+        .map_err(|_| AppError::Configuration("credential encryption key is invalid".into()))?;
+    let nonce_ref = Nonce::try_from(nonce.as_slice())
+        .map_err(|_| AppError::Configuration("stored legacy WeChat credential is invalid".into()))?;
+    let aad = format!("signet:wechat-mini-app-secret:v1:{app_id}");
+    let plaintext = cipher.decrypt(
+        &nonce_ref,
+        aes_gcm::aead::Payload { msg: &ciphertext, aad: aad.as_bytes() },
+    ).map_err(|_| AppError::Configuration("stored legacy WeChat credential is invalid".into()))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| AppError::Configuration("stored legacy WeChat credential is invalid".into()))
+}
+
 /// Encrypts an administrator-visible authorization code at rest with RSA-OAEP
 /// (SHA-256).  The signing-key record is used as protected server key material:
 /// a signing-key database compromise already permits token forgery, so it is a

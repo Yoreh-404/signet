@@ -477,8 +477,9 @@ async fn authorize(
         ))
         .into_response());
     }
-    if !session_binding_satisfies_reauthentication(&request, &session)
-        && session.needs_reauthentication(prompt, request.max_age, util::now_ts())
+    if application_login_expired(&state, authorization_snapshot.application.as_ref(), &session).await?
+        || (!session_binding_satisfies_reauthentication(&request, &session)
+            && session.needs_reauthentication(prompt, request.max_age, util::now_ts()))
     {
         if prompt.none {
             return redirect_authorization_error(
@@ -840,8 +841,9 @@ async fn authorize_consent(
         headers: &headers,
         remote_addr: Some(remote_addr),
     };
-    if !session_binding_satisfies_reauthentication(&request, &session)
-        && session.needs_reauthentication(prompt, request.max_age, util::now_ts())
+    if application_login_expired(&state, authorization_snapshot.application.as_ref(), &session).await?
+        || (!session_binding_satisfies_reauthentication(&request, &session)
+            && session.needs_reauthentication(prompt, request.max_age, util::now_ts()))
     {
         let return_to = authorize_return_to_for_interaction(&state, &request, true).await?;
         return Ok(Redirect::to(&frontend_login_url(
@@ -1639,6 +1641,19 @@ fn reauthentication_pending(request: &ResolvedAuthorizeRequest) -> bool {
     request.reauthentication_required && request.selected_session_id.is_none()
 }
 
+async fn application_login_expired(
+    state: &AppState,
+    application: Option<&crate::db::ApplicationRecord>,
+    session: &SessionRecord,
+) -> AppResult<bool> {
+    let seconds = if let Some(application) = application {
+        applications::application_login_validity_seconds(state, &application.id).await?
+    } else {
+        30 * 86_400
+    };
+    Ok(util::now_ts().saturating_sub(session.created_at) >= seconds)
+}
+
 fn session_binding_satisfies_reauthentication(
     request: &ResolvedAuthorizeRequest,
     session: &SessionRecord,
@@ -1690,6 +1705,27 @@ async fn has_selectable_browser_accounts(
                 // the selected user receives the full AuthorizationSnapshot
                 // before a code is issued.
                 if user.is_active != 1 || user.archived_at.is_some() {
+                    continue;
+                }
+            }
+            return Ok(true);
+        }
+    }
+    if runtime.is_some_and(|runtime| !runtime.policy.is_interactive_client_runtime_active()) {
+        return Ok(false);
+    }
+    for remembered in state.db.list_remembered_browser_context_accounts(&context_id).await? {
+        let Some(user) = state.db.find_user_by_id(&remembered.user_id).await? else {
+            continue;
+        };
+        if user.is_active == 1 && user.archived_at.is_none()
+            && state.db.find_trial_enrollment_for_user(&user.id).await?.is_none()
+        {
+            if let Some(runtime) = runtime {
+                let allowed = state.db.users_can_access_application(
+                    &runtime.application, &[user.id.clone()]
+                ).await?;
+                if !allowed.contains(&user.id) {
                     continue;
                 }
             }
@@ -1935,9 +1971,9 @@ pub(crate) async fn complete_browser_account_reauthentication(
     else {
         return Ok(false);
     };
-    if !reauthentication_pending(&request) {
-        return Ok(false);
-    }
+    // An expired remembered account may be selected before the interaction
+    // has a selected session. A successful fresh password login establishes
+    // the required binding directly rather than activating the stale session.
     let _ = validate_authorize_request_with_runtime(state, &request).await?;
     if request
         .selected_user_id
@@ -1958,6 +1994,9 @@ pub(crate) async fn complete_browser_account_reauthentication(
         .ok_or(AppError::Unauthorized)?;
     let expected_request = request.clone();
     request.reauthentication_required = false;
+    request.account_selection_prompted = true;
+    request.account_selection_required = false;
+    request.prompt = prompt_without_select_account(request.prompt.as_deref());
     request.selected_user_id = Some(authenticated_user_id.to_string());
     request.selected_session_id = Some(session.id);
     crate::par::update_interaction_authorization_request(
