@@ -176,6 +176,7 @@ pub(crate) async fn project_axon_admin_v2(
         return Ok(None);
     };
     if scope != "openid" || public_session_id.is_empty() || policy.signed_withdrawal
+        || client.require_pkce != 1 || client.require_s256_pkce != 1
         || issuer != policy.issuer || policy.introspection_client_id.is_empty()
         || policy.activation_epoch <= 0 || crate::util::now_ts() < policy.activation_epoch
     {
