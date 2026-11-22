@@ -4,6 +4,8 @@ use crate::{
 };
 use serde_json::{Map, Number, Value};
 
+pub(crate) const AXON_ADMIN_AUTHORITY_CLAIM: &str = "axon_admin_authority";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutputTarget {
     IdToken,
@@ -62,6 +64,10 @@ pub fn mapped_claims(
 ) -> AppResult<Map<String, Value>> {
     let mut claims = Map::new();
     for record in records {
+        // Ignore legacy stored collisions without breaking unrelated logins.
+        if record.claim_name.trim() == AXON_ADMIN_AUTHORITY_CLAIM {
+            continue;
+        }
         validate_mapper_record(record)?;
         if !record.is_active() || !record.includes_target(target) {
             continue;
@@ -267,6 +273,7 @@ pub fn client_field_names() -> &'static [&'static str] {
 }
 
 const STRUCTURAL_RESERVED_CLAIMS: &[&str] = &[
+    AXON_ADMIN_AUTHORITY_CLAIM,
     "iss",
     "sub",
     "aud",
@@ -291,6 +298,9 @@ mod tests {
     #[test]
     fn reserved_claims_are_rejected() {
         assert!(validate_claim_name("sub").is_err());
+        assert!(validate_claim_name(AXON_ADMIN_AUTHORITY_CLAIM).is_err());
+        assert!(validate_claim_name(" axon_admin_authority ").is_err());
+        assert!(validate_claim_name("axon_admin").is_ok());
         assert!(validate_claim_name("email_verified").is_ok());
         assert!(validate_claim_name("x-company-role").is_ok());
     }

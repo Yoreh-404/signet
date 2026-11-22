@@ -19,7 +19,8 @@ class AuthorityStateTest(unittest.TestCase):
             )
 
             def transition(old_generation, enrollment, expected_revision, expected_digest,
-                           new_revision, new_digest, new_withdrawn):
+                           new_revision, new_digest, new_withdrawn, *,
+                           local_disable=False, reapproved=False):
                 return db.execute("""
                     UPDATE axon_admin_authority_state
                     SET revision = ?, digest = ?, generation = generation + 1,
@@ -27,19 +28,25 @@ class AuthorityStateTest(unittest.TestCase):
                     WHERE organization_id = 'tenant' AND application_slug = 'axon'
                       AND enrollment_id = ?
                       AND generation = ? AND revision = ? AND digest = ?
-                      AND (? > revision
-                           OR (? = revision AND ? = digest AND ? = 1 AND withdrawn = 0))
+                      AND ((? > revision AND (withdrawn = 0 OR ? = 1 OR ? = 1))
+                           OR (? = 1 AND ? = revision AND ? = digest
+                               AND ? = 1 AND withdrawn = 0))
                     """, (new_revision, new_digest, new_withdrawn, enrollment,
                           old_generation, expected_revision, expected_digest,
-                          new_revision, new_revision, new_digest, new_withdrawn)).rowcount
+                          new_revision, new_withdrawn, reapproved, local_disable,
+                          new_revision, new_digest, new_withdrawn)).rowcount
 
-            self.assertEqual(transition(1, "verified-enrollment", 3, digest, 3, digest, 1), 1)
+            self.assertEqual(transition(1, "verified-enrollment", 3, digest, 3, digest, 1), 0)
+            self.assertEqual(transition(1, "verified-enrollment", 3, digest, 3, digest, 1,
+                                        local_disable=True), 1)
             db.execute("DELETE FROM applications WHERE slug = 'axon'")
             db.execute("INSERT INTO applications VALUES ('axon')")
             self.assertEqual(transition(1, "verified-enrollment", 3, digest, 4, replacement, 0), 0)
             self.assertEqual(transition(2, "verified-enrollment", 3, digest, 3, digest, 0), 0)
             self.assertEqual(transition(2, "replacement-enrollment", 3, digest, 4, replacement, 0), 0)
-            self.assertEqual(transition(2, "verified-enrollment", 3, digest, 4, replacement, 0), 1)
+            self.assertEqual(transition(2, "verified-enrollment", 3, digest, 4, replacement, 0), 0)
+            self.assertEqual(transition(2, "verified-enrollment", 3, digest, 4, replacement, 0,
+                                        reapproved=True), 1)
             self.assertEqual(db.execute(
                 "SELECT revision, generation, withdrawn FROM axon_admin_authority_state"
             ).fetchone(), (4, 3, 0))

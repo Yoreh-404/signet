@@ -256,6 +256,7 @@ impl AuthorizationSnapshot {
                 Value::String(entitlements.policy_version.clone()),
             );
         }
+        claims.remove(claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM);
         if self.reserve_axon_admin {
             claims.remove("axon_admin");
             claims.remove("sid");
