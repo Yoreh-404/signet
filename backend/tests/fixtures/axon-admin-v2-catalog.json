@@ -131,6 +131,8 @@
   "admin:agent:system.workflows:definition",
   "admin:agent:system.workflows:definitions_page",
   "admin:agent:system.workflows:detail",
+  "admin:agent:system.workflows:disable_definition",
+  "admin:agent:system.workflows:enable_definition",
   "admin:agent:system.workflows:events",
   "admin:agent:system.workflows:inspect",
   "admin:agent:system.workflows:inventory",

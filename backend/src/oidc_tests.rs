@@ -1837,6 +1837,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     use serde_json::{Value, json};
     let (mut state, path) = test_app_state().await;
     let user = insert_refresh_test_user(&state, "axon-v2").await;
+    let operator = insert_refresh_test_user(&state, "axon-v2-operator").await;
     let demo = test_refresh_client(&state).await;
     let binding = state.db.find_application_client_binding_by_public_client_id(&demo.client_id)
         .await.unwrap().unwrap();
@@ -1852,6 +1853,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     let permissions: Vec<String> = serde_json::from_str(include_str!(
         "../tests/fixtures/axon-admin-v2-catalog.json"
     )).unwrap();
+    assert_eq!(permissions.len(), 171);
     let mapping = json!({"version":2,"source":"signet.is_admin","claim":"axon_admin_authority",
         "output":"access_token","client_id":demo.client_id,"audience":resource,"permissions":permissions});
     let durable = json!({"application_id":app.slug,"revision":3,
@@ -1901,6 +1903,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         let mut conn = pool.get().unwrap();
         conn.batch_execute(include_str!("../../scripts/axon-admin-v2-tombstone.sql")).unwrap();
         sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
+        sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&operator.id).execute(&mut conn).unwrap();
         sql_query("UPDATE clients SET organization_id=?, audience=?, redirect_uris=?, scopes='[\"openid\"]',
             grant_types='[\"authorization_code\"]', require_pkce=1, require_s256_pkce=1 WHERE id=?")
             .bind::<Text,_>(&app.organization_id).bind::<Text,_>(resource)
@@ -1933,21 +1936,25 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     assert!(crate::oidc_authorization::project_axon_admin_v2(
         &state, &authz, &client, &user, Some(resource), &sid, "openid", &issuer,
     ).await.unwrap().is_some(), "v2 candidate projection prerequisites did not match");
-    let code = "synthetic-axon-admin-code";
     let challenge_verifier = "fixture-verifier-for-s256-challenge-000000000";
-    state.db.insert_authorization_code(NewAuthorizationCode {
-        code: code.into(), client_id: client.client_id.clone(), user_id: user.id.clone(),
-        application_id: Some(app.id.clone()), authorization_profile_id: Some(binding.authorization_profile_id),
-        auth_context_id: None, session_id: Some(sid),
-        redirect_uri: redirect.clone(), scope: "openid".into(), resource: Some(resource.into()),
-        authorization_details: None, nonce: None,
-        code_challenge: Some(util::sha256_base64url(challenge_verifier)), code_challenge_method: Some("S256".into()),
-        auth_time: now, acr: assurance::ACR_PASSWORD.into(), amr: vec!["pwd".into()], expires_at: now+120,
-    }).await.unwrap();
-    let mut req = test_authorization_code_token_request(code);
-    req.redirect_uri = Some(redirect);
-    req.code_verifier = Some(challenge_verifier.into());
-    let Json(tokens) = token_from_authorization_code(state.clone(), client, req, issuer, None).await.unwrap();
+    let exchange = async |state: &AppState, code: &str| {
+        let client = test_refresh_client(state).await;
+        state.db.insert_authorization_code(NewAuthorizationCode {
+            code: code.into(), client_id: client.client_id.clone(), user_id: user.id.clone(),
+            application_id: Some(app.id.clone()), authorization_profile_id: Some(binding.authorization_profile_id.clone()),
+            auth_context_id: None, session_id: Some(sid.clone()),
+            redirect_uri: redirect.clone(), scope: "openid".into(), resource: Some(resource.into()),
+            authorization_details: None, nonce: None,
+            code_challenge: Some(util::sha256_base64url(challenge_verifier)), code_challenge_method: Some("S256".into()),
+            auth_time: now, acr: assurance::ACR_PASSWORD.into(), amr: vec!["pwd".into()], expires_at: now+120,
+        }).await.unwrap();
+        let mut req = test_authorization_code_token_request(code);
+        req.redirect_uri = Some(redirect.clone());
+        req.code_verifier = Some(challenge_verifier.into());
+        let Json(tokens) = token_from_authorization_code(state.clone(), client, req, issuer.clone(), None).await.unwrap();
+        tokens
+    };
+    let tokens = exchange(&state, "synthetic-axon-admin-code").await;
     let read = |value: &str| -> Value {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(value.split('.').nth(1).unwrap()).unwrap()).unwrap()
     };
@@ -1965,24 +1972,53 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         .body(Body::from(format!("token_type_hint=axon_admin_authority&token={}", tokens.access_token))).unwrap();
     let before = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
     assert!(before == json!({"active":true,"axon_admin_authority":expected}), "confidential live-authority assertion did not match");
-    {
-        let mut conn = pool.get().unwrap();
-        sql_query("UPDATE users SET is_admin=0 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
-    }
-    let after = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
-    assert_eq!(after, json!({"active":false}));
-    {
-        let mut conn = pool.get().unwrap();
-        sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
-    }
-    assert!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await["active"] == true);
     let backup = std::env::temp_dir().join(format!("signet-axon-restore-{}.sqlite", uuid::Uuid::new_v4()));
     {
         let mut conn = pool.get().unwrap();
         sql_query("VACUUM INTO ?").bind::<Text,_>(backup.to_string_lossy().as_ref())
             .execute(&mut conn).unwrap();
     }
+    let operator = state.db.find_user_by_id(&operator.id).await.unwrap().unwrap();
+    let operator_jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
+        None, &operator, "password", auth::LoginEventContext::default()).await.unwrap();
+    let cookie = operator_jar.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; ");
+    let change = crate::admin::routes().with_state(state.clone()).oneshot(
+        Request::put(format!("/api/admin/users/{}", user.id))
+            .header(header::COOKIE, cookie).header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "email":user.email,"username":user.username,"display_name":user.display_name,
+                "phone":user.phone,"is_admin":false,"is_active":true,
+            }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(change.status(), StatusCode::OK, "actual admin route did not demote the fixture");
+    let demoted = state.db.find_user_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!((demoted.is_admin, demoted.is_active), (0,1));
+    let ordinary = |fresh: &super::oidc_token::TokenResponse| {
+        let id = read(fresh.id_token.as_deref().unwrap());
+        assert_eq!(id["sub"], read(tokens.id_token.as_deref().unwrap())["sub"]);
+        assert!(id.get(claim).is_none());
+        assert!(read(&fresh.access_token).get(claim).is_none());
+    };
+    assert_eq!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await, json!({"active":false}));
+    ordinary(&exchange(&state, "synthetic-after-demotion").await);
+
+    let mut restored_settings = state.settings.clone();
+    restored_settings.database.url = backup.to_string_lossy().into_owned();
+    let restored_db = crate::db::Db::connect(&restored_settings).unwrap();
+    let restored = AppState::new(restored_settings, restored_db, state.jwt.clone());
+    let restored_router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
+        super::oidc_resource::introspect)).with_state(restored.clone());
+    let legacy_user = restored.db.find_user_by_id(&user.id).await.unwrap().unwrap();
+    assert_eq!(legacy_user.is_admin, 1, "backup predates demotion");
+    // Negative control: the old role itself was in the backup. An unchanged
+    // application floor does not independently remember account demotions.
+    assert_eq!(oidc_http_body_json(restored_router.clone().oneshot(request()).await.unwrap()).await["active"], true);
     set_floor(2, true);
+    assert_eq!(
+        oidc_http_body_json(restored_router.clone().oneshot(request()).await.unwrap()).await,
+        json!({"active":false}),
+    );
+    ordinary(&exchange(&restored, "synthetic-restored-while-halted").await);
     assert_eq!(
         oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await,
         json!({"active":false}),
@@ -2000,17 +2036,13 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     // intentionally not part of it. Even clearing halt leaves generation 2
     // as a floor, making the backup's previously live generation 1 inert.
     set_floor(2, false);
-    let mut restored_settings = state.settings.clone();
-    restored_settings.database.url = backup.to_string_lossy().into_owned();
-    let restored_db = crate::db::Db::connect(&restored_settings).unwrap();
-    let restored = AppState::new(restored_settings, restored_db, state.jwt.clone());
-    let restored_router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
-        super::oidc_resource::introspect)).with_state(restored);
     assert_eq!(
         oidc_http_body_json(restored_router.oneshot(request()).await.unwrap()).await,
         json!({"active":false}),
         "restoring a still-live same revision must not restore disabled authority",
     );
+    ordinary(&exchange(&restored, "synthetic-restored-with-retained-floor").await);
+    drop(restored);
     drop(state);
     let _ = std::fs::remove_file(backup);
     let _ = std::fs::remove_dir_all(anchor_dir);
