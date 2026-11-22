@@ -288,7 +288,7 @@ pub(super) async fn token_from_authorization_code(
         &client,
         &issuer,
         IssueUserTokensInput {
-            code_created_at: Some(record.created_at),
+            consent_bound_code: Some(record.code),
             user_id: record.user_id,
             scope: record.scope,
             resource: merge_token_resource(record.resource, payload.resource)?,
@@ -362,7 +362,7 @@ pub(super) async fn token_from_device_code(
         &client,
         &issuer,
         IssueUserTokensInput {
-            code_created_at: None,
+            consent_bound_code: None,
             user_id,
             scope: record.scope,
             resource: merge_token_resource(record.resource, payload.resource)?,
@@ -617,7 +617,7 @@ fn invalid_refresh_token_grant() -> AppError {
 }
 
 pub(super) struct IssueUserTokensInput {
-    code_created_at: Option<i64>,
+    consent_bound_code: Option<String>,
     user_id: String,
     scope: String,
     resource: Option<String>,
@@ -641,7 +641,7 @@ pub(super) async fn issue_tokens_for_user(
     input: IssueUserTokensInput,
 ) -> AppResult<Json<TokenResponse>> {
     let IssueUserTokensInput {
-        code_created_at,
+        consent_bound_code,
         user_id,
         scope,
         resource,
@@ -713,7 +713,7 @@ pub(super) async fn issue_tokens_for_user(
             &user,
             binding,
             dpop.as_ref(),
-            code_created_at.ok_or(AppError::Forbidden)?,
+            consent_bound_code.as_deref().ok_or(AppError::Forbidden)?,
         )
         .await?
     } else {

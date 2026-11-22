@@ -67,6 +67,7 @@ mod tests {
 
     fn consent(scopes: &str) -> ClientGrantRecord {
         ClientGrantRecord {
+            website_generation: None,
             user_id: "user".to_string(),
             client_id: "client".to_string(),
             granted_scopes: scopes.to_string(),

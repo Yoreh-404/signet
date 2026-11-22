@@ -253,6 +253,10 @@ pub fn routes() -> Router<AppState> {
         .route("/oauth2/logout", get(logout_get).post(logout_post))
         .route("/connect/register", post(crate::dcr::register_client))
         .route(
+            "/connect/register/website",
+            post(crate::dcr::register_website_client),
+        )
+        .route(
             "/connect/register/{client_id}/namespaces/{namespace_id}/peers",
             get(crate::peer_discovery::list),
         )
@@ -537,6 +541,11 @@ async fn authorize(
     {
         return Ok(response);
     }
+    let website_generation = if crate::dcr::is_website_client_id(&client.client_id) {
+        website_token::generation(&state, &client.client_id, &current.user.id).await?
+    } else {
+        None
+    };
     let requires_consent =
         requires_authorization_consent(&state, &current.user, &client, &requested_scopes).await?;
     if prompt.none && requires_consent {
@@ -570,6 +579,7 @@ async fn authorize(
         &authorization_snapshot,
         request,
         requested_scopes,
+        website_generation.as_deref(),
     )
     .await
 }
@@ -880,7 +890,7 @@ async fn authorize_consent(
     };
     match payload.action.as_str() {
         "approve" => {
-            if payload.remember.is_some() {
+            let website_generation = if payload.remember.is_some() {
                 let existing = state
                     .db
                     .find_client_grant(&current.user.id, &client.client_id)
@@ -890,8 +900,13 @@ async fn authorize_consent(
                 state
                     .db
                     .upsert_client_grant(&current.user.id, &client.client_id, granted_scopes)
-                    .await?;
-            }
+                    .await?
+                    .website_generation
+            } else if crate::dcr::is_website_client_id(&client.client_id) {
+                website_token::generation(&state, &client.client_id, &current.user.id).await?
+            } else {
+                None
+            };
             issue_authorization_code_redirect(
                 &http_context,
                 &current.user,
@@ -900,6 +915,7 @@ async fn authorize_consent(
                 &authorization_snapshot,
                 request,
                 requested_scopes,
+                website_generation.as_deref(),
             )
             .await
         }
@@ -995,6 +1011,7 @@ async fn issue_authorization_code_redirect(
     authorization_snapshot: &AuthorizationSnapshot,
     request: ResolvedAuthorizeRequest,
     requested_scopes: Vec<String>,
+    website_generation: Option<&str>,
 ) -> AppResult<Response> {
     ensure_trial_enrollment_client_allowed_for_user(context.state, &user.id, &client.client_id)
         .await?;
@@ -1013,6 +1030,11 @@ async fn issue_authorization_code_redirect(
         .as_ref()
         .ok_or(AppError::Forbidden)?;
     let code = util::random_token(32);
+    let code = if crate::dcr::is_website_client_id(&client.client_id) {
+        website_token::bind_code(&code, website_generation)
+    } else {
+        code
+    };
     let session_assurance = session.authentication_assurance();
     let requested_assurance = request.requested_assurance()?;
     let acr =

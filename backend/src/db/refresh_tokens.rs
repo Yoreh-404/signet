@@ -191,7 +191,7 @@ impl Db {
         let client_id = client_id.to_string();
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at, website_generation FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2)
             );
@@ -217,7 +217,7 @@ impl Db {
         with_conn!(self, |conn, kind| {
             let placeholders = placeholders(kind, 2, client_ids.len());
             let sql = format!(
-                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE client_id IN ({}) AND user_id = {} AND authorization_profile_id = 'default'",
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at, website_generation FROM client_grants WHERE client_id IN ({}) AND user_id = {} AND authorization_profile_id = 'default'",
                 placeholders.as_str(),
                 ph(kind, client_ids.len() + 1),
             );
@@ -254,32 +254,37 @@ impl Db {
         let user_id = user_id.to_string();
         let client_id = client_id.to_string();
         let now = util::now_ts();
+        let generation =
+            crate::dcr::is_website_client_id(&client_id).then(|| util::random_token(32));
         with_conn!(self, |conn, kind| {
             let update_sql = format!(
-                "UPDATE client_grants SET granted_scopes = {}, updated_at = {}, revoked_at = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
+                "UPDATE client_grants SET granted_scopes = {}, updated_at = {}, revoked_at = {}, website_generation = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
                 ph(kind, 4),
-                ph(kind, 5)
+                ph(kind, 5),
+                ph(kind, 6)
             );
             let changed = sql_query(update_sql)
                 .bind::<Text, _>(&granted_scopes)
                 .bind::<BigInt, _>(now)
                 .bind::<Nullable<BigInt>, _>(None::<i64>)
+                .bind::<Nullable<Text>, _>(&generation)
                 .bind::<Text, _>(&user_id)
                 .bind::<Text, _>(&client_id)
                 .execute(&mut conn)
                 .map_err(AppError::from)?;
             if changed == 0 {
                 let insert_sql = format!(
-                    "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at) VALUES ({}, {}, 'default', {}, {}, {}, {})",
+                    "INSERT INTO client_grants (user_id, client_id, authorization_profile_id, granted_scopes, granted_at, updated_at, revoked_at, website_generation) VALUES ({}, {}, 'default', {}, {}, {}, {}, {})",
                     ph(kind, 1),
                     ph(kind, 2),
                     ph(kind, 3),
                     ph(kind, 4),
                     ph(kind, 5),
-                    ph(kind, 6)
+                    ph(kind, 6),
+                    ph(kind, 7)
                 );
                 sql_query(insert_sql)
                     .bind::<Text, _>(&user_id)
@@ -288,11 +293,12 @@ impl Db {
                     .bind::<BigInt, _>(now)
                     .bind::<BigInt, _>(now)
                     .bind::<Nullable<BigInt>, _>(None::<i64>)
+                    .bind::<Nullable<Text>, _>(&generation)
                     .execute(&mut conn)
                     .map_err(AppError::from)?;
             }
             let sql = format!(
-                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
+                "SELECT user_id, client_id, granted_scopes, granted_at, updated_at, revoked_at, website_generation FROM client_grants WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default'",
                 ph(kind, 1),
                 ph(kind, 2)
             );
@@ -301,6 +307,12 @@ impl Db {
                 .bind::<Text, _>(client_id)
                 .get_result::<ClientGrantRecord>(&mut conn)
                 .map_err(AppError::from)
+                .and_then(|grant| {
+                    if grant.website_generation != generation {
+                        return Err(AppError::Forbidden);
+                    }
+                    Ok(grant)
+                })
         })
     }
 
@@ -308,17 +320,21 @@ impl Db {
         let user_id = user_id.to_string();
         let client_id = client_id.to_string();
         let now = util::now_ts();
+        let generation =
+            crate::dcr::is_website_client_id(&client_id).then(|| util::random_token(32));
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "UPDATE client_grants SET revoked_at = {}, updated_at = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default' AND revoked_at IS NULL",
+                "UPDATE client_grants SET revoked_at = {}, updated_at = {}, website_generation = {} WHERE user_id = {} AND client_id = {} AND authorization_profile_id = 'default' AND revoked_at IS NULL",
                 ph(kind, 1),
                 ph(kind, 2),
                 ph(kind, 3),
-                ph(kind, 4)
+                ph(kind, 4),
+                ph(kind, 5)
             );
             sql_query(sql)
                 .bind::<BigInt, _>(now)
                 .bind::<BigInt, _>(now)
+                .bind::<Nullable<Text>, _>(&generation)
                 .bind::<Text, _>(user_id)
                 .bind::<Text, _>(client_id)
                 .execute(&mut conn)

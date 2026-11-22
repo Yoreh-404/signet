@@ -22,15 +22,8 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 async fn register(api: &Router, origin: &str) -> (PeerMember, String) {
-    let request = Request::post("/connect/register")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({"redirect_uris": [format!("{origin}/callback")]}).to_string(),
-        ))
-        .unwrap();
-    let response = api.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
+    let body = registration(api, "/connect/register/website", origin).await;
+    assert_eq!(body["subject_type"], "pairwise");
     (
         PeerMember {
             client_id: body["client_id"].as_str().unwrap().into(),
@@ -38,6 +31,18 @@ async fn register(api: &Router, origin: &str) -> (PeerMember, String) {
         },
         body["registration_access_token"].as_str().unwrap().into(),
     )
+}
+
+async fn registration(api: &Router, endpoint: &str, origin: &str) -> Value {
+    let request = Request::post(endpoint)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"redirect_uris": [format!("{origin}/callback")]}).to_string(),
+        ))
+        .unwrap();
+    let response = api.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
 }
 
 async fn get(api: &Router, site: &PeerMember, ns: &str, token: &str) -> axum::response::Response {
@@ -73,11 +78,16 @@ async fn fixture() -> (AppState, std::path::PathBuf) {
 #[tokio::test]
 async fn peer_directory_tracks_registration_namespace_and_current_origin() {
     let (mut state, path) = fixture().await;
+    state.settings.oidc.allow_dynamic_client_registration = true;
     let api = oidc::routes().with_state(state.clone());
+    let legacy = registration(&api, "/connect/register", "https://legacy.example").await;
+    assert_eq!(legacy["token_endpoint_auth_method"], "client_secret_basic");
+    assert!(legacy["client_secret"].is_string());
     let (a, a_token) = register(&api, "https://a.example").await;
     let (b, b_token) = register(&api, "https://b.example").await;
     let (c, c_token) = register(&api, "https://c.example").await;
     state.settings.oidc.allow_public_website_registration = false;
+    state.settings.oidc.allow_dynamic_client_registration = false;
     state.settings.discovery.namespaces = vec![
         PeerNamespace {
             id: "ab".into(),
@@ -165,48 +175,65 @@ async fn website_login_tokens_disclose_only_a_pairwise_identity() {
         .unwrap();
     let callback = format!("{}/callback", site.origin);
     let verifier = "abcdefghijklmnopqrstuvwxyz-01234567890123456789";
-    state
+    let initial = state
         .db
-        .insert_authorization_code(NewAuthorizationCode {
-            code: "website-login-test-code".into(),
-            client_id: site.client_id.clone(),
-            user_id: user.id.clone(),
-            application_id: None,
-            authorization_profile_id: None,
-            auth_context_id: None,
-            session_id: None,
-            redirect_uri: callback.clone(),
-            scope: "openid".into(),
-            resource: None,
-            authorization_details: None,
-            nonce: Some("website-login-nonce".into()),
-            code_challenge: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier))),
-            code_challenge_method: Some("S256".into()),
-            auth_time: util::now_ts(),
-            acr: sso_backend::assurance::ACR_PASSWORD.into(),
-            amr: vec!["pwd".into()],
-            expires_at: util::now_ts() + 300,
-        })
+        .upsert_client_grant(&user.id, &site.client_id, "openid".into())
         .await
         .unwrap();
-    let form = serde_urlencoded::to_string([
-        ("grant_type", "authorization_code"),
-        ("client_id", site.client_id.as_str()),
-        ("redirect_uri", callback.as_str()),
-        ("code", "website-login-test-code"),
-        ("code_verifier", verifier),
-    ])
-    .unwrap();
-    let response = api
-        .clone()
-        .oneshot(
+    let generation = initial.website_generation.as_deref().unwrap();
+    let code = |random: &str| {
+        format!(
+            "{random}.{}",
+            util::identity_factor_digest(generation, "website-authorization-code", random)
+        )
+    };
+    let first_code = code("website-login-test-code");
+    let pending_code = code("website-pending-test-code");
+    for code in [&first_code, &pending_code] {
+        state
+            .db
+            .insert_authorization_code(NewAuthorizationCode {
+                code: code.clone(),
+                client_id: site.client_id.clone(),
+                user_id: user.id.clone(),
+                application_id: None,
+                authorization_profile_id: None,
+                auth_context_id: None,
+                session_id: None,
+                redirect_uri: callback.clone(),
+                scope: "openid".into(),
+                resource: None,
+                authorization_details: None,
+                nonce: Some("website-login-nonce".into()),
+                code_challenge: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier))),
+                code_challenge_method: Some("S256".into()),
+                auth_time: util::now_ts(),
+                acr: sso_backend::assurance::ACR_PASSWORD.into(),
+                amr: vec!["pwd".into()],
+                expires_at: util::now_ts() + 300,
+            })
+            .await
+            .unwrap();
+    }
+    let form = |code: &str| {
+        serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("client_id", site.client_id.as_str()),
+            ("redirect_uri", callback.as_str()),
+            ("code", code),
+            ("code_verifier", verifier),
+        ])
+        .unwrap()
+    };
+    let redeem = |code: &str| {
+        api.clone().oneshot(
             Request::post("/oauth2/token")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(form))
+                .body(Body::from(form(code)))
                 .unwrap(),
         )
-        .await
-        .unwrap();
+    };
+    let response = redeem(&first_code).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = json_body(response).await;
     assert!(response.get("refresh_token").is_none());
@@ -238,17 +265,35 @@ async fn website_login_tokens_disclose_only_a_pairwise_identity() {
     let payload = claims.to_string();
     assert!(!payload.contains(&user.id) && !payload.contains(email));
 
-    let response = api
-        .oneshot(
+    let userinfo = || {
+        api.clone().oneshot(
             Request::get("/oauth2/userinfo")
                 .header(header::AUTHORIZATION, format!("Bearer {access}"))
                 .body(Body::empty())
                 .unwrap(),
         )
-        .await
-        .unwrap();
+    };
+    let response = userinfo().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await, json!({"sub": subject}));
+    assert!(
+        state
+            .db
+            .revoke_client_grant(&user.id, &site.client_id)
+            .await
+            .unwrap()
+    );
+    let restored = state
+        .db
+        .upsert_client_grant(&user.id, &site.client_id, "openid".into())
+        .await
+        .unwrap();
+    assert_ne!(initial.website_generation, restored.website_generation);
+    assert_eq!(userinfo().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        redeem(&pending_code).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
     drop(state);
     let _ = std::fs::remove_file(path);
 }

@@ -1,11 +1,13 @@
 use super::DatabaseKind;
 
 pub(crate) fn migration_sql(kind: DatabaseKind) -> Vec<&'static str> {
-    match kind {
+    let mut statements = match kind {
         DatabaseKind::Sqlite => SQLITE_MIGRATIONS.to_vec(),
         DatabaseKind::Postgres => POSTGRES_MIGRATIONS.to_vec(),
         DatabaseKind::Mysql => MYSQL_MIGRATIONS.to_vec(),
-    }
+    };
+    statements.push("ALTER TABLE client_grants ADD COLUMN website_generation VARCHAR(64) NULL");
+    statements
 }
 
 pub(crate) fn is_ignorable_migration_error(statement: &str, error: &str) -> bool {

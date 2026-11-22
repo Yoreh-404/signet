@@ -152,6 +152,9 @@ pub struct RefreshTokenInput {
 
 #[derive(Debug, Clone, diesel::QueryableByName, Serialize)]
 pub struct ClientGrantRecord {
+    #[diesel(sql_type = Nullable<Text>)]
+    #[serde(skip)]
+    pub website_generation: Option<String>,
     #[diesel(sql_type = Text)]
     pub user_id: String,
     #[diesel(sql_type = Text)]

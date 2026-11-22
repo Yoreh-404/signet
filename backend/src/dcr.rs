@@ -527,8 +527,29 @@ pub async fn register_client(
     Json(payload): Json<ClientMetadata>,
 ) -> AppResult<Json<ClientRegistrationResponse>> {
     ensure_dcr_enabled(&state)?;
+    // Existing RFC 7591 integrations retain their registration profile.
+    let website = !state.settings.oidc.allow_dynamic_client_registration;
+    register_client_with_profile(state, headers, payload, website).await
+}
+
+pub async fn register_website_client(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ClientMetadata>,
+) -> AppResult<Json<ClientRegistrationResponse>> {
+    if !state.settings.oidc.allow_public_website_registration {
+        return Err(AppError::Forbidden);
+    }
+    register_client_with_profile(state, headers, payload, true).await
+}
+
+async fn register_client_with_profile(
+    state: AppState,
+    headers: HeaderMap,
+    payload: ClientMetadata,
+    website: bool,
+) -> AppResult<Json<ClientRegistrationResponse>> {
     let registrar = DynamicClientRegistrar::new(state.settings.oidc.supported_scopes.clone());
-    let website = state.settings.oidc.allow_public_website_registration;
     let metadata = if website {
         payload.website_profile(None)?
     } else {
@@ -954,7 +975,7 @@ mod tests {
             metadata[key] = value;
             assert!(
                 matches!(
-                    register_client(
+                    register_website_client(
                         State(state.clone()),
                         HeaderMap::new(),
                         Json(serde_json::from_value(metadata).unwrap())

@@ -33,8 +33,9 @@ struct Grant {
     user: String,
     application: String,
     profile: String,
-    approval_time: i64,
-    consent: Consent,
+    generation: Option<String>,
+    // Required marker rejects old envelopes (missing Option fields deserialize as None).
+    generation_bound: bool,
     exp: i64,
     jkt: Option<String>,
 }
@@ -46,33 +47,25 @@ fn cipher(private_pem: &str) -> Aes256Gcm {
     Aes256Gcm::new_from_slice(&mac.finalize().into_bytes()).expect("SHA-256 produces a 256-bit key")
 }
 
-#[derive(PartialEq, Serialize, Deserialize)]
-enum Consent {
-    Absent,
-    Remembered(i64),
-    PreviouslyRevoked(i64),
-}
-
-async fn consent_at(
+pub(super) async fn generation(
     state: &AppState,
     client: &str,
     user: &str,
-    approval_time: i64,
-) -> AppResult<Consent> {
-    match state.db.find_client_grant(user, client).await? {
-        None => Ok(Consent::Absent),
-        Some(g) if g.revoked_at.is_some() => match g.revoked_at {
-            Some(t) if t < approval_time => Ok(Consent::PreviouslyRevoked(t)),
-            _ => Err(AppError::Unauthorized),
-        },
-        Some(g)
-            if g.updated_at <= approval_time
-                && g.granted_scopes.split_whitespace().any(|s| s == "openid") =>
-        {
-            Ok(Consent::Remembered(g.updated_at))
-        }
-        Some(_) => Err(AppError::Unauthorized),
-    }
+) -> AppResult<Option<String>> {
+    Ok(state
+        .db
+        .find_client_grant(user, client)
+        .await?
+        .and_then(|g| g.website_generation))
+}
+
+pub(super) fn bind_code(random: &str, generation: Option<&str>) -> String {
+    let tag = util::identity_factor_digest(
+        generation.unwrap_or_default(),
+        "website-authorization-code",
+        random,
+    );
+    format!("{random}.{tag}")
 }
 
 pub(super) async fn issue(
@@ -82,16 +75,21 @@ pub(super) async fn issue(
     user: &UserRecord,
     binding: &ApplicationClientBindingRecord,
     proof: Option<&DpopBinding>,
-    approval_time: i64,
+    code: &str,
 ) -> AppResult<String> {
+    let generation = generation(state, &client.client_id, &user.id).await?;
+    let (random, _) = code.split_once('.').ok_or_else(invalid_code)?;
+    if bind_code(random, generation.as_deref()) != code {
+        return Err(invalid_code());
+    }
     let grant = Grant {
         issuer: issuer.into(),
         client: client.client_id.clone(),
         user: user.id.clone(),
         application: binding.application_id.clone(),
         profile: binding.authorization_profile_id.clone(),
-        approval_time,
-        consent: consent_at(state, &client.client_id, &user.id, approval_time).await?,
+        generation,
+        generation_bound: true,
         exp: util::now_ts() + state.settings.oidc.access_token_ttl_seconds,
         jkt: proof.map(|p| p.jkt.clone()),
     };
@@ -160,7 +158,8 @@ pub(super) async fn userinfo(
         )
         .map_err(|_| AppError::Unauthorized)?;
     let grant: Grant = serde_json::from_slice(&message).map_err(|_| AppError::Unauthorized)?;
-    if grant.exp <= util::now_ts()
+    if !grant.generation_bound
+        || grant.exp <= util::now_ts()
         || !issuers.contains(&grant.issuer)
         || !crate::dcr::is_website_client_id(&grant.client)
     {
@@ -189,7 +188,7 @@ pub(super) async fn userinfo(
         .ok_or(AppError::Unauthorized)?;
     let user = load_oidc_user(state, &grant.user).await?;
     ensure_trial_enrollment_client_allowed_for_user(state, &user.id, &client.client_id).await?;
-    if consent_at(state, &client.client_id, &user.id, grant.approval_time).await? != grant.consent {
+    if generation(state, &client.client_id, &user.id).await? != grant.generation {
         return Err(AppError::Unauthorized);
     }
     let snapshot = AuthorizationSnapshot::load(state, &client, &user).await?;
@@ -201,4 +200,8 @@ pub(super) async fn userinfo(
     Ok(Json(
         serde_json::json!({"sub": subject::subject_for_client(&grant.issuer, &user, &client)?}),
     ))
+}
+
+fn invalid_code() -> AppError {
+    AppError::Oidc("invalid authorization code".into())
 }

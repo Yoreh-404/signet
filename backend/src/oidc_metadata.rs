@@ -23,6 +23,8 @@ pub(super) struct DiscoveryDocument {
     authorization_details_types_supported: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     registration_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    website_registration_endpoint: Option<String>,
     userinfo_endpoint: String,
     jwks_uri: String,
     end_session_endpoint: String,
@@ -70,6 +72,11 @@ pub(super) async fn discovery(
         registration_endpoint: (state.settings.oidc.allow_dynamic_client_registration
             || state.settings.oidc.allow_public_website_registration)
             .then(|| absolute(&issuer, "/connect/register")),
+        website_registration_endpoint: state
+            .settings
+            .oidc
+            .allow_public_website_registration
+            .then(|| absolute(&issuer, "/connect/register/website")),
         userinfo_endpoint: absolute(&issuer, &state.settings.oidc.userinfo_endpoint),
         jwks_uri: absolute(&issuer, &state.settings.oidc.jwks_uri),
         end_session_endpoint: absolute(&issuer, &state.settings.oidc.end_session_endpoint),
