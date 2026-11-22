@@ -30,7 +30,10 @@ use tokio::{
 };
 use url::{Host, Url};
 
+mod axon_v2;
 mod crypto;
+#[allow(unused_imports)] // Wired only with the durable enrollment transaction.
+pub(crate) use axon_v2::{ApprovedAxonDeclaration, verify_approved_axon_v2};
 mod normalization;
 #[cfg(test)]
 #[path = "application_discovery/normalization_tests.rs"]
@@ -1732,6 +1735,48 @@ mod tests {
         let signature = signing_key.sign(input.as_bytes());
         let token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
         (token.into_bytes(), jwks)
+    }
+
+    #[test]
+    fn signed_opt_in_v2_does_not_change_incumbent_verification() {
+        let (body, _) = signed_contract();
+        let raw = std::str::from_utf8(&body).unwrap().split('.').nth(1).unwrap();
+        let mut payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(raw).unwrap()).unwrap();
+        let origin = "https://axon.example";
+        let resource = "https://axon.example/api";
+        let catalog = vec!["admin:standing:inbox".to_string()];
+        payload["modules"]["clients"][0]["audiences"] = serde_json::json!([resource]);
+        payload["modules"]["clients"][0]["scopes"] = serde_json::json!(["openid"]);
+        payload["modules"]["axon_admin_mapping"] = serde_json::json!({
+            "version": 2, "source": "signet.is_admin", "claim": "axon_admin_authority",
+            "output": "access_token", "client_id": "web", "audience": resource,
+            "permissions": catalog
+        });
+        let signing_key = SigningKey::from_bytes(&[37; 32]);
+        let jwks = serde_json::json!({"keys":[{
+            "kty":"OKP", "crv":"Ed25519", "x":URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+            "kid":"key-1", "use":"sig", "alg":"EdDSA"
+        }]}).to_string();
+        let approved = ApprovedAxonDeclaration {
+            organization_id: "org-1", application_id: "axon", revision: 2,
+            website_origin: origin, discovery_issuer: origin, discovery_audience: "https://sso.example",
+            client_id: "web", resource_audience: resource, pinned_jwks: &jwks, catalog: &catalog,
+        };
+        let sign = |raw: &str| {
+            let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","kid":"key-1"}"#);
+            let input = format!("{header}.{}", URL_SAFE_NO_PAD.encode(raw));
+            format!("{input}.{}", URL_SAFE_NO_PAD.encode(signing_key.sign(input.as_bytes()).to_bytes()))
+        };
+        let body = sign(&payload.to_string());
+        let verified = verify_approved_axon_v2(body.as_bytes(), "org-1", origin, &approved).unwrap();
+        assert_eq!(verified.redacted_payload["modules"]["axon_admin_mapping"]["version"], 2);
+        assert_eq!(verified.redacted_payload["modules"]["axon_admin_mapping"]["permissions"], serde_json::json!(catalog));
+        assert!(verify_and_normalize(body.as_bytes(), &jwks, origin, "axon", "https://sso.example", "org-1").is_err());
+        assert!(verify_approved_axon_v2(body.as_bytes(), "other", origin, &approved).is_err());
+        let duplicate = sign(&payload.to_string().replace(
+            "\"version\":2", "\"version\":2,\"version\":2",
+        ));
+        assert!(verify_approved_axon_v2(duplicate.as_bytes(), "org-1", origin, &approved).is_err());
     }
 
     #[test]
