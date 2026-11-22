@@ -512,9 +512,6 @@ pub(super) async fn token_from_refresh_token(
     let token_audience = resource
         .as_deref()
         .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
-    crate::oidc_authorization::apply_axon_admin_claim(
-        &state, &authorization_snapshot, &client, &user, token_audience, &mut access_claims,
-    ).await?;
     let access_token = state.jwt.sign_access_token_with_issuer_and_claims(
         &issuer,
         TokenSubject {
@@ -761,11 +758,11 @@ pub(super) async fn issue_tokens_for_user(
         let token_audience = resource
             .as_deref()
             .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
-        if login_code_level.is_none() && sid.is_some() && application_id.is_some()
-            && let Some(snapshot) = authorization_snapshot.as_ref()
+        if login_code_level.is_none() && application_id.is_some()
+            && let (Some(snapshot), Some(public_sid)) = (authorization_snapshot.as_ref(), sid.as_deref())
         {
             crate::oidc_authorization::apply_axon_admin_claim(
-                state, snapshot, client, &user, token_audience, &mut access_claims,
+                state, snapshot, client, &user, token_audience, public_sid, &mut access_claims,
             ).await?;
         }
         state.jwt.sign_access_token_with_issuer_and_claims(

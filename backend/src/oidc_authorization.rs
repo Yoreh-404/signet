@@ -30,6 +30,7 @@ pub(crate) async fn apply_axon_admin_claim(
     client: &ClientRecord,
     user: &UserRecord,
     audience: Option<&str>,
+    public_session_id: &str,
     claims: &mut Map<String, Value>,
 ) -> AppResult<()> {
     let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref() else {
@@ -42,7 +43,7 @@ pub(crate) async fn apply_axon_admin_claim(
     ) else { return Ok(()) };
     if crate::dcr::is_website_client_id(&client.client_id)
         || client.client_id != trust.client_id || audience != Some(trust.audience.as_str())
-        || trust.audience.is_empty() || !trust.origin.starts_with("https://")
+        || trust.audience.is_empty() || public_session_id.is_empty() || !trust.origin.starts_with("https://")
         || client.audience != trust.audience
         || client.is_active != 1 || app.is_active != 1 || binding.is_active != 1
         || binding.protocol != "oidc" || binding.client_db_id != client.id
@@ -52,7 +53,7 @@ pub(crate) async fn apply_axon_admin_claim(
     {
         return Ok(());
     }
-    if !client.grant_types()?.iter().all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token")) {
+    if client.grant_types()? != ["authorization_code"] || client.scopes()? != ["openid"] {
         return Ok(());
     }
     let redirects = client.redirect_uris()?;
@@ -80,10 +81,18 @@ pub(crate) async fn apply_axon_admin_claim(
     let Some(contract) = row.snapshot_json.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) else {
         return Ok(());
     };
-    if let Some(value) = verified_axon_admin(&contract, trust, &pin, user.is_admin) {
-        claims.insert("axon_admin".into(), value);
-    }
+    project_verified_axon_session(&contract, trust, &pin, user.is_admin, public_session_id, claims);
     Ok(())
+}
+
+fn project_verified_axon_session(
+    contract: &Value, trust: &crate::config::AxonAdminTrust, pin: &str, is_admin: i32,
+    public_session_id: &str, claims: &mut Map<String, Value>,
+) {
+    if let Some(value) = verified_axon_admin(contract, trust, pin, is_admin) {
+        claims.insert("axon_admin".into(), value);
+        claims.insert("sid".into(), Value::String(public_session_id.into()));
+    }
 }
 
 fn verified_axon_admin(
@@ -124,6 +133,12 @@ mod axon_mapping_tests {
         assert_eq!(verified_axon_admin(&contract, &trust, "verified", 1), Some(json!(true)));
         assert_eq!(verified_axon_admin(&contract, &trust, "verified", 0), Some(json!(false)));
         assert_eq!(verified_axon_admin(&contract, &trust, "other", 1), None);
+        let mut claims = Map::new();
+        project_verified_axon_session(&contract, &trust, "other", 1, "session-test", &mut claims);
+        assert!(claims.is_empty());
+        project_verified_axon_session(&contract, &trust, "verified", 0, "session-test", &mut claims);
+        assert_eq!(claims["sid"], json!("session-test"));
+        assert_eq!(claims["axon_admin"], json!(false));
         contract["modules"]["axon_admin_mapping"]["audience"] = json!("https://other.test");
         assert_eq!(verified_axon_admin(&contract, &trust, "verified", 1), None);
     }
@@ -215,6 +230,7 @@ impl AuthorizationSnapshot {
         }
         if self.reserve_axon_admin {
             claims.remove("axon_admin");
+            claims.remove("sid");
         }
         Ok(claims)
     }
@@ -238,6 +254,7 @@ impl ClientClaimsSnapshot {
         let mut claims = client_claims_for_user(&self.mappers, client, user, scope, target)?;
         if self.reserve_axon_admin {
             claims.remove("axon_admin");
+            claims.remove("sid");
         }
         Ok(claims)
     }
