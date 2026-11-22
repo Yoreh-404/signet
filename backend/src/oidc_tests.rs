@@ -1912,7 +1912,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, "a".repeat(43))
         .await.unwrap().is_some(), "v2 enrolled current snapshot was not visible");
     let authz = crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &user).await.unwrap();
-    assert_eq!(authz.binding.as_ref().unwrap().protocol, "oidc");
+    assert!(matches!(authz.binding.as_ref().unwrap().protocol.as_str(), "oidc" | "oauth2_oidc"));
     assert!(crate::oidc_authorization::project_axon_admin_v2(
         &state, &authz, &client, &user, Some(resource), &sid, "openid", &issuer,
     ).await.unwrap().is_some(), "v2 candidate projection prerequisites did not match");

@@ -50,6 +50,9 @@ async fn trusted_axon_client<'a>(
     app: &ApplicationRecord,
     binding: &ApplicationClientBindingRecord,
 ) -> AppResult<Option<(&'a crate::config::AxonAdminTrust, String, Value)>> {
+    if binding.protocol != "oidc" {
+        return Ok(None);
+    }
     let Some((trust, pin, row)) = trusted_axon_enrollment(state, client, app, binding).await? else {
         return Ok(None);
     };
@@ -81,7 +84,8 @@ async fn trusted_axon_enrollment<'a>(
         || trust.audience.is_empty() || !trust.origin.starts_with("https://")
         || client.audience != trust.audience
         || client.is_active != 1 || app.is_active != 1 || binding.is_active != 1
-        || binding.protocol != "oidc" || binding.client_db_id != client.id
+        || !matches!(binding.protocol.as_str(), "oidc" | "oauth2_oidc")
+        || binding.client_db_id != client.id
         || binding.application_id != app.id || app.slug != trust.application_id
         || app.organization_id != trust.organization_id
         || client.organization_id.as_deref() != Some(trust.organization_id.as_str())
