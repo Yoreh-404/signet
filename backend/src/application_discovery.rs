@@ -33,7 +33,7 @@ use url::{Host, Url};
 mod axon_v2;
 mod crypto;
 #[allow(unused_imports)] // Wired only with the durable enrollment transaction.
-pub(crate) use axon_v2::{ApprovedAxonDeclaration, verify_approved_axon_v2};
+pub(crate) use axon_v2::{ApprovedAxonDeclaration, VerifiedAxonDeclaration, verify_approved_axon_v2};
 mod normalization;
 #[cfg(test)]
 #[path = "application_discovery/normalization_tests.rs"]
@@ -1769,6 +1769,7 @@ mod tests {
         };
         let body = sign(&payload.to_string());
         let verified = verify_approved_axon_v2(body.as_bytes(), "org-1", origin, &approved).unwrap();
+        let verified = verified.manifest();
         assert_eq!(verified.redacted_payload["modules"]["axon_admin_mapping"]["version"], 2);
         assert_eq!(verified.redacted_payload["modules"]["axon_admin_mapping"]["permissions"], serde_json::json!(catalog));
         assert!(verify_and_normalize(body.as_bytes(), &jwks, origin, "axon", "https://sso.example", "org-1").is_err());

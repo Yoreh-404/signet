@@ -16,6 +16,18 @@ pub(crate) struct ApprovedAxonDeclaration<'a> {
     pub catalog: &'a [String],
 }
 
+pub(crate) struct VerifiedAxonDeclaration {
+    manifest: VerifiedApplicationManifest,
+    organization_id: String,
+    website_origin: String,
+}
+
+impl VerifiedAxonDeclaration {
+    pub(crate) fn manifest(&self) -> &VerifiedApplicationManifest { &self.manifest }
+    pub(crate) fn organization_id(&self) -> &str { &self.organization_id }
+    pub(crate) fn website_origin(&self) -> &str { &self.website_origin }
+}
+
 #[derive(Deserialize)]
 struct RawDeclaration {
     format: String,
@@ -54,7 +66,7 @@ pub(crate) fn verify_approved_axon_v2(
     enrolled_org: &str,
     enrolled_website: &str,
     approved: &ApprovedAxonDeclaration<'_>,
-) -> AppResult<VerifiedApplicationManifest> {
+) -> AppResult<VerifiedAxonDeclaration> {
     if body.is_empty() || body.len() > 512 * 1024 {
         return Err(AppError::BadRequest("invalid discovery body size".into()));
     }
@@ -85,7 +97,11 @@ pub(crate) fn verify_approved_axon_v2(
     verified.redacted_payload["modules"]["axon_admin_mapping"] =
         serde_json::to_value(wire).map_err(|_| bad_mapping())?;
     verified.redacted_payload["_signet_axon_verified_signer"] = Value::String(pin);
-    Ok(verified)
+    Ok(VerifiedAxonDeclaration {
+        manifest: verified,
+        organization_id: enrolled_org.to_owned(),
+        website_origin: approved.website_origin.to_owned(),
+    })
 }
 
 fn bad_mapping() -> AppError {

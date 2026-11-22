@@ -8,5 +8,9 @@ CREATE TABLE axon_admin_authority_state (
     digest TEXT NOT NULL CHECK (length(digest) = 43),
     generation BIGINT NOT NULL CHECK (generation > 0),
     withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1)),
+    snapshot_json TEXT,
+    expires_at BIGINT,
+    CHECK ((snapshot_json IS NULL) = (expires_at IS NULL)),
+    CHECK (withdrawn = 0 OR snapshot_json IS NULL),
     PRIMARY KEY (organization_id, application_slug)
 );

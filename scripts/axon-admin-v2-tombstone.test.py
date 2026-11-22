@@ -5,6 +5,26 @@ import unittest
 
 
 class AuthorityStateTest(unittest.TestCase):
+    def test_generation_and_snapshot_commit_or_fail_together(self):
+        with sqlite3.connect(":memory:") as db:
+            db.executescript(Path(__file__).with_name(
+                "axon-admin-v2-tombstone.sql").read_text())
+            db.execute("""INSERT INTO axon_admin_authority_state
+                (organization_id, application_slug, enrollment_id, revision, digest, generation, withdrawn)
+                VALUES ('tenant','axon','enrollment',1,?,1,0)""", ("a"*43,))
+            update = """UPDATE axon_admin_authority_state
+                SET revision = ?, digest = ?, generation = generation+1, snapshot_json = ?, expires_at = ?
+                WHERE organization_id = ? AND application_slug = 'axon' AND enrollment_id = 'enrollment'
+                  AND generation = ? AND revision < ? AND withdrawn = 0"""
+            fields = (2, "b"*43, '{"revision":2}', 120)
+            self.assertEqual(db.execute(update, (*fields, "wrong", 1, 2)).rowcount, 0)
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(update, (*fields[:3], None, "tenant", 1, 2))
+            state = "SELECT revision, generation, snapshot_json FROM axon_admin_authority_state"
+            self.assertEqual(db.execute(state).fetchone(), (1, 1, None))
+            self.assertEqual(db.execute(update, (*fields, "tenant", 1, 2)).rowcount, 1)
+            self.assertEqual(db.execute(state).fetchone(), (2, 2, '{"revision":2}'))
+
     def test_withdrawal_fences_stale_writers_and_survives_app_deletion(self):
         with sqlite3.connect(":memory:") as db:
             db.executescript(Path(__file__).with_name(
@@ -14,7 +34,7 @@ class AuthorityStateTest(unittest.TestCase):
             digest = "a" * 43
             replacement = "b" * 43
             db.execute(
-                "INSERT INTO axon_admin_authority_state VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO axon_admin_authority_state (organization_id, application_slug, enrollment_id, revision, digest, generation, withdrawn) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("tenant", "axon", "verified-enrollment", 3, digest, 1, 0),
             )
 

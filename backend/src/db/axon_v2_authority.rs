@@ -6,6 +6,7 @@ use super::{
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl};
+use crate::application_discovery::VerifiedAxonDeclaration;
 
 pub(crate) struct AxonV2Enrollment {
     pub application_db_id: String,
@@ -14,13 +15,6 @@ pub(crate) struct AxonV2Enrollment {
     pub enrollment_id: String,
     pub website_origin: String,
     pub signer_pin: String,
-}
-
-pub(crate) struct AxonV2Advance {
-    pub expected_generation: i64,
-    pub revision: i64,
-    pub digest: String,
-    pub withdrawal: bool,
 }
 
 #[derive(Debug, diesel::QueryableByName)]
@@ -37,22 +31,34 @@ pub(crate) struct AxonV2Reservation {
 
 #[allow(dead_code)] // Future guarded reconciliation caller.
 impl Db {
-    /// Atomically accept a verified higher-revision declaration or withdrawal.
+    /// Atomically stage a verified higher-revision declaration and snapshot.
     /// Expected generation comes from the durable store, never the statement.
     /// Operator disable/reapproval are separate controls, not parameters here.
-    /// Prior to activation, combine this transaction with snapshot reconciliation.
+    /// This never updates general v1 reconciliation or activates issuance.
     pub(crate) async fn reserve_axon_v2_revision(
         &self,
         scope: AxonV2Enrollment,
-        change: AxonV2Advance,
+        expected_generation: i64,
+        verified: VerifiedAxonDeclaration,
     ) -> AppResult<AxonV2Reservation> {
-        let digest = change.digest.as_bytes();
-        if scope.enrollment_id.is_empty() || change.expected_generation <= 0 || change.revision <= 0
+        let manifest = verified.manifest();
+        let digest = manifest.digest.as_bytes();
+        if scope.enrollment_id.is_empty() || expected_generation <= 0 || manifest.revision <= 0
+            || verified.organization_id() != scope.organization_id
+            || verified.website_origin() != scope.website_origin
+            || manifest.application_id != scope.application_slug
+            || manifest.redacted_payload["_signet_axon_verified_signer"].as_str()
+                != Some(scope.signer_pin.as_str())
             || digest.len() != 43
             || !digest.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
         {
             return Err(AppError::Forbidden);
         }
+        let revision = manifest.revision;
+        let digest = manifest.digest.clone();
+        let expires = manifest.expires_at;
+        let snapshot = serde_json::to_string(&manifest.redacted_payload)
+            .map_err(|_| AppError::Internal("cannot serialize Axon declaration snapshot".into()))?;
         with_conn!(self, |conn, kind| {
             conn.transaction::<AxonV2Reservation, AppError, _>(|conn| {
                 // Same lock order as incumbent discovery updates.
@@ -81,18 +87,21 @@ impl Db {
                     return Err(AppError::Forbidden);
                 }
 
+                if expires <= crate::util::now_ts() {
+                    return Err(AppError::Forbidden);
+                }
                 let change_sql = format!(
-                    "UPDATE axon_admin_authority_state SET revision = {}, digest = {}, generation = generation + 1, withdrawn = {}
+                    "UPDATE axon_admin_authority_state SET revision = {}, digest = {}, generation = generation + 1, snapshot_json = {}, expires_at = {}
                      WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
                        AND generation = {} AND revision < {} AND withdrawn = 0",
                     ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
-                    ph(kind,6), ph(kind,7), ph(kind,8),
+                    ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9),
                 );
-                if sql_query(change_sql).bind::<BigInt, _>(change.revision)
-                    .bind::<Text, _>(&change.digest).bind::<Integer, _>(i32::from(change.withdrawal))
+                if sql_query(change_sql).bind::<BigInt, _>(revision)
+                    .bind::<Text, _>(&digest).bind::<Text, _>(&snapshot).bind::<BigInt, _>(expires)
                     .bind::<Text, _>(&scope.organization_id).bind::<Text, _>(&scope.application_slug)
-                    .bind::<Text, _>(&scope.enrollment_id).bind::<BigInt, _>(change.expected_generation)
-                    .bind::<BigInt, _>(change.revision).execute(conn).map_err(AppError::from)? != 1
+                    .bind::<Text, _>(&scope.enrollment_id).bind::<BigInt, _>(expected_generation)
+                    .bind::<BigInt, _>(revision).execute(conn).map_err(AppError::from)? != 1
                 {
                     return Err(AppError::Forbidden);
                 }
