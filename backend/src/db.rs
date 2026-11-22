@@ -143,6 +143,7 @@ mod application_authorization_types;
 mod application_discovery;
 mod application_discovery_read;
 mod application_discovery_types;
+mod axon_v2_authority;
 #[macro_use]
 mod application_write_sql;
 #[macro_use]

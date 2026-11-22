@@ -11,8 +11,8 @@ class AuthorityStateTest(unittest.TestCase):
                 "axon-admin-v2-tombstone.sql").read_text())
             db.execute("CREATE TABLE applications (slug TEXT PRIMARY KEY)")
             db.execute("INSERT INTO applications VALUES ('axon')")
-            digest = "sha256:" + "a" * 64
-            replacement = "sha256:" + "b" * 64
+            digest = "a" * 43
+            replacement = "b" * 43
             db.execute(
                 "INSERT INTO axon_admin_authority_state VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("tenant", "axon", "verified-enrollment", 3, digest, 1, 0),

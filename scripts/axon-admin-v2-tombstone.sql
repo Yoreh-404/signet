@@ -5,8 +5,8 @@ CREATE TABLE axon_admin_authority_state (
     application_slug TEXT NOT NULL,
     enrollment_id TEXT NOT NULL,
     revision BIGINT NOT NULL CHECK (revision > 0),
-    digest TEXT NOT NULL CHECK (length(digest) = 71),
+    digest TEXT NOT NULL CHECK (length(digest) = 43),
     generation BIGINT NOT NULL CHECK (generation > 0),
-    withdrawn SMALLINT NOT NULL CHECK (withdrawn IN (0, 1)),
+    withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1)),
     PRIMARY KEY (organization_id, application_slug)
 );
