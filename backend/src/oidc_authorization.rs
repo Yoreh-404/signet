@@ -175,7 +175,7 @@ pub(crate) async fn project_axon_admin_v2(
     let (Some(app), Some(binding)) = (&snapshot.application, &snapshot.binding) else {
         return Ok(None);
     };
-    if scope != "openid" || public_session_id.is_empty()
+    if scope != "openid" || public_session_id.is_empty() || policy.signed_withdrawal
         || issuer != policy.issuer || policy.introspection_client_id.is_empty()
         || policy.activation_epoch <= 0 || crate::util::now_ts() < policy.activation_epoch
     {
@@ -265,6 +265,7 @@ mod axon_mapping_tests {
             enrollment_id: "test".into(), revision: 3, digest: "a".repeat(43), permissions,
             issuer: "https://signet.example".into(), introspection_client_id: "operator-resource".into(),
             activation_epoch: 1,
+            signed_withdrawal: false,
         };
         let mut current = json!({
             "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",

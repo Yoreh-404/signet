@@ -268,6 +268,8 @@ pub struct AxonAdminV2Policy {
     pub issuer: String,
     pub introspection_client_id: String,
     pub activation_epoch: i64,
+    #[serde(default)]
+    pub signed_withdrawal: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

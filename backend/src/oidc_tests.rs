@@ -1865,13 +1865,16 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         enrollment_id: "fixture-enrollment".into(), revision: 3, digest: "a".repeat(43),
         permissions: permissions.clone(), issuer: issuer.clone(),
         introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
+        signed_withdrawal: false,
     });
     state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
-        application_id: app.id.clone(), management_mode: "website".into(),
+        application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
         website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: jwks,
-        last_verified_revision: None, last_verified_version: None, last_verified_digest: None,
-        last_verified_expires_at: None, sync_status: "pending".into(),
-        last_fetched_at: None, last_success_at: None, last_error: None, snapshot_json: None,
+        last_verified_revision: Some(3), last_verified_version: Some("fixture".into()),
+        last_verified_digest: Some("a".repeat(43)), last_verified_expires_at: Some(now+300),
+        sync_status: crate::application_discovery_contract::SYNC_STATUS_SYNCED.into(),
+        last_fetched_at: Some(now), last_success_at: Some(now), last_error: None,
+        snapshot_json: Some(r#"{"modules":{}}"#.into()),
         operator_disabled: false,
     }).await.unwrap();
     let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
@@ -1920,7 +1923,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     };
     let expected = json!({"version":2,"application_id":app.slug,"revision":3,"permissions":permissions});
     let claim = "axon_admin_authority";
-    assert_eq!(read(&tokens.access_token)[claim], expected);
+    assert!(read(&tokens.access_token)[claim] == expected, "full v2 access claim did not match");
     assert!(read(tokens.id_token.as_deref().unwrap()).get(claim).is_none());
     assert!(tokens.refresh_token.is_none());
     let router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
@@ -1930,7 +1933,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         .header(header::AUTHORIZATION, format!("Basic {}", STANDARD.encode(format!("{}:{secret}", verifier.client_id))))
         .body(Body::from(format!("token_type_hint=axon_admin_authority&token={}", tokens.access_token))).unwrap();
     let before = oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await;
-    assert_eq!(before, json!({"active":true,"axon_admin_authority":expected}));
+    assert!(before == json!({"active":true,"axon_admin_authority":expected}), "confidential live-authority assertion did not match");
     {
         let mut conn = pool.get().unwrap();
         sql_query("UPDATE users SET is_admin=0 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();

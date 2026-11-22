@@ -69,7 +69,7 @@ pub(crate) fn verify_approved_axon_v2(
     enrolled_website: &str,
     approved: &ApprovedAxonDeclaration<'_>,
 ) -> AppResult<VerifiedAxonDeclaration> {
-    verify(body, enrolled_org, enrolled_website, approved, false)
+    verify(body, enrolled_org, enrolled_website, approved, false, None)
 }
 
 /// Requires explicit trusted approval of this higher omission revision.
@@ -80,15 +80,16 @@ pub(crate) fn verify_approved_axon_v2_withdrawal(
     enrolled_website: &str,
     approved: &ApprovedAxonDeclaration<'_>,
 ) -> AppResult<VerifiedAxonDeclaration> {
-    verify(body, enrolled_org, enrolled_website, approved, true)
+    verify(body, enrolled_org, enrolled_website, approved, true, None)
 }
 
-fn verify(
+pub(super) fn verify(
     body: &[u8],
     enrolled_org: &str,
     enrolled_website: &str,
     approved: &ApprovedAxonDeclaration<'_>,
     withdrawal: bool,
+    challenge: Option<(&str, i64)>,
 ) -> AppResult<VerifiedAxonDeclaration> {
     if body.is_empty() || body.len() > 512 * 1024 {
         return Err(AppError::BadRequest("invalid discovery body size".into()));
@@ -112,6 +113,12 @@ fn verify(
         return Err(bad_mapping());
     }
     let base = serde_json::from_value::<ApplicationContract>(value).map_err(|_| bad_mapping())?;
+    if let Some((challenge, ttl)) = challenge {
+        validate_registration_contract(
+            &base, approved.discovery_issuer, approved.application_id,
+            approved.discovery_audience, challenge, ttl,
+        )?;
+    }
     let mut verified = normalize_application_contract(
         &base,
         &payload,

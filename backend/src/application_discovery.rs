@@ -110,6 +110,15 @@ struct DiscoveryLease {
     commit_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
+enum SyncManifest {
+    Incumbent(VerifiedApplicationManifest),
+    AxonV2 {
+        manifest: VerifiedAxonDeclaration,
+        enrollment: String,
+        digest: String,
+    },
+}
+
 type DiscoveryCommitGates = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 
 static DISCOVERY_COMMIT_GATES: OnceLock<Mutex<DiscoveryCommitGates>> = OnceLock::new();
@@ -170,7 +179,7 @@ impl DiscoveryLease {
     async fn apply_if_owner(
         &self,
         state: &AppState,
-        manifest: VerifiedApplicationManifest,
+        manifest: SyncManifest,
     ) -> AppResult<Option<ApplicationDiscoveryRecord>> {
         let _commit_guard = self.commit_gate.lock().await;
         if !state
@@ -184,16 +193,16 @@ impl DiscoveryLease {
         {
             return Ok(None);
         }
-        state
-            .db
-            .commit_application_discovery_if_owner(
-                &self.application_id,
-                &self.owner_token,
-                self.lease_generation,
-                manifest.into(),
-            )
-            .await
-            .map(Some)
+        match manifest {
+            SyncManifest::Incumbent(manifest) => state.db.commit_application_discovery_if_owner(
+                &self.application_id, &self.owner_token, self.lease_generation, manifest.into(),
+            ).await.map(Some),
+            SyncManifest::AxonV2 { manifest, enrollment, digest } =>
+                state.db.commit_axon_v2_discovery_if_owner(
+                    &self.application_id, &self.owner_token, self.lease_generation,
+                    enrollment, &digest, manifest,
+                ).await.map(Some),
+        }
     }
 
     async fn release(&self, state: &AppState) -> AppResult<bool> {
@@ -1380,7 +1389,12 @@ pub async fn sync_application(
             return Err(error);
         }
     };
-    match sync_application_once(state, &discovery).await {
+    let verified = match sync_axon_v2_if_approved(state, &discovery).await {
+        Ok(Some(manifest)) => Ok(manifest),
+        Ok(None) => sync_application_once(state, &discovery).await.map(SyncManifest::Incumbent),
+        Err(failure) => Err(failure),
+    };
+    match verified {
         Ok(manifest) => match lease.apply_if_owner(state, manifest).await {
             Ok(Some(record)) => {
                 let _ = lease.release(state).await;
@@ -1416,6 +1430,60 @@ pub async fn sync_application(
             }
         }
     }
+}
+
+async fn sync_axon_v2_if_approved(
+    state: &AppState, discovery: &ApplicationDiscoveryRecord,
+) -> Result<Option<SyncManifest>, SyncFailure> {
+    let (Some(policy), Some(trust)) = (
+        state.settings.discovery.axon_admin_v2.as_ref(),
+        state.settings.discovery.axon_admin_trust.as_ref(),
+    ) else { return Ok(None); };
+    let application = state.db.find_application_by_id(&discovery.application_id).await
+        .map_err(SyncFailure::unknown)?.ok_or_else(|| SyncFailure::unknown(AppError::NotFound))?;
+    if application.slug != trust.application_id || application.organization_id != trust.organization_id {
+        return Ok(None);
+    }
+    let website = website_origin(&discovery.website_url).map_err(SyncFailure::unknown)?;
+    let audience = state.settings.oidc.issuer.trim_end_matches('/');
+    if website != trust.origin || policy.issuer != audience || audience.is_empty()
+        || policy.enrollment_id.is_empty() || policy.revision <= 0
+        || axon_signer_pin(&trust.signing_public_jwks).is_none()
+        || axon_signer_pin(&trust.signing_public_jwks) != axon_signer_pin(&discovery.signing_public_jwks)
+    {
+        return Err(SyncFailure::rejected(AppError::Forbidden));
+    }
+    let approved = ApprovedAxonDeclaration {
+        organization_id: &trust.organization_id, application_id: &trust.application_id,
+        revision: policy.revision, website_origin: &trust.origin, discovery_issuer: &website,
+        discovery_audience: audience, client_id: &trust.client_id,
+        resource_audience: &trust.audience, pinned_jwks: &trust.signing_public_jwks,
+        catalog: &policy.permissions,
+    };
+    let ttl = state.settings.discovery.auto_registration.challenge_ttl_seconds;
+    let (fetch_secret, challenge) = if discovery.fetch_secret_ciphertext.trim().is_empty() {
+        let challenge = new_discovery_challenge(&state.settings.discovery.challenge_secret, &website, ttl)
+            .map_err(SyncFailure::unknown)?;
+        verify_discovery_challenge(&state.settings.discovery.challenge_secret, &website, &challenge)
+            .map_err(SyncFailure::unknown)?;
+        (None, Some(challenge))
+    } else {
+        let secret = util::decrypt_discovery_secret(
+            &state.settings.discovery.encryption_key, &discovery.fetch_secret_ciphertext,
+        ).map_err(SyncFailure::unknown)?;
+        (Some(secret), None)
+    };
+    let url = default_discovery_url(&discovery.website_url).map_err(SyncFailure::unknown)?;
+    let body = fetch_discovery_body(
+        &url, fetch_secret.as_deref(), challenge.as_deref(), state.settings.discovery.allow_private_networks,
+    ).await.map_err(SyncFailure::unknown)?;
+    let manifest = axon_v2::verify(
+        &body, &application.organization_id, &discovery.website_url, &approved,
+        policy.signed_withdrawal, challenge.as_deref().map(|value| (value, ttl)),
+    ).map_err(SyncFailure::rejected)?;
+    Ok(Some(SyncManifest::AxonV2 {
+        manifest, enrollment: policy.enrollment_id.clone(), digest: policy.digest.clone(),
+    }))
 }
 
 async fn sync_application_once(

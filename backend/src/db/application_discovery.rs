@@ -496,8 +496,33 @@ impl Db {
             application_id,
             manifest,
             Some((owner_token.to_string(), lease_generation)),
+            None,
         )
         .await
+    }
+
+    /// Commit normalized ordinary discovery state and the approved v2 fence
+    /// together. The caller must own the exact managed-discovery lease.
+    #[allow(dead_code)]
+    pub(crate) async fn commit_axon_v2_discovery_if_owner(
+        &self,
+        application_id: &str,
+        owner_token: &str,
+        lease_generation: i64,
+        enrollment_id: String,
+        approved_digest: &str,
+        verified: crate::application_discovery::VerifiedAxonDeclaration,
+    ) -> AppResult<ApplicationDiscoveryRecord> {
+        let manifest = verified.manifest();
+        if enrollment_id.is_empty() || manifest.digest != approved_digest {
+            return Err(AppError::Forbidden);
+        }
+        self.apply_application_contract_with_lease(
+            application_id,
+            manifest.clone().into(),
+            Some((owner_token.to_string(), lease_generation)),
+            Some((enrollment_id, verified)),
+        ).await
     }
 
     pub async fn mark_application_discovery_sync_error_if_owner(
@@ -817,7 +842,7 @@ impl Db {
     where
         M: Into<ApplicationDiscoveryManifest>,
     {
-        self.apply_application_contract_with_lease(application_id, manifest.into(), None)
+        self.apply_application_contract_with_lease(application_id, manifest.into(), None, None)
             .await
     }
     async fn apply_application_contract_with_lease(
@@ -825,6 +850,7 @@ impl Db {
         application_id: &str,
         manifest: ApplicationDiscoveryManifest,
         lease: Option<(String, i64)>,
+        authority: Option<(String, crate::application_discovery::VerifiedAxonDeclaration)>,
     ) -> AppResult<ApplicationDiscoveryRecord> {
         let application_id = application_id.to_string();
         let snapshot_json = util::to_json(&manifest.redacted_payload)?;
@@ -874,6 +900,53 @@ impl Db {
                     return Err(AppError::BadRequest(
                         "application is not website-managed".to_string(),
                     ));
+                }
+                if let Some((enrollment, verified)) = authority.as_ref() {
+                    #[derive(diesel::QueryableByName)]
+                    struct EnrolledApp {
+                        #[diesel(sql_type = Text)]
+                        organization_id: String,
+                        #[diesel(sql_type = Text)]
+                        slug: String,
+                    }
+                    let sql = format!("SELECT organization_id, slug FROM applications WHERE id = {} AND is_active = 1", ph(kind,1));
+                    let app = sql_query(sql).bind::<Text, _>(&application_id)
+                        .get_result::<EnrolledApp>(conn).optional().map_err(AppError::from)?
+                        .ok_or(AppError::Forbidden)?;
+                    let now = util::now_ts();
+                    if current.operator_disabled != 0 || manifest.expires_at <= now
+                        || app.organization_id != verified.organization_id()
+                        || app.slug != verified.manifest().application_id
+                        || crate::application_discovery::website_origin(&current.website_url).ok().as_deref()
+                            != Some(verified.website_origin())
+                        || crate::application_discovery::axon_signer_pin(&current.signing_public_jwks).as_deref()
+                            != verified.manifest().redacted_payload["_signet_axon_verified_signer"].as_str()
+                    {
+                        return Err(AppError::Forbidden);
+                    }
+                    let withdrawn = i32::from(verified.is_withdrawal());
+                    let publish = format!(
+                        "UPDATE axon_admin_authority_state
+                         SET generation = CASE WHEN revision < {} THEN generation + 1 ELSE generation END,
+                             revision = {}, digest = {}, withdrawn = {}, snapshot_json = {}, expires_at = {}
+                         WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
+                           AND ((revision < {} AND withdrawn = 0)
+                              OR (revision = {} AND digest = {} AND withdrawn = {}))",
+                        ph(kind,1),ph(kind,2),ph(kind,3),ph(kind,4),ph(kind,5),ph(kind,6),ph(kind,7),
+                        ph(kind,8),ph(kind,9),ph(kind,10),ph(kind,11),ph(kind,12),ph(kind,13),
+                    );
+                    if sql_query(publish)
+                        .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
+                        .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
+                        .bind::<Nullable<Text>,_>((withdrawn == 0).then_some(snapshot_json.as_str()))
+                        .bind::<Nullable<BigInt>,_>((withdrawn == 0).then_some(manifest.expires_at))
+                        .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug).bind::<Text,_>(enrollment)
+                        .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
+                        .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
+                        .execute(conn).map_err(AppError::from)? != 1
+                    {
+                        return Err(AppError::Forbidden);
+                    }
                 }
                 if let Some(previous_revision) = current.last_verified_revision {
                     if manifest.revision < previous_revision {
