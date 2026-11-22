@@ -77,7 +77,8 @@ pub(crate) enum MissingApplicationClientPolicy {
 /// for every relation. Keeping this assembler synchronous makes the read
 /// model boundary explicit: once the graph is available, a binding list must
 /// never open a connection for a client, mapper, or organization.
-pub(crate) fn application_client_binding_responses_from_graph(
+pub(crate) async fn application_client_binding_responses_from_graph(
+    state: &AppState,
     graph: &ApplicationGraphRecordSet,
     protocol: Option<&str>,
     missing_client_policy: MissingApplicationClientPolicy,
@@ -157,10 +158,11 @@ pub(crate) fn application_response_from_graph(
     graph: ApplicationGraphRecordSet,
 ) -> AppResult<ApplicationResponse> {
     let client_bindings = application_client_binding_responses_from_graph(
+        state,
         &graph,
         None,
         MissingApplicationClientPolicy::Skip,
-    )?;
+    ).await?;
     let ApplicationGraphRecordSet {
         modules,
         profiles,

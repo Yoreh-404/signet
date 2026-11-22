@@ -25,10 +25,11 @@ pub(super) async fn list(
     managed_application(&state, &jar, &id).await?;
     let graph = state.db.read_application_client_binding_graph(&id).await?;
     let clients = application_client_binding_responses_from_graph(
+        &state,
         &graph,
         Some("oidc"),
         MissingApplicationClientPolicy::NotFound,
-    )?
+    ).await?
     .into_iter()
     .map(|binding| binding.client)
     .collect();

@@ -269,8 +269,9 @@ pub(super) async fn list_application_client_bindings(
     let (_current, _application) = managed_application(&state, &jar, &id).await?;
     let graph = state.db.read_application_client_binding_graph(&id).await?;
     Ok(Json(application_client_binding_responses_from_graph(
+        &state,
         &graph,
         None,
         MissingApplicationClientPolicy::Skip,
-    )?))
+    ).await?))
 }
