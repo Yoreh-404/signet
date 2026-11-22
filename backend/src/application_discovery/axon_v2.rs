@@ -20,12 +20,14 @@ pub(crate) struct VerifiedAxonDeclaration {
     manifest: VerifiedApplicationManifest,
     organization_id: String,
     website_origin: String,
+    withdrawal: bool,
 }
 
 impl VerifiedAxonDeclaration {
     pub(crate) fn manifest(&self) -> &VerifiedApplicationManifest { &self.manifest }
     pub(crate) fn organization_id(&self) -> &str { &self.organization_id }
     pub(crate) fn website_origin(&self) -> &str { &self.website_origin }
+    pub(crate) fn is_withdrawal(&self) -> bool { self.withdrawal }
 }
 
 #[derive(Deserialize)]
@@ -43,7 +45,7 @@ struct RawDeclaration {
 #[derive(Deserialize)]
 struct RawModules {
     clients: Vec<ClientContract>,
-    axon_admin_mapping: V2Mapping,
+    axon_admin_mapping: Option<V2Mapping>,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -67,6 +69,27 @@ pub(crate) fn verify_approved_axon_v2(
     enrolled_website: &str,
     approved: &ApprovedAxonDeclaration<'_>,
 ) -> AppResult<VerifiedAxonDeclaration> {
+    verify(body, enrolled_org, enrolled_website, approved, false)
+}
+
+/// Requires explicit trusted approval of this higher omission revision.
+/// Does not accept null, v1 or a malformed mapping as withdrawal.
+pub(crate) fn verify_approved_axon_v2_withdrawal(
+    body: &[u8],
+    enrolled_org: &str,
+    enrolled_website: &str,
+    approved: &ApprovedAxonDeclaration<'_>,
+) -> AppResult<VerifiedAxonDeclaration> {
+    verify(body, enrolled_org, enrolled_website, approved, true)
+}
+
+fn verify(
+    body: &[u8],
+    enrolled_org: &str,
+    enrolled_website: &str,
+    approved: &ApprovedAxonDeclaration<'_>,
+    withdrawal: bool,
+) -> AppResult<VerifiedAxonDeclaration> {
     if body.is_empty() || body.len() > 512 * 1024 {
         return Err(AppError::BadRequest("invalid discovery body size".into()));
     }
@@ -79,12 +102,15 @@ pub(crate) fn verify_approved_axon_v2(
     }
     let pin = axon_signer_pin(approved.pinned_jwks).ok_or(AppError::Unauthorized)?;
     let payload = verify_jws(&extract_jws(body)?, approved.pinned_jwks)?;
-    let wire = parse_approved_mapping(&payload, approved)?;
+    let wire = parse_approved_mapping(&payload, approved, withdrawal)?;
 
     // Decode all ordinary v3 modules via the existing normalizer, but only
     // after the raw serde pass checked duplicates in the authority boundary.
     let mut value: Value = serde_json::from_slice(&payload).map_err(|_| bad_mapping())?;
-    value["modules"].as_object_mut().ok_or_else(bad_mapping)?.remove("axon_admin_mapping");
+    let raw_mapping = value["modules"].as_object_mut().ok_or_else(bad_mapping)?.remove("axon_admin_mapping");
+    if withdrawal && raw_mapping.is_some() {
+        return Err(bad_mapping());
+    }
     let base = serde_json::from_value::<ApplicationContract>(value).map_err(|_| bad_mapping())?;
     let mut verified = normalize_application_contract(
         &base,
@@ -94,13 +120,16 @@ pub(crate) fn verify_approved_axon_v2(
         approved.discovery_audience,
         approved.organization_id,
     )?;
-    verified.redacted_payload["modules"]["axon_admin_mapping"] =
-        serde_json::to_value(wire).map_err(|_| bad_mapping())?;
+    if let Some(wire) = wire {
+        verified.redacted_payload["modules"]["axon_admin_mapping"] =
+            serde_json::to_value(wire).map_err(|_| bad_mapping())?;
+    }
     verified.redacted_payload["_signet_axon_verified_signer"] = Value::String(pin);
     Ok(VerifiedAxonDeclaration {
         manifest: verified,
         organization_id: enrolled_org.to_owned(),
         website_origin: approved.website_origin.to_owned(),
+        withdrawal,
     })
 }
 
@@ -111,14 +140,21 @@ fn bad_mapping() -> AppError {
 fn parse_approved_mapping(
     payload: &[u8],
     approved: &ApprovedAxonDeclaration<'_>,
-) -> AppResult<V2Mapping> {
+    withdrawal: bool,
+) -> AppResult<Option<V2Mapping>> {
     let raw = serde_json::from_slice::<RawDeclaration>(payload).map_err(|_| bad_mapping())?;
-    let mapping = raw.modules.axon_admin_mapping;
     if raw.format != FORMAT || raw.application_id != approved.application_id
         || raw.revision <= 0 || raw.revision != approved.revision || raw.iss != approved.discovery_issuer
         || !audience_contains(&raw.aud, approved.discovery_audience)
         || raw.iat >= raw.exp
-        || mapping.version != 2 || mapping.source != "signet.is_admin"
+    {
+        return Err(bad_mapping());
+    }
+    if withdrawal {
+        return raw.modules.axon_admin_mapping.is_none().then_some(None).ok_or_else(bad_mapping);
+    }
+    let mapping = raw.modules.axon_admin_mapping.ok_or_else(bad_mapping)?;
+    if mapping.version != 2 || mapping.source != "signet.is_admin"
         || mapping.claim != crate::claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM
         || mapping.output != "access_token" || approved.client_id.is_empty()
         || approved.resource_audience.is_empty() || mapping.client_id != approved.client_id
@@ -137,5 +173,5 @@ fn parse_approved_mapping(
     {
         return Err(bad_mapping());
     }
-    Ok(mapping)
+    Ok(Some(mapping))
 }

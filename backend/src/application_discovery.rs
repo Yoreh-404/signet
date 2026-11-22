@@ -33,7 +33,7 @@ use url::{Host, Url};
 mod axon_v2;
 mod crypto;
 #[allow(unused_imports)] // Wired only with the durable enrollment transaction.
-pub(crate) use axon_v2::{ApprovedAxonDeclaration, VerifiedAxonDeclaration, verify_approved_axon_v2};
+pub(crate) use axon_v2::{ApprovedAxonDeclaration, VerifiedAxonDeclaration, verify_approved_axon_v2, verify_approved_axon_v2_withdrawal};
 mod normalization;
 #[cfg(test)]
 #[path = "application_discovery/normalization_tests.rs"]
@@ -1778,6 +1778,19 @@ mod tests {
             "\"version\":2", "\"version\":2,\"version\":2",
         ));
         assert!(verify_approved_axon_v2(duplicate.as_bytes(), "org-1", origin, &approved).is_err());
+
+        payload["revision"] = Value::from(3);
+        payload["modules"].as_object_mut().unwrap().remove("axon_admin_mapping");
+        let omitted = sign(&payload.to_string());
+        assert!(verify_approved_axon_v2_withdrawal(omitted.as_bytes(), "org-1", origin, &approved).is_err());
+        let next = ApprovedAxonDeclaration { revision: 3, ..approved };
+        assert!(verify_approved_axon_v2(omitted.as_bytes(), "org-1", origin, &next).is_err());
+        let withdrawal = verify_approved_axon_v2_withdrawal(omitted.as_bytes(), "org-1", origin, &next).unwrap();
+        assert!(withdrawal.is_withdrawal());
+        assert_eq!(withdrawal.manifest().revision, 3);
+        payload["modules"]["axon_admin_mapping"] = Value::Null;
+        let null = sign(&payload.to_string());
+        assert!(verify_approved_axon_v2_withdrawal(null.as_bytes(), "org-1", origin, &next).is_err());
     }
 
     #[test]

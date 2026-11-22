@@ -4,7 +4,7 @@ use super::{
     AppError, AppResult, DatabaseKind, Db, blocking, ph, select_application_discovery_sql,
 };
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Integer, Text};
+use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{Connection, OptionalExtension, RunQueryDsl};
 use crate::application_discovery::VerifiedAxonDeclaration;
 
@@ -57,8 +57,11 @@ impl Db {
         let revision = manifest.revision;
         let digest = manifest.digest.clone();
         let expires = manifest.expires_at;
-        let snapshot = serde_json::to_string(&manifest.redacted_payload)
-            .map_err(|_| AppError::Internal("cannot serialize Axon declaration snapshot".into()))?;
+        let withdrawal = verified.is_withdrawal();
+        let snapshot = if withdrawal { None } else {
+            Some(serde_json::to_string(&manifest.redacted_payload)
+                .map_err(|_| AppError::Internal("cannot serialize Axon declaration snapshot".into()))?)
+        };
         with_conn!(self, |conn, kind| {
             conn.transaction::<AxonV2Reservation, AppError, _>(|conn| {
                 // Same lock order as incumbent discovery updates.
@@ -91,14 +94,16 @@ impl Db {
                     return Err(AppError::Forbidden);
                 }
                 let change_sql = format!(
-                    "UPDATE axon_admin_authority_state SET revision = {}, digest = {}, generation = generation + 1, snapshot_json = {}, expires_at = {}
+                    "UPDATE axon_admin_authority_state SET revision = {}, digest = {}, generation = generation + 1, snapshot_json = {}, expires_at = {}, withdrawn = {}
                      WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
                        AND generation = {} AND revision < {} AND withdrawn = 0",
                     ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
-                    ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9),
+                    ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9), ph(kind,10),
                 );
                 if sql_query(change_sql).bind::<BigInt, _>(revision)
-                    .bind::<Text, _>(&digest).bind::<Text, _>(&snapshot).bind::<BigInt, _>(expires)
+                    .bind::<Text, _>(&digest).bind::<Nullable<Text>, _>(snapshot.as_deref())
+                    .bind::<Nullable<BigInt>, _>((!withdrawal).then_some(expires))
+                    .bind::<Integer, _>(i32::from(withdrawal))
                     .bind::<Text, _>(&scope.organization_id).bind::<Text, _>(&scope.application_slug)
                     .bind::<Text, _>(&scope.enrollment_id).bind::<BigInt, _>(expected_generation)
                     .bind::<BigInt, _>(revision).execute(conn).map_err(AppError::from)? != 1
@@ -112,6 +117,46 @@ impl Db {
                 sql_query(read).bind::<Text, _>(&scope.organization_id)
                     .bind::<Text, _>(&scope.application_slug).bind::<Text, _>(&scope.enrollment_id)
                     .get_result(conn).map_err(AppError::from)
+            })
+        })
+    }
+
+    /// Dedicated, authorized local control. Not callable from normal discovery
+    /// sync. Invalidates staged state without inventing a signed wire revision.
+    pub(crate) async fn disable_axon_v2_reservation(
+        &self,
+        scope: AxonV2Enrollment,
+        expected_generation: i64,
+    ) -> AppResult<()> {
+        if scope.enrollment_id.is_empty() || expected_generation <= 0 {
+            return Err(AppError::Forbidden);
+        }
+        with_conn!(self, |conn, kind| {
+            conn.transaction::<(), AppError, _>(|conn| {
+                let lock = format!(
+                    "UPDATE applications SET updated_at = updated_at WHERE id = {} AND organization_id = {} AND slug = {}",
+                    ph(kind,1), ph(kind,2), ph(kind,3),
+                );
+                if sql_query(lock).bind::<Text, _>(&scope.application_db_id)
+                    .bind::<Text, _>(&scope.organization_id).bind::<Text, _>(&scope.application_slug)
+                    .execute(conn).map_err(AppError::from)? != 1
+                {
+                    return Err(AppError::Forbidden);
+                }
+                let update = format!(
+                    "UPDATE axon_admin_authority_state SET withdrawn = 1, generation = generation + 1,
+                     snapshot_json = NULL, expires_at = NULL
+                     WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
+                       AND generation = {} AND withdrawn = 0",
+                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4),
+                );
+                if sql_query(update).bind::<Text, _>(&scope.organization_id)
+                    .bind::<Text, _>(&scope.application_slug).bind::<Text, _>(&scope.enrollment_id)
+                    .bind::<BigInt, _>(expected_generation).execute(conn).map_err(AppError::from)? != 1
+                {
+                    return Err(AppError::Forbidden);
+                }
+                Ok(())
             })
         })
     }
