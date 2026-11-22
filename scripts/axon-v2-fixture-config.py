@@ -49,6 +49,7 @@ def main():
     parser.add_argument("--revision", type=int)
     parser.add_argument("--digest")
     parser.add_argument("--activation-epoch", type=int)
+    parser.add_argument("--rollback-marker", type=Path)
     parser.add_argument("--canonical-origins-isolated", action="store_true")
     args = parser.parse_args()
     fixture_dir = os.environ.get("AXON_V2_FIXTURE_DIR")
@@ -98,14 +99,16 @@ def main():
         }.items():
             text += f"{key} = {json.dumps(value)}\n"
     if args.phase == "v2":
-        if not all((args.introspection_client, args.enrollment_id, args.revision, args.digest, args.activation_epoch)):
-            parser.error("v2 requires introspection client, enrollment ID, approved revision/digest and activation epoch")
+        if not all((args.introspection_client, args.enrollment_id, args.revision, args.digest,
+                    args.activation_epoch, args.rollback_marker)):
+            parser.error("v2 requires introspection client, enrollment ID, approved revision/digest, activation epoch and independent rollback marker")
         permissions = json.loads((root / "backend/tests/fixtures/axon-admin-v2-catalog.json").read_text())
         text += "\n[discovery.axon_admin_v2]\n"
         for key, value in {
             "enrollment_id": args.enrollment_id, "revision": args.revision, "digest": args.digest,
             "permissions": permissions, "issuer": args.issuer,
             "introspection_client_id": args.introspection_client, "activation_epoch": args.activation_epoch,
+            "rollback_marker_path": str(args.rollback_marker.resolve()),
         }.items():
             text += f"{key} = {json.dumps(value)}\n"
     tomllib.loads(text)

@@ -509,19 +509,21 @@ impl Db {
         application_id: &str,
         owner_token: &str,
         lease_generation: i64,
-        enrollment_id: String,
-        approved_digest: &str,
         verified: crate::application_discovery::VerifiedAxonDeclaration,
+        policy: crate::config::AxonAdminV2Policy,
+        trust: crate::config::AxonAdminTrust,
     ) -> AppResult<ApplicationDiscoveryRecord> {
         let manifest = verified.manifest();
-        if enrollment_id.is_empty() || manifest.digest != approved_digest {
+        if policy.enrollment_id.is_empty() || manifest.digest != policy.digest
+            || manifest.revision != policy.revision || verified.is_withdrawal() != policy.signed_withdrawal
+        {
             return Err(AppError::Forbidden);
         }
         self.apply_application_contract_with_lease(
             application_id,
             manifest.clone().into(),
             Some((owner_token.to_string(), lease_generation)),
-            Some((enrollment_id, verified)),
+            Some((verified, policy, trust)),
         ).await
     }
 
@@ -850,7 +852,8 @@ impl Db {
         application_id: &str,
         manifest: ApplicationDiscoveryManifest,
         lease: Option<(String, i64)>,
-        authority: Option<(String, crate::application_discovery::VerifiedAxonDeclaration)>,
+        authority: Option<(crate::application_discovery::VerifiedAxonDeclaration,
+            crate::config::AxonAdminV2Policy, crate::config::AxonAdminTrust)>,
     ) -> AppResult<ApplicationDiscoveryRecord> {
         let application_id = application_id.to_string();
         let snapshot_json = util::to_json(&manifest.redacted_payload)?;
@@ -901,7 +904,14 @@ impl Db {
                         "application is not website-managed".to_string(),
                     ));
                 }
-                if let Some((enrollment, verified)) = authority.as_ref() {
+                if let Some((verified, policy, trust)) = authority.as_ref() {
+                    let floor = crate::application_discovery::read_axon_rollback_floor(policy, trust)
+                        .ok_or(AppError::Forbidden)?;
+                    if (floor.halted && !verified.is_withdrawal()) || manifest.revision < floor.revision
+                        || (manifest.revision == floor.revision && manifest.digest != floor.digest)
+                    {
+                        return Err(AppError::Forbidden);
+                    }
                     #[derive(diesel::QueryableByName)]
                     struct EnrolledApp {
                         #[diesel(sql_type = Text)]
@@ -930,18 +940,22 @@ impl Db {
                          SET generation = CASE WHEN revision < {} THEN generation + 1 ELSE generation END,
                              revision = {}, digest = {}, withdrawn = {}, snapshot_json = {}, expires_at = {}
                          WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
+                           AND generation >= {} AND (revision > {} OR (revision = {} AND digest = {}))
                            AND ((revision < {} AND withdrawn = 0)
                               OR (revision = {} AND digest = {} AND withdrawn = {}
                                   AND (expires_at IS NULL OR expires_at <= {})))",
                         ph(kind,1),ph(kind,2),ph(kind,3),ph(kind,4),ph(kind,5),ph(kind,6),ph(kind,7),
                         ph(kind,8),ph(kind,9),ph(kind,10),ph(kind,11),ph(kind,12),ph(kind,13),ph(kind,14),
+                        ph(kind,15),ph(kind,16),ph(kind,17),ph(kind,18),
                     );
                     if sql_query(publish)
                         .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
                         .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
                         .bind::<Nullable<Text>,_>((withdrawn == 0).then_some(snapshot_json.as_str()))
                         .bind::<Nullable<BigInt>,_>((withdrawn == 0).then_some(manifest.expires_at))
-                        .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug).bind::<Text,_>(enrollment)
+                        .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug).bind::<Text,_>(&policy.enrollment_id)
+                        .bind::<BigInt,_>(floor.minimum_generation).bind::<BigInt,_>(floor.revision)
+                        .bind::<BigInt,_>(floor.revision).bind::<Text,_>(&floor.digest)
                         .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
                         .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
                         .bind::<BigInt,_>(manifest.expires_at)

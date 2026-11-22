@@ -61,6 +61,7 @@ impl Db {
     /// from until a separately verified higher approved revision reconciles.
     pub(crate) async fn reopen_axon_v2_reservation(
         &self, scope: AxonV2Enrollment, generation: i64, approved_revision: i64,
+        expected_revision: i64, expected_digest: String,
     ) -> AppResult<()> {
         if generation <= 0 || approved_revision <= 0 || scope.enrollment_id.is_empty() {
             return Err(AppError::Forbidden);
@@ -78,12 +79,14 @@ impl Db {
                 let reopen = format!(
                     "UPDATE axon_admin_authority_state SET withdrawn = 0, generation = generation + 1
                      WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
-                       AND generation = {} AND revision < {} AND withdrawn = 1 AND snapshot_json IS NULL",
-                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
+                       AND generation = {} AND revision < {} AND revision = {} AND digest = {}
+                       AND withdrawn = 1 AND snapshot_json IS NULL",
+                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6), ph(kind,7),
                 );
                 if sql_query(reopen).bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.application_slug)
                     .bind::<Text,_>(&scope.enrollment_id).bind::<BigInt,_>(generation)
-                    .bind::<BigInt,_>(approved_revision).execute(conn).map_err(AppError::from)? != 1
+                    .bind::<BigInt,_>(approved_revision).bind::<BigInt,_>(expected_revision)
+                    .bind::<Text,_>(&expected_digest).execute(conn).map_err(AppError::from)? != 1
                 { return Err(AppError::Forbidden); }
                 Ok(())
             })
@@ -146,6 +149,7 @@ impl Db {
         user_id: String,
         expected_revision: i64,
         expected_digest: String,
+        minimum_generation: i64,
     ) -> AppResult<Option<serde_json::Value>> {
         with_conn!(self, |conn, kind| {
             let query = format!(
@@ -156,12 +160,12 @@ impl Db {
                  JOIN users u ON u.id = {}
                  WHERE a.id = {} AND s.organization_id = {} AND s.application_slug = {}
                    AND s.enrollment_id = {} AND s.revision = {} AND s.digest = {}
-                   AND s.withdrawn = 0 AND s.snapshot_json IS NOT NULL AND s.expires_at > {}
+                   AND s.generation >= {} AND s.withdrawn = 0 AND s.snapshot_json IS NOT NULL AND s.expires_at > {}
                    AND a.is_active = 1 AND d.operator_disabled = 0 AND d.management_mode = {}
                    AND d.last_verified_revision = s.revision AND d.last_verified_digest = s.digest
                    AND u.is_admin = 1 AND u.is_active = 1 AND u.archived_at IS NULL",
                 ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
-                ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9),
+                ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9), ph(kind,10),
             );
             let found = sql_query(query).bind::<Text, _>(&user_id)
                 .bind::<Text, _>(&scope.application_db_id)
@@ -170,6 +174,7 @@ impl Db {
                 .bind::<Text, _>(&scope.enrollment_id)
                 .bind::<BigInt, _>(expected_revision)
                 .bind::<Text, _>(&expected_digest)
+                .bind::<BigInt, _>(minimum_generation)
                 .bind::<BigInt, _>(crate::util::now_ts())
                 .bind::<Text, _>(crate::application_discovery::MANAGEMENT_MODE_WEBSITE)
                 .get_result::<LiveAxonV2Snapshot>(&mut conn).optional().map_err(AppError::from)?;
@@ -282,6 +287,8 @@ impl Db {
         &self,
         scope: AxonV2Enrollment,
         expected_generation: i64,
+        expected_revision: i64,
+        expected_digest: String,
     ) -> AppResult<()> {
         if scope.enrollment_id.is_empty() || expected_generation <= 0 {
             return Err(AppError::Forbidden);
@@ -302,12 +309,13 @@ impl Db {
                     "UPDATE axon_admin_authority_state SET withdrawn = 1, generation = generation + 1,
                      snapshot_json = NULL, expires_at = NULL
                      WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
-                       AND generation = {} AND withdrawn = 0",
-                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4),
+                       AND generation = {} AND revision = {} AND digest = {} AND withdrawn = 0",
+                    ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6),
                 );
                 if sql_query(update).bind::<Text, _>(&scope.organization_id)
                     .bind::<Text, _>(&scope.application_slug).bind::<Text, _>(&scope.enrollment_id)
-                    .bind::<BigInt, _>(expected_generation).execute(conn).map_err(AppError::from)? != 1
+                    .bind::<BigInt, _>(expected_generation).bind::<BigInt,_>(expected_revision)
+                    .bind::<Text,_>(&expected_digest).execute(conn).map_err(AppError::from)? != 1
                 {
                     return Err(AppError::Forbidden);
                 }

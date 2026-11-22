@@ -1,10 +1,41 @@
 """SQLite-only offline regression. No database file or migration runner."""
+import json
 from pathlib import Path
 import sqlite3
+import tempfile
 import unittest
 
 
 class AuthorityStateTest(unittest.TestCase):
+    def test_sqlite_restore_cannot_clear_independent_generation_floor(self):
+        with tempfile.TemporaryDirectory() as anchor_dir, \
+                tempfile.TemporaryDirectory() as backup_dir, \
+                sqlite3.connect(":memory:") as current, \
+                sqlite3.connect(Path(backup_dir) / "old.sqlite") as backup:
+            marker = Path(anchor_dir) / "floor.json"
+            current.executescript(Path(__file__).with_name("axon-admin-v2-tombstone.sql").read_text())
+            digest = "a" * 43
+            current.execute("""INSERT INTO axon_admin_authority_state
+                (organization_id,application_slug,enrollment_id,revision,digest,generation,withdrawn,snapshot_json,expires_at)
+                VALUES ('tenant','axon','enrollment',3,?,1,0,'{}',100)""", (digest,))
+            current.commit()
+            current.backup(backup)
+            current.execute("""UPDATE axon_admin_authority_state SET withdrawn=1, generation=2,
+                               snapshot_json=NULL, expires_at=NULL""")
+
+            def authorizes(db, generation, halted):
+                marker.write_text(json.dumps({"minimum_generation": generation, "halted": halted}))
+                retained = json.loads(marker.read_text())
+                return not retained["halted"] and db.execute("""SELECT 1 FROM axon_admin_authority_state
+                    WHERE organization_id='tenant' AND application_slug='axon' AND enrollment_id='enrollment'
+                    AND revision=3 AND digest=? AND generation>=? AND withdrawn=0 AND expires_at>50""",
+                    (digest, retained["minimum_generation"])).fetchone() is not None
+
+            self.assertTrue(authorizes(backup, 1, False))
+            self.assertFalse(authorizes(current, 2, True))
+            self.assertFalse(authorizes(backup, 2, True))
+            self.assertFalse(authorizes(backup, 2, False))
+
     def test_generation_and_snapshot_commit_or_fail_together(self):
         with sqlite3.connect(":memory:") as db:
             db.executescript(Path(__file__).with_name(

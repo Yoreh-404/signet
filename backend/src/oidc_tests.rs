@@ -1856,6 +1856,22 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         "output":"access_token","client_id":demo.client_id,"audience":resource,"permissions":permissions});
     let durable = json!({"application_id":app.slug,"revision":3,
         "_signet_axon_verified_signer":pin,"modules":{"axon_admin_mapping":mapping}}).to_string();
+    let anchor_dir = std::env::temp_dir().join(format!("signet-axon-floor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&anchor_dir).unwrap();
+    let marker = anchor_dir.join("authority-floor.json");
+    let set_floor = |generation: i64, halted: bool| {
+        let pending = anchor_dir.join("next.json");
+        std::fs::write(&pending, json!({
+            "organization_id": app.organization_id, "application_id": app.slug,
+            "enrollment_id": "fixture-enrollment", "minimum_generation": generation,
+            "revision": 3, "digest": "a".repeat(43), "halted": halted,
+        }).to_string()).unwrap();
+        let mut permissions = std::fs::metadata(&pending).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&pending, permissions).unwrap();
+        std::fs::rename(pending, &marker).unwrap();
+    };
+    set_floor(1, false);
     state.settings.discovery.axon_admin_trust = Some(crate::config::AxonAdminTrust {
         origin: origin.into(), organization_id: app.organization_id.clone(),
         application_id: app.slug.clone(), client_id: demo.client_id.clone(),
@@ -1866,6 +1882,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         permissions: permissions.clone(), issuer: issuer.clone(),
         introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
         signed_withdrawal: false,
+        rollback_marker_path: Some(marker.to_string_lossy().into_owned()),
     });
     state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
         application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
@@ -1909,7 +1926,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         application_slug: app.slug.clone(), enrollment_id: "fixture-enrollment".into(),
         website_origin: origin.into(), signer_pin: pin.clone(),
     };
-    assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, "a".repeat(43))
+    assert!(state.db.live_axon_v2_snapshot(enrollment, user.id.clone(), 3, "a".repeat(43), 1)
         .await.unwrap().is_some(), "v2 enrolled current snapshot was not visible");
     let authz = crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &user).await.unwrap();
     assert!(matches!(authz.binding.as_ref().unwrap().protocol.as_str(), "oidc" | "oauth2_oidc"));
@@ -1959,6 +1976,17 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&user.id).execute(&mut conn).unwrap();
     }
     assert!(oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await["active"] == true);
+    let backup = std::env::temp_dir().join(format!("signet-axon-restore-{}.sqlite", uuid::Uuid::new_v4()));
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("VACUUM INTO ?").bind::<Text,_>(backup.to_string_lossy().as_ref())
+            .execute(&mut conn).unwrap();
+    }
+    set_floor(2, true);
+    assert_eq!(
+        oidc_http_body_json(router.clone().oneshot(request()).await.unwrap()).await,
+        json!({"active":false}),
+    );
     let control = crate::application_discovery::run_axon_v2_operator_command(
         &state.settings, &state.db, &["disable".into(), "1".into()],
     ).await;
@@ -1968,7 +1996,24 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     assert!(crate::application_discovery::run_axon_v2_operator_command(
         &state.settings, &state.db, &["reapprove".into(), "2".into()],
     ).await.is_err(), "same signed revision cannot reopen a disabled enrollment");
+    // Restore only the SQLite backup. The independently retained marker is
+    // intentionally not part of it. Even clearing halt leaves generation 2
+    // as a floor, making the backup's previously live generation 1 inert.
+    set_floor(2, false);
+    let mut restored_settings = state.settings.clone();
+    restored_settings.database.url = backup.to_string_lossy().into_owned();
+    let restored_db = crate::db::Db::connect(&restored_settings).unwrap();
+    let restored = AppState::new(restored_settings, restored_db, state.jwt.clone());
+    let restored_router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
+        super::oidc_resource::introspect)).with_state(restored);
+    assert_eq!(
+        oidc_http_body_json(restored_router.oneshot(request()).await.unwrap()).await,
+        json!({"active":false}),
+        "restoring a still-live same revision must not restore disabled authority",
+    );
     drop(state);
+    let _ = std::fs::remove_file(backup);
+    let _ = std::fs::remove_dir_all(anchor_dir);
     let _ = std::fs::remove_file(path);
 }
 

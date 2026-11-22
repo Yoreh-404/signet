@@ -270,6 +270,8 @@ pub struct AxonAdminV2Policy {
     pub activation_epoch: i64,
     #[serde(default)]
     pub signed_withdrawal: bool,
+    #[serde(default)]
+    pub rollback_marker_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

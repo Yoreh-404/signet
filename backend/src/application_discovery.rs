@@ -39,6 +39,8 @@ mod normalization;
 #[path = "application_discovery/normalization_tests.rs"]
 mod normalization_tests;
 mod pure;
+mod axon_v2_rollback;
+pub(crate) use axon_v2_rollback::{AxonRollbackFloor, read_axon_rollback_floor};
 use crypto::{PinnedJwks, verify_jws, verify_jws_with_embedded_key};
 use normalization::{
     contract_authorization_module, index_policy_effects, normalize_authorization_bindings,
@@ -64,6 +66,8 @@ pub async fn run_axon_v2_operator_command(
     let (Some(policy), Some(trust)) = (
         settings.discovery.axon_admin_v2.as_ref(), settings.discovery.axon_admin_trust.as_ref(),
     ) else { return Err(AppError::Forbidden); };
+    let floor = read_axon_rollback_floor(policy, trust).ok_or_else(||
+        AppError::Configuration("Axon authority requires an independent rollback marker".into()))?;
     let pin = axon_signer_pin(&trust.signing_public_jwks).ok_or(AppError::Forbidden)?;
     let app = db.find_application_by_slug_in_organization(&trust.organization_id, &trust.application_id)
         .await?.ok_or(AppError::Forbidden)?;
@@ -78,23 +82,35 @@ pub async fn run_axon_v2_operator_command(
     match args {
         [command, prior_revision, prior_digest] if command == "prepare" => {
             let revision = prior_revision.parse::<i64>().map_err(|_| AppError::Forbidden)?;
-            if policy.revision <= revision || policy.signed_withdrawal {
+            if policy.revision <= revision || policy.signed_withdrawal
+                || floor.halted || floor.minimum_generation != 1 || floor.revision != revision
+                || floor.digest != *prior_digest
+            {
                 return Err(AppError::Forbidden);
             }
             db.prepare_axon_v2_reservation(scope, revision, prior_digest.clone()).await
         }
         [command, generation] if command == "disable" => {
             let generation = generation.parse::<i64>().map_err(|_| AppError::Forbidden)?;
-            db.disable_axon_v2_reservation(scope, generation).await
+            if !floor.halted || generation.checked_add(1) != Some(floor.minimum_generation) {
+                return Err(AppError::Forbidden);
+            }
+            db.disable_axon_v2_reservation(scope, generation, floor.revision, floor.digest).await
         }
         [command, generation] if command == "reapprove" && !policy.signed_withdrawal => {
             let generation = generation.parse::<i64>().map_err(|_| AppError::Forbidden)?;
-            db.reopen_axon_v2_reservation(scope, generation, policy.revision).await
+            if !floor.halted || generation != floor.minimum_generation || policy.revision <= floor.revision {
+                return Err(AppError::Forbidden);
+            }
+            db.reopen_axon_v2_reservation(
+                scope, generation, policy.revision, floor.revision, floor.digest,
+            ).await
         }
         [command] if command == "status" => {
             let status = db.axon_v2_reservation_status(scope).await?;
-            println!("revision={} digest={} generation={} withdrawn={}",
-                status.revision, status.digest, status.generation, status.withdrawn != 0);
+            println!("revision={} digest={} generation={} withdrawn={} independent_floor={} halted={}",
+                status.revision, status.digest, status.generation, status.withdrawn != 0,
+                floor.minimum_generation, floor.halted);
             Ok(())
         }
         _ => Err(AppError::BadRequest("usage: axon-v2 prepare <prior-revision> <prior-digest> | status | disable <generation> | reapprove <generation>".into())),
@@ -163,8 +179,8 @@ enum SyncManifest {
     Incumbent(VerifiedApplicationManifest),
     AxonV2 {
         manifest: VerifiedAxonDeclaration,
-        enrollment: String,
-        digest: String,
+        policy: crate::config::AxonAdminV2Policy,
+        trust: crate::config::AxonAdminTrust,
     },
 }
 
@@ -246,10 +262,10 @@ impl DiscoveryLease {
             SyncManifest::Incumbent(manifest) => state.db.commit_application_discovery_if_owner(
                 &self.application_id, &self.owner_token, self.lease_generation, manifest.into(),
             ).await.map(Some),
-            SyncManifest::AxonV2 { manifest, enrollment, digest } =>
+            SyncManifest::AxonV2 { manifest, policy, trust } =>
                 state.db.commit_axon_v2_discovery_if_owner(
                     &self.application_id, &self.owner_token, self.lease_generation,
-                    enrollment, &digest, manifest,
+                    manifest, policy, trust,
                 ).await.map(Some),
         }
     }
@@ -1493,6 +1509,14 @@ async fn sync_axon_v2_if_approved(
     if application.slug != trust.application_id || application.organization_id != trust.organization_id {
         return Ok(None);
     }
+    let floor = read_axon_rollback_floor(policy, trust).ok_or_else(|| SyncFailure::unknown(
+        AppError::Configuration("Axon authority requires an independent rollback marker".into()),
+    ))?;
+    if (floor.halted && !policy.signed_withdrawal)
+        || policy.revision < floor.revision || (policy.revision == floor.revision && policy.digest != floor.digest)
+    {
+        return Err(SyncFailure::rejected(AppError::Forbidden));
+    }
     let website = website_origin(&discovery.website_url).map_err(SyncFailure::unknown)?;
     let audience = state.settings.oidc.issuer.trim_end_matches('/');
     if website != trust.origin || policy.issuer != audience || audience.is_empty()
@@ -1531,7 +1555,7 @@ async fn sync_axon_v2_if_approved(
         policy.signed_withdrawal, challenge.as_deref().map(|value| (value, ttl)),
     ).map_err(SyncFailure::rejected)?;
     Ok(Some(SyncManifest::AxonV2 {
-        manifest, enrollment: policy.enrollment_id.clone(), digest: policy.digest.clone(),
+        manifest, policy: policy.clone(), trust: trust.clone(),
     }))
 }
 

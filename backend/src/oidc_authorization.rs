@@ -214,8 +214,16 @@ pub(crate) async fn project_axon_admin_v2(
         website_origin: trust.origin.clone(),
         signer_pin: pin.clone(),
     };
+    let Some(floor) = crate::application_discovery::read_axon_rollback_floor(policy, trust) else {
+        return Ok(None);
+    };
+    if floor.halted || policy.revision < floor.revision
+        || (policy.revision == floor.revision && policy.digest != floor.digest)
+    {
+        return Ok(None);
+    }
     let Some(current) = state.db.live_axon_v2_snapshot(
-        enrollment, user.id.clone(), policy.revision, policy.digest.clone(),
+        enrollment, user.id.clone(), policy.revision, policy.digest.clone(), floor.minimum_generation,
     ).await? else {
         return Ok(None);
     };
@@ -223,6 +231,9 @@ pub(crate) async fn project_axon_admin_v2(
         session.expires_at > crate::util::now_ts()
             && crate::util::session_public_id(&session.id) == public_session_id
     }) {
+        return Ok(None);
+    }
+    if crate::application_discovery::read_axon_rollback_floor(policy, trust).as_ref() != Some(&floor) {
         return Ok(None);
     }
     project_current_axon_v2(&current, trust, &pin, policy)
@@ -271,6 +282,7 @@ mod axon_mapping_tests {
             issuer: "https://signet.example".into(), introspection_client_id: "operator-resource".into(),
             activation_epoch: 1,
             signed_withdrawal: false,
+            rollback_marker_path: None,
         };
         let mut current = json!({
             "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",
