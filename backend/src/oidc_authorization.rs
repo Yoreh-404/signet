@@ -138,10 +138,109 @@ fn verified_axon_admin(
         }))).then_some(Value::Bool(is_admin == 1))
 }
 
+/// Dedicated authorization-code access-token projection candidate.
+/// No endpoint caller until the confidential live-authority check is paired.
+#[allow(dead_code)]
+pub(crate) async fn project_axon_admin_v2(
+    state: &AppState,
+    snapshot: &AuthorizationSnapshot,
+    client: &ClientRecord,
+    user: &UserRecord,
+    audience: Option<&str>,
+    public_session_id: &str,
+    scope: &str,
+) -> AppResult<Option<Value>> {
+    let Some(policy) = state.settings.discovery.axon_admin_v2.as_ref() else {
+        return Ok(None);
+    };
+    let (Some(app), Some(binding)) = (&snapshot.application, &snapshot.binding) else {
+        return Ok(None);
+    };
+    if scope != "openid" || public_session_id.is_empty() {
+        return Ok(None);
+    }
+    let Some((trust, pin, _)) = trusted_axon_client(state, client, app, binding).await? else {
+        return Ok(None);
+    };
+    if audience != Some(trust.audience.as_str())
+        || policy.enrollment_id.is_empty() || policy.revision <= 0
+        || policy.permissions.is_empty()
+        || !policy.permissions.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return Ok(None);
+    }
+    let enrollment = crate::db::AxonV2Enrollment {
+        application_db_id: app.id.clone(),
+        organization_id: trust.organization_id.clone(),
+        application_slug: trust.application_id.clone(),
+        enrollment_id: policy.enrollment_id.clone(),
+        website_origin: trust.origin.clone(),
+        signer_pin: pin.clone(),
+    };
+    let Some(current) = state.db.live_axon_v2_snapshot(
+        enrollment, user.id.clone(), policy.revision, policy.digest.clone(),
+    ).await? else {
+        return Ok(None);
+    };
+    project_current_axon_v2(&current, trust, &pin, policy)
+}
+
+fn project_current_axon_v2(
+    current: &Value, trust: &crate::config::AxonAdminTrust, pin: &str,
+    policy: &crate::config::AxonAdminV2Policy,
+) -> AppResult<Option<Value>> {
+    let mapping = serde_json::json!({
+        "version": 2, "source": "signet.is_admin",
+        "claim": claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM, "output": "access_token",
+        "client_id": trust.client_id, "audience": trust.audience, "permissions": policy.permissions,
+    });
+    if current["application_id"].as_str() != Some(trust.application_id.as_str())
+        || current["_signet_axon_verified_signer"].as_str() != Some(pin)
+        || current["revision"].as_i64() != Some(policy.revision)
+        || current["modules"]["axon_admin_mapping"] != mapping
+    {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "version": 2, "application_id": trust.application_id,
+        "revision": policy.revision, "permissions": policy.permissions,
+    })))
+}
+
 #[cfg(test)]
 mod axon_mapping_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn v2_projects_only_the_complete_approved_catalog() {
+        let permissions: Vec<String> = serde_json::from_str(include_str!(
+            "../tests/fixtures/axon-admin-v2-catalog.json"
+        )).unwrap();
+        assert_eq!(permissions.len(), 169);
+        let trust = crate::config::AxonAdminTrust {
+            origin: "https://axon.example".into(), organization_id: "test".into(),
+            application_id: "axon".into(), client_id: "operator-browser".into(),
+            audience: "https://axon.example/api".into(), signing_public_jwks: String::new(),
+        };
+        let policy = crate::config::AxonAdminV2Policy {
+            enrollment_id: "test".into(), revision: 3, digest: "a".repeat(43), permissions,
+        };
+        let mut current = json!({
+            "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",
+            "modules": { "axon_admin_mapping": {
+                "version": 2, "source": "signet.is_admin", "claim": "axon_admin_authority",
+                "output": "access_token", "client_id": trust.client_id, "audience": trust.audience,
+                "permissions": policy.permissions,
+            } }
+        });
+        let claim = project_current_axon_v2(&current, &trust, "test-pin", &policy).unwrap().unwrap();
+        assert_eq!(claim, json!({
+            "version": 2, "application_id": "axon", "revision": 3, "permissions": policy.permissions,
+        }));
+        current["modules"]["axon_admin_mapping"]["permissions"].as_array_mut().unwrap().pop();
+        assert!(project_current_axon_v2(&current, &trust, "test-pin", &policy).unwrap().is_none());
+    }
 
     #[test]
     fn axon_mapping_requires_exact_signer_and_resource_and_uses_current_admin_bit() {

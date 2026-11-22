@@ -29,8 +29,64 @@ pub(crate) struct AxonV2Reservation {
     pub withdrawn: i32,
 }
 
+#[derive(diesel::QueryableByName)]
+struct LiveAxonV2Snapshot {
+    #[diesel(sql_type = Text)]
+    snapshot_json: String,
+    #[diesel(sql_type = Text)]
+    website_url: String,
+    #[diesel(sql_type = Text)]
+    signing_public_jwks: String,
+}
+
 #[allow(dead_code)] // Future guarded reconciliation caller.
 impl Db {
+    /// One consistent statement snapshot of the fenced authority and global user.
+    pub(crate) async fn live_axon_v2_snapshot(
+        &self,
+        scope: AxonV2Enrollment,
+        user_id: String,
+        expected_revision: i64,
+        expected_digest: String,
+    ) -> AppResult<Option<serde_json::Value>> {
+        with_conn!(self, |conn, kind| {
+            let query = format!(
+                "SELECT s.snapshot_json, d.website_url, d.signing_public_jwks
+                 FROM axon_admin_authority_state s
+                 JOIN applications a ON a.organization_id = s.organization_id AND a.slug = s.application_slug
+                 JOIN application_discovery d ON d.application_id = a.id
+                 JOIN users u ON u.id = {}
+                 WHERE a.id = {} AND s.organization_id = {} AND s.application_slug = {}
+                   AND s.enrollment_id = {} AND s.revision = {} AND s.digest = {}
+                   AND s.withdrawn = 0 AND s.snapshot_json IS NOT NULL AND s.expires_at > {}
+                   AND a.is_active = 1 AND d.operator_disabled = 0 AND d.management_mode = {}
+                   AND u.is_admin = 1 AND u.is_active = 1 AND u.archived_at IS NULL",
+                ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
+                ph(kind,6), ph(kind,7), ph(kind,8), ph(kind,9),
+            );
+            let found = sql_query(query).bind::<Text, _>(&user_id)
+                .bind::<Text, _>(&scope.application_db_id)
+                .bind::<Text, _>(&scope.organization_id)
+                .bind::<Text, _>(&scope.application_slug)
+                .bind::<Text, _>(&scope.enrollment_id)
+                .bind::<BigInt, _>(expected_revision)
+                .bind::<Text, _>(&expected_digest)
+                .bind::<BigInt, _>(crate::util::now_ts())
+                .bind::<Text, _>(crate::application_discovery::MANAGEMENT_MODE_WEBSITE)
+                .get_result::<LiveAxonV2Snapshot>(&mut conn).optional().map_err(AppError::from)?;
+            let Some(row) = found else { return Ok(None); };
+            if crate::application_discovery::website_origin(&row.website_url).ok().as_deref()
+                != Some(scope.website_origin.as_str())
+                || crate::application_discovery::axon_signer_pin(&row.signing_public_jwks).as_deref()
+                    != Some(scope.signer_pin.as_str())
+            {
+                return Ok(None);
+            }
+            serde_json::from_str(&row.snapshot_json).map(Some)
+                .map_err(|_| AppError::Internal("invalid stored Axon declaration snapshot".into()))
+        })
+    }
+
     /// Atomically stage a verified higher-revision declaration and snapshot.
     /// Expected generation comes from the durable store, never the statement.
     /// Operator disable/reapproval are separate controls, not parameters here.

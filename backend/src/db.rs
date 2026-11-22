@@ -144,6 +144,8 @@ mod application_discovery;
 mod application_discovery_read;
 mod application_discovery_types;
 mod axon_v2_authority;
+#[allow(unused_imports)] // Only exposed to the coordinated v2 OIDC boundary.
+pub(crate) use axon_v2_authority::AxonV2Enrollment;
 #[macro_use]
 mod application_write_sql;
 #[macro_use]

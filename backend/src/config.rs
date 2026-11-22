@@ -254,6 +254,17 @@ pub struct DiscoverySettings {
     pub auto_registration: AutoRegistrationSettings,
     #[serde(default)]
     pub axon_admin_trust: Option<AxonAdminTrust>,
+    #[serde(default)]
+    pub axon_admin_v2: Option<AxonAdminV2Policy>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AxonAdminV2Policy {
+    pub enrollment_id: String,
+    pub revision: i64,
+    pub digest: String,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -277,6 +288,7 @@ impl Default for DiscoverySettings {
             challenge_secret: String::new(),
             auto_registration: AutoRegistrationSettings::default(),
             axon_admin_trust: None,
+            axon_admin_v2: None,
         }
     }
 }
