@@ -139,8 +139,6 @@ fn verified_axon_admin(
 }
 
 /// Dedicated authorization-code access-token projection candidate.
-/// No endpoint caller until the confidential live-authority check is paired.
-#[allow(dead_code)]
 pub(crate) async fn project_axon_admin_v2(
     state: &AppState,
     snapshot: &AuthorizationSnapshot,
@@ -149,6 +147,7 @@ pub(crate) async fn project_axon_admin_v2(
     audience: Option<&str>,
     public_session_id: &str,
     scope: &str,
+    issuer: &str,
 ) -> AppResult<Option<Value>> {
     let Some(policy) = state.settings.discovery.axon_admin_v2.as_ref() else {
         return Ok(None);
@@ -156,7 +155,10 @@ pub(crate) async fn project_axon_admin_v2(
     let (Some(app), Some(binding)) = (&snapshot.application, &snapshot.binding) else {
         return Ok(None);
     };
-    if scope != "openid" || public_session_id.is_empty() {
+    if scope != "openid" || public_session_id.is_empty()
+        || issuer != policy.issuer || policy.introspection_client_id.is_empty()
+        || policy.activation_epoch <= 0 || crate::util::now_ts() < policy.activation_epoch
+    {
         return Ok(None);
     }
     let Some((trust, pin, _)) = trusted_axon_client(state, client, app, binding).await? else {
@@ -166,6 +168,16 @@ pub(crate) async fn project_axon_admin_v2(
         || policy.enrollment_id.is_empty() || policy.revision <= 0
         || policy.permissions.is_empty()
         || !policy.permissions.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return Ok(None);
+    }
+    let Some(verifier) = state.db.find_client_by_client_id(&policy.introspection_client_id).await?
+    else { return Ok(None); };
+    if verifier.is_active != 1 || verifier.token_endpoint_auth_method == "none"
+        || verifier.client_id == trust.client_id
+        || crate::dcr::is_website_client_id(&verifier.client_id)
+        || verifier.organization_id.as_deref() != Some(trust.organization_id.as_str())
+        || verifier.audience != trust.audience
     {
         return Ok(None);
     }
@@ -182,6 +194,12 @@ pub(crate) async fn project_axon_admin_v2(
     ).await? else {
         return Ok(None);
     };
+    if !state.db.list_user_sessions(&user.id).await?.iter().any(|session| {
+        session.expires_at > crate::util::now_ts()
+            && crate::util::session_public_id(&session.id) == public_session_id
+    }) {
+        return Ok(None);
+    }
     project_current_axon_v2(&current, trust, &pin, policy)
 }
 
@@ -225,6 +243,8 @@ mod axon_mapping_tests {
         };
         let policy = crate::config::AxonAdminV2Policy {
             enrollment_id: "test".into(), revision: 3, digest: "a".repeat(43), permissions,
+            issuer: "https://signet.example".into(), introspection_client_id: "operator-resource".into(),
+            activation_epoch: 1,
         };
         let mut current = json!({
             "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",

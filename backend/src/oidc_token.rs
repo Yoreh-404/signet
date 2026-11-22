@@ -764,6 +764,14 @@ pub(super) async fn issue_tokens_for_user(
             crate::oidc_authorization::apply_axon_admin_claim(
                 state, snapshot, client, &user, token_audience, public_sid, &mut access_claims,
             ).await?;
+            if consent_bound_code.is_some()
+                && let Some(authority) = crate::oidc_authorization::project_axon_admin_v2(
+                    state, snapshot, client, &user, token_audience, public_sid, &scope, issuer,
+                ).await?
+            {
+                access_claims.insert(crate::claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM.into(), authority);
+                access_claims.insert("sid".into(), serde_json::Value::String(public_sid.to_owned()));
+            }
         }
         state.jwt.sign_access_token_with_issuer_and_claims(
             issuer,

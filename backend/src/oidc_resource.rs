@@ -24,6 +24,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
 };
 use serde::Deserialize;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub(super) fn authorization_token(headers: &HeaderMap) -> AppResult<(&'static str, &str)> {
     let header = headers
@@ -190,7 +191,9 @@ pub(super) async fn introspect(
     if client.token_endpoint_auth_method == "none" {
         return Err(AppError::Unauthorized);
     }
-    let _hint = payload.token_type_hint.as_deref();
+    if payload.token_type_hint.as_deref() == Some(crate::claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM) {
+        return introspect_axon_admin_authority(&state, &client, &headers, &payload.token).await;
+    }
     let issuers = state.accepted_issuers(&headers).await?;
     let issuer_refs = issuers.iter().map(String::as_str).collect::<Vec<_>>();
     let expected_audience = introspection_audience(&client);
@@ -333,6 +336,61 @@ pub(super) async fn introspect(
         })));
     }
     Ok(Json(serde_json::json!({ "active": false })))
+}
+
+async fn introspect_axon_admin_authority(
+    state: &AppState,
+    verifier: &ClientRecord,
+    headers: &HeaderMap,
+    token: &str,
+) -> AppResult<Json<serde_json::Value>> {
+    use serde_json::{Value, json};
+    let inactive = || Ok(Json(json!({"active": false})));
+    let (Some(policy), Some(trust)) = (
+        state.settings.discovery.axon_admin_v2.as_ref(), state.settings.discovery.axon_admin_trust.as_ref(),
+    ) else {
+        return inactive();
+    };
+    if verifier.client_id != policy.introspection_client_id
+        || verifier.client_id == trust.client_id || verifier.is_active != 1
+        || crate::dcr::is_website_client_id(&verifier.client_id)
+        || verifier.organization_id.as_deref() != Some(trust.organization_id.as_str())
+        || introspection_audience(verifier) != trust.audience
+        || token.len() > 32_768
+    {
+        return inactive();
+    }
+    let issuers = state.accepted_issuers(headers).await?;
+    if !issuers.contains(&policy.issuer) {
+        return inactive();
+    }
+    let Ok(claims) = state.jwt.verify_access_token_for_introspection(token, &[&policy.issuer]) else {
+        return inactive();
+    };
+    if claims.iat < policy.activation_epoch || claims.iat > util::now_ts()
+        || claims.exp <= util::now_ts() || claims.aud != trust.audience
+        || claims.client_id != trust.client_id || claims.scope != "openid"
+        || claims.act.is_some() || claims.gpt_sso_login_code_level.is_some()
+    {
+        return inactive();
+    }
+    let Some(sid) = claims.sid.as_deref() else { return inactive(); };
+    let Some(source) = state.db.find_client_by_client_id(&claims.client_id).await? else { return inactive(); };
+    if !introspected_access_token_is_live(state, Some(&source), &claims).await? {
+        return inactive();
+    }
+    let Ok(user) = load_oidc_user(state, &claims.sub).await else { return inactive(); };
+    let Ok(snapshot) = AuthorizationSnapshot::load(state, &source, &user).await else { return inactive(); };
+    let Some(live) = crate::oidc_authorization::project_axon_admin_v2(
+        state, &snapshot, &source, &user, Some(&claims.aud), sid, &claims.scope, &claims.iss,
+    ).await? else { return inactive(); };
+    // Re-read the exact payload only after verifying this same access token.
+    let signed = token.split('.').nth(1).and_then(|raw| URL_SAFE_NO_PAD.decode(raw).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if signed.as_ref().and_then(|v| v.get(crate::claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM)) != Some(&live) {
+        return inactive();
+    }
+    Ok(Json(json!({"active": true, "axon_admin_authority": live})))
 }
 
 fn introspection_audience(client: &ClientRecord) -> String {

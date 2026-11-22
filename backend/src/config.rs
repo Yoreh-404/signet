@@ -265,6 +265,9 @@ pub struct AxonAdminV2Policy {
     pub revision: i64,
     pub digest: String,
     pub permissions: Vec<String>,
+    pub issuer: String,
+    pub introspection_client_id: String,
+    pub activation_epoch: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
