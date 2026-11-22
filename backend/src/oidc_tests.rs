@@ -7,6 +7,38 @@ use axum::{
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn reserved_authority_never_projects_from_stored_mappers() {
+    use crate::claim_mapper::{AXON_ADMIN_AUTHORITY_CLAIM, ClaimContext, ClaimOutputTarget, mapped_claims};
+    let (state, path) = test_app_state().await;
+    let user = insert_refresh_test_user(&state, "mapper").await;
+    let client = test_client();
+    let mapper = |name: &str| crate::db::ClientClaimMapperRecord {
+        id: name.to_owned(),
+        client_db_id: client.id.clone(),
+        claim_name: name.to_owned(),
+        source: "static".into(),
+        source_value: "true".into(),
+        value_type: "bool".into(),
+        include_in_id_token: 1,
+        include_in_access_token: 1,
+        include_in_userinfo: 1,
+        is_active: 1,
+        sort_order: 0,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let records = [mapper(AXON_ADMIN_AUTHORITY_CLAIM), mapper("axon_admin"), mapper("x-team")];
+    let context = ClaimContext { user: &user, client: &client, scope: "openid" };
+    for target in [ClaimOutputTarget::AccessToken, ClaimOutputTarget::IdToken, ClaimOutputTarget::UserInfo] {
+        let output = mapped_claims(&records, &context, target).unwrap();
+        assert!(!output.contains_key(AXON_ADMIN_AUTHORITY_CLAIM));
+        assert_eq!(output["axon_admin"], serde_json::json!(true));
+        assert_eq!(output["x-team"], serde_json::json!(true));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
 struct StubInteractionStore {
     request_uri: String,
     stored: Mutex<Vec<ResolvedAuthorizeRequest>>,
