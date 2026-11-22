@@ -1512,8 +1512,8 @@ async fn sync_axon_v2_if_approved(
     let floor = read_axon_rollback_floor(policy, trust).ok_or_else(|| SyncFailure::unknown(
         AppError::Configuration("Axon authority requires an independent rollback marker".into()),
     ))?;
-    if (floor.halted && !policy.signed_withdrawal)
-        || policy.revision < floor.revision || (policy.revision == floor.revision && policy.digest != floor.digest)
+    if (!floor.halted && policy.signed_withdrawal)
+        || policy.revision != floor.revision || policy.digest != floor.digest
     {
         return Err(SyncFailure::rejected(AppError::Forbidden));
     }

@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--digest")
     parser.add_argument("--activation-epoch", type=int)
     parser.add_argument("--rollback-marker", type=Path)
+    parser.add_argument("--rollback-marker-uid", type=int)
     parser.add_argument("--canonical-origins-isolated", action="store_true")
     args = parser.parse_args()
     fixture_dir = os.environ.get("AXON_V2_FIXTURE_DIR")
@@ -111,6 +112,9 @@ def main():
             "rollback_marker_path": str(args.rollback_marker.resolve()),
         }.items():
             text += f"{key} = {json.dumps(value)}\n"
+        if args.rollback_marker_uid is None or args.rollback_marker_uid < 0:
+            parser.error("v2 requires the externally verified rollback anchor owner UID")
+        text += f"rollback_marker_owner_uid = {args.rollback_marker_uid}\n"
     tomllib.loads(text)
     args.out.write_text(text)
 

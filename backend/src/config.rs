@@ -272,6 +272,8 @@ pub struct AxonAdminV2Policy {
     pub signed_withdrawal: bool,
     #[serde(default)]
     pub rollback_marker_path: Option<String>,
+    #[serde(default)]
+    pub rollback_marker_owner_uid: Option<u32>,
     /// Independent reviewed pin for destructive, account-specific v2 denial.
     #[serde(default)]
     pub account_revocations: Option<AxonAccountRevocations>,

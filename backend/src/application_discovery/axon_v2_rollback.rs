@@ -28,19 +28,9 @@ pub(crate) fn read_axon_rollback_floor(
     if !path.is_absolute() {
         return None;
     }
-    let info = path.symlink_metadata().ok()?;
-    if !info.is_file() || info.len() > 4096 {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if info.permissions().mode() & 0o222 != 0 {
-            return None;
-        }
-    }
+    let file = open_operator_anchor(path, policy.rollback_marker_owner_uid?, 4096)?;
     let mut bytes = Vec::new();
-    File::open(path).ok()?.take(4097).read_to_end(&mut bytes).ok()?;
+    file.take(4097).read_to_end(&mut bytes).ok()?;
     if bytes.len() > 4096 {
         return None;
     }
@@ -84,21 +74,11 @@ struct AccountEvidence {
 fn read_account_evidence(
     config: &crate::config::AxonAccountRevocations,
     floor: &AxonRollbackFloor,
+    owner: u32,
 ) -> Option<AccountEvidence> {
     let path = Path::new(&config.marker_path);
     if !path.is_absolute() { return None; }
-    let info = path.symlink_metadata().ok()?;
-    if !info.is_file() || info.len() > MAX_ACCOUNT_EVIDENCE { return None; }
-    let file = File::open(path).ok()?;
-    let opened = file.metadata().ok()?;
-    if !opened.is_file() || opened.len() > MAX_ACCOUNT_EVIDENCE { return None; }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if opened.permissions().mode() & 0o222 != 0
-            || (info.dev(), info.ino()) != (opened.dev(), opened.ino())
-        { return None; }
-    }
+    let file = open_operator_anchor(path, owner, MAX_ACCOUNT_EVIDENCE)?;
     let mut bytes = Vec::new();
     file.take(MAX_ACCOUNT_EVIDENCE + 1).read_to_end(&mut bytes).ok()?;
     if bytes.len() as u64 > MAX_ACCOUNT_EVIDENCE { return None; }
@@ -134,17 +114,19 @@ pub(crate) fn axon_account_may_project(
 ) -> bool {
     policy.account_revocations.as_ref().is_none_or(|config| {
         policy.revision == floor.revision && policy.digest == floor.digest
-            && read_account_evidence(config, floor).is_some_and(|evidence| {
+            && policy.rollback_marker_owner_uid
+                .and_then(|owner| read_account_evidence(config, floor, owner)).is_some_and(|evidence| {
                 evidence.revoked_account_ids.binary_search_by(|id| id.as_str().cmp(account_id)).is_err()
             })
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn exact_account_evidence_rejects_same_generation_replay_and_other_scope() {
@@ -152,6 +134,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("current.json");
         let next = dir.join("next.json");
+        let owner = rustix::process::geteuid().as_raw();
         let floor = AxonRollbackFloor {
             organization_id: "tenant".into(), application_id: "axon".into(), enrollment_id: "enrollment".into(),
             minimum_generation: 4, revision: 5, digest: "a".repeat(43), halted: false,
@@ -171,11 +154,13 @@ mod tests {
             }))
         };
         let write = |envelope: &serde_json::Value| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(&next, envelope.to_string()).unwrap();
             let mut permissions = std::fs::metadata(&next).unwrap().permissions();
             permissions.set_readonly(true);
             std::fs::set_permissions(&next, permissions).unwrap();
             std::fs::rename(&next, &path).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         };
         let mut config = crate::config::AxonAccountRevocations {
             marker_path:path.to_string_lossy().into_owned(),
@@ -183,33 +168,105 @@ mod tests {
             payload_digest:String::new(),
         };
         let (old_pin, old) = sign("tenant", &[], &key);
+        let read = |config: &crate::config::AxonAccountRevocations, floor: &AxonRollbackFloor| {
+            read_account_evidence(config, floor, owner)
+        };
         config.payload_digest = old_pin;
-        assert!(read_account_evidence(&config, &floor).is_none(), "missing is not a valid empty list");
+        assert!(read(&config, &floor).is_none(), "missing is not a valid empty list");
         write(&old);
-        assert!(read_account_evidence(&config, &floor).unwrap().revoked_account_ids.is_empty());
+        assert!(read(&config, &floor).unwrap().revoked_account_ids.is_empty());
         let (pin, current) = sign("tenant", &[user], &key);
         config.payload_digest = pin.clone();
-        assert!(read_account_evidence(&config, &floor).is_none(), "same-generation older valid proof");
+        assert!(read(&config, &floor).is_none(), "same-generation older valid proof");
         write(&current);
-        assert_eq!(read_account_evidence(&config, &floor).unwrap().revoked_account_ids, [user]);
-        assert!(!read_account_evidence(&config, &floor).unwrap().revoked_account_ids.contains(&other.into()));
+        assert_eq!(read(&config, &floor).unwrap().revoked_account_ids, [user]);
+        assert!(!read(&config, &floor).unwrap().revoked_account_ids.contains(&other.into()));
+        assert!(read_account_evidence(&config, &floor, owner.wrapping_add(1)).is_none());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read(&config, &floor).is_none(), "valid evidence on a writable parent is untrusted");
         let (_, wrong_key) = sign("tenant", &[user], &SigningKey::from_bytes(&[8;32]));
         write(&wrong_key);
-        assert!(read_account_evidence(&config, &floor).is_none());
+        assert!(read(&config, &floor).is_none());
         let (wrong_scope_pin, wrong_scope) = sign("different-tenant", &[user], &key);
         config.payload_digest = wrong_scope_pin;
         write(&wrong_scope);
-        assert!(read_account_evidence(&config, &floor).is_none());
+        assert!(read(&config, &floor).is_none());
         let (bad_pin, bad) = sign("tenant", &[other,user], &key);
         config.payload_digest = bad_pin;
         write(&bad);
-        assert!(read_account_evidence(&config, &floor).is_none());
+        assert!(read(&config, &floor).is_none());
         config.payload_digest = pin;
         write(&old);
-        assert!(read_account_evidence(&config, &floor).is_none(), "old file atomically restored");
+        assert!(read(&config, &floor).is_none(), "old file atomically restored");
         write(&current);
         let advanced_floor = AxonRollbackFloor { minimum_generation: 5, ..floor };
-        assert!(read_account_evidence(&config, &advanced_floor).is_none());
+        assert!(read(&config, &advanced_floor).is_none());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_operator_anchor(path: &Path, owner: u32, limit: u64) -> Option<File> {
+    use rustix::fs::{self, FileType, Mode, OFlags};
+    let parent = fs::open(
+        path.parent()?, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ).ok()?;
+    let trusted = fs::fstat(&parent).ok()?;
+    if trusted.st_uid != owner || trusted.st_mode & 0o222 != 0 {
+        return None;
+    }
+    let fd = fs::openat(
+        &parent, path.file_name()?, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ).ok()?;
+    let opened = fs::fstat(&fd).ok()?;
+    if opened.st_uid != owner || opened.st_mode & 0o222 != 0
+        || opened.st_size <= 0 || opened.st_size as u64 > limit
+        || FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+        || opened.st_dev != trusted.st_dev
+    {
+        return None;
+    }
+    // Test-only temp fixtures cannot mount a filesystem. Production requires
+    // both descriptors on an authenticated operator's read-only mount.
+    #[cfg(not(test))]
+    {
+        use rustix::fs::StatVfsMountFlags;
+        if owner == rustix::process::geteuid().as_raw()
+            || !fs::fstatvfs(&parent).ok()?.f_flag.contains(StatVfsMountFlags::RDONLY)
+            || !fs::fstatvfs(&fd).ok()?.f_flag.contains(StatVfsMountFlags::RDONLY)
+        {
+            return None;
+        }
+    }
+    Some(File::from(fd))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_operator_anchor(_: &Path, _: u32, _: u64) -> Option<File> {
+    None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn atomic_anchor_open_rejects_writable_parent_and_symlink() {
+    use std::{fs, os::unix::fs::{PermissionsExt, symlink}};
+    let dir = std::env::temp_dir().join(format!("signet-anchor-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let real = dir.join("real");
+    let link = dir.join("link");
+    fs::write(&real, b"synthetic anchor contents").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o400)).unwrap();
+    symlink(&real, &link).unwrap();
+    let owner = rustix::process::geteuid().as_raw();
+    assert!(open_operator_anchor(&real, owner, 4096).is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(open_operator_anchor(&link, owner, 4096).is_none());
+    assert!(open_operator_anchor(&real, owner.wrapping_add(1), 4096).is_none());
+    assert!(open_operator_anchor(&real, owner, 1).is_none());
+    assert!(open_operator_anchor(&real, owner, 4096).is_some());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(dir).unwrap();
 }

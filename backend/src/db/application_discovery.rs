@@ -907,8 +907,8 @@ impl Db {
                 if let Some((verified, policy, trust)) = authority.as_ref() {
                     let floor = crate::application_discovery::read_axon_rollback_floor(policy, trust)
                         .ok_or(AppError::Forbidden)?;
-                    if (floor.halted && !verified.is_withdrawal()) || manifest.revision < floor.revision
-                        || (manifest.revision == floor.revision && manifest.digest != floor.digest)
+                    if (!floor.halted && verified.is_withdrawal()) || manifest.revision != floor.revision
+                        || manifest.digest != floor.digest
                     {
                         return Err(AppError::Forbidden);
                     }
@@ -940,13 +940,12 @@ impl Db {
                          SET generation = CASE WHEN revision < {} THEN generation + 1 ELSE generation END,
                              revision = {}, digest = {}, withdrawn = {}, snapshot_json = {}, expires_at = {}
                          WHERE organization_id = {} AND application_slug = {} AND enrollment_id = {}
-                           AND generation >= {} AND (revision > {} OR (revision = {} AND digest = {}))
-                           AND ((revision < {} AND withdrawn = 0)
-                              OR (revision = {} AND digest = {} AND withdrawn = {}
+                           AND ((revision < {} AND withdrawn = 0 AND generation = {} AND {} = 1)
+                              OR (revision = {} AND digest = {} AND generation >= {} AND withdrawn = {}
                                   AND (expires_at IS NULL OR expires_at <= {})))",
                         ph(kind,1),ph(kind,2),ph(kind,3),ph(kind,4),ph(kind,5),ph(kind,6),ph(kind,7),
                         ph(kind,8),ph(kind,9),ph(kind,10),ph(kind,11),ph(kind,12),ph(kind,13),ph(kind,14),
-                        ph(kind,15),ph(kind,16),ph(kind,17),ph(kind,18),
+                        ph(kind,15),ph(kind,16),ph(kind,17),
                     );
                     if sql_query(publish)
                         .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
@@ -954,10 +953,10 @@ impl Db {
                         .bind::<Nullable<Text>,_>((withdrawn == 0).then_some(snapshot_json.as_str()))
                         .bind::<Nullable<BigInt>,_>((withdrawn == 0).then_some(manifest.expires_at))
                         .bind::<Text,_>(&app.organization_id).bind::<Text,_>(&app.slug).bind::<Text,_>(&policy.enrollment_id)
-                        .bind::<BigInt,_>(floor.minimum_generation).bind::<BigInt,_>(floor.revision)
-                        .bind::<BigInt,_>(floor.revision).bind::<Text,_>(&floor.digest)
-                        .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(manifest.revision)
-                        .bind::<Text,_>(&manifest.digest).bind::<Integer,_>(withdrawn)
+                        .bind::<BigInt,_>(manifest.revision).bind::<BigInt,_>(floor.minimum_generation-1)
+                        .bind::<Integer,_>(i32::from(floor.halted))
+                        .bind::<BigInt,_>(manifest.revision).bind::<Text,_>(&manifest.digest)
+                        .bind::<BigInt,_>(floor.minimum_generation).bind::<Integer,_>(withdrawn)
                         .bind::<BigInt,_>(manifest.expires_at)
                         .execute(conn).map_err(AppError::from)? != 1
                     {
