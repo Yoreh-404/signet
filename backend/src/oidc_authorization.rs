@@ -18,6 +18,12 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
+pub(crate) fn reserve_axon_admin_claim(state: &AppState, client: &ClientRecord) -> bool {
+    crate::dcr::is_website_client_id(&client.client_id)
+        || state.settings.discovery.axon_admin_trust.as_ref()
+            .is_some_and(|trust| trust.client_id == client.client_id)
+}
+
 pub(crate) async fn apply_axon_admin_claim(
     state: &AppState,
     snapshot: &AuthorizationSnapshot,
@@ -130,6 +136,7 @@ pub(crate) struct AuthorizationSnapshot {
     pub(crate) binding: Option<ApplicationClientBindingRecord>,
     pub(crate) mappers: Vec<ClientClaimMapperRecord>,
     pub(crate) entitlements: Option<authorization::ApplicationEntitlements>,
+    reserve_axon_admin: bool,
 }
 
 /// Client-connection claims without application/user entitlements.  Login
@@ -138,6 +145,7 @@ pub(crate) struct AuthorizationSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct ClientClaimsSnapshot {
     pub(crate) mappers: Vec<ClientClaimMapperRecord>,
+    reserve_axon_admin: bool,
 }
 
 impl AuthorizationSnapshot {
@@ -169,6 +177,7 @@ impl AuthorizationSnapshot {
             binding,
             mappers,
             entitlements,
+            reserve_axon_admin: reserve_axon_admin_claim(state, client),
         })
     }
 
@@ -204,6 +213,9 @@ impl AuthorizationSnapshot {
                 Value::String(entitlements.policy_version.clone()),
             );
         }
+        if self.reserve_axon_admin {
+            claims.remove("axon_admin");
+        }
         Ok(claims)
     }
 }
@@ -212,6 +224,7 @@ impl ClientClaimsSnapshot {
     pub(crate) async fn load(state: &AppState, client: &ClientRecord) -> AppResult<Self> {
         Ok(Self {
             mappers: state.db.list_client_claim_mappers(&client.id).await?,
+            reserve_axon_admin: reserve_axon_admin_claim(state, client),
         })
     }
 
@@ -222,7 +235,11 @@ impl ClientClaimsSnapshot {
         scope: &str,
         target: ClaimOutputTarget,
     ) -> AppResult<Map<String, Value>> {
-        client_claims_for_user(&self.mappers, client, user, scope, target)
+        let mut claims = client_claims_for_user(&self.mappers, client, user, scope, target)?;
+        if self.reserve_axon_admin {
+            claims.remove("axon_admin");
+        }
+        Ok(claims)
     }
 }
 

@@ -296,6 +296,9 @@ pub async fn exchange_token(
         },
         ClaimOutputTarget::AccessToken,
     )?;
+    if crate::oidc_authorization::reserve_axon_admin_claim(state, client) {
+        extra_claims.remove("axon_admin");
+    }
     extra_claims.insert("act".to_string(), actor);
     extra_claims.insert(
         "grant_id".to_string(),
