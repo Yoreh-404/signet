@@ -1885,6 +1885,7 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
         introspection_client_id: verifier.client_id.clone(), activation_epoch: now - 1,
         signed_withdrawal: false,
         rollback_marker_path: Some(marker.to_string_lossy().into_owned()),
+        account_revocations: None,
     });
     state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
         application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
@@ -2013,6 +2014,65 @@ async fn axon_v2_ordinary_code_issues_full_access_only_and_rechecks_authority() 
     // Negative control: the old role itself was in the backup. An unchanged
     // application floor does not independently remember account demotions.
     assert_eq!(oidc_http_body_json(restored_router.clone().oneshot(request()).await.unwrap()).await["active"], true);
+    {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let account_marker = anchor_dir.join("account-revocations.json");
+        let sign = |ids: Vec<String>| {
+            let payload = json!({
+                "format":"signet-axon-account-revocations/v1",
+                "organization_id":app.organization_id,"application_id":app.slug,
+                "enrollment_id":"fixture-enrollment","minimum_generation":1,"revision":3,
+                "digest":"a".repeat(43),"revoked_account_ids":ids,
+            }).to_string();
+            let digest = util::sha256_base64url(&payload);
+            let signature = key.sign(payload.as_bytes());
+            (digest, json!({"payload":URL_SAFE_NO_PAD.encode(payload),"signature":URL_SAFE_NO_PAD.encode(signature.to_bytes())}))
+        };
+        let write = |value: &Value| {
+            let next = anchor_dir.join("next-account.json");
+            std::fs::write(&next, value.to_string()).unwrap();
+            let mut permissions = std::fs::metadata(&next).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&next, permissions).unwrap();
+            std::fs::rename(next, &account_marker).unwrap();
+        };
+        let (old_digest, old) = sign(vec![]);
+        let (new_digest, updated) = sign(vec![demoted.id.clone()]);
+        let reopen = |digest: String| {
+            let mut settings = restored.settings.clone();
+            settings.discovery.axon_admin_v2.as_mut().unwrap().account_revocations =
+                Some(crate::config::AxonAccountRevocations {
+                    marker_path:account_marker.to_string_lossy().into_owned(),
+                    signing_public_key:URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+                    payload_digest:digest,
+                });
+            let db = crate::db::Db::connect(&settings).unwrap();
+            AppState::new(settings, db, state.jwt.clone())
+        };
+        let introspection = |s: AppState| axum::Router::new().route("/oauth2/introspect", axum::routing::post(
+            super::oidc_resource::introspect)).with_state(s);
+        write(&old);
+        assert_eq!(oidc_http_body_json(introspection(reopen(old_digest)).oneshot(request()).await.unwrap()).await["active"], true);
+        let fenced = reopen(new_digest.clone());
+        assert_eq!(oidc_http_body_json(introspection(fenced.clone()).oneshot(request()).await.unwrap()).await, json!({"active":false}));
+        write(&updated);
+        assert_eq!(oidc_http_body_json(introspection(fenced.clone()).oneshot(request()).await.unwrap()).await, json!({"active":false}));
+        ordinary(&exchange(&fenced, "synthetic-restored-signed-account-revocation").await);
+        let operator_jar = auth::issue_session_with_login_event(&fenced, CookieJar::new(), &HeaderMap::new(),
+            None, &operator, "password", auth::LoginEventContext::default()).await.unwrap();
+        let operator_session = auth::require_current_user(&fenced, &operator_jar).await.unwrap();
+        let operator_sid = util::session_public_id(&operator_session.session_id);
+        let client = test_refresh_client(&fenced).await;
+        let operator_binding = crate::oidc_authorization::AuthorizationSnapshot::load(&fenced, &client, &operator).await.unwrap();
+        assert_eq!(crate::oidc_authorization::project_axon_admin_v2(
+            &fenced, &operator_binding, &client, &operator, Some(resource), &operator_sid, "openid", &issuer,
+        ).await.unwrap(), Some(expected.clone()), "another current global administrator is not revoked");
+        write(&old);
+        let restarted = reopen(new_digest);
+        assert_eq!(oidc_http_body_json(introspection(restarted.clone()).oneshot(request()).await.unwrap()).await, json!({"active":false}));
+        ordinary(&exchange(&restarted, "synthetic-restored-account-replay-denied").await);
+    }
     set_floor(2, true);
     assert_eq!(
         oidc_http_body_json(restored_router.clone().oneshot(request()).await.unwrap()).await,

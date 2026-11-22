@@ -29,3 +29,35 @@ and fresh v2 issuance against the restored backup. The same OIDC identity can
 still receive an ID token without the privileged projection. This does not
 qualify a production restore, PostgreSQL restore, automated role journal, or
 an online cross-service cutover.
+
+## Optional independently pinned account denials
+
+With explicitly configured `discovery.axon_admin_v2.account_revocations`,
+the v2 projection requires a matching signed evidence file. Configure an
+absolute `marker_path`, the independent Ed25519 `signing_public_key`
+(unpadded base64url raw public key), and the reviewed `payload_digest`
+(unpadded base64url SHA-256 of the exact signed payload bytes).
+
+The read-only regular file contains a JSON envelope with unpadded base64url
+`payload` and `signature`. The Ed25519 signature covers the exact payload
+bytes. The payload is JSON with format `signet-axon-account-revocations/v1`,
+the floor's `organization_id`, `application_id`, `enrollment_id`,
+`minimum_generation`, `revision`, and `digest`, and a lexically sorted
+unique `revoked_account_ids` list of at most 512 canonical Signet account UUIDs.
+A correctly signed empty list is valid; an absent or invalid file denies all
+v2 authority for the enrollment. A valid list denies only the named accounts.
+Signed evidence never grants authority or changes a Signet role.
+The independently retained floor revision and digest must match the active
+configured declaration exactly in this mode. A transitional mismatch remains
+halted for v2 projection until independently reconciled.
+
+Keep both evidence and its reviewed config pin independently of database
+backups, in an operator-owned location that the service cannot replace.
+An older valid file at the same generation fails the digest pin.
+Installing a new list is a reviewed operator procedure: halt the enrollment
+and stop serving old-config replicas, atomically replace the evidence, and
+restart with the new independently retained pin before reopening. Do not
+reopen based on an old pin, remove denials as part of a restore, or use
+these files as a substitute for current role reconciliation. There is no
+automatic journal, automatic unrevocation, or protection if both independent
+inputs are rolled back.

@@ -219,6 +219,7 @@ pub(crate) async fn project_axon_admin_v2(
     };
     if floor.halted || policy.revision < floor.revision
         || (policy.revision == floor.revision && policy.digest != floor.digest)
+        || !crate::application_discovery::axon_account_may_project(policy, &floor, &user.id)
     {
         return Ok(None);
     }
@@ -233,7 +234,9 @@ pub(crate) async fn project_axon_admin_v2(
     }) {
         return Ok(None);
     }
-    if crate::application_discovery::read_axon_rollback_floor(policy, trust).as_ref() != Some(&floor) {
+    if crate::application_discovery::read_axon_rollback_floor(policy, trust).as_ref() != Some(&floor)
+        || !crate::application_discovery::axon_account_may_project(policy, &floor, &user.id)
+    {
         return Ok(None);
     }
     project_current_axon_v2(&current, trust, &pin, policy)
@@ -271,7 +274,7 @@ mod axon_mapping_tests {
         let permissions: Vec<String> = serde_json::from_str(include_str!(
             "../tests/fixtures/axon-admin-v2-catalog.json"
         )).unwrap();
-        assert_eq!(permissions.len(), 169);
+        assert_eq!(permissions.len(), 171);
         let trust = crate::config::AxonAdminTrust {
             origin: "https://axon.example".into(), organization_id: "test".into(),
             application_id: "axon".into(), client_id: "operator-browser".into(),
@@ -283,6 +286,7 @@ mod axon_mapping_tests {
             activation_epoch: 1,
             signed_withdrawal: false,
             rollback_marker_path: None,
+            account_revocations: None,
         };
         let mut current = json!({
             "application_id": "axon", "revision": 3, "_signet_axon_verified_signer": "test-pin",

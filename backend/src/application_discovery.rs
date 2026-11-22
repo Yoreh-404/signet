@@ -40,7 +40,7 @@ mod normalization;
 mod normalization_tests;
 mod pure;
 mod axon_v2_rollback;
-pub(crate) use axon_v2_rollback::{AxonRollbackFloor, read_axon_rollback_floor};
+pub(crate) use axon_v2_rollback::{axon_account_may_project, read_axon_rollback_floor};
 use crypto::{PinnedJwks, verify_jws, verify_jws_with_embedded_key};
 use normalization::{
     contract_authorization_module, index_policy_effects, normalize_authorization_bindings,
