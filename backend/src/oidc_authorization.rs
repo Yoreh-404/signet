@@ -33,17 +33,30 @@ pub(crate) async fn apply_axon_admin_claim(
     public_session_id: &str,
     claims: &mut Map<String, Value>,
 ) -> AppResult<()> {
-    let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref() else {
+    let (Some(app), Some(binding)) = (&snapshot.application, &snapshot.binding) else {
         return Ok(());
     };
-    let (Some(app), Some(binding), Some(pin)) = (
-        &snapshot.application,
-        &snapshot.binding,
-        crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks),
-    ) else { return Ok(()) };
+    if let Some((trust, pin, contract)) = trusted_axon_client(state, client, app, binding).await?
+        && audience == Some(trust.audience.as_str()) && !public_session_id.is_empty()
+    {
+        project_verified_axon_session(&contract, trust, &pin, user.is_admin, public_session_id, claims);
+    }
+    Ok(())
+}
+
+async fn trusted_axon_client<'a>(
+    state: &'a AppState,
+    client: &ClientRecord,
+    app: &ApplicationRecord,
+    binding: &ApplicationClientBindingRecord,
+) -> AppResult<Option<(&'a crate::config::AxonAdminTrust, String, Value)>> {
+    let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref() else {
+        return Ok(None);
+    };
+    let Some(pin) = crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks) else { return Ok(None) };
     if crate::dcr::is_website_client_id(&client.client_id)
-        || client.client_id != trust.client_id || audience != Some(trust.audience.as_str())
-        || trust.audience.is_empty() || public_session_id.is_empty() || !trust.origin.starts_with("https://")
+        || client.client_id != trust.client_id
+        || trust.audience.is_empty() || !trust.origin.starts_with("https://")
         || client.audience != trust.audience
         || client.is_active != 1 || app.is_active != 1 || binding.is_active != 1
         || binding.protocol != "oidc" || binding.client_db_id != client.id
@@ -51,22 +64,17 @@ pub(crate) async fn apply_axon_admin_claim(
         || app.organization_id != trust.organization_id
         || client.organization_id.as_deref() != Some(trust.organization_id.as_str())
     {
-        return Ok(());
+        return Ok(None);
     }
     if client.grant_types()? != ["authorization_code"] || client.scopes()? != ["openid"] {
-        return Ok(());
+        return Ok(None);
     }
     let redirects = client.redirect_uris()?;
-    if redirects.is_empty() || !redirects.iter().all(|redirect| {
-        url::Url::parse(redirect).is_ok_and(|url| {
-            url.username().is_empty() && url.password().is_none()
-                && url.origin().ascii_serialization() == trust.origin
-        })
-    }) {
-        return Ok(());
+    if redirects != [format!("{}/admin/api/auth/signet/callback", trust.origin)] {
+        return Ok(None);
     }
     let Some(row) = state.db.find_application_discovery(&app.id).await? else {
-        return Ok(());
+        return Ok(None);
     };
     if row.management_mode != crate::application_discovery::MANAGEMENT_MODE_WEBSITE
         || row.operator_disabled != 0
@@ -76,13 +84,33 @@ pub(crate) async fn apply_axon_admin_claim(
         || crate::application_discovery::website_origin(&row.website_url).ok().as_deref() != Some(trust.origin.as_str())
         || crate::application_discovery::axon_signer_pin(&row.signing_public_jwks).as_deref() != Some(pin.as_str())
     {
-        return Ok(());
+        return Ok(None);
     }
     let Some(contract) = row.snapshot_json.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) else {
-        return Ok(());
+        return Ok(None);
     };
-    project_verified_axon_session(&contract, trust, &pin, user.is_admin, public_session_id, claims);
-    Ok(())
+    Ok(verified_axon_admin(&contract, trust, &pin, 0)
+        .is_some().then_some((trust, pin, contract)))
+}
+
+pub(crate) async fn governed_axon_logout_uri(
+    state: &AppState,
+    client: &ClientRecord,
+) -> AppResult<Option<String>> {
+    if !state.settings.discovery.axon_admin_trust.as_ref()
+        .is_some_and(|trust| trust.client_id == client.client_id)
+    {
+        return Ok(None);
+    }
+    let Some(binding) = state.db.find_application_client_binding_by_public_client_id(&client.client_id).await? else {
+        return Ok(None);
+    };
+    let Some(app) = state.db.find_application_by_id(&binding.application_id).await? else {
+        return Ok(None);
+    };
+    Ok(trusted_axon_client(state, client, &app, &binding).await?.map(|(trust, _, _)|
+        format!("{}/admin/api/auth/signet/backchannel-logout", trust.origin)
+    ))
 }
 
 fn project_verified_axon_session(

@@ -32,16 +32,20 @@ impl Db {
         &self,
         user_id: &str,
         logout_uri_column: &'static str,
+        policy_client_id: Option<&str>,
     ) -> AppResult<Vec<ClientRecord>> {
         let user_id = user_id.to_string();
+        let policy_client_id = policy_client_id.map(str::to_owned);
         with_conn!(self, |conn, kind| {
             let sql = format!(
-                "{} WHERE is_active = 1 AND COALESCE({}, '') <> '' AND client_id IN (SELECT DISTINCT oidc_client_id FROM login_events WHERE user_id = {} AND oidc_client_id IS NOT NULL) ORDER BY updated_at DESC",
+                "{} WHERE is_active = 1 AND (COALESCE({}, '') <> '' OR client_id = {}) AND client_id IN (SELECT DISTINCT oidc_client_id FROM login_events WHERE user_id = {} AND oidc_client_id IS NOT NULL) ORDER BY updated_at DESC",
                 super::select_client_sql(),
                 logout_uri_column,
-                ph(kind, 1)
+                ph(kind, 1),
+                ph(kind, 2)
             );
             sql_query(sql)
+                .bind::<Nullable<Text>, _>(policy_client_id)
                 .bind::<Text, _>(user_id)
                 .load::<ClientRecord>(&mut conn)
                 .map_err(AppError::from)
@@ -51,8 +55,9 @@ impl Db {
     pub async fn list_backchannel_logout_clients_for_user(
         &self,
         user_id: &str,
+        policy_client_id: Option<&str>,
     ) -> AppResult<Vec<ClientRecord>> {
-        self.list_logout_clients_for_user(user_id, "backchannel_logout_uri")
+        self.list_logout_clients_for_user(user_id, "backchannel_logout_uri", policy_client_id)
             .await
     }
 
@@ -60,7 +65,7 @@ impl Db {
         &self,
         user_id: &str,
     ) -> AppResult<Vec<ClientRecord>> {
-        self.list_logout_clients_for_user(user_id, "frontchannel_logout_uri")
+        self.list_logout_clients_for_user(user_id, "frontchannel_logout_uri", None)
             .await
     }
 

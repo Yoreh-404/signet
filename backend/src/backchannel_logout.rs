@@ -123,10 +123,25 @@ pub async fn notify_user_logout(
     user: &UserRecord,
     sid: Option<&str>,
 ) -> AppResult<()> {
-    let clients = state
+    let policy_client_id = state.settings.discovery.axon_admin_trust.as_ref()
+        .map(|trust| trust.client_id.as_str());
+    let mut clients = state
         .db
-        .list_backchannel_logout_clients_for_user(&user.id)
+        .list_backchannel_logout_clients_for_user(&user.id, policy_client_id)
         .await?;
+    if let Some(index) = clients.iter().position(|client| Some(client.client_id.as_str()) == policy_client_id) {
+        match crate::oidc_authorization::governed_axon_logout_uri(state, &clients[index]).await {
+            Ok(Some(uri)) => {
+                clients[index].backchannel_logout_uri = uri;
+                clients[index].backchannel_logout_session_required = 1;
+            }
+            Ok(None) => { clients.remove(index); }
+            Err(error) => {
+                tracing::warn!(%error, "could not resolve governed Axon logout registration");
+                clients.remove(index);
+            }
+        }
+    }
     if clients.is_empty() {
         return Ok(());
     }

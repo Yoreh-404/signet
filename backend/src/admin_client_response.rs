@@ -24,23 +24,38 @@ pub(crate) async fn list_clients(
         .db
         .list_client_claim_mappers_by_client_ids(&client_ids)
         .await?;
-    let clients = clients
-        .into_iter()
-        .map(|client| {
+    let mut response = Vec::with_capacity(clients.len());
+    for client in clients {
             let claim_mappers = mappers_by_client
                 .remove(&client.id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|mapper| mapper.public())
                 .collect();
-            public_client_from_context(
+            let mut public = public_client_from_context(
                 &client,
                 Some((&organization.slug, &organization.name)),
                 claim_mappers,
-            )
-        })
-        .collect::<AppResult<Vec<_>>>()?;
-    Ok(Json(clients))
+            )?;
+            project_governed_logout(&state, &client, &mut public).await?;
+            response.push(public);
+    }
+    Ok(Json(response))
+}
+
+pub(crate) async fn project_governed_logout(
+    state: &AppState,
+    client: &ClientRecord,
+    public: &mut PublicClient,
+) -> AppResult<()> {
+    if state.settings.discovery.axon_admin_trust.as_ref()
+        .is_some_and(|trust| trust.client_id == client.client_id)
+    {
+        let uri = crate::oidc_authorization::governed_axon_logout_uri(state, client).await?;
+        public.backchannel_logout_session_required = uri.is_some();
+        public.backchannel_logout_uri = uri.unwrap_or_default();
+    }
+    Ok(())
 }
 
 pub(crate) fn public_client_from_context(
@@ -73,11 +88,13 @@ pub(crate) async fn public_client_with_claim_mappers(
     } else {
         None
     };
-    public_client_from_context(
+    let mut public = public_client_from_context(
         &client,
         organization
             .as_ref()
             .map(|organization| (organization.slug.as_str(), organization.name.as_str())),
         mappers,
-    )
+    )?;
+    project_governed_logout(state, &client, &mut public).await?;
+    Ok(public)
 }

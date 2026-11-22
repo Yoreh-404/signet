@@ -121,7 +121,7 @@ pub(crate) fn application_client_binding_responses_from_graph(
             continue;
         };
 
-        let public = public_client_from_context(
+        let mut public = public_client_from_context(
             client,
             client
                 .organization_id
@@ -133,6 +133,7 @@ pub(crate) fn application_client_binding_responses_from_graph(
                 .cloned()
                 .unwrap_or_default(),
         )?;
+        super::admin_client_response::project_governed_logout(state, client, &mut public).await?;
         response.push(ApplicationClientBindingResponse {
             client: public,
             protocol: binding.protocol.clone(),
