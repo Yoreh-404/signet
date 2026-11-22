@@ -14,7 +14,7 @@ function inputs() {
     { ...record, mapping: m, verified: true, notBefore: 10, expires: 100 },
     { ...binding, subject: 'sample', registration: 'operator_bound_axon', scope: 'openid',
       output: 'access_token', browserSessionBound: true, customClaims: {} },
-    { tenant: binding.tenant, subject: 'sample', currentAdmin: true }, 50];
+    { subject: 'sample', currentAdmin: true }, 50];
 }
 test('only the exact reserved resource access claim is projected', () => {
   assert.deepEqual(project(...inputs()), { axon_admin_authority: {
@@ -28,7 +28,7 @@ for (const [index, changes] of [
   [2, { ...Object.fromEntries(Object.keys(binding).filter(k=>k!=='signer').map(k => [k,'other'])),
     registration: 'public_dcr', output: 'id_token', scope: 'openid admin', browserSessionBound: false,
     customClaims: { axon_admin_authority: {} } }],
-  [3, { currentAdmin: false, tenant: 'other', subject: 'other' }]
+  [3, { currentAdmin: false, subject: 'other' }]
 ]) {
   for (const [k,v] of Object.entries(changes)) test('reject mismatch ' + index + '.' + k, () => {
     const args = inputs(); args[index][k] = v; assert.equal(project(...args), null);

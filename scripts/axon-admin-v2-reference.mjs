@@ -36,7 +36,7 @@ export function project(policy, snapshot, grant, account, now) {
   if (!['tenant','application_id','origin','issuer','client_id','audience'].every(k => policy[k] === grant[k]) ||
       grant.registration !== 'operator_bound_axon' || grant.output !== 'access_token' ||
       grant.scope !== 'openid' || grant.browserSessionBound !== true ||
-      account.tenant !== policy.tenant || !id(account.subject) || account.subject !== grant.subject ||
+      !id(account.subject) || account.subject !== grant.subject ||
       account.currentAdmin !== true || !object(grant.customClaims) ||
       Object.hasOwn(grant.customClaims, claim)) return null;
 
