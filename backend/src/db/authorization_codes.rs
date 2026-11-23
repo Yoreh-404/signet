@@ -8,6 +8,122 @@ use diesel::{
     sql_types::{BigInt, Nullable, Text},
 };
 
+// This statement and all its binds are shared with transaction-owned callers.
+macro_rules! insert_code_on_connection {
+    ($conn:expr, $kind:expr, $code:expr, $amr:expr, $now:expr) => {{
+        let (kind, code, amr, now) = ($kind, $code, $amr, $now);
+        let sql = format!(
+            "INSERT INTO authorization_codes (code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8),
+            ph(kind, 9),
+            ph(kind, 10),
+            ph(kind, 11),
+            ph(kind, 12),
+            ph(kind, 13),
+            ph(kind, 14),
+            ph(kind, 15),
+            ph(kind, 16),
+            ph(kind, 17),
+            ph(kind, 18),
+            ph(kind, 19),
+            ph(kind, 20)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(code.code)
+            .bind::<Text, _>(code.client_id)
+            .bind::<Text, _>(code.user_id)
+            .bind::<Nullable<Text>, _>(code.application_id)
+            .bind::<Nullable<Text>, _>(code.authorization_profile_id)
+            .bind::<Nullable<Text>, _>(code.auth_context_id)
+            .bind::<Nullable<Text>, _>(code.session_id)
+            .bind::<Text, _>(code.redirect_uri)
+            .bind::<Text, _>(code.scope)
+            .bind::<Nullable<Text>, _>(code.resource)
+            .bind::<Nullable<Text>, _>(code.authorization_details)
+            .bind::<Nullable<Text>, _>(code.nonce)
+            .bind::<Nullable<Text>, _>(code.code_challenge)
+            .bind::<Nullable<Text>, _>(code.code_challenge_method)
+            .bind::<BigInt, _>(code.auth_time)
+            .bind::<Text, _>(code.acr)
+            .bind::<Text, _>(amr)
+            .bind::<BigInt, _>(code.expires_at)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<BigInt, _>(now)
+            .execute($conn)
+            .map(|_| ())
+            .map_err(AppError::from)
+    }};
+}
+
+/// Insert the already prepared code on an existing SQLite transaction connection.
+/// This helper does not make any authorization decisions or start a transaction.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Incumbent admission is intentionally not mounted.
+pub(super) fn insert_sqlite_authorization_code_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    code: NewAuthorizationCode,
+    amr: String,
+    now: i64,
+) -> AppResult<()> {
+    insert_code_on_connection!(conn, DatabaseKind::Sqlite, code, amr, now)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod insert_on_connection_tests {
+    use super::*;
+    use diesel::{connection::SimpleConnection, result::Error, SqliteConnection};
+
+    #[test]
+    fn ordinary_insert_obeys_caller_commit_and_rollback() {
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let schema = crate::db::migration_sql::SQLITE_MIGRATIONS.iter()
+            .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS authorization_codes (")).unwrap();
+        conn.batch_execute(schema).unwrap();
+        let synthetic = NewAuthorizationCode {
+            code: "fixture-not-a-credential".into(), client_id: "client".into(),
+            user_id: "user".into(), application_id: Some("app".into()),
+            authorization_profile_id: Some("profile".into()), auth_context_id: Some("context".into()),
+            session_id: Some("session".into()), redirect_uri: "https://app.invalid/callback".into(),
+            scope: "openid".into(), resource: None, authorization_details: None, nonce: None,
+            code_challenge: Some("synthetic-challenge".into()), code_challenge_method: Some("S256".into()),
+            auth_time: 1, acr: "fixture".into(), amr: vec!["pwd".into()], expires_at: 60,
+        };
+        let amr = util::to_json(&synthetic.amr).unwrap();
+        let insert = |conn: &mut SqliteConnection| {
+            insert_sqlite_authorization_code_on_conn(conn, synthetic.clone(), amr.clone(), 17)
+        };
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)] redirect_uri: String,
+            #[diesel(sql_type = Text)] amr: String,
+            #[diesel(sql_type = BigInt)] created_at: i64,
+            #[diesel(sql_type = Nullable<BigInt>)] consumed_at: Option<i64>,
+        }
+        let read = |conn: &mut SqliteConnection| sql_query("SELECT redirect_uri, amr, created_at,
+            consumed_at FROM authorization_codes WHERE code='fixture-not-a-credential'")
+            .get_result::<Row>(conn).optional().unwrap();
+        let rollback: AppResult<()> = conn.immediate_transaction(|conn| {
+            insert(conn)?;
+            assert!(read(conn).is_some());
+            Err(Error::RollbackTransaction.into())
+        });
+        assert!(rollback.is_err());
+        assert!(read(&mut conn).is_none());
+        conn.immediate_transaction(insert).unwrap();
+        let row = read(&mut conn).unwrap();
+        assert_eq!((row.redirect_uri, row.amr, row.created_at, row.consumed_at),
+            (synthetic.redirect_uri.clone(), amr.clone(), 17, None));
+        assert!(insert(&mut conn).is_err(), "ordinary duplicate handling is unchanged");
+    }
+}
+
 impl Db {
     pub async fn find_oidc_login_grant(
         &self,
@@ -114,53 +230,7 @@ impl Db {
         let now = util::now_ts();
         let amr = util::to_json(&code.amr)?;
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO authorization_codes (code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, auth_time, acr, amr, expires_at, consumed_at, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10),
-                ph(kind, 11),
-                ph(kind, 12),
-                ph(kind, 13),
-                ph(kind, 14),
-                ph(kind, 15),
-                ph(kind, 16),
-                ph(kind, 17),
-                ph(kind, 18),
-                ph(kind, 19),
-                ph(kind, 20)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(code.code)
-                .bind::<Text, _>(code.client_id)
-                .bind::<Text, _>(code.user_id)
-                .bind::<Nullable<Text>, _>(code.application_id)
-                .bind::<Nullable<Text>, _>(code.authorization_profile_id)
-                .bind::<Nullable<Text>, _>(code.auth_context_id)
-                .bind::<Nullable<Text>, _>(code.session_id)
-                .bind::<Text, _>(code.redirect_uri)
-                .bind::<Text, _>(code.scope)
-                .bind::<Nullable<Text>, _>(code.resource)
-                .bind::<Nullable<Text>, _>(code.authorization_details)
-                .bind::<Nullable<Text>, _>(code.nonce)
-                .bind::<Nullable<Text>, _>(code.code_challenge)
-                .bind::<Nullable<Text>, _>(code.code_challenge_method)
-                .bind::<BigInt, _>(code.auth_time)
-                .bind::<Text, _>(code.acr)
-                .bind::<Text, _>(amr)
-                .bind::<BigInt, _>(code.expires_at)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(AppError::from)
+            insert_code_on_connection!(&mut conn, kind, code, amr, now)
         })
     }
 
