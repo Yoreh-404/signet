@@ -3,25 +3,7 @@ use diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query,
     sql_types::{BigInt, Text}};
 
 use diesel::connection::SimpleConnection;
-
-const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    profile TEXT NOT NULL CHECK (profile = 'incumbent_v1'),
-    application_db_id TEXT NOT NULL,
-    client_db_id TEXT NOT NULL,
-    organization_id TEXT NOT NULL,
-    enrollment_id TEXT NOT NULL,
-    host_sha256 TEXT NOT NULL,
-    signer_pin TEXT NOT NULL,
-    policy_sha256 TEXT NOT NULL,
-    policy_json TEXT NOT NULL,
-    revision BIGINT NOT NULL CHECK (revision > 0),
-    generation BIGINT NOT NULL CHECK (generation > 0),
-    withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1))
-)";
-
-#[derive(Clone, Copy)]
-struct Version<'a> { digest: &'a str, revision: i64, generation: i64 }
+use crate::db::axon_v3_incumbent_storage::{SCHEMA, Version};
 
 fn replace(
     db: &mut SqliteConnection, expected: Version<'_>, next: Version<'_>,
