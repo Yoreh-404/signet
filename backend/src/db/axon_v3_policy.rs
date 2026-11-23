@@ -4,7 +4,7 @@
 use super::{AppError, AppResult, DatabaseKind, Db, blocking, ph};
 use crate::application_discovery::axon_v3_acceptance::VerifiedPolicy;
 use crate::application_discovery::axon_v3_restore::RestoreInterlock;
-use diesel::{OptionalExtension, RunQueryDsl, sql_query, sql_types::{BigInt, Text}};
+use diesel::{Connection, OptionalExtension, RunQueryDsl, sql_query, sql_types::{BigInt, Text}};
 use serde_json::{Value, json};
 
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_staged_application_policy (
@@ -63,8 +63,18 @@ impl Db {
         interlock: &RestoreInterlock,
     ) -> AppResult<()> {
         let Some(initial) = interlock.reconciled() else { return Err(AppError::Forbidden); };
+        let interlock = interlock.clone();
+        self.activate_axon_v3_policy_checked(enrolled, expected_sha256, move ||
+            interlock.reconciled().as_ref() == Some(&initial)).await
+    }
+
+    async fn activate_axon_v3_policy_checked(
+        &self, enrolled: crate::config::AxonAdminV3Enrollment, expected_sha256: String,
+        final_interlock_check: impl FnOnce() -> bool + Send + 'static,
+    ) -> AppResult<()> {
         with_conn!(self, |conn, kind| {
             if matches!(kind, DatabaseKind::Mysql) { return Err(AppError::Forbidden); }
+            conn.transaction::<(), AppError, _>(|conn| {
             let sql = format!(
                 "INSERT INTO axon_v3_application_activation (
                    application_db_id, organization_id, enrollment_id, client_db_id,
@@ -76,7 +86,7 @@ impl Db {
                  JOIN organizations o ON o.id = p.organization_id AND o.is_active = 1
                  JOIN clients c ON c.id = p.client_db_id AND c.is_active = 1 AND c.organization_id = o.id
                  JOIN application_client_bindings b ON b.application_id = a.id
-                   AND b.client_db_id = c.id AND b.is_active = 1 AND b.protocol = 'oauth2_oidc'
+                   AND b.client_db_id = c.id AND b.is_active = 1 AND b.protocol IN ('oauth2_oidc', 'oidc')
                  JOIN clients v ON v.organization_id = o.id AND v.audience = c.audience
                    AND v.is_active = 1 AND v.token_endpoint_auth_method <> 'none'
                  WHERE p.organization_id = {} AND p.enrollment_id = {} AND a.slug = {}
@@ -102,12 +112,13 @@ impl Db {
                 .bind::<Text,_>(&enrolled.organization_id).bind::<Text,_>(&enrolled.enrollment_id)
                 .bind::<Text,_>(&enrolled.application_id).bind::<Text,_>(&enrolled.client_id)
                 .bind::<Text,_>(&enrolled.introspection_client_id).bind::<Text,_>(&enrolled.audience)
-                .bind::<Text,_>(&expected_sha256).execute(&mut conn).map_err(AppError::from)?;
-            if changed != 1 { return Err(AppError::Forbidden); }
-            Ok(())
-        })?;
-        if interlock.reconciled().as_ref() != Some(&initial) { return Err(AppError::Forbidden); }
-        Ok(())
+                .bind::<Text,_>(&expected_sha256).execute(conn).map_err(AppError::from)?;
+                // A failed final hold check rolls back the CAS, rather than
+                // exposing an activation on the next reconciled marker.
+                if changed != 1 || !final_interlock_check() { return Err(AppError::Forbidden); }
+                Ok(())
+            })
+        })
     }
 
     pub(crate) async fn withdraw_axon_v3_policy(
@@ -322,6 +333,7 @@ mod tests {
         assert!(read().await.unwrap().is_none());
         update(r#"{"format":"signet-privileged-restore/v1","state":"reconciled","operation_id":"ac84cfd6-f2d8-46f3-8fd1-986c43afd131"}"#);
         let ready = fs::read_to_string(&marker).unwrap();
+        let held = r#"{"format":"signet-privileged-restore/v1","state":"held","operation_id":"df63e995-c3c1-487f-9aa9-468c13431322"}"#;
         pool.get().unwrap().batch_execute("
             INSERT INTO clients (id,client_id,client_name,organization_id,redirect_uris,post_logout_redirect_uris,scopes,audience,
               grant_types,response_types,token_endpoint_auth_method,require_pkce,require_s256_pkce,is_active,created_at,updated_at)
@@ -364,10 +376,38 @@ mod tests {
         assert_eq!(proof["subject"], "fixture-admin");
         assert_eq!(proof["revision"], 4);
         assert!(proof.get("exp").is_none());
+        let mut next_policy = policy();
+        next_policy["revision"] = json!(5);
+        next_policy["generation"] = json!(8);
+        let verified = verify_case(&next_policy.to_string(), |claims| {
+            claims["revision"] = json!(5);
+            claims["generation"] = json!(8);
+        }, 9, HEADER, (5, 8, false), 1100).unwrap();
+        let next_digest = verified.sha256().to_owned();
+        db.stage_axon_v3_policy(verified).await.unwrap();
+        assert_eq!(read().await.unwrap().unwrap()["revision"], 4, "staging must preserve active");
+        let (next_dir, next_marker) = (dir.clone(), marker.clone());
+        let next_gate = interlock.clone();
+        let before = interlock.reconciled().unwrap();
+        let config = settings.discovery.axon_admin_v3.clone().unwrap();
+        assert!(db.activate_axon_v3_policy_checked(config, next_digest, move || {
+            // Called after the tentative activation but inside its transaction.
+            fs::set_permissions(&next_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let temp = next_dir.join("hold.json");
+            fs::write(&temp, held).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o400)).unwrap();
+            fs::rename(&temp, &next_marker).unwrap();
+            fs::set_permissions(&next_dir, fs::Permissions::from_mode(0o500)).unwrap();
+            next_gate.reconciled().as_ref() == Some(&before)
+        }).await.is_err());
+        assert!(read().await.unwrap().is_none());
+        update(&ready);
+        assert_eq!(read().await.unwrap().unwrap()["revision"], 4,
+            "reopening must not publish the failed new activation");
         let mut foreign = scope();
         foreign.origin = "https://other.example".into();
         assert!(db.read_active_axon_v3_policy(foreign, &interlock).await.unwrap().is_none());
-        update(r#"{"format":"signet-privileged-restore/v1","state":"held","operation_id":"df63e995-c3c1-487f-9aa9-468c13431322"}"#);
+        update(held);
         assert!(read().await.unwrap().is_none(), "old DB row cannot defeat a restore hold");
         update(r#"{"format":"signet-privileged-restore/v1","state":"reconciled"}"#);
         assert!(read().await.unwrap().is_none(), "incomplete reconciliation must deny");
