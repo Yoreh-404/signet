@@ -1831,6 +1831,88 @@ fn authorization_code_tokens_preserve_login_code_provenance() {
 
 #[cfg(all(feature = "sqlite", target_os = "linux"))]
 #[tokio::test]
+async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligibility() {
+    use crate::application_discovery::axon_v3_acceptance::{
+        TrustedFloor, TrustedRegistration, tests::{HEADER, sign}, verify_acceptance,
+    };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+    use ed25519_dalek::SigningKey;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let (state, path) = test_app_state().await;
+    let fixture = insert_refresh_test_user(&state, "incumbent-preflight").await;
+    let client = test_refresh_client(&state).await;
+    let binding = state.db.find_application_client_binding_by_public_client_id(&client.client_id)
+        .await.unwrap().unwrap();
+    let app = state.db.find_application_by_id(&binding.application_id).await.unwrap().unwrap();
+    let origin = "https://axon.example";
+    let issuer = "https://signet.example";
+    let audience = "https://axon.example/admin";
+    let callback = format!("{origin}/admin/api/auth/signet/callback");
+    let now = util::now_ts();
+    let public = SigningKey::from_bytes(&[9; 32]).verifying_key();
+    let approved_jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":"approval",
+        "x":URL_SAFE_NO_PAD.encode(public.as_bytes())}]}).to_string();
+    state.db.upsert_application_discovery(crate::db::NewApplicationDiscovery {
+        application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
+        website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: approved_jwks.clone(),
+        last_verified_revision: Some(3), last_verified_version: Some("fixture".into()),
+        last_verified_digest: Some("prior-verified-metadata-fixture".into()), last_verified_expires_at: Some(now-1),
+        sync_status: crate::application_discovery_contract::SYNC_STATUS_SYNCED.into(), last_error: None,
+        last_fetched_at: Some(now-301), last_success_at: Some(now-301), operator_disabled: false,
+        snapshot_json: Some(json!({"modules":{"axon_admin_mapping":{"permissions":["admin:session:read"]}}}).to_string()),
+    }).await.unwrap();
+
+    let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
+        sql_query("DELETE FROM organization_members WHERE user_id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
+        sql_query("UPDATE clients SET organization_id=?,audience=?,redirect_uris=?,scopes='[\"openid\"]',
+            grant_types='[\"authorization_code\"]',require_pkce=1,require_s256_pkce=1 WHERE id=?")
+            .bind::<Text,_>(&app.organization_id).bind::<Text,_>(audience)
+            .bind::<Text,_>(json!([callback]).to_string()).bind::<Text,_>(&client.id).execute(&mut conn).unwrap();
+    }
+    let jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
+        None, &fixture, "password", auth::LoginEventContext::default()).await.unwrap();
+    let current = auth::require_current_user(&state, &jar).await.unwrap();
+    assert_eq!(current.user.is_admin, 1);
+    let client = test_refresh_client(&state).await;
+    assert_eq!(client.require_s256_pkce, 1);
+    assert!(crate::oidc_authorization::AuthorizationSnapshot::load_runtime(&state, &client).await.is_err());
+    assert!(crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &current.user).await.is_err());
+
+    let permissions = vec!["admin:session:read".to_string()];
+    let enrollment = "explicit-incumbent-test";
+    let policy = json!({"format":"axon.signet.application-admin.policy.v3",
+        "organization_id":app.organization_id,"enrollment_id":enrollment,"application_id":app.slug,
+        "issuer":issuer,"client_id":client.client_id,"audience":audience,"origin":origin,
+        "revision":4,"generation":8,"permissions":permissions}).to_string();
+    let digest = format!("sha256:{:x}", Sha256::digest(&policy));
+    let claims = json!({"format":"axon.signet.application-admin.acceptance.v3","policy_sha256":digest,
+        "revision":4,"generation":8,"aud":issuer,"iat":now,"exp":now+300}).to_string();
+    let trusted = TrustedRegistration {
+        organization_id: &app.organization_id, enrollment_id: enrollment, application_id: &app.slug,
+        issuer, client_id: &client.client_id, audience, origin, permissions: &permissions,
+        approval_audience: issuer, approval_jwks: &approved_jwks,
+        floor: &TrustedFloor { policy_sha256: &digest, revision: 4, generation: 8, halted: false },
+    };
+    assert!(verify_acceptance(policy.as_bytes(), "", &trusted, now).is_err());
+    assert!(verify_acceptance(policy.as_bytes(), &sign(&claims, 8, HEADER), &trusted, now).is_err());
+    let approved = verify_acceptance(policy.as_bytes(), &sign(&claims, 9, HEADER), &trusted, now).unwrap();
+    // Acceptance checks the signed bytes only. It never enables a website
+    // registration or tags an ordinary OAuth request with special authority.
+    assert!(state.db.stage_axon_v3_policy(approved).await.is_err());
+    assert!(crate::oidc_authorization::AuthorizationSnapshot::load_runtime(&state, &client).await.is_err());
+    assert!(crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &current.user).await.is_err());
+    drop(state);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(all(feature = "sqlite", target_os = "linux"))]
+#[tokio::test]
 async fn axon_v3_introspection_uses_current_policy_and_restore_gate_without_personal_enrollment() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use diesel::{RunQueryDsl, connection::SimpleConnection, sql_query, sql_types::Text};
