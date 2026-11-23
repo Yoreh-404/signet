@@ -39,6 +39,11 @@ fn hash(value: &str) -> bool {
         && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 
+pub(crate) fn approved_enrolled_signer(approved: &VerifiedPolicy, pin: &str, jwks: &str) -> bool {
+    axon_signer_pin(jwks).as_deref() == Some(pin)
+        && enrolled_signer_key_sha256(jwks).as_deref() == Some(approved.signer_key_sha256())
+}
+
 /// This is an admission precondition, not authorization. Any future caller
 /// must obtain the pin and measured Host from its explicitly configured
 /// control plane and recheck current state atomically when admitting a code.
@@ -69,8 +74,7 @@ pub(crate) async fn matches(
     if !organization_active || application.is_active != 1 || application.organization_id != policy.organization_id
         || application.slug != policy.application_id || site.management_mode != MANAGEMENT_MODE_WEBSITE
         || site.operator_disabled != 0 || site.website_url != policy.origin
-        || axon_signer_pin(&site.signing_public_jwks).as_deref() != Some(pin.signer_pin)
-        || enrolled_signer_key_sha256(&site.signing_public_jwks).as_deref() != Some(approved.signer_key_sha256())
+        || !approved_enrolled_signer(approved, pin.signer_pin, &site.signing_public_jwks)
         || binding.application_id != application.id || binding.client_db_id != pin.client_db_id
         || binding.is_active != 1 || !matches!(binding.protocol.as_str(), "oidc" | "oauth2_oidc")
         || client.id != pin.client_db_id || client.is_active != 1

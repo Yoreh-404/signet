@@ -51,9 +51,8 @@ impl<'a> RestoreSnapshot<'a> {
 pub(crate) mod sqlite {
     use super::{RestoreInterlock, RestoreSnapshot, Version};
     use crate::application_discovery::{
-        axon_signer_pin,
-        axon_v3_acceptance::{VerifiedPolicy, enrolled_signer_key_sha256},
-        incumbent_preflight::IncumbentPin,
+        axon_v3_acceptance::VerifiedPolicy,
+        incumbent_preflight::{IncumbentPin, approved_enrolled_signer},
     };
     use diesel::{Connection, QueryResult, RunQueryDsl, SqliteConnection, result::Error,
         sql_query, sql_types::{BigInt, Text}};
@@ -83,8 +82,7 @@ pub(crate) mod sqlite {
         let policy = next.policy();
         if binding.withdrawn || binding.policy_sha256 != next.sha256()
             || binding.revision != policy.revision || binding.generation != policy.generation
-            || axon_signer_pin(enrolled_jwks).as_deref() != Some(binding.signer_pin)
-            || enrolled_signer_key_sha256(enrolled_jwks).as_deref() != Some(next.signer_key_sha256())
+            || !approved_enrolled_signer(next, binding.signer_pin, enrolled_jwks)
         {
             return Err(Error::RollbackTransaction);
         }
