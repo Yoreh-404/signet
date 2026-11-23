@@ -2,9 +2,10 @@
 //! consumes this yet; V2 enrollment is not V3 approval.
 #![allow(dead_code)]
 
-use super::{crypto::{PinnedJwks, verify_jws}, normalize_permission_key, website_origin};
+use super::{crypto::PinnedJwks, normalize_permission_key, website_origin};
 use crate::error::{AppError, AppResult};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -101,17 +102,29 @@ pub(super) fn verify_acceptance(
     {
         return Err(deny());
     }
-    let encoded_header = approval.split_once('.').ok_or_else(deny)?.0;
+    let (signing_input, encoded_signature) = approval.rsplit_once('.').ok_or_else(deny)?;
+    let (encoded_header, encoded_payload) = signing_input.split_once('.').ok_or_else(deny)?;
     let bytes = URL_SAFE_NO_PAD.decode(encoded_header).map_err(|_| deny())?;
     let header: Header = serde_json::from_slice(&bytes).map_err(|_| deny())?;
     if header.alg != "EdDSA" || header.typ != ACCEPTANCE_TYP || header.kid.is_empty() {
         return Err(deny());
     }
     let keyring: PinnedJwks = serde_json::from_str(trusted.approval_jwks).map_err(|_| deny())?;
-    if keyring.keys.iter().filter(|key| key.kid.as_deref() == Some(header.kid.as_str())).count() != 1 {
+    let mut keys = keyring.keys.iter().filter(|key| key.kid.as_deref() == Some(header.kid.as_str()));
+    let key = keys.next().ok_or_else(deny)?;
+    if keys.next().is_some() || key.kty != "OKP" || key.crv != "Ed25519"
+        || key.use_.as_deref().is_some_and(|usage| usage != "sig")
+        || key.alg.as_deref().is_some_and(|alg| alg != "EdDSA")
+    {
         return Err(deny());
     }
-    let payload = verify_jws(approval, trusted.approval_jwks)?;
+    let public: [u8; 32] = URL_SAFE_NO_PAD.decode(&key.x).map_err(|_| deny())?
+        .try_into().map_err(|_| deny())?;
+    let key = VerifyingKey::from_bytes(&public).map_err(|_| deny())?;
+    let signature = URL_SAFE_NO_PAD.decode(encoded_signature).map_err(|_| deny())?;
+    let signature = Signature::from_slice(&signature).map_err(|_| deny())?;
+    key.verify_strict(signing_input.as_bytes(), &signature).map_err(|_| deny())?;
+    let payload = URL_SAFE_NO_PAD.decode(encoded_payload).map_err(|_| deny())?;
     let signed: Acceptance = serde_json::from_slice(&payload).map_err(|_| deny())?;
     if signed.format != ACCEPTANCE_FORMAT || signed.policy_sha256 != digest
         || signed.revision != stable.revision || signed.generation != stable.generation
@@ -163,16 +176,21 @@ mod tests {
         });
         change(&mut claims);
         let approval = sign(&claims.to_string(), seed, header);
-        let public = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        verify_raw(raw, &approval, &digest, floor, now, SigningKey::from_bytes(&[9; 32]).verifying_key().as_bytes())
+    }
+
+    fn verify_raw(raw: &str, approval: &str, digest: &str, floor: (i64, i64, bool), now: i64, public: &[u8; 32])
+        -> AppResult<StablePolicy>
+    {
         let jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519",
-            "kid":"approval","x":URL_SAFE_NO_PAD.encode(public.as_bytes())}]}).to_string();
-        verify_acceptance(raw.as_bytes(), &approval, &TrustedRegistration {
+            "kid":"approval","x":URL_SAFE_NO_PAD.encode(public)}]}).to_string();
+        verify_acceptance(raw.as_bytes(), approval, &TrustedRegistration {
             organization_id: "example-org", enrollment_id: "enrollment", application_id: "axon",
             issuer: "https://signet.example", client_id: "bound-client",
             audience: "https://axon.example/admin", origin: "https://axon.example",
             permissions: &["admin:session:read".into()], approval_audience: "signet-verifier",
             approval_jwks: &jwks, floor: &TrustedFloor {
-                policy_sha256: &digest, revision: floor.0, generation: floor.1, halted: floor.2,
+                policy_sha256: digest, revision: floor.0, generation: floor.1, halted: floor.2,
             },
         }, now)
     }
@@ -222,5 +240,39 @@ mod tests {
         assert!(verify_case(&duplicate, |_| {}, 9, HEADER, (4, 7, false), 1100).is_err());
         let duplicate_header = HEADER.replace(r#""kid":"approval""#, r#""kid":"approval","kid":"approval""#);
         assert!(verify_case(&raw, |_| {}, 9, &duplicate_header, (4, 7, false), 1100).is_err());
+    }
+
+    #[test]
+    fn immutable_floor_denies_same_tuple_equivocation_and_signed_duplicate_claims() {
+        let raw = policy().to_string();
+        let digest = format!("sha256:{:x}", Sha256::digest(&raw));
+        let public = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let claims = json!({"format": ACCEPTANCE_FORMAT, "policy_sha256": digest, "revision": 4,
+            "generation": 7, "aud": "signet-verifier", "iat": 1000, "exp": 1900});
+        let approval = sign(&claims.to_string(), 9, HEADER);
+        let verify = |bytes: &str, jws: &str| verify_raw(bytes, jws, &digest, (4, 7, false), 1100, public.as_bytes());
+        assert!(verify(&raw, &approval).is_ok());
+
+        let equivalent = format!("{raw}\n");
+        let mut equivocated_claims = claims.clone();
+        equivocated_claims["policy_sha256"] = json!(format!("sha256:{:x}", Sha256::digest(&equivalent)));
+        assert!(verify(&equivalent, &sign(&equivocated_claims.to_string(), 9, HEADER)).is_err());
+
+        let encoded = claims.to_string();
+        let duplicate = format!(r#"{{"revision":4,{}"#, &encoded[1..]);
+        assert!(verify(&raw, &sign(&duplicate, 9, HEADER)).is_err());
+
+        // The compressed Edwards identity is a weak Ed25519 key. An identity
+        // R and zero S produce a signature that non-strict verification accepts.
+        let mut weak_key = [0; 32];
+        weak_key[0] = 1;
+        let mut weak_signature = [0; 64];
+        weak_signature[0] = 1;
+        let input = format!("{}.{}", URL_SAFE_NO_PAD.encode(HEADER), URL_SAFE_NO_PAD.encode(encoded));
+        use ed25519_dalek::Verifier;
+        assert!(VerifyingKey::from_bytes(&weak_key).unwrap()
+            .verify(input.as_bytes(), &Signature::from_bytes(&weak_signature)).is_ok());
+        let forged = format!("{input}.{}", URL_SAFE_NO_PAD.encode(weak_signature));
+        assert!(verify_raw(&raw, &forged, &digest, (4, 7, false), 1100, &weak_key).is_err());
     }
 }
