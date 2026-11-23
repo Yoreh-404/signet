@@ -35,7 +35,7 @@ pub(crate) mod axon_v3_acceptance;
 pub(crate) mod axon_v3_restore;
 mod axon_v3_operator;
 pub(crate) mod incumbent_preflight;
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod incumbent_storage_tests;
 pub use axon_v3_operator::run_axon_v3_operator_command;
 mod crypto;
