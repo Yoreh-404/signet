@@ -150,6 +150,32 @@ macro_rules! insert_locked_compatibility_application_on_conn {
     }};
 }
 
+macro_rules! find_auth_context_on_conn {
+    ($conn:expr, $kind:expr, $domain:expr, $user:expr) => {{
+        let (kind, auth_domain_id, user_id) = ($kind, $domain, $user);
+        let sql = format!(
+            "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE auth_domain_id = {} AND user_id = {} AND revoked_at IS NULL ORDER BY authenticated_at DESC LIMIT 1",
+            ph(kind, 1),
+            ph(kind, 2)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(auth_domain_id)
+            .bind::<Text, _>(user_id)
+            .get_result::<ApplicationAuthContextRecord>($conn)
+            .optional()
+            .map_err(AppError::from)
+    }};
+}
+
+/// Use the existing read on a caller-owned connection, without pool checkout.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Not yet used for incumbent code admission.
+pub(super) fn find_sqlite_application_auth_context_on_conn(
+    conn: &mut diesel::SqliteConnection, auth_domain_id: &str, user_id: &str,
+) -> AppResult<Option<ApplicationAuthContextRecord>> {
+    find_auth_context_on_conn!(conn, DatabaseKind::Sqlite, auth_domain_id, user_id)
+}
+
 impl Db {
     pub async fn list_applications(
         &self,
@@ -323,17 +349,7 @@ impl Db {
         let auth_domain_id = auth_domain_id.to_string();
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE auth_domain_id = {} AND user_id = {} AND revoked_at IS NULL ORDER BY authenticated_at DESC LIMIT 1",
-                ph(kind, 1),
-                ph(kind, 2)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(auth_domain_id)
-                .bind::<Text, _>(user_id)
-                .get_result::<ApplicationAuthContextRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
+            find_auth_context_on_conn!(&mut conn, kind, auth_domain_id, user_id)
         })
     }
 

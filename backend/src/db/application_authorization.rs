@@ -16,6 +16,31 @@ use std::collections::BTreeMap;
 
 use super::query_types::ApplicationAuthorizationProfileCountRow;
 
+macro_rules! find_profile_by_id_on_conn {
+    ($conn:expr, $kind:expr, $profile_id:expr) => {{
+        let (kind, profile_id,) = ($kind, $profile_id,);
+        let sql = format!(
+            "{} WHERE id = {}",
+            select_application_authorization_profile_sql(),
+            ph(kind, 1)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(profile_id)
+            .get_result::<ApplicationAuthorizationProfileRecord>($conn)
+            .optional()
+            .map_err(AppError::from)
+    }};
+}
+
+/// Use the existing read on a caller-owned connection, without pool checkout.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Not yet used for incumbent code admission.
+pub(super) fn find_sqlite_authorization_profile_by_id_on_conn(
+    conn: &mut diesel::SqliteConnection, profile_id: &str,
+) -> AppResult<Option<ApplicationAuthorizationProfileRecord>> {
+    find_profile_by_id_on_conn!(conn, DatabaseKind::Sqlite, profile_id)
+}
+
 impl Db {
     pub async fn list_application_authorization_groups(
         &self,
@@ -402,16 +427,7 @@ impl Db {
     ) -> AppResult<Option<ApplicationAuthorizationProfileRecord>> {
         let profile_id = profile_id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "{} WHERE id = {}",
-                select_application_authorization_profile_sql(),
-                ph(kind, 1)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(profile_id)
-                .get_result::<ApplicationAuthorizationProfileRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
+            find_profile_by_id_on_conn!(&mut conn, kind, profile_id)
         })
     }
 
