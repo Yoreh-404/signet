@@ -764,6 +764,20 @@ pub(super) async fn issue_tokens_for_user(
             crate::oidc_authorization::apply_axon_admin_claim(
                 state, snapshot, client, &user, token_audience, public_sid, &mut access_claims,
             ).await?;
+            // V3 proves current authority at introspection. Bind this exact
+            // authorization-code access token to the live browser session,
+            // without issuing a V2 or V3 authority claim in the token.
+            if consent_bound_code.is_some() && scope == "openid"
+                && let Some(v3) = state.settings.discovery.axon_admin_v3.as_ref()
+                && issuer == v3.issuer && token_audience == Some(v3.audience.as_str())
+                && client.client_id == v3.client_id
+                && client.organization_id.as_deref() == Some(v3.organization_id.as_str())
+                && client.require_pkce == 1 && client.require_s256_pkce == 1
+                && snapshot.application.as_ref().is_some_and(|app|
+                    app.slug == v3.application_id && app.organization_id == v3.organization_id)
+            {
+                insert_sid_claim(&mut access_claims, Some(public_sid));
+            }
             if consent_bound_code.is_some()
                 && let Some(authority) = crate::oidc_authorization::project_axon_admin_v2(
                     state, snapshot, client, &user, token_audience, public_sid, &scope, issuer,

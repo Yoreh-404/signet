@@ -1916,6 +1916,7 @@ async fn axon_v3_introspection_uses_current_policy_and_restore_gate_without_pers
     req.redirect_uri = Some(redirect);
     req.code_verifier = Some(challenge_verifier.into());
     let Json(tokens) = token_from_authorization_code(state.clone(), client, req, issuer.clone(), None).await.unwrap();
+    assert!(tokens.refresh_token.is_none(), "openid-only client does not acquire offline access");
     let router = axum::Router::new().route("/oauth2/introspect", axum::routing::post(
         super::oidc_resource::introspect)).with_state(state.clone());
     let request = |hint: &str, client: &str, password: &str| Request::post("/oauth2/introspect")
@@ -1926,6 +1927,27 @@ async fn axon_v3_introspection_uses_current_policy_and_restore_gate_without_pers
     let inactive = json!({"active":false});
     assert_eq!(oidc_http_body_json(router.clone().oneshot(exact()).await.unwrap()).await, inactive);
     set_gate(true);
+    let claims = state.jwt.verify_access_token_for_introspection(&tokens.access_token, &[&issuer])
+        .expect("fixture should have a valid access token for the configured issuer");
+    assert_eq!(claims.scope, "openid");
+    assert_eq!(claims.aud, resource);
+    assert_eq!(claims.client_id, demo.client_id);
+    let current_source = test_refresh_client(&state).await;
+    assert!(super::oidc_token_liveness::introspected_access_token_is_live(
+        &state, Some(&current_source), &claims,
+    ).await.unwrap(), "standard current grant/binding check");
+    assert!(state.db.list_user_sessions(&claims.sub).await.unwrap().iter().any(|s|
+        Some(util::session_public_id(&s.id).as_str()) == claims.sid.as_deref()), "live session binding");
+    let enrolled = state.settings.discovery.axon_admin_v3.as_ref().unwrap();
+    let interlock = crate::application_discovery::axon_v3_restore::RestoreInterlock::new(
+        enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid,
+    );
+    assert!(state.db.read_active_axon_v3_policy(crate::db::AxonV3CheckedScope {
+        organization_id: enrolled.organization_id.clone(), enrollment_id: enrolled.enrollment_id.clone(),
+        application_id: enrolled.application_id.clone(), issuer: claims.iss.clone(), client_id: claims.client_id.clone(),
+        verifier_client_id: verifier.client_id.clone(), audience: claims.aud.clone(), origin: origin.into(),
+        subject: claims.sub.clone(),
+    }, &interlock).await.unwrap().is_some(), "registered active policy");
     let response = router.clone().oneshot(exact()).await.unwrap();
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let active = oidc_http_body_json(response).await;
@@ -1943,9 +1965,12 @@ async fn axon_v3_introspection_uses_current_policy_and_restore_gate_without_pers
     set_gate(true);
     assert_eq!(oidc_http_body_json(router.clone().oneshot(exact()).await.unwrap()).await, inactive);
     let ordinary = request("access_token", &verifier.client_id, secret);
-    let ordinary = oidc_http_body_json(router.oneshot(ordinary).await.unwrap()).await;
+    let ordinary = oidc_http_body_json(router.clone().oneshot(ordinary).await.unwrap()).await;
     assert_eq!(ordinary["active"], true);
     assert!(ordinary.get("axon_admin_authority_v3").is_none());
+    pool.get().unwrap().batch_execute("UPDATE users SET is_admin=1 WHERE username='refresh-axon-v3'").unwrap();
+    state.db.delete_session(&signed_in.session_id).await.unwrap();
+    assert_eq!(oidc_http_body_json(router.oneshot(exact()).await.unwrap()).await, inactive);
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();
     drop(state);
