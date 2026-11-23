@@ -1975,6 +1975,27 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         .expect("the alternative key signed the same exact policy validly for a different trust input");
     assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin), &host, &other_approval, &wanted)
         .await.unwrap(), "cryptographically valid approval from the wrong enrolled signer must deny");
+    #[cfg(feature = "axon-incumbent-storage")]
+    {
+        let mut next_policy: serde_json::Value = serde_json::from_str(approved.bytes()).unwrap();
+        next_policy["revision"] = json!(5);
+        next_policy["generation"] = json!(9);
+        let next_policy = next_policy.to_string();
+        let next_digest = format!("sha256:{:x}", Sha256::digest(&next_policy));
+        let next_claims = json!({"format":"axon.signet.application-admin.acceptance.v3",
+            "policy_sha256":next_digest,"revision":5,"generation":9,
+            "aud":issuer,"iat":now,"exp":now+300}).to_string();
+        let next = verify_acceptance(next_policy.as_bytes(), &sign(&next_claims, 9, HEADER),
+            &TrustedRegistration { approval_jwks: &approved_jwks,
+                floor: &TrustedFloor { policy_sha256: &next_digest, revision: 5, generation: 9, halted: false },
+                ..other_trust
+            }, now).unwrap();
+        let next_pin = IncumbentPin { policy_sha256: &next_digest, revision: 5, generation: 9, ..pin };
+        assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &host, &next, &wanted)
+            .await.unwrap());
+        crate::application_discovery::incumbent_storage_tests::signed_file_bench(
+            &path, &pin, &approved, &next);
+    }
     for wrong in [
         RequestScope { issuer: "https://foreign.example", ..wanted },
         RequestScope { client_id: "unrelated-client", ..wanted },

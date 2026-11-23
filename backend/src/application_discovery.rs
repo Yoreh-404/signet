@@ -36,7 +36,7 @@ pub(crate) mod axon_v3_restore;
 mod axon_v3_operator;
 pub(crate) mod incumbent_preflight;
 #[cfg(all(test, feature = "sqlite"))]
-mod incumbent_storage_tests;
+pub(crate) mod incumbent_storage_tests;
 pub use axon_v3_operator::run_axon_v3_operator_command;
 mod crypto;
 #[allow(unused_imports)] // Wired only with the durable enrollment transaction.
