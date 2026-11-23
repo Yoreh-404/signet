@@ -33,6 +33,8 @@ use url::{Host, Url};
 mod axon_v2;
 pub(crate) mod axon_v3_acceptance;
 pub(crate) mod axon_v3_restore;
+mod axon_v3_operator;
+pub use axon_v3_operator::run_axon_v3_operator_command;
 mod crypto;
 #[allow(unused_imports)] // Wired only with the durable enrollment transaction.
 pub(crate) use axon_v2::{ApprovedAxonDeclaration, VerifiedAxonDeclaration, verify_approved_axon_v2, verify_approved_axon_v2_withdrawal};

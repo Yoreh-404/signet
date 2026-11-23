@@ -22,10 +22,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let db = Db::connect_with_retry(&settings).await?;
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("axon-v2") {
-        let rest = args.collect::<Vec<_>>();
-        application_discovery::run_axon_v2_operator_command(&settings, &db, &rest).await?;
-        return Ok(());
+    match args.next().as_deref() {
+        Some("axon-v2") => {
+            let rest = args.collect::<Vec<_>>();
+            application_discovery::run_axon_v2_operator_command(&settings, &db, &rest).await?;
+            return Ok(());
+        }
+        Some("axon-v3") => {
+            let rest = args.collect::<Vec<_>>();
+            application_discovery::run_axon_v3_operator_command(&settings, &db, &rest).await?;
+            return Ok(());
+        }
+        _ => {}
     }
     if settings.database.run_migrations {
         db.migrate().await?;

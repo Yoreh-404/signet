@@ -57,6 +57,79 @@ struct ActivePolicy {
 }
 
 impl Db {
+    /// Deliberate foreground activation, never called by discovery or OAuth.
+    pub(crate) async fn activate_axon_v3_policy(
+        &self, enrolled: crate::config::AxonAdminV3Enrollment, expected_sha256: String,
+        interlock: &RestoreInterlock,
+    ) -> AppResult<()> {
+        let Some(initial) = interlock.reconciled() else { return Err(AppError::Forbidden); };
+        with_conn!(self, |conn, kind| {
+            if matches!(kind, DatabaseKind::Mysql) { return Err(AppError::Forbidden); }
+            let sql = format!(
+                "INSERT INTO axon_v3_application_activation (
+                   application_db_id, organization_id, enrollment_id, client_db_id,
+                   revision, generation, policy_sha256, policy_json, withdrawn)
+                 SELECT p.application_db_id, p.organization_id, p.enrollment_id, p.client_db_id,
+                   p.revision, p.generation, p.policy_sha256, p.policy_json, 0
+                 FROM axon_v3_staged_application_policy p
+                 JOIN applications a ON a.id = p.application_db_id AND a.is_active = 1 AND a.organization_id = p.organization_id
+                 JOIN organizations o ON o.id = p.organization_id AND o.is_active = 1
+                 JOIN clients c ON c.id = p.client_db_id AND c.is_active = 1 AND c.organization_id = o.id
+                 JOIN application_client_bindings b ON b.application_id = a.id
+                   AND b.client_db_id = c.id AND b.is_active = 1 AND b.protocol = 'oauth2_oidc'
+                 JOIN clients v ON v.organization_id = o.id AND v.audience = c.audience
+                   AND v.is_active = 1 AND v.token_endpoint_auth_method <> 'none'
+                 WHERE p.organization_id = {} AND p.enrollment_id = {} AND a.slug = {}
+                   AND c.client_id = {} AND v.client_id = {} AND c.audience = {} AND p.policy_sha256 = {}
+                   AND c.require_pkce = 1 AND c.require_s256_pkce = 1
+                   AND NOT EXISTS (SELECT 1 FROM application_discovery d
+                     WHERE d.application_id = a.id AND d.management_mode = 'website_managed')
+                 ON CONFLICT(application_db_id) DO UPDATE SET
+                   revision = excluded.revision, generation = excluded.generation,
+                   policy_sha256 = excluded.policy_sha256, policy_json = excluded.policy_json, withdrawn = 0
+                 WHERE axon_v3_application_activation.organization_id = excluded.organization_id
+                   AND axon_v3_application_activation.enrollment_id = excluded.enrollment_id
+                   AND axon_v3_application_activation.client_db_id = excluded.client_db_id
+                   AND ((excluded.revision > axon_v3_application_activation.revision
+                         AND excluded.generation > axon_v3_application_activation.generation)
+                     OR (excluded.revision = axon_v3_application_activation.revision
+                         AND excluded.generation = axon_v3_application_activation.generation
+                         AND excluded.policy_sha256 = axon_v3_application_activation.policy_sha256
+                         AND axon_v3_application_activation.withdrawn = 0))",
+                ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6), ph(kind,7),
+            );
+            let changed = sql_query(sql)
+                .bind::<Text,_>(&enrolled.organization_id).bind::<Text,_>(&enrolled.enrollment_id)
+                .bind::<Text,_>(&enrolled.application_id).bind::<Text,_>(&enrolled.client_id)
+                .bind::<Text,_>(&enrolled.introspection_client_id).bind::<Text,_>(&enrolled.audience)
+                .bind::<Text,_>(&expected_sha256).execute(&mut conn).map_err(AppError::from)?;
+            if changed != 1 { return Err(AppError::Forbidden); }
+            Ok(())
+        })?;
+        if interlock.reconciled().as_ref() != Some(&initial) { return Err(AppError::Forbidden); }
+        Ok(())
+    }
+
+    pub(crate) async fn withdraw_axon_v3_policy(
+        &self, enrolled: crate::config::AxonAdminV3Enrollment, expected_sha256: String,
+    ) -> AppResult<()> {
+        with_conn!(self, |conn, kind| {
+            if matches!(kind, DatabaseKind::Mysql) { return Err(AppError::Forbidden); }
+            let sql = format!(
+                "UPDATE axon_v3_application_activation SET withdrawn = 1
+                 WHERE organization_id = {} AND enrollment_id = {} AND policy_sha256 = {}
+                   AND application_db_id IN (SELECT id FROM applications WHERE organization_id = {} AND slug = {})",
+                ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5),
+            );
+            let changed = sql_query(sql)
+                .bind::<Text,_>(&enrolled.organization_id).bind::<Text,_>(&enrolled.enrollment_id)
+                .bind::<Text,_>(&expected_sha256).bind::<Text,_>(&enrolled.organization_id)
+                .bind::<Text,_>(&enrolled.application_id).execute(&mut conn).map_err(AppError::from)?;
+            if changed != 1 { return Err(AppError::Forbidden); }
+            Ok(())
+        })
+    }
+
     pub(crate) async fn read_active_axon_v3_policy(
         &self, scope: CheckedScope, interlock: &RestoreInterlock,
     ) -> AppResult<Option<Value>> {
@@ -221,6 +294,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn check_restore_read_side(db: &Db, db_path: &std::path::Path) {
         use std::{fs, os::unix::fs::PermissionsExt};
+        use crate::application_discovery::{run_axon_v3_operator_command, axon_v3_acceptance::tests::sign};
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use ed25519_dalek::SigningKey;
+        use sha2::{Digest, Sha256};
         let Db::Sqlite(pool) = db else { unreachable!() };
         let dir = db_path.with_extension("restore");
         fs::create_dir(&dir).unwrap();
@@ -253,12 +330,35 @@ mod tests {
             INSERT INTO users (id,email,username,password_hash,is_admin,is_active,created_at,updated_at)
               VALUES ('fixture-admin','fixture@example.invalid','fixture-admin','not-a-credential',1,1,0,0);").unwrap();
         assert!(read().await.unwrap().is_none(), "staged row cannot grant");
-        // The fixture records an explicit activation. No runtime or staging
-        // code can create an activation row implicitly.
-        pool.get().unwrap().batch_execute("INSERT INTO axon_v3_application_activation
-            SELECT application_db_id, organization_id, enrollment_id, client_db_id,
-                   revision, generation, policy_sha256, policy_json, 0
-            FROM axon_v3_staged_application_policy WHERE application_db_id='app-db';").unwrap();
+        let mut settings: crate::Settings = toml::from_str(include_str!("../../../config/default.toml")).unwrap();
+        settings.discovery.axon_admin_v3 = Some(crate::config::AxonAdminV3Enrollment {
+            organization_id: "example-org".into(), enrollment_id: "enrollment".into(),
+            application_id: "axon".into(), issuer: "https://signet.example".into(),
+            client_id: "bound-client".into(), introspection_client_id: "confidential-verifier".into(),
+            audience: "https://axon.example/admin".into(), origin: "https://axon.example".into(),
+            restore_marker_path: marker.clone(), restore_marker_owner_uid: rustix::process::geteuid().as_raw(),
+        });
+        let public = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        settings.discovery.axon_admin_trust = Some(crate::config::AxonAdminTrust {
+            organization_id: "example-org".into(), application_id: "axon".into(),
+            client_id: "bound-client".into(), audience: "https://axon.example/admin".into(),
+            origin: "https://axon.example".into(), signing_public_jwks: json!({"keys":[{
+                "kty":"OKP","crv":"Ed25519","kid":"approval","x":URL_SAFE_NO_PAD.encode(public.as_bytes()),
+            }]}).to_string(),
+        });
+        let raw = policy().to_string();
+        let digest = format!("sha256:{:x}", Sha256::digest(&raw));
+        let now = crate::util::now_ts();
+        let approval = sign(&json!({"format":"axon.signet.application-admin.acceptance.v3",
+            "policy_sha256":digest,"revision":4,"generation":7,"aud":"https://signet.example",
+            "iat":now,"exp":now+900}).to_string(), 9, HEADER);
+        let policy_file = db_path.with_extension("policy.json");
+        let approval_file = db_path.with_extension("approval.jws");
+        fs::write(&policy_file, raw).unwrap();
+        fs::write(&approval_file, approval).unwrap();
+        let activate = vec!["activate".to_owned(), policy_file.to_str().unwrap().to_owned(),
+            approval_file.to_str().unwrap().to_owned(), digest.clone()];
+        run_axon_v3_operator_command(&settings, db, &activate).await.unwrap();
         let proof = read().await.unwrap().unwrap();
         assert_eq!(proof["format"], "axon.signet.application-admin.live.v3");
         assert_eq!(proof["subject"], "fixture-admin");
@@ -274,9 +374,13 @@ mod tests {
         pool.get().unwrap().batch_execute("UPDATE users SET is_admin=0 WHERE id='fixture-admin'").unwrap();
         update(&ready);
         assert!(read().await.unwrap().is_none(), "current demotion wins on reopen");
-        pool.get().unwrap().batch_execute("UPDATE users SET is_admin=1 WHERE id='fixture-admin';
-            UPDATE axon_v3_application_activation SET withdrawn=1 WHERE application_db_id='app-db'").unwrap();
+        pool.get().unwrap().batch_execute("UPDATE users SET is_admin=1 WHERE id='fixture-admin'").unwrap();
+        run_axon_v3_operator_command(&settings, db, &["withdraw".into(), digest]).await.unwrap();
         assert!(read().await.unwrap().is_none(), "withdrawn activation cannot grant");
+        assert!(run_axon_v3_operator_command(&settings, db, &activate).await.is_err(),
+            "the same signed policy cannot reopen a withdrawn revision");
+        fs::remove_file(policy_file).unwrap();
+        fs::remove_file(approval_file).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }

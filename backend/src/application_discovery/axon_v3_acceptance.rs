@@ -168,7 +168,7 @@ pub(crate) mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{Value, json};
 
-    fn sign(raw: &str, seed: u8, header: &str) -> String {
+    pub(crate) fn sign(raw: &str, seed: u8, header: &str) -> String {
         let signing_input = format!("{}.{}", URL_SAFE_NO_PAD.encode(header), URL_SAFE_NO_PAD.encode(raw));
         let key = SigningKey::from_bytes(&[seed; 32]);
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()).to_bytes()))
