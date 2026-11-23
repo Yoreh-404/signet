@@ -62,6 +62,23 @@ pub(crate) mod sqlite {
         conn: &mut SqliteConnection, enrolled: &crate::config::AxonAdminV3Enrollment,
         trust: &crate::config::AxonAdminTrust, expected: Option<Version<'_>>, next: &VerifiedPolicy,
     ) -> QueryResult<()> {
+        write_enrolled_incumbent_checked(conn, enrolled, trust, expected, next, || ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_enrolled_incumbent_with_test_hook(
+        conn: &mut SqliteConnection, enrolled: &crate::config::AxonAdminV3Enrollment,
+        trust: &crate::config::AxonAdminTrust, expected: Option<Version<'_>>, next: &VerifiedPolicy,
+        after_registry_read: impl FnOnce(),
+    ) -> QueryResult<()> {
+        write_enrolled_incumbent_checked(conn, enrolled, trust, expected, next, after_registry_read)
+    }
+
+    fn write_enrolled_incumbent_checked(
+        conn: &mut SqliteConnection, enrolled: &crate::config::AxonAdminV3Enrollment,
+        trust: &crate::config::AxonAdminTrust, expected: Option<Version<'_>>, next: &VerifiedPolicy,
+        after_registry_read: impl FnOnce(),
+    ) -> QueryResult<()> {
         let p = next.policy();
         if p.organization_id != enrolled.organization_id || p.enrollment_id != enrolled.enrollment_id
             || p.application_id != enrolled.application_id || p.issuer != enrolled.issuer
@@ -76,6 +93,7 @@ pub(crate) mod sqlite {
         let signer = crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks)
             .ok_or(Error::RollbackTransaction)?;
         let gate = RestoreInterlock::new(enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid);
+        let initial = RestoreSnapshot::capture(&gate).ok_or(Error::RollbackTransaction)?;
         let callback = format!("{}/admin/api/auth/signet/callback", p.origin);
         #[derive(diesel::QueryableByName)]
         struct BindingRow {
@@ -97,7 +115,8 @@ pub(crate) mod sqlite {
         fn exactly(raw: &str, expected: &str) -> bool {
             serde_json::from_str::<Vec<String>>(raw).is_ok_and(|v| v == [expected])
         }
-        conn.transaction(|conn| {
+        // Resolution and CAS share one writer lock; the inner CAS is a savepoint.
+        conn.immediate_transaction(|conn| {
             let rows: Vec<BindingRow> = sql_query("SELECT a.id AS application_db_id,
                 c.id AS client_db_id, d.signing_public_jwks AS enrolled_jwks,
                 c.redirect_uris, c.scopes, c.grant_types, c.response_types
@@ -122,11 +141,16 @@ pub(crate) mod sqlite {
             {
                 return Err(Error::RollbackTransaction);
             }
+            after_registry_read();
             compare_and_set(conn, &gate, &IncumbentPin {
                 application_db_id: &row.application_db_id, client_db_id: &row.client_db_id,
                 policy_sha256: next.sha256(), signer_pin: &signer, revision: p.revision,
                 generation: p.generation, withdrawn: false,
-            }, &row.enrolled_jwks, expected, next)
+            }, &row.enrolled_jwks, expected, next)?;
+            if !initial.unchanged() {
+                return Err(Error::RollbackTransaction);
+            }
+            Ok(())
         })
     }
 

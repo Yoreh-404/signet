@@ -148,6 +148,67 @@ pub(crate) fn signed_file_bench(
     assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 0, "old command cannot affect new digest");
     assert_eq!(sqlite::withdraw(&mut conn, &next_pin).unwrap(), 1);
     drop(conn);
+
+    // Use the actual migrated registry (not the storage-only database above)
+    // with the same enrolled test JWKS and signed VerifiedPolicy.
+    let p = approved.policy();
+    let enrolled = crate::config::AxonAdminV3Enrollment {
+        organization_id: p.organization_id.clone(), enrollment_id: p.enrollment_id.clone(),
+        application_id: p.application_id.clone(), issuer: p.issuer.clone(),
+        client_id: p.client_id.clone(), introspection_client_id: "not-used-by-writer".into(),
+        audience: p.audience.clone(), origin: p.origin.clone(),
+        restore_marker_path: marker.clone(), restore_marker_owner_uid: rustix::process::geteuid().as_raw(),
+    };
+    let trust = crate::config::AxonAdminTrust {
+        organization_id: p.organization_id.clone(), application_id: p.application_id.clone(),
+        client_id: p.client_id.clone(), audience: p.audience.clone(), origin: p.origin.clone(),
+        signing_public_jwks: enrolled_jwks.into(),
+    };
+    let registry = || SqliteConnection::establish(fixture_path.to_str().unwrap()).unwrap();
+    let mut registry_conn = registry();
+    registry_conn.batch_execute(SCHEMA).unwrap();
+    assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &trust, None, foreign).is_err());
+    let wrong_site = crate::config::AxonAdminTrust { origin: "https://foreign.example".into(), ..trust.clone() };
+    assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &wrong_site, None, approved).is_err());
+    assert!(sqlite::write_enrolled_incumbent_with_test_hook(
+        &mut registry_conn, &enrolled, &trust, None, approved, || set_gate(true))
+        .is_err(), "replacement marker invalidates the entire transaction, including its savepoint");
+    let mut competing = registry();
+    let disable_site = |conn: &mut SqliteConnection| sql_query(
+        "UPDATE application_discovery SET operator_disabled=1 WHERE application_id=?")
+        .bind::<Text,_>(pin.application_db_id).execute(conn);
+    sqlite::write_enrolled_incumbent_with_test_hook(&mut registry_conn, &enrolled, &trust, None, approved, || {
+        competing.batch_execute("PRAGMA busy_timeout=0;").unwrap();
+        let rejected = disable_site(&mut competing).unwrap_err();
+        assert!(rejected.to_string().contains("database is locked"), "{rejected}");
+    }).unwrap();
+    #[derive(diesel::QueryableByName)]
+    struct Saved {
+        #[diesel(sql_type = Text)] application_db_id: String,
+        #[diesel(sql_type = Text)] client_db_id: String,
+        #[diesel(sql_type = Text)] policy_sha256: String,
+        #[diesel(sql_type = Text)] signer_pin: String,
+    }
+    let saved = |conn: &mut SqliteConnection| sql_query("SELECT application_db_id, client_db_id,
+        policy_sha256, signer_pin FROM axon_v3_incumbent_activation WHERE singleton=1")
+        .get_result::<Saved>(conn).unwrap();
+    drop(registry_conn);
+    let written = saved(&mut registry());
+    assert_eq!((written.application_db_id.as_str(), written.client_db_id.as_str(),
+        written.policy_sha256.as_str(), written.signer_pin.as_str()),
+        (pin.application_db_id, pin.client_db_id, approved.sha256(), pin.signer_pin));
+    assert_eq!(disable_site(&mut competing).unwrap(), 1, "write is possible after the incumbent transaction");
+    assert!(sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).is_err());
+    assert_eq!(saved(&mut registry()).policy_sha256, approved.sha256());
+    sql_query("UPDATE application_discovery SET operator_disabled=0 WHERE application_id=?")
+        .bind::<Text,_>(pin.application_db_id).execute(&mut competing).unwrap();
+    set_gate(false);
+    assert!(sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).is_err());
+    assert_eq!(saved(&mut registry()).policy_sha256, approved.sha256());
+    set_gate(true);
+    sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).unwrap();
+    assert_eq!(saved(&mut registry()).policy_sha256, replacement.sha256());
+
     fs::set_permissions(&marker_root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
