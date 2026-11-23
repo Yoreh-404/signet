@@ -207,7 +207,7 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-fn open_operator_anchor(path: &Path, owner: u32, limit: u64) -> Option<File> {
+pub(super) fn open_operator_anchor(path: &Path, owner: u32, limit: u64) -> Option<File> {
     use rustix::fs::{self, FileType, Mode, OFlags};
     let parent = fs::open(
         path.parent()?, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -245,7 +245,7 @@ fn open_operator_anchor(path: &Path, owner: u32, limit: u64) -> Option<File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_operator_anchor(_: &Path, _: u32, _: u64) -> Option<File> {
+pub(super) fn open_operator_anchor(_: &Path, _: u32, _: u64) -> Option<File> {
     None
 }
 

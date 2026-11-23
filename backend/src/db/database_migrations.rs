@@ -36,6 +36,8 @@ impl Db {
             ).map_err(|err| AppError::Database(err.to_string()))?;
             conn.batch_execute(super::axon_v3_policy::SCHEMA)
                 .map_err(|err| AppError::Database(err.to_string()))?;
+            conn.batch_execute(super::axon_v3_policy::ACTIVE_SCHEMA)
+                .map_err(|err| AppError::Database(err.to_string()))?;
             Ok(())
         })?;
         self.remove_legacy_phone_uniqueness().await?;

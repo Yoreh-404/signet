@@ -89,6 +89,15 @@ fn exact_https_origin(value: &str) -> bool {
     value.starts_with("https://") && website_origin(value).is_ok_and(|origin| origin == value)
 }
 
+/// Validate stored bytes without applying the one-time acceptance clock.
+pub(crate) fn read_stored_policy(bytes: &[u8], expected_sha256: &str) -> Option<StablePolicy> {
+    if bytes.len() > 65_536 || format!("sha256:{:x}", Sha256::digest(bytes)) != expected_sha256 {
+        return None;
+    }
+    let policy: StablePolicy = serde_json::from_slice(bytes).ok()?;
+    (policy.format == POLICY_FORMAT).then_some(policy)
+}
+
 pub(crate) fn verify_acceptance(
     policy_bytes: &[u8], approval: &str, trusted: &TrustedRegistration<'_>, now: i64,
 ) -> AppResult<VerifiedPolicy> {

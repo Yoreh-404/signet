@@ -3,7 +3,9 @@
 
 use super::{AppError, AppResult, DatabaseKind, Db, blocking, ph};
 use crate::application_discovery::axon_v3_acceptance::VerifiedPolicy;
-use diesel::{RunQueryDsl, sql_query, sql_types::{BigInt, Text}};
+use crate::application_discovery::axon_v3_restore::RestoreInterlock;
+use diesel::{OptionalExtension, RunQueryDsl, sql_query, sql_types::{BigInt, Text}};
+use serde_json::{Value, json};
 
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_staged_application_policy (
     application_db_id VARCHAR(255) PRIMARY KEY,
@@ -16,7 +18,98 @@ pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_staged_appli
     policy_json TEXT NOT NULL
 )";
 
+pub(super) const ACTIVE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_application_activation (
+    application_db_id VARCHAR(255) PRIMARY KEY,
+    revision BIGINT NOT NULL,
+    generation BIGINT NOT NULL,
+    policy_sha256 VARCHAR(71) NOT NULL,
+    withdrawn INTEGER NOT NULL
+)";
+
+/// Derived exclusively from authenticated resource introspection and its
+/// configured exact confidential verifier binding, never request JSON.
+pub(crate) struct CheckedScope {
+    pub organization_id: String,
+    pub enrollment_id: String,
+    pub application_id: String,
+    pub issuer: String,
+    pub client_id: String,
+    pub verifier_client_id: String,
+    pub audience: String,
+    pub origin: String,
+    pub subject: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ActivePolicy {
+    #[diesel(sql_type = Text)]
+    policy_json: String,
+    #[diesel(sql_type = Text)]
+    policy_sha256: String,
+    #[diesel(sql_type = BigInt)]
+    revision: i64,
+    #[diesel(sql_type = BigInt)]
+    generation: i64,
+}
+
 impl Db {
+    pub(crate) async fn read_active_axon_v3_policy(
+        &self, scope: CheckedScope, interlock: &RestoreInterlock,
+    ) -> AppResult<Option<Value>> {
+        let Some(initial) = interlock.reconciled() else { return Ok(None); };
+        if scope.client_id == scope.verifier_client_id
+            || crate::dcr::is_website_client_id(&scope.client_id)
+            || crate::dcr::is_website_client_id(&scope.verifier_client_id)
+        { return Ok(None); }
+        let row = with_conn!(self, |conn, kind| {
+            let sql = format!(
+                "SELECT p.policy_json, p.policy_sha256, p.revision, p.generation
+                 FROM axon_v3_staged_application_policy p
+                 JOIN axon_v3_application_activation x ON x.application_db_id = p.application_db_id
+                   AND x.revision = p.revision AND x.generation = p.generation
+                   AND x.policy_sha256 = p.policy_sha256 AND x.withdrawn = 0
+                 JOIN applications a ON a.id = p.application_db_id AND a.is_active = 1
+                 JOIN organizations o ON o.id = p.organization_id AND o.id = a.organization_id AND o.is_active = 1
+                 JOIN users u ON u.is_active = 1 AND u.is_admin = 1 AND u.archived_at IS NULL
+                 JOIN organization_members m ON m.organization_id = o.id AND m.user_id = u.id AND m.is_active = 1
+                 JOIN application_client_bindings b ON b.application_id = a.id AND b.client_db_id = p.client_db_id
+                   AND b.is_active = 1 AND b.protocol = 'oauth2_oidc'
+                 JOIN clients c ON c.id = p.client_db_id AND c.organization_id = o.id
+                   AND c.is_active = 1 AND c.require_pkce = 1 AND c.require_s256_pkce = 1
+                 JOIN clients v ON v.organization_id = o.id AND v.audience = c.audience
+                   AND v.is_active = 1 AND v.token_endpoint_auth_method <> 'none'
+                 WHERE p.organization_id = {} AND p.enrollment_id = {} AND a.slug = {}
+                   AND c.client_id = {} AND v.client_id = {} AND c.audience = {} AND u.id = {}",
+                ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6), ph(kind,7),
+            );
+            let row = sql_query(sql)
+                .bind::<Text,_>(&scope.organization_id).bind::<Text,_>(&scope.enrollment_id)
+                .bind::<Text,_>(&scope.application_id).bind::<Text,_>(&scope.client_id)
+                .bind::<Text,_>(&scope.verifier_client_id).bind::<Text,_>(&scope.audience)
+                .bind::<Text,_>(&scope.subject)
+                .get_result::<ActivePolicy>(&mut conn).optional().map_err(AppError::from)?;
+            let Some(row) = row else { return Ok::<_, AppError>(None); };
+            let Some(policy) = crate::application_discovery::axon_v3_acceptance::read_stored_policy(
+                row.policy_json.as_bytes(), &row.policy_sha256,
+            ) else { return Ok(None); };
+            if policy.issuer != scope.issuer || policy.origin != scope.origin
+                || policy.organization_id != scope.organization_id || policy.enrollment_id != scope.enrollment_id
+                || policy.application_id != scope.application_id || policy.client_id != scope.client_id
+                || policy.audience != scope.audience || policy.revision != row.revision
+                || policy.generation != row.generation
+            { return Ok(None); }
+            Ok(Some(json!({
+                "format":"axon.signet.application-admin.live.v3",
+                "policy_sha256":row.policy_sha256, "organization_id":policy.organization_id,
+                "enrollment_id":policy.enrollment_id, "application_id":policy.application_id,
+                "issuer":policy.issuer, "client_id":policy.client_id, "audience":policy.audience,
+                "origin":policy.origin, "subject":scope.subject,
+                "revision":row.revision, "generation":row.generation, "permissions":policy.permissions,
+            })))
+        })?;
+        Ok(if interlock.reconciled().as_ref() == Some(&initial) { row } else { None })
+    }
+
     /// A verified declaration is input to staging, not a grant. Only the
     /// existing active, exact client/application registration can be staged.
     pub(crate) async fn stage_axon_v3_policy(&self, approved: VerifiedPolicy) -> AppResult<()> {
@@ -109,6 +202,8 @@ mod tests {
         pool.get().unwrap().batch_execute(registration).unwrap();
         db.stage_axon_v3_policy(put(4, 7, false)).await.unwrap();
         db.stage_axon_v3_policy(put(4, 7, false)).await.unwrap();
+        #[cfg(target_os = "linux")]
+        check_restore_read_side(&db, &path).await;
         assert!(db.stage_axon_v3_policy(put(4, 7, true)).await.is_err());
         assert!(db.stage_axon_v3_policy(put(5, 7, false)).await.is_err());
         db.stage_axon_v3_policy(put(5, 8, false)).await.unwrap();
@@ -117,5 +212,69 @@ mod tests {
         assert!(db.stage_axon_v3_policy(put(6, 9, false)).await.is_err());
         drop(db);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn check_restore_read_side(db: &Db, db_path: &std::path::Path) {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let Db::Sqlite(pool) = db else { unreachable!() };
+        let dir = db_path.with_extension("restore");
+        fs::create_dir(&dir).unwrap();
+        let marker = dir.join("current.json");
+        let update = |data: &str| {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let tmp = dir.join("new.json");
+            fs::write(&tmp, data).unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o400)).unwrap();
+            fs::rename(&tmp, &marker).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        };
+        let interlock = RestoreInterlock::new(marker.clone(), rustix::process::geteuid().as_raw());
+        let scope = || CheckedScope {
+            organization_id: "example-org".into(), enrollment_id: "enrollment".into(),
+            application_id: "axon".into(), issuer: "https://signet.example".into(),
+            client_id: "bound-client".into(), verifier_client_id: "confidential-verifier".into(),
+            audience: "https://axon.example/admin".into(), origin: "https://axon.example".into(),
+            subject: "fixture-admin".into(),
+        };
+        let read = || db.read_active_axon_v3_policy(scope(), &interlock);
+        assert!(read().await.unwrap().is_none());
+        update(r#"{"format":"signet-privileged-restore/v1","state":"reconciled","operation_id":"ac84cfd6-f2d8-46f3-8fd1-986c43afd131"}"#);
+        let ready = fs::read_to_string(&marker).unwrap();
+        pool.get().unwrap().batch_execute("
+            INSERT INTO clients (id,client_id,client_name,organization_id,redirect_uris,post_logout_redirect_uris,scopes,audience,
+              grant_types,response_types,token_endpoint_auth_method,require_pkce,require_s256_pkce,is_active,created_at,updated_at)
+              VALUES ('verifier-db','confidential-verifier','Resource','example-org','[]','[]','[]','https://axon.example/admin',
+                       '[]','[]','client_secret_basic',0,0,1,0,0);
+            INSERT INTO users (id,email,username,password_hash,is_admin,is_active,created_at,updated_at)
+              VALUES ('fixture-admin','fixture@example.invalid','fixture-admin','not-a-credential',1,1,0,0);
+            INSERT INTO organization_members (organization_id,user_id,role,is_active,created_at,updated_at)
+              VALUES ('example-org','fixture-admin','member',1,0,0);").unwrap();
+        assert!(read().await.unwrap().is_none(), "staged row cannot grant");
+        // The fixture records an explicit activation. No runtime or staging
+        // code can create an activation row implicitly.
+        pool.get().unwrap().batch_execute("INSERT INTO axon_v3_application_activation
+            SELECT application_db_id, revision, generation, policy_sha256, 0
+            FROM axon_v3_staged_application_policy WHERE application_db_id='app-db';").unwrap();
+        let proof = read().await.unwrap().unwrap();
+        assert_eq!(proof["format"], "axon.signet.application-admin.live.v3");
+        assert_eq!(proof["subject"], "fixture-admin");
+        assert_eq!(proof["revision"], 4);
+        assert!(proof.get("exp").is_none());
+        let mut foreign = scope();
+        foreign.origin = "https://other.example".into();
+        assert!(db.read_active_axon_v3_policy(foreign, &interlock).await.unwrap().is_none());
+        update(r#"{"format":"signet-privileged-restore/v1","state":"held","operation_id":"df63e995-c3c1-487f-9aa9-468c13431322"}"#);
+        assert!(read().await.unwrap().is_none(), "old DB row cannot defeat a restore hold");
+        update(r#"{"format":"signet-privileged-restore/v1","state":"reconciled"}"#);
+        assert!(read().await.unwrap().is_none(), "incomplete reconciliation must deny");
+        pool.get().unwrap().batch_execute("UPDATE users SET is_admin=0 WHERE id='fixture-admin'").unwrap();
+        update(&ready);
+        assert!(read().await.unwrap().is_none(), "current demotion wins on reopen");
+        pool.get().unwrap().batch_execute("UPDATE users SET is_admin=1 WHERE id='fixture-admin';
+            UPDATE axon_v3_application_activation SET withdrawn=1 WHERE application_db_id='app-db'").unwrap();
+        assert!(read().await.unwrap().is_none(), "withdrawn activation cannot grant");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }
