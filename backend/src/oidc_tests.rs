@@ -1835,7 +1835,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     use crate::application_discovery::axon_v3_acceptance::{
         TrustedFloor, TrustedRegistration, tests::{HEADER, sign}, verify_acceptance,
     };
-    use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use ed25519_dalek::SigningKey;
     use serde_json::json;
@@ -1871,7 +1871,8 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
         sql_query("DELETE FROM organization_members WHERE user_id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
         sql_query("UPDATE clients SET organization_id=?,audience=?,redirect_uris=?,scopes='[\"openid\"]',
-            grant_types='[\"authorization_code\"]',require_pkce=1,require_s256_pkce=1 WHERE id=?")
+            grant_types='[\"authorization_code\"]',token_endpoint_auth_method='none',
+            require_pkce=1,require_s256_pkce=1 WHERE id=?")
             .bind::<Text,_>(&app.organization_id).bind::<Text,_>(audience)
             .bind::<Text,_>(json!([callback]).to_string()).bind::<Text,_>(&client.id).execute(&mut conn).unwrap();
     }
@@ -1907,10 +1908,10 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let body = serde_urlencoded::to_string([
         ("grant_type","authorization_code"), ("code",code.as_str()),
         ("redirect_uri", callback.as_str()), ("code_verifier",challenge_verifier),
+        ("client_id",client.client_id.as_str()),
     ]).unwrap();
     let response = router.clone().oneshot(Request::post("/oauth2/token")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(header::AUTHORIZATION, format!("Basic {}",STANDARD.encode("demo-web:demo-secret-change-me")))
         .body(Body::from(body)).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = oidc_http_body_json(response).await;
@@ -1950,6 +1951,59 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert!(verify_acceptance(policy.as_bytes(), "", &trusted, now).is_err());
     assert!(verify_acceptance(policy.as_bytes(), &sign(&claims, 8, HEADER), &trusted, now).is_err());
     let approved = verify_acceptance(policy.as_bytes(), &sign(&claims, 9, HEADER), &trusted, now).unwrap();
+    use crate::application_discovery::{axon_signer_pin, incumbent_preflight::{self, IncumbentPin, RequestScope}};
+    let host = format!("sha256:{}", "1".repeat(64));
+    let signer_pin = axon_signer_pin(&approved_jwks).unwrap();
+    let pin = IncumbentPin {
+        application_db_id: &app.id, client_db_id: &client.id, host_sha256: &host,
+        policy_sha256: &digest, signer_pin: &signer_pin, revision: 4, generation: 8, withdrawn: false,
+    };
+    let challenge = util::sha256_base64url(challenge_verifier);
+    let wanted = RequestScope {
+        issuer, client_id: &client.client_id, resource: audience, redirected_to: &callback,
+        scope: "openid", challenge_method: "S256", challenge: &challenge,
+    };
+    let eligible = async |pin: Option<&IncumbentPin<'_>>, request: &RequestScope<'_>|
+        incumbent_preflight::matches(&state, &jar, pin, &host, &approved, request).await;
+    assert!(eligible(Some(&pin), &wanted).await.unwrap());
+    assert!(!eligible(None, &wanted).await.unwrap());
+    for wrong in [
+        RequestScope { issuer: "https://foreign.example", ..wanted },
+        RequestScope { client_id: "unrelated-client", ..wanted },
+        RequestScope { resource: "https://axon.example/other", ..wanted },
+        RequestScope { redirected_to: "https://axon.example/other", ..wanted },
+        RequestScope { scope: "openid email", ..wanted },
+        RequestScope { challenge_method: "plain", ..wanted },
+        RequestScope { challenge: "", ..wanted },
+    ] {
+        assert!(!eligible(Some(&pin), &wrong).await.unwrap());
+    }
+    for wrong in [
+        IncumbentPin { generation: 7, ..pin },
+        IncumbentPin { revision: 3, ..pin },
+        IncumbentPin { withdrawn: true, ..pin },
+        IncumbentPin { signer_pin: "different", ..pin },
+        IncumbentPin { client_db_id: "another", ..pin },
+    ] {
+        assert!(!eligible(Some(&wrong), &wanted).await.unwrap());
+    }
+    assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin),
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        &approved, &wanted).await.unwrap());
+    assert!(!incumbent_preflight::matches(&state, &CookieJar::new(), Some(&pin), &host,
+        &approved, &wanted).await.unwrap());
+    sql_query("UPDATE users SET is_admin=0 WHERE id=?")
+        .bind::<Text,_>(&fixture.id).execute(&mut pool.get().unwrap()).unwrap();
+    assert!(!eligible(Some(&pin), &wanted).await.unwrap());
+    sql_query("UPDATE users SET is_admin=1 WHERE id=?")
+        .bind::<Text,_>(&fixture.id).execute(&mut pool.get().unwrap()).unwrap();
+    sql_query("UPDATE application_discovery SET operator_disabled=1 WHERE application_id=?")
+        .bind::<Text,_>(&app.id).execute(&mut pool.get().unwrap()).unwrap();
+    assert!(!eligible(Some(&pin), &wanted).await.unwrap());
+    sql_query("UPDATE application_discovery SET operator_disabled=0 WHERE application_id=?")
+        .bind::<Text,_>(&app.id).execute(&mut pool.get().unwrap()).unwrap();
+    state.db.delete_session(&current.session_id).await.unwrap();
+    assert!(!eligible(Some(&pin), &wanted).await.unwrap());
     // Acceptance checks the signed bytes only. It never enables a website
     // registration or tags an ordinary OAuth request with special authority.
     assert!(state.db.stage_axon_v3_policy(approved).await.is_err());
