@@ -89,8 +89,10 @@ pub(crate) fn signed_file_bench(
     pin: &super::incumbent_preflight::IncumbentPin<'_>,
     approved: &super::axon_v3_acceptance::VerifiedPolicy,
     replacement: &super::axon_v3_acceptance::VerifiedPolicy,
+    foreign: &super::axon_v3_acceptance::VerifiedPolicy,
+    enrolled_jwks: &str,
 ) {
-    use crate::db::axon_v3_incumbent_storage::RestoreSnapshot;
+    use crate::db::axon_v3_incumbent_storage::{RestoreSnapshot, sqlite};
     use super::axon_v3_restore::RestoreInterlock;
     use std::{fs, os::unix::fs::{DirBuilderExt, PermissionsExt}};
 
@@ -117,48 +119,34 @@ pub(crate) fn signed_file_bench(
     let a = Version { digest: approved.sha256(), revision: pin.revision, generation: pin.generation };
     let b = Version { digest: replacement.sha256(), revision: replacement.policy().revision,
         generation: replacement.policy().generation };
-    let insert = |conn: &mut SqliteConnection| -> diesel::QueryResult<()> {
-        let snapshot = RestoreSnapshot::capture(&gate).ok_or(diesel::result::Error::RollbackTransaction)?;
-        conn.transaction(|conn| {
-            let changed = sql_query("INSERT INTO axon_v3_incumbent_activation
-                SELECT 1, 'incumbent_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
-                WHERE NOT EXISTS (SELECT 1 FROM axon_v3_incumbent_activation WHERE singleton = 1)")
-                .bind::<Text, _>(pin.application_db_id).bind::<Text, _>(pin.client_db_id)
-                .bind::<Text, _>(&approved.policy().organization_id)
-                .bind::<Text, _>(&approved.policy().enrollment_id)
-                .bind::<Text, _>(pin.host_sha256).bind::<Text, _>(pin.signer_pin)
-                .bind::<Text, _>(a.digest).bind::<Text, _>(approved.bytes())
-                .bind::<BigInt, _>(a.revision).bind::<BigInt, _>(a.generation)
-                .execute(conn)?;
-            if changed != 1 || !snapshot.unchanged() {
-                return Err(diesel::result::Error::RollbackTransaction);
-            }
-            Ok(())
-        })
+    let next_pin = super::incumbent_preflight::IncumbentPin {
+        policy_sha256: b.digest, revision: b.revision, generation: b.generation, ..*pin
     };
-    assert!(insert(&mut conn).is_err(), "missing real marker");
+    let insert = |conn: &mut SqliteConnection, approved| {
+        sqlite::compare_and_set(conn, &gate, pin, enrolled_jwks, None, approved)
+    };
+    assert!(insert(&mut conn, approved).is_err(), "missing real marker");
     set_gate(true);
-    insert(&mut conn).unwrap();
-    assert!(insert(&mut conn).is_err(), "first activation expects no row");
-    let snapshot = RestoreSnapshot::capture(&gate).unwrap();
-    assert!(replace_checked(&mut conn, a, b, replacement.bytes(), || {
-        set_gate(true);
-        snapshot.unchanged()
-    }).is_err(), "marker replacement rolls back SQL");
+    assert!(insert(&mut conn, foreign).is_err(), "valid but non-enrolled signer");
+    insert(&mut conn, approved).unwrap();
+    assert!(insert(&mut conn, approved).is_err(), "first activation expects no row");
+    assert!(sqlite::compare_and_set_with_test_hook(&mut conn, &gate, &next_pin, enrolled_jwks,
+        Some(a), replacement, || set_gate(true)).is_err(), "marker replacement rolls back SQL");
     set_gate(false);
     assert!(RestoreSnapshot::capture(&gate).is_none());
-    assert_eq!(withdraw(&mut conn, b).unwrap(), 0);
-    assert_eq!(withdraw(&mut conn, a).unwrap(), 1, "withdrawal works while held");
+    assert_eq!(sqlite::withdraw(&mut conn, &next_pin).unwrap(), 0);
+    assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 1, "withdrawal works while held");
     drop(conn);
     set_gate(true);
     let mut conn = open();
-    let snapshot = RestoreSnapshot::capture(&gate).unwrap();
-    assert_eq!(withdraw(&mut conn, a).unwrap(), 0, "reopen retains exact tombstone");
-    assert!(replace_checked(&mut conn, a, a, approved.bytes(), || snapshot.unchanged()).is_err());
-    assert!(replace_checked(&mut conn, b, b, replacement.bytes(), || snapshot.unchanged()).is_err());
-    replace_checked(&mut conn, a, b, replacement.bytes(), || snapshot.unchanged()).unwrap();
-    assert_eq!(withdraw(&mut conn, a).unwrap(), 0, "old command cannot affect new digest");
-    assert_eq!(withdraw(&mut conn, b).unwrap(), 1);
+    assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 0, "reopen retains exact tombstone");
+    assert!(sqlite::compare_and_set(&mut conn, &gate, pin, enrolled_jwks, Some(a), approved).is_err());
+    assert!(sqlite::compare_and_set(&mut conn, &gate, &next_pin, enrolled_jwks, Some(b), replacement).is_err());
+    let foreign_host = super::incumbent_preflight::IncumbentPin { host_sha256: "foreign", ..next_pin };
+    assert!(sqlite::compare_and_set(&mut conn, &gate, &foreign_host, enrolled_jwks, Some(a), replacement).is_err());
+    sqlite::compare_and_set(&mut conn, &gate, &next_pin, enrolled_jwks, Some(a), replacement).unwrap();
+    assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 0, "old command cannot affect new digest");
+    assert_eq!(sqlite::withdraw(&mut conn, &next_pin).unwrap(), 1);
     drop(conn);
     fs::set_permissions(&marker_root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();

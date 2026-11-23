@@ -1994,7 +1994,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &host, &next, &wanted)
             .await.unwrap());
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
-            &path, &pin, &approved, &next);
+            &path, &pin, &approved, &next, &other_approval, &approved_jwks);
     }
     for wrong in [
         RequestScope { issuer: "https://foreign.example", ..wanted },
