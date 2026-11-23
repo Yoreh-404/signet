@@ -20,9 +20,13 @@ pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_staged_appli
 
 pub(super) const ACTIVE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_application_activation (
     application_db_id VARCHAR(255) PRIMARY KEY,
+    organization_id VARCHAR(255) NOT NULL,
+    enrollment_id VARCHAR(255) NOT NULL,
+    client_db_id VARCHAR(255) NOT NULL,
     revision BIGINT NOT NULL,
     generation BIGINT NOT NULL,
     policy_sha256 VARCHAR(71) NOT NULL,
+    policy_json TEXT NOT NULL,
     withdrawn INTEGER NOT NULL
 )";
 
@@ -64,22 +68,20 @@ impl Db {
         let row = with_conn!(self, |conn, kind| {
             let sql = format!(
                 "SELECT p.policy_json, p.policy_sha256, p.revision, p.generation
-                 FROM axon_v3_staged_application_policy p
-                 JOIN axon_v3_application_activation x ON x.application_db_id = p.application_db_id
-                   AND x.revision = p.revision AND x.generation = p.generation
-                   AND x.policy_sha256 = p.policy_sha256 AND x.withdrawn = 0
+                 FROM axon_v3_application_activation p
                  JOIN applications a ON a.id = p.application_db_id AND a.is_active = 1
                  JOIN organizations o ON o.id = p.organization_id AND o.id = a.organization_id AND o.is_active = 1
                  JOIN users u ON u.is_active = 1 AND u.is_admin = 1 AND u.archived_at IS NULL
-                 JOIN organization_members m ON m.organization_id = o.id AND m.user_id = u.id AND m.is_active = 1
                  JOIN application_client_bindings b ON b.application_id = a.id AND b.client_db_id = p.client_db_id
-                   AND b.is_active = 1 AND b.protocol = 'oauth2_oidc'
+                   AND b.is_active = 1 AND b.protocol IN ('oauth2_oidc', 'oidc')
                  JOIN clients c ON c.id = p.client_db_id AND c.organization_id = o.id
                    AND c.is_active = 1 AND c.require_pkce = 1 AND c.require_s256_pkce = 1
                  JOIN clients v ON v.organization_id = o.id AND v.audience = c.audience
                    AND v.is_active = 1 AND v.token_endpoint_auth_method <> 'none'
-                 WHERE p.organization_id = {} AND p.enrollment_id = {} AND a.slug = {}
-                   AND c.client_id = {} AND v.client_id = {} AND c.audience = {} AND u.id = {}",
+                 WHERE p.withdrawn = 0 AND p.organization_id = {} AND p.enrollment_id = {} AND a.slug = {}
+                   AND c.client_id = {} AND v.client_id = {} AND c.audience = {} AND u.id = {}
+                   AND NOT EXISTS (SELECT 1 FROM application_discovery d
+                     WHERE d.application_id = a.id AND d.management_mode = 'website_managed')",
                 ph(kind,1), ph(kind,2), ph(kind,3), ph(kind,4), ph(kind,5), ph(kind,6), ph(kind,7),
             );
             let row = sql_query(sql)
@@ -129,11 +131,13 @@ impl Db {
                  FROM applications a
                  JOIN organizations o ON o.id = a.organization_id AND o.is_active = 1
                  JOIN application_client_bindings b ON b.application_id = a.id
-                   AND b.is_active = 1 AND b.protocol = 'oauth2_oidc'
+                   AND b.is_active = 1 AND b.protocol IN ('oauth2_oidc', 'oidc')
                  JOIN clients c ON c.id = b.client_db_id AND c.organization_id = o.id
                    AND c.is_active = 1 AND c.require_pkce = 1 AND c.require_s256_pkce = 1
                  WHERE a.is_active = 1 AND o.id = {} AND a.slug = {}
                    AND c.client_id = {} AND c.audience = {}
+                   AND NOT EXISTS (SELECT 1 FROM application_discovery d
+                     WHERE d.application_id = a.id AND d.management_mode = 'website_managed')
                  ON CONFLICT(application_db_id) DO UPDATE SET
                    revision = excluded.revision, generation = excluded.generation,
                    policy_sha256 = excluded.policy_sha256, policy_json = excluded.policy_json
@@ -247,14 +251,13 @@ mod tests {
               VALUES ('verifier-db','confidential-verifier','Resource','example-org','[]','[]','[]','https://axon.example/admin',
                        '[]','[]','client_secret_basic',0,0,1,0,0);
             INSERT INTO users (id,email,username,password_hash,is_admin,is_active,created_at,updated_at)
-              VALUES ('fixture-admin','fixture@example.invalid','fixture-admin','not-a-credential',1,1,0,0);
-            INSERT INTO organization_members (organization_id,user_id,role,is_active,created_at,updated_at)
-              VALUES ('example-org','fixture-admin','member',1,0,0);").unwrap();
+              VALUES ('fixture-admin','fixture@example.invalid','fixture-admin','not-a-credential',1,1,0,0);").unwrap();
         assert!(read().await.unwrap().is_none(), "staged row cannot grant");
         // The fixture records an explicit activation. No runtime or staging
         // code can create an activation row implicitly.
         pool.get().unwrap().batch_execute("INSERT INTO axon_v3_application_activation
-            SELECT application_db_id, revision, generation, policy_sha256, 0
+            SELECT application_db_id, organization_id, enrollment_id, client_db_id,
+                   revision, generation, policy_sha256, policy_json, 0
             FROM axon_v3_staged_application_policy WHERE application_db_id='app-db';").unwrap();
         let proof = read().await.unwrap().unwrap();
         assert_eq!(proof["format"], "axon.signet.application-admin.live.v3");

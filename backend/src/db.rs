@@ -145,6 +145,7 @@ mod application_discovery_read;
 mod application_discovery_types;
 mod axon_v2_authority;
 mod axon_v3_policy;
+pub(crate) use axon_v3_policy::CheckedScope as AxonV3CheckedScope;
 #[allow(unused_imports)] // Only exposed to the coordinated v2 OIDC boundary.
 pub(crate) use axon_v2_authority::AxonV2Enrollment;
 #[macro_use]

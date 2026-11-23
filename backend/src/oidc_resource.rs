@@ -22,6 +22,7 @@ use axum::{
     Form, Json,
     extract::State,
     http::{HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -186,10 +187,26 @@ pub(super) async fn introspect(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(payload): Form<IntrospectionRequest>,
+) -> AppResult<Response> {
+    let v3 = payload.token_type_hint.as_deref() == Some(AXON_ADMIN_V3_HINT);
+    let mut response = introspect_value(state, headers, payload).await?.into_response();
+    if v3 {
+        response.headers_mut().insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+    Ok(response)
+}
+
+const AXON_ADMIN_V3_HINT: &str = "axon_admin_authority_v3";
+
+async fn introspect_value(
+    state: AppState, headers: HeaderMap, payload: IntrospectionRequest,
 ) -> AppResult<Json<serde_json::Value>> {
     let client = authenticate_client_at(&state, &headers, &payload, "/oauth2/introspect").await?;
     if client.token_endpoint_auth_method == "none" {
         return Err(AppError::Unauthorized);
+    }
+    if payload.token_type_hint.as_deref() == Some(AXON_ADMIN_V3_HINT) {
+        return introspect_durable_axon_admin(&state, &client, &headers, &payload.token).await;
     }
     if payload.token_type_hint.as_deref() == Some(crate::claim_mapper::AXON_ADMIN_AUTHORITY_CLAIM) {
         return introspect_axon_admin_authority(&state, &client, &headers, &payload.token).await;
@@ -336,6 +353,47 @@ pub(super) async fn introspect(
         })));
     }
     Ok(Json(serde_json::json!({ "active": false })))
+}
+
+async fn introspect_durable_axon_admin(
+    state: &AppState, verifier: &ClientRecord, headers: &HeaderMap, token: &str,
+) -> AppResult<Json<serde_json::Value>> {
+    use serde_json::json;
+    let inactive = || Ok(Json(json!({"active":false})));
+    let Some(enrolled) = state.settings.discovery.axon_admin_v3.as_ref() else { return inactive(); };
+    if verifier.client_id != enrolled.introspection_client_id
+        || verifier.client_id == enrolled.client_id || verifier.is_active != 1
+        || verifier.organization_id.as_deref() != Some(enrolled.organization_id.as_str())
+        || verifier.audience != enrolled.audience || token.len() > 32_768
+        || !state.accepted_issuers(headers).await?.contains(&enrolled.issuer)
+    { return inactive(); }
+    let Ok(claims) = state.jwt.verify_access_token_for_introspection(token, &[&enrolled.issuer])
+        else { return inactive(); };
+    let now = util::now_ts();
+    if claims.iat <= 0 || claims.iat > now || claims.exp <= now || claims.scope != "openid"
+        || claims.client_id != enrolled.client_id || claims.aud != enrolled.audience
+        || claims.act.is_some() || claims.gpt_sso_login_code_level.is_some()
+        || super::oidc_token_liveness::is_machine_token_claims(&claims)
+    { return inactive(); }
+    let Some(sid) = claims.sid.as_deref() else { return inactive(); };
+    let Some(source) = state.db.find_client_by_client_id(&enrolled.client_id).await? else { return inactive(); };
+    if !introspected_access_token_is_live(state, Some(&source), &claims).await?
+        || !state.db.list_user_sessions(&claims.sub).await?.iter().any(|session|
+            session.expires_at > util::now_ts() && crate::util::session_public_id(&session.id) == sid)
+    { return inactive(); }
+    let interlock = crate::application_discovery::axon_v3_restore::RestoreInterlock::new(
+        enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid,
+    );
+    let Some(live) = state.db.read_active_axon_v3_policy(crate::db::AxonV3CheckedScope {
+        organization_id: enrolled.organization_id.clone(), enrollment_id: enrolled.enrollment_id.clone(),
+        application_id: enrolled.application_id.clone(), issuer: claims.iss.clone(),
+        client_id: claims.client_id.clone(), verifier_client_id: verifier.client_id.clone(),
+        audience: claims.aud.clone(), origin: enrolled.origin.clone(), subject: claims.sub.clone(),
+    }, &interlock).await? else { return inactive(); };
+    Ok(Json(json!({
+        "active":true, "iss":claims.iss, "sub":claims.sub, "client_id":claims.client_id,
+        "aud":claims.aud, "iat":claims.iat, "exp":claims.exp, (AXON_ADMIN_V3_HINT):live,
+    })))
 }
 
 async fn introspect_axon_admin_authority(

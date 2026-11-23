@@ -256,6 +256,23 @@ pub struct DiscoverySettings {
     pub axon_admin_trust: Option<AxonAdminTrust>,
     #[serde(default)]
     pub axon_admin_v2: Option<AxonAdminV2Policy>,
+    #[serde(default)]
+    pub axon_admin_v3: Option<AxonAdminV3Enrollment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AxonAdminV3Enrollment {
+    pub organization_id: String,
+    pub enrollment_id: String,
+    pub application_id: String,
+    pub issuer: String,
+    pub client_id: String,
+    pub introspection_client_id: String,
+    pub audience: String,
+    pub origin: String,
+    pub restore_marker_path: std::path::PathBuf,
+    pub restore_marker_owner_uid: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -309,6 +326,7 @@ impl Default for DiscoverySettings {
             auto_registration: AutoRegistrationSettings::default(),
             axon_admin_trust: None,
             axon_admin_v2: None,
+            axon_admin_v3: None,
         }
     }
 }
@@ -1290,6 +1308,19 @@ impl Settings {
                 || crate::application_discovery::axon_signer_pin(&trust.signing_public_jwks).is_none())
         {
             anyhow::bail!("discovery.axon_admin_trust requires exact binding fields and one pinned signing key");
+        }
+        if let Some(v3) = &self.discovery.axon_admin_v3
+            && (!v3.restore_marker_path.is_absolute()
+                || [&v3.organization_id, &v3.enrollment_id, &v3.application_id,
+                    &v3.issuer, &v3.client_id, &v3.introspection_client_id, &v3.audience, &v3.origin]
+                    .iter().any(|value| value.is_empty() || value.trim() != value.as_str())
+                || [&v3.issuer, &v3.origin].iter().any(|value| !value.starts_with("https://")
+                    || crate::application_discovery::website_origin(value).ok().as_deref() != Some(value.as_str()))
+                || v3.client_id == v3.introspection_client_id
+                || crate::dcr::is_website_client_id(&v3.client_id)
+                || crate::dcr::is_website_client_id(&v3.introspection_client_id))
+        {
+            anyhow::bail!("discovery.axon_admin_v3 requires an exact registered binding and independent restore marker");
         }
         validate_billing_settings(&self.billing)?;
         if self.performance.runtime_settings_cache_millis > 60_000 {
