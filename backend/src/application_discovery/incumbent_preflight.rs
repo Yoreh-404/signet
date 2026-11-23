@@ -15,7 +15,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 pub(crate) struct IncumbentPin<'a> {
     pub application_db_id: &'a str,
     pub client_db_id: &'a str,
-    pub host_sha256: &'a str,
     pub policy_sha256: &'a str,
     pub signer_pin: &'a str,
     pub revision: i64,
@@ -34,27 +33,22 @@ pub(crate) struct RequestScope<'a> {
     pub challenge: &'a str,
 }
 
-fn hash(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|h| h.len() == 64
-        && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-}
-
 pub(crate) fn approved_enrolled_signer(approved: &VerifiedPolicy, pin: &str, jwks: &str) -> bool {
     axon_signer_pin(jwks).as_deref() == Some(pin)
         && enrolled_signer_key_sha256(jwks).as_deref() == Some(approved.signer_key_sha256())
 }
 
 /// This is an admission precondition, not authorization. Any future caller
-/// must obtain the pin and measured Host from its explicitly configured
+/// must obtain the pin from its explicitly configured
 /// control plane and recheck current state atomically when admitting a code.
 pub(crate) async fn matches(
     state: &AppState, jar: &CookieJar, configured: Option<&IncumbentPin<'_>>,
-    measured_host: &str, approved: &VerifiedPolicy, request: &RequestScope<'_>,
+    approved: &VerifiedPolicy, request: &RequestScope<'_>,
 ) -> AppResult<bool> {
     let Some(pin) = configured else { return Ok(false); };
     let policy = approved.policy();
     let callback = format!("{}/admin/api/auth/signet/callback", policy.origin);
-    if pin.withdrawn || !hash(pin.host_sha256) || pin.host_sha256 != measured_host
+    if pin.withdrawn
         || pin.policy_sha256 != approved.sha256()
         || pin.revision != policy.revision || pin.generation != policy.generation
         || crate::dcr::is_website_client_id(request.client_id)

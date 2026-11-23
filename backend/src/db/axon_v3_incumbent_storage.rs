@@ -11,7 +11,6 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
     client_db_id TEXT NOT NULL,
     organization_id TEXT NOT NULL,
     enrollment_id TEXT NOT NULL,
-    host_sha256 TEXT NOT NULL,
     signer_pin TEXT NOT NULL,
     policy_sha256 TEXT NOT NULL,
     policy_json TEXT NOT NULL,
@@ -90,11 +89,11 @@ pub(crate) mod sqlite {
         conn.transaction(|conn| {
             let changed = match expected {
                 None => sql_query("INSERT INTO axon_v3_incumbent_activation
-                    SELECT 1, 'incumbent_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
+                    SELECT 1, 'incumbent_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
                     WHERE NOT EXISTS (SELECT 1 FROM axon_v3_incumbent_activation WHERE singleton = 1)")
                     .bind::<Text, _>(binding.application_db_id).bind::<Text, _>(binding.client_db_id)
                     .bind::<Text, _>(&policy.organization_id).bind::<Text, _>(&policy.enrollment_id)
-                    .bind::<Text, _>(binding.host_sha256).bind::<Text, _>(binding.signer_pin)
+                    .bind::<Text, _>(binding.signer_pin)
                     .bind::<Text, _>(next.sha256()).bind::<Text, _>(next.bytes())
                     .bind::<BigInt, _>(policy.revision).bind::<BigInt, _>(policy.generation)
                     .execute(conn)?,
@@ -102,14 +101,14 @@ pub(crate) mod sqlite {
                     SET policy_sha256 = ?, policy_json = ?, revision = ?, generation = ?, withdrawn = 0
                     WHERE singleton = 1 AND profile = 'incumbent_v1'
                     AND application_db_id = ? AND client_db_id = ? AND organization_id = ?
-                    AND enrollment_id = ? AND host_sha256 = ? AND signer_pin = ?
+                    AND enrollment_id = ? AND signer_pin = ?
                     AND policy_sha256 = ? AND revision = ? AND generation = ?
                     AND revision < ? AND generation < ?")
                     .bind::<Text, _>(next.sha256()).bind::<Text, _>(next.bytes())
                     .bind::<BigInt, _>(policy.revision).bind::<BigInt, _>(policy.generation)
                     .bind::<Text, _>(binding.application_db_id).bind::<Text, _>(binding.client_db_id)
                     .bind::<Text, _>(&policy.organization_id).bind::<Text, _>(&policy.enrollment_id)
-                    .bind::<Text, _>(binding.host_sha256).bind::<Text, _>(binding.signer_pin)
+                    .bind::<Text, _>(binding.signer_pin)
                     .bind::<Text, _>(expected.digest).bind::<BigInt, _>(expected.revision)
                     .bind::<BigInt, _>(expected.generation)
                     .bind::<BigInt, _>(policy.revision).bind::<BigInt, _>(policy.generation)
@@ -128,10 +127,10 @@ pub(crate) mod sqlite {
         -> QueryResult<usize> {
         sql_query("UPDATE axon_v3_incumbent_activation SET withdrawn = 1
             WHERE singleton = 1 AND profile = 'incumbent_v1' AND withdrawn = 0
-            AND application_db_id = ? AND client_db_id = ? AND host_sha256 = ? AND signer_pin = ?
+            AND application_db_id = ? AND client_db_id = ? AND signer_pin = ?
             AND policy_sha256 = ? AND revision = ? AND generation = ?")
             .bind::<Text, _>(binding.application_db_id).bind::<Text, _>(binding.client_db_id)
-            .bind::<Text, _>(binding.host_sha256).bind::<Text, _>(binding.signer_pin)
+            .bind::<Text, _>(binding.signer_pin)
             .bind::<Text, _>(binding.policy_sha256)
             .bind::<BigInt, _>(binding.revision).bind::<BigInt, _>(binding.generation)
             .execute(conn)

@@ -53,7 +53,7 @@ fn axon_v3_incumbent_storage_is_singleton_and_cas_does_not_resurrect_withdrawal(
     db.batch_execute(SCHEMA).unwrap();
     let seed = |db: &mut SqliteConnection, id, profile| sql_query(
         "INSERT INTO axon_v3_incumbent_activation
-        VALUES (?, ?, 'app', 'client', 'org', 'enrollment', 'host', 'signer', 'a', '{}', 1, 1, 0)")
+        VALUES (?, ?, 'app', 'client', 'org', 'enrollment', 'signer', 'a', '{}', 1, 1, 0)")
         .bind::<diesel::sql_types::Integer, _>(id).bind::<Text, _>(profile).execute(db);
     assert!(seed(&mut db, 2, "incumbent_v1").is_err());
     assert!(seed(&mut db, 1, "managed").is_err());
@@ -142,8 +142,8 @@ pub(crate) fn signed_file_bench(
     assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 0, "reopen retains exact tombstone");
     assert!(sqlite::compare_and_set(&mut conn, &gate, pin, enrolled_jwks, Some(a), approved).is_err());
     assert!(sqlite::compare_and_set(&mut conn, &gate, &next_pin, enrolled_jwks, Some(b), replacement).is_err());
-    let foreign_host = super::incumbent_preflight::IncumbentPin { host_sha256: "foreign", ..next_pin };
-    assert!(sqlite::compare_and_set(&mut conn, &gate, &foreign_host, enrolled_jwks, Some(a), replacement).is_err());
+    let foreign_app = super::incumbent_preflight::IncumbentPin { application_db_id: "foreign", ..next_pin };
+    assert!(sqlite::compare_and_set(&mut conn, &gate, &foreign_app, enrolled_jwks, Some(a), replacement).is_err());
     sqlite::compare_and_set(&mut conn, &gate, &next_pin, enrolled_jwks, Some(a), replacement).unwrap();
     assert_eq!(sqlite::withdraw(&mut conn, pin).unwrap(), 0, "old command cannot affect new digest");
     assert_eq!(sqlite::withdraw(&mut conn, &next_pin).unwrap(), 1);

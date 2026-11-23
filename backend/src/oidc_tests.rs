@@ -1952,10 +1952,9 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert!(verify_acceptance(policy.as_bytes(), &sign(&claims, 8, HEADER), &trusted, now).is_err());
     let approved = verify_acceptance(policy.as_bytes(), &sign(&claims, 9, HEADER), &trusted, now).unwrap();
     use crate::application_discovery::{axon_signer_pin, incumbent_preflight::{self, IncumbentPin, RequestScope}};
-    let host = format!("sha256:{}", "1".repeat(64));
     let signer_pin = axon_signer_pin(&approved_jwks).unwrap();
     let pin = IncumbentPin {
-        application_db_id: &app.id, client_db_id: &client.id, host_sha256: &host,
+        application_db_id: &app.id, client_db_id: &client.id,
         policy_sha256: &digest, signer_pin: &signer_pin, revision: 4, generation: 8, withdrawn: false,
     };
     let challenge = util::sha256_base64url(challenge_verifier);
@@ -1964,7 +1963,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         scope: "openid", challenge_method: "S256", challenge: &challenge,
     };
     let eligible = async |pin: Option<&IncumbentPin<'_>>, request: &RequestScope<'_>|
-        incumbent_preflight::matches(&state, &jar, pin, &host, &approved, request).await;
+        incumbent_preflight::matches(&state, &jar, pin, &approved, request).await;
     assert!(eligible(Some(&pin), &wanted).await.unwrap());
     assert!(!eligible(None, &wanted).await.unwrap());
     let other_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
@@ -1973,7 +1972,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let other_trust = TrustedRegistration { approval_jwks: &other_jwks, ..trusted };
     let other_approval = verify_acceptance(policy.as_bytes(), &sign(&claims, 8, HEADER), &other_trust, now)
         .expect("the alternative key signed the same exact policy validly for a different trust input");
-    assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin), &host, &other_approval, &wanted)
+    assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin), &other_approval, &wanted)
         .await.unwrap(), "cryptographically valid approval from the wrong enrolled signer must deny");
     #[cfg(feature = "axon-incumbent-storage")]
     {
@@ -1991,7 +1990,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 ..other_trust
             }, now).unwrap();
         let next_pin = IncumbentPin { policy_sha256: &next_digest, revision: 5, generation: 9, ..pin };
-        assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &host, &next, &wanted)
+        assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &next, &wanted)
             .await.unwrap());
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
             &path, &pin, &approved, &next, &other_approval, &approved_jwks);
@@ -2013,13 +2012,11 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         IncumbentPin { withdrawn: true, ..pin },
         IncumbentPin { signer_pin: "different", ..pin },
         IncumbentPin { client_db_id: "another", ..pin },
+        IncumbentPin { application_db_id: "another", ..pin },
     ] {
         assert!(!eligible(Some(&wrong), &wanted).await.unwrap());
     }
-    assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin),
-        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        &approved, &wanted).await.unwrap());
-    assert!(!incumbent_preflight::matches(&state, &CookieJar::new(), Some(&pin), &host,
+    assert!(!incumbent_preflight::matches(&state, &CookieJar::new(), Some(&pin),
         &approved, &wanted).await.unwrap());
     sql_query("UPDATE users SET is_admin=0 WHERE id=?")
         .bind::<Text,_>(&fixture.id).execute(&mut pool.get().unwrap()).unwrap();
