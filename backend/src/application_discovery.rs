@@ -31,7 +31,7 @@ use tokio::{
 use url::{Host, Url};
 
 mod axon_v2;
-mod axon_v3_acceptance;
+pub(crate) mod axon_v3_acceptance;
 mod crypto;
 #[allow(unused_imports)] // Wired only with the durable enrollment transaction.
 pub(crate) use axon_v2::{ApprovedAxonDeclaration, VerifiedAxonDeclaration, verify_approved_axon_v2, verify_approved_axon_v2_withdrawal};

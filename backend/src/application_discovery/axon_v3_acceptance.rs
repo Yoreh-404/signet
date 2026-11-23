@@ -16,7 +16,7 @@ const ACCEPTANCE_TYP: &str = "axon-signet-admin-acceptance-v3+jwt";
 
 /// Supplied by separately approved V3 registration and the independently
 /// retained current rollback floor, never derived from either untrusted input.
-pub(super) struct TrustedRegistration<'a> {
+pub(crate) struct TrustedRegistration<'a> {
     pub organization_id: &'a str,
     pub enrollment_id: &'a str,
     pub application_id: &'a str,
@@ -30,7 +30,7 @@ pub(super) struct TrustedRegistration<'a> {
     pub floor: &'a TrustedFloor<'a>,
 }
 
-pub(super) struct TrustedFloor<'a> {
+pub(crate) struct TrustedFloor<'a> {
     pub policy_sha256: &'a str,
     pub revision: i64,
     pub generation: i64,
@@ -39,7 +39,7 @@ pub(super) struct TrustedFloor<'a> {
 
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StablePolicy {
+pub(crate) struct StablePolicy {
     format: String,
     pub organization_id: String,
     pub enrollment_id: String,
@@ -51,6 +51,18 @@ pub(super) struct StablePolicy {
     pub revision: i64,
     pub generation: i64,
     pub permissions: Vec<String>,
+}
+
+pub(crate) struct VerifiedPolicy {
+    policy: StablePolicy,
+    bytes: String,
+    sha256: String,
+}
+
+impl VerifiedPolicy {
+    pub(crate) fn policy(&self) -> &StablePolicy { &self.policy }
+    pub(crate) fn bytes(&self) -> &str { &self.bytes }
+    pub(crate) fn sha256(&self) -> &str { &self.sha256 }
 }
 
 #[derive(Deserialize)]
@@ -77,9 +89,9 @@ fn exact_https_origin(value: &str) -> bool {
     value.starts_with("https://") && website_origin(value).is_ok_and(|origin| origin == value)
 }
 
-pub(super) fn verify_acceptance(
+pub(crate) fn verify_acceptance(
     policy_bytes: &[u8], approval: &str, trusted: &TrustedRegistration<'_>, now: i64,
-) -> AppResult<StablePolicy> {
+) -> AppResult<VerifiedPolicy> {
     let deny = || AppError::Unauthorized;
     if policy_bytes.len() > 65_536 || approval.len() > 8192 || trusted.floor.halted {
         return Err(deny());
@@ -134,11 +146,15 @@ pub(super) fn verify_acceptance(
     {
         return Err(deny());
     }
-    Ok(stable)
+    Ok(VerifiedPolicy {
+        policy: stable,
+        bytes: std::str::from_utf8(policy_bytes).map_err(|_| deny())?.to_owned(),
+        sha256: digest,
+    })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::{Value, json};
@@ -149,7 +165,7 @@ mod tests {
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()).to_bytes()))
     }
 
-    fn policy() -> Value {
+    pub(crate) fn policy() -> Value {
         json!({
             "format": POLICY_FORMAT, "organization_id": "example-org",
             "enrollment_id": "enrollment", "application_id": "axon",
@@ -159,16 +175,16 @@ mod tests {
         })
     }
 
-    const HEADER: &str = r#"{"alg":"EdDSA","typ":"axon-signet-admin-acceptance-v3+jwt","kid":"approval"}"#;
+    pub(crate) const HEADER: &str = r#"{"alg":"EdDSA","typ":"axon-signet-admin-acceptance-v3+jwt","kid":"approval"}"#;
 
-    fn verify_case(
+    pub(crate) fn verify_case(
         raw: &str,
         change: impl FnOnce(&mut Value),
         seed: u8,
         header: &str,
         floor: (i64, i64, bool),
         now: i64,
-    ) -> AppResult<StablePolicy> {
+    ) -> AppResult<VerifiedPolicy> {
         let digest = format!("sha256:{:x}", Sha256::digest(raw));
         let mut claims = json!({
             "format": ACCEPTANCE_FORMAT, "policy_sha256": digest, "revision": 4,
@@ -180,7 +196,7 @@ mod tests {
     }
 
     fn verify_raw(raw: &str, approval: &str, digest: &str, floor: (i64, i64, bool), now: i64, public: &[u8; 32])
-        -> AppResult<StablePolicy>
+        -> AppResult<VerifiedPolicy>
     {
         let jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519",
             "kid":"approval","x":URL_SAFE_NO_PAD.encode(public)}]}).to_string();
