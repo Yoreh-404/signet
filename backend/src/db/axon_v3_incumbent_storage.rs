@@ -55,6 +55,40 @@ pub(crate) mod sqlite {
     };
     use diesel::{Connection, QueryResult, RunQueryDsl, SqliteConnection, result::Error,
         sql_query, sql_types::{BigInt, Text}};
+    use diesel::OptionalExtension;
+
+    /// Read-side prerequisite only. The caller must also establish current
+    /// interactive browser eligibility with the same exact verified pin and
+    /// recheck the authorities atomically at code admission. This cannot
+    /// construct verified policy from unauthenticated ledger bytes.
+    pub(crate) fn exact_active_policy(
+        conn: &mut SqliteConnection, gate: &RestoreInterlock, pin: &IncumbentPin<'_>,
+        enrolled_jwks: &str, approved: &VerifiedPolicy,
+    ) -> QueryResult<bool> {
+        let Some(snapshot) = RestoreSnapshot::capture(gate) else { return Ok(false); };
+        let p = approved.policy();
+        if pin.withdrawn || pin.policy_sha256 != approved.sha256()
+            || pin.revision != p.revision || pin.generation != p.generation
+            || !approved_enrolled_signer(approved, pin.signer_pin, enrolled_jwks)
+        {
+            return Ok(false);
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Active {
+            #[diesel(sql_type = Text)] policy_json: String,
+        }
+        let active = sql_query("SELECT policy_json FROM axon_v3_incumbent_activation
+            WHERE singleton = 1 AND profile = 'incumbent_v1' AND withdrawn = 0
+            AND application_db_id = ? AND client_db_id = ? AND organization_id = ?
+            AND enrollment_id = ? AND signer_pin = ?
+            AND policy_sha256 = ? AND revision = ? AND generation = ?")
+            .bind::<Text, _>(pin.application_db_id).bind::<Text, _>(pin.client_db_id)
+            .bind::<Text, _>(&p.organization_id).bind::<Text, _>(&p.enrollment_id)
+            .bind::<Text, _>(pin.signer_pin).bind::<Text, _>(approved.sha256())
+            .bind::<BigInt, _>(p.revision).bind::<BigInt, _>(p.generation)
+            .get_result::<Active>(conn).optional()?;
+        Ok(active.is_some_and(|row| row.policy_json == approved.bytes()) && snapshot.unchanged())
+    }
 
     /// Dormant foreground writer. Both configured trust and the enrolled
     /// registry must agree; no caller-supplied DB ID and no shared stage.

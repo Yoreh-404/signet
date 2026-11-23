@@ -197,17 +197,26 @@ pub(crate) fn signed_file_bench(
     assert_eq!((written.application_db_id.as_str(), written.client_db_id.as_str(),
         written.policy_sha256.as_str(), written.signer_pin.as_str()),
         (pin.application_db_id, pin.client_db_id, approved.sha256(), pin.signer_pin));
+    let active = |pin, proof| sqlite::exact_active_policy(&mut registry(), &gate, pin, enrolled_jwks, proof).unwrap();
+    assert!(active(pin, approved));
+    assert!(!active(pin, foreign));
+    assert!(!active(&next_pin, replacement));
     assert_eq!(disable_site(&mut competing).unwrap(), 1, "write is possible after the incumbent transaction");
     assert!(sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).is_err());
     assert_eq!(saved(&mut registry()).policy_sha256, approved.sha256());
     sql_query("UPDATE application_discovery SET operator_disabled=0 WHERE application_id=?")
         .bind::<Text,_>(pin.application_db_id).execute(&mut competing).unwrap();
     set_gate(false);
+    assert!(!active(pin, approved));
     assert!(sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).is_err());
     assert_eq!(saved(&mut registry()).policy_sha256, approved.sha256());
     set_gate(true);
     sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).unwrap();
     assert_eq!(saved(&mut registry()).policy_sha256, replacement.sha256());
+    assert!(active(&next_pin, replacement));
+    assert!(!active(pin, approved));
+    assert_eq!(sqlite::withdraw(&mut registry(), &next_pin).unwrap(), 1);
+    assert!(!active(&next_pin, replacement));
 
     fs::set_permissions(&marker_root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();
