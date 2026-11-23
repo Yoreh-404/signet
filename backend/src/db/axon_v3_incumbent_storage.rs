@@ -57,6 +57,35 @@ pub(crate) mod sqlite {
         sql_query, sql_types::{BigInt, Text}};
     use diesel::OptionalExtension;
 
+    /// Transaction-owned browser predicate; the caller supplies the
+    /// server-derived hash and exact authenticated session, never HTTP data.
+    /// Returns no material usable as a bearer and does not authorize a code.
+    pub(crate) fn current_incumbent_browser_on_conn(
+        conn: &mut SqliteConnection, credential_id: &str, session_id: &str,
+        user_id: &str, now: i64,
+    ) -> QueryResult<bool> {
+        #[derive(diesel::QueryableByName)]
+        struct Match {
+            #[diesel(sql_type = Text)] id: String,
+        }
+        // Match session_from_cookie: prefer a current credential mapping,
+        // then allow the original direct session ID. Check the exact resolved
+        // session even if another session belongs to the same account.
+        sql_query("SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.id = COALESCE((
+                SELECT mapped.id FROM session_credentials sc
+                JOIN sessions mapped ON mapped.id = sc.session_id
+                WHERE sc.credential_id = ? AND sc.expires_at >= ? AND mapped.expires_at >= ?
+            ), ?) AND s.id = ? AND u.id = ?
+            AND s.expires_at > ? AND u.is_admin = 1 AND u.is_active = 1 AND u.archived_at IS NULL
+            AND COALESCE(s.login_method, '') <> 'authorization_code'
+            AND NOT EXISTS (SELECT 1 FROM trial_enrollments t WHERE t.user_id = u.id)")
+            .bind::<Text, _>(credential_id).bind::<BigInt, _>(now).bind::<BigInt, _>(now)
+            .bind::<Text, _>(credential_id).bind::<Text, _>(session_id).bind::<Text, _>(user_id)
+            .bind::<BigInt, _>(now).get_result::<Match>(conn).optional()
+            .map(|row| row.is_some_and(|row| row.id == session_id))
+    }
+
     /// Read-side prerequisite only. The caller must also establish current
     /// interactive browser eligibility with the same exact verified pin and
     /// recheck the authorities atomically at code admission. This cannot
