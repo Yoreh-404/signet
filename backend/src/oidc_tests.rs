@@ -1835,7 +1835,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     use crate::application_discovery::axon_v3_acceptance::{
         TrustedFloor, TrustedRegistration, tests::{HEADER, sign}, verify_acceptance,
     };
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use ed25519_dalek::SigningKey;
     use serde_json::json;
@@ -1859,7 +1859,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         application_id: app.id.clone(), management_mode: crate::application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
         website_url: origin.into(), fetch_secret_ciphertext: String::new(), signing_public_jwks: approved_jwks.clone(),
         last_verified_revision: Some(3), last_verified_version: Some("fixture".into()),
-        last_verified_digest: Some("prior-verified-metadata-fixture".into()), last_verified_expires_at: Some(now-1),
+        last_verified_digest: Some("prior-verified-metadata-fixture".into()), last_verified_expires_at: Some(now+600),
         sync_status: crate::application_discovery_contract::SYNC_STATUS_SYNCED.into(), last_error: None,
         last_fetched_at: Some(now-301), last_success_at: Some(now-301), operator_disabled: false,
         snapshot_json: Some(json!({"modules":{"axon_admin_mapping":{"permissions":["admin:session:read"]}}}).to_string()),
@@ -1881,6 +1881,54 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert_eq!(current.user.is_admin, 1);
     let client = test_refresh_client(&state).await;
     assert_eq!(client.require_s256_pkce, 1);
+    let session_cookie = jar.get(&state.settings.security.cookie_name).unwrap();
+    let challenge_verifier = "incumbent-generic-s256-wire-proof-01234567890123456789";
+    let router = routes().with_state(state.clone());
+    let authorize = || {
+        let query = serde_urlencoded::to_string([
+            ("response_type", "code"), ("client_id", client.client_id.as_str()),
+            ("redirect_uri", callback.as_str()), ("scope", "openid"), ("resource", audience),
+            ("state", "incumbent-generic"), ("code_challenge_method", "S256"),
+            ("code_challenge", &util::sha256_base64url(challenge_verifier)),
+        ]).unwrap();
+        let mut request = Request::builder()
+            .uri(format!("/oauth2/authorize?{query}"))
+            .header(header::COOKIE, format!("{}={}", session_cookie.name(),session_cookie.value()))
+            .body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43001))));
+        request
+    };
+    let before = router.clone().oneshot(authorize()).await.unwrap();
+    assert_eq!(before.status(), StatusCode::SEE_OTHER);
+    let location = redirect_url(&before);
+    assert_eq!(location.path(), "/admin/api/auth/signet/callback");
+    assert_eq!(query_value(&location, "state"), "incumbent-generic");
+    let code = query_value(&location, "code");
+    let body = serde_urlencoded::to_string([
+        ("grant_type","authorization_code"), ("code",code.as_str()),
+        ("redirect_uri", callback.as_str()), ("code_verifier",challenge_verifier),
+    ]).unwrap();
+    let response = router.clone().oneshot(Request::post("/oauth2/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, format!("Basic {}",STANDARD.encode("demo-web:demo-secret-change-me")))
+        .body(Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = oidc_http_body_json(response).await;
+    let token = response["access_token"].as_str().unwrap();
+    assert_eq!(state.jwt.verify_access_token(token).unwrap().sub, current.user.id);
+    let body: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert!(body.get("axon_admin_authority_v3").is_none());
+    sql_query("UPDATE application_discovery SET last_verified_expires_at=? WHERE application_id=?")
+        .bind::<diesel::sql_types::BigInt,_>(util::now_ts()-1).bind::<Text,_>(&app.id)
+        .execute(&mut pool.get().unwrap()).unwrap();
+    let after = router.oneshot(authorize()).await.unwrap();
+    if after.status().is_redirection() {
+        assert!(!redirect_url(&after).query_pairs().any(|(key,_)| key=="code"));
+        assert!(redirect_url(&after).query_pairs().any(|(key,_)| key=="error"));
+    } else {
+        assert!(after.status().is_client_error(), "unexpected expired site's status: {}", after.status());
+    }
     assert!(crate::oidc_authorization::AuthorizationSnapshot::load_runtime(&state, &client).await.is_err());
     assert!(crate::oidc_authorization::AuthorizationSnapshot::load(&state, &client, &current.user).await.is_err());
 
