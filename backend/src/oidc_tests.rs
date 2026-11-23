@@ -1967,6 +1967,14 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         incumbent_preflight::matches(&state, &jar, pin, &host, &approved, request).await;
     assert!(eligible(Some(&pin), &wanted).await.unwrap());
     assert!(!eligible(None, &wanted).await.unwrap());
+    let other_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
+    let other_jwks = json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":"approval",
+        "x":URL_SAFE_NO_PAD.encode(other_key.as_bytes())}]}).to_string();
+    let other_trust = TrustedRegistration { approval_jwks: &other_jwks, ..trusted };
+    let other_approval = verify_acceptance(policy.as_bytes(), &sign(&claims, 8, HEADER), &other_trust, now)
+        .expect("the alternative key signed the same exact policy validly for a different trust input");
+    assert!(!incumbent_preflight::matches(&state, &jar, Some(&pin), &host, &other_approval, &wanted)
+        .await.unwrap(), "cryptographically valid approval from the wrong enrolled signer must deny");
     for wrong in [
         RequestScope { issuer: "https://foreign.example", ..wanted },
         RequestScope { client_id: "unrelated-client", ..wanted },

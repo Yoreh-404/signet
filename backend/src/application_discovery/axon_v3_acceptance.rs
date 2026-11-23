@@ -57,12 +57,27 @@ pub(crate) struct VerifiedPolicy {
     policy: StablePolicy,
     bytes: String,
     sha256: String,
+    signer_key_sha256: String,
 }
 
 impl VerifiedPolicy {
     pub(crate) fn policy(&self) -> &StablePolicy { &self.policy }
     pub(crate) fn bytes(&self) -> &str { &self.bytes }
     pub(crate) fn sha256(&self) -> &str { &self.sha256 }
+    pub(crate) fn signer_key_sha256(&self) -> &str { &self.signer_key_sha256 }
+}
+
+/// An incumbent registration pins exactly one Ed25519 signing key.
+/// Use the raw public key fingerprint, not the textual JWK encoding.
+pub(super) fn enrolled_signer_key_sha256(jwks: &str) -> Option<String> {
+    let keys = serde_json::from_str::<PinnedJwks>(jwks).ok()?;
+    let [key] = keys.keys.as_slice() else { return None; };
+    if key.kty != "OKP" || key.crv != "Ed25519"
+        || key.use_.as_deref().is_some_and(|usage| usage != "sig")
+        || key.alg.as_deref().is_some_and(|alg| alg != "EdDSA")
+    { return None; }
+    let public: [u8; 32] = URL_SAFE_NO_PAD.decode(&key.x).ok()?.try_into().ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(public)))
 }
 
 #[derive(Deserialize)]
@@ -159,6 +174,7 @@ pub(crate) fn verify_acceptance(
         policy: stable,
         bytes: std::str::from_utf8(policy_bytes).map_err(|_| deny())?.to_owned(),
         sha256: digest,
+        signer_key_sha256: format!("sha256:{:x}", Sha256::digest(public)),
     })
 }
 
