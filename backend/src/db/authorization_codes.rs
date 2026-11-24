@@ -75,8 +75,6 @@ pub(crate) fn insert_sqlite_authorization_code_on_conn(
     insert_code_on_connection!(conn, DatabaseKind::Sqlite, code, amr, now)
 }
 
-#[cfg(all(test, feature = "sqlite"))]
-mod insert_on_connection_tests {
 // Reuse the ordinary code binding checks and single-use CAS on the concrete
 // connection selected by the caller. The caller owns the transaction.
 macro_rules! consume_authorization_code_on_conn {
@@ -160,6 +158,8 @@ pub(super) fn consume_sqlite_authorization_code_for_client_on_conn(
     )
 }
 
+#[cfg(all(test, feature = "sqlite"))]
+mod insert_on_connection_tests {
     use super::*;
     use diesel::{connection::SimpleConnection, result::Error, SqliteConnection};
 
