@@ -2168,6 +2168,27 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 assert_eq!(available(conn, &ordinary_code), 1);
                 assert!(matches!(redeem(conn, &ordinary_code), Err(AppError::Forbidden)));
                 assert_eq!(available(conn, &ordinary_code), 1, "ordinary code must stay untouched");
+                // Open a distinct connection and reconstruct from only the
+                // durable receipt, trusted enrollment/floor and restore gate.
+                let reopen = || {
+                    use diesel::Connection;
+                    diesel::SqliteConnection::establish(path.to_str().unwrap()).unwrap()
+                };
+                let read_now = now + 301; // Original acceptance JWS is no longer live.
+                let restored = crate::db::axon_v3_incumbent_storage::sqlite::restore_accepted_policy(
+                    &mut reopen(), gate, &pin, &trusted, read_now,
+                ).unwrap().unwrap();
+                assert_eq!(restored.bytes(), approved.bytes());
+                assert_eq!(restored.signer_key_sha256(), approved.signer_key_sha256());
+                {
+                    use diesel::Connection;
+                    conn.test_transaction::<_, AppError, _>(|conn| {
+                        use crate::db::axon_v3_incumbent_storage::sqlite;
+                        assert_eq!(sqlite::withdraw(conn, &pin)?, 1);
+                        assert!(sqlite::restore_accepted_policy(conn, gate, &pin, &trusted, read_now)?.is_none());
+                        Ok(())
+                    });
+                }
                 let before = count(conn);
                 let no_mismatch_insert = |_: &mut diesel::SqliteConnection| -> AppResult<()> {
                     panic!("a request with a different resource must never reach insertion")

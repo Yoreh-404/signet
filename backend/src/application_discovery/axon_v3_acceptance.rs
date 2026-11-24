@@ -58,6 +58,8 @@ pub(crate) struct VerifiedPolicy {
     bytes: String,
     sha256: String,
     signer_key_sha256: String,
+    approval: String,
+    verified_at: i64,
 }
 
 impl VerifiedPolicy {
@@ -65,6 +67,8 @@ impl VerifiedPolicy {
     pub(crate) fn bytes(&self) -> &str { &self.bytes }
     pub(crate) fn sha256(&self) -> &str { &self.sha256 }
     pub(crate) fn signer_key_sha256(&self) -> &str { &self.signer_key_sha256 }
+    pub(crate) fn approval(&self) -> &str { &self.approval }
+    pub(crate) fn verified_at(&self) -> i64 { self.verified_at }
 }
 
 /// An incumbent registration pins exactly one Ed25519 signing key.
@@ -175,6 +179,8 @@ pub(crate) fn verify_acceptance(
         bytes: std::str::from_utf8(policy_bytes).map_err(|_| deny())?.to_owned(),
         sha256: digest,
         signer_key_sha256: format!("sha256:{:x}", Sha256::digest(public)),
+        approval: approval.to_owned(),
+        verified_at: now,
     })
 }
 

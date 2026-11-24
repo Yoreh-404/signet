@@ -53,7 +53,7 @@ fn axon_v3_incumbent_storage_is_singleton_and_cas_does_not_resurrect_withdrawal(
     db.batch_execute(SCHEMA).unwrap();
     let seed = |db: &mut SqliteConnection, id, profile| sql_query(
         "INSERT INTO axon_v3_incumbent_activation
-        VALUES (?, ?, 'app', 'client', 'org', 'enrollment', 'signer', 'a', '{}', 1, 1, 0)")
+        VALUES (?, ?, 'app', 'client', 'org', 'enrollment', 'signer', 'a', '{}', 1, 1, 0, NULL, NULL)")
         .bind::<diesel::sql_types::Integer, _>(id).bind::<Text, _>(profile).execute(db);
     assert!(seed(&mut db, 2, "incumbent_v1").is_err());
     assert!(seed(&mut db, 1, "managed").is_err());

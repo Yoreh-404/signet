@@ -16,7 +16,9 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
     policy_json TEXT NOT NULL,
     revision BIGINT NOT NULL CHECK (revision > 0),
     generation BIGINT NOT NULL CHECK (generation > 0),
-    withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1))
+    withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1)),
+    accepted_jws TEXT,
+    verified_at BIGINT
 )";
 
 /// Installed only with the dormant SQLite incumbent ledger. No code or
@@ -208,6 +210,55 @@ pub(crate) mod sqlite {
             .bind::<BigInt, _>(p.revision).bind::<BigInt, _>(p.generation)
             .get_result::<Active>(conn).optional()?;
         Ok(active.is_some_and(|row| row.policy_json == approved.bytes()) && snapshot.unchanged())
+    }
+
+    /// Dormant restart reader. The trusted floor and enrollment must come from
+    /// protected caller state, not the database record being recovered.
+    /// This reconstructs policy material, not a user/session authorization.
+    pub(crate) fn restore_accepted_policy(
+        conn: &mut SqliteConnection,
+        gate: &RestoreInterlock,
+        pin: &IncumbentPin<'_>,
+        trusted: &crate::application_discovery::axon_v3_acceptance::TrustedRegistration<'_>,
+        now: i64,
+    ) -> QueryResult<Option<VerifiedPolicy>> {
+        use crate::application_discovery::axon_v3_acceptance::verify_acceptance;
+        #[derive(diesel::QueryableByName)]
+        struct Receipt {
+            #[diesel(sql_type = Text)] policy_json: String,
+            #[diesel(sql_type = Text)] accepted_jws: String,
+            #[diesel(sql_type = BigInt)] verified_at: i64,
+        }
+        conn.transaction(|conn| {
+            let Some(marker) = RestoreSnapshot::capture(gate) else { return Ok(None); };
+            let receipt = sql_query("SELECT policy_json, accepted_jws, verified_at
+                FROM axon_v3_incumbent_activation
+                WHERE singleton=1 AND profile='incumbent_v1' AND withdrawn=0
+                AND accepted_jws IS NOT NULL AND verified_at > 0 AND verified_at <= ?
+                AND application_db_id=? AND client_db_id=? AND signer_pin=?
+                AND policy_sha256=? AND revision=? AND generation=?")
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(pin.application_db_id).bind::<Text, _>(pin.client_db_id)
+                .bind::<Text, _>(pin.signer_pin).bind::<Text, _>(pin.policy_sha256)
+                .bind::<BigInt, _>(pin.revision).bind::<BigInt, _>(pin.generation)
+                .get_result::<Receipt>(conn).optional()?;
+            let Some(receipt) = receipt else { return Ok(None); };
+            let Ok(policy) = verify_acceptance(
+                receipt.policy_json.as_bytes(), &receipt.accepted_jws, trusted, receipt.verified_at,
+            ) else { return Ok(None); };
+            #[derive(diesel::QueryableByName)]
+            struct Site { #[diesel(sql_type = Text)] application_id: String }
+            let fresh = sql_query("SELECT application_id FROM application_discovery
+                WHERE application_id=? AND management_mode='website_managed'
+                AND operator_disabled=0 AND last_verified_revision IS NOT NULL
+                AND snapshot_json IS NOT NULL
+                AND (last_verified_expires_at IS NULL OR last_verified_expires_at > ?)")
+                .bind::<Text, _>(pin.application_db_id).bind::<BigInt, _>(now)
+                .get_result::<Site>(conn).optional()?
+                .is_some_and(|site| site.application_id == pin.application_db_id);
+            Ok((fresh && exact_active_policy(conn, gate, pin, &policy)? && marker.unchanged())
+                .then_some(policy))
+        })
     }
 
     /// Persist the exact admitted purpose beside the ordinary code in the
@@ -568,16 +619,18 @@ pub(crate) mod sqlite {
         conn.transaction(|conn| {
             let changed = match expected {
                 None => sql_query("INSERT INTO axon_v3_incumbent_activation
-                    SELECT 1, 'incumbent_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0
+                    SELECT 1, 'incumbent_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?
                     WHERE NOT EXISTS (SELECT 1 FROM axon_v3_incumbent_activation WHERE singleton = 1)")
                     .bind::<Text, _>(binding.application_db_id).bind::<Text, _>(binding.client_db_id)
                     .bind::<Text, _>(&policy.organization_id).bind::<Text, _>(&policy.enrollment_id)
                     .bind::<Text, _>(binding.signer_pin)
                     .bind::<Text, _>(next.sha256()).bind::<Text, _>(next.bytes())
                     .bind::<BigInt, _>(policy.revision).bind::<BigInt, _>(policy.generation)
+                    .bind::<Text, _>(next.approval()).bind::<BigInt, _>(next.verified_at())
                     .execute(conn)?,
                 Some(expected) => sql_query("UPDATE axon_v3_incumbent_activation
-                    SET policy_sha256 = ?, policy_json = ?, revision = ?, generation = ?, withdrawn = 0
+                    SET policy_sha256 = ?, policy_json = ?, revision = ?, generation = ?, withdrawn = 0,
+                        accepted_jws = ?, verified_at = ?
                     WHERE singleton = 1 AND profile = 'incumbent_v1'
                     AND application_db_id = ? AND client_db_id = ? AND organization_id = ?
                     AND enrollment_id = ? AND signer_pin = ?
@@ -585,6 +638,7 @@ pub(crate) mod sqlite {
                     AND revision < ? AND generation < ?")
                     .bind::<Text, _>(next.sha256()).bind::<Text, _>(next.bytes())
                     .bind::<BigInt, _>(policy.revision).bind::<BigInt, _>(policy.generation)
+                    .bind::<Text, _>(next.approval()).bind::<BigInt, _>(next.verified_at())
                     .bind::<Text, _>(binding.application_db_id).bind::<Text, _>(binding.client_db_id)
                     .bind::<Text, _>(&policy.organization_id).bind::<Text, _>(&policy.enrollment_id)
                     .bind::<Text, _>(binding.signer_pin)
