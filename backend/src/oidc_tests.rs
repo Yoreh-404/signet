@@ -3621,17 +3621,9 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
     state.settings.discovery.allow_private_networks = false;
     state.settings.discovery.encryption_key = URL_SAFE_NO_PAD.encode([23_u8; 32]);
     let client = test_refresh_client(&state).await;
-    let app = state.db.insert_application(crate::db::NewApplication {
-        organization_id: client.organization_id.unwrap(),
-        slug: "axon".into(),
-        name: "Discovery fixture".into(),
-        description: None,
-        access_mode: applications::ACCESS_ALL_SIGNET_USERS.into(),
-        registration_mode: applications::REGISTRATION_DISABLED.into(),
-        account_selection_mode: applications::ACCOUNT_SELECTION_OPTIONAL.into(),
-        unique_identity_factors: Vec::new(),
-        is_active: true,
-    }).await.unwrap();
+    let organization_id = client.organization_id.as_deref().expect("seeded client organization");
+    let app = state.db.find_application_by_slug_in_organization(organization_id, "axon")
+        .await.unwrap().expect("seeded Axon application in the exact fixture organization");
     let manager = insert_refresh_test_user(&state, "discovery-manager").await;
     let other = insert_refresh_test_user(&state, "discovery-nonmanager").await;
     let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
