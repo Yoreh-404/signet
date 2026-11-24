@@ -2098,7 +2098,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         let ordinary_code = query_value(&redirect_url(&ordinary_issued), "code");
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
             &path, &pin, &approved, &next, &other_approval, &approved_jwks,
-            |conn, gate, set_gate| {
+            async |conn, gate, set_gate| {
                 let admit_with = |conn: &mut diesel::SqliteConnection,
                     resolved: &ResolvedAuthorizeRequest,
                     setup: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
@@ -2161,6 +2161,12 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                     .bind::<Text,_>(&challenge).get_result::<Count>(conn).unwrap().count;
                 assert_eq!(inserted, 1);
                 assert_eq!(count(conn), before + 1);
+                let generic = router.clone().oneshot(exchange(&code)).await.unwrap();
+                assert!(generic.status().is_client_error());
+                let rejected = oidc_http_body_json(generic).await;
+                assert!(rejected.get("access_token").is_none());
+                assert_eq!(available(conn, &code), 1,
+                    "ordinary token exchange must refuse the mark without consuming the code");
                 for role in [0, 1] {
                     sql_query("UPDATE users SET is_admin=? WHERE id=?")
                         .bind::<diesel::sql_types::Integer,_>(role).bind::<Text,_>(&fixture.id)
@@ -2228,7 +2234,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 assert!(redeem(conn, &code).is_err(), "the ordinary single-use CAS remains authoritative");
                 assert_eq!(markers(conn), 0, "successful consumption retires the purpose marker");
             },
-        );
+        ).await;
         let ordinary_token = router.clone().oneshot(exchange(&ordinary_code)).await.unwrap();
         assert_eq!(ordinary_token.status(), StatusCode::OK);
         let ordinary_body = oidc_http_body_json(ordinary_token).await;

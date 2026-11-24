@@ -404,6 +404,24 @@ impl Db {
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<AuthorizationCodeRecord, AppError, _>(|conn| {
+                #[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+                if matches!(kind, DatabaseKind::Sqlite) {
+                    // Installing the internal ledger opts this SQLite database
+                    // into purpose isolation; no table means ordinary behavior.
+                    use super::CountRow;
+                    let installed = sql_query("SELECT COUNT(*) AS count FROM main.sqlite_master
+                        WHERE type='table' AND name='axon_v3_incumbent_code_provenance'")
+                        .get_result::<CountRow>(conn).map_err(AppError::from)?.count != 0;
+                    if installed {
+                        let marked = sql_query("SELECT COUNT(*) AS count
+                            FROM main.axon_v3_incumbent_code_provenance WHERE code_sha256=?")
+                            .bind::<Text,_>(util::sha256_base64url(&code))
+                            .get_result::<CountRow>(conn).map_err(AppError::from)?.count != 0;
+                        if marked {
+                            return Err(AppError::Oidc("invalid authorization code".to_string()));
+                        }
+                    }
+                }
                 consume_authorization_code_on_conn!(
                     conn, kind, code, client_id, redirect_uri, code_verifier,
                     require_pkce, require_s256_pkce, now

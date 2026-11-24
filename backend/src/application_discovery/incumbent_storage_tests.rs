@@ -84,14 +84,16 @@ fn axon_v3_incumbent_storage_is_singleton_and_cas_does_not_resurrect_withdrawal(
 /// Called only by the exact synthetic enrollment test after preflight has
 /// matched the real session, current registry and enrolled signer.
 #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage"))]
-pub(crate) fn signed_file_bench(
+pub(crate) async fn signed_file_bench(
     fixture_path: &std::path::Path,
     pin: &super::incumbent_preflight::IncumbentPin<'_>,
     approved: &super::axon_v3_acceptance::VerifiedPolicy,
     replacement: &super::axon_v3_acceptance::VerifiedPolicy,
     foreign: &super::axon_v3_acceptance::VerifiedPolicy,
     enrolled_jwks: &str,
-    admission_fixture: impl FnOnce(&mut SqliteConnection, &super::axon_v3_restore::RestoreInterlock, &dyn Fn(bool)),
+    admission_fixture: impl AsyncFnOnce(
+        &mut SqliteConnection, &super::axon_v3_restore::RestoreInterlock, &dyn Fn(bool),
+    ),
 ) {
     use crate::db::axon_v3_incumbent_storage::{RestoreSnapshot, sqlite};
     use super::axon_v3_restore::RestoreInterlock;
@@ -202,7 +204,7 @@ pub(crate) fn signed_file_bench(
     let active = |pin, proof| registry().immediate_transaction(|conn|
         sqlite::exact_active_policy(conn, &gate, pin, proof)).unwrap();
     assert!(active(pin, approved));
-    admission_fixture(&mut registry(), &gate, &set_gate);
+    admission_fixture(&mut registry(), &gate, &set_gate).await;
     let rotated = registry().immediate_transaction::<(), diesel::result::Error, _>(|conn| {
         sql_query("UPDATE application_discovery SET signing_public_jwks='{}' WHERE application_id=?")
             .bind::<Text,_>(pin.application_db_id).execute(conn)?;
