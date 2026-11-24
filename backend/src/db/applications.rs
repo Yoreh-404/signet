@@ -176,6 +176,60 @@ pub(super) fn find_sqlite_application_auth_context_on_conn(
     find_auth_context_on_conn!(conn, DatabaseKind::Sqlite, auth_domain_id, user_id)
 }
 
+// Keep insertion and full readback on the same concrete Diesel connection.
+macro_rules! insert_auth_context_on_conn {
+    ($conn:expr, $kind:expr, $context:expr, $amr:expr, $now:expr) => {{
+        let (kind, context, amr, now) = ($kind, $context, $amr, $now);
+        let sql = format!(
+            "INSERT INTO application_auth_contexts (id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            ph(kind, 1),
+            ph(kind, 2),
+            ph(kind, 3),
+            ph(kind, 4),
+            ph(kind, 5),
+            ph(kind, 6),
+            ph(kind, 7),
+            ph(kind, 8),
+            ph(kind, 9),
+            ph(kind, 10)
+        );
+        sql_query(sql)
+            .bind::<Text, _>(&context.id)
+            .bind::<Text, _>(&context.auth_domain_id)
+            .bind::<Text, _>(&context.user_id)
+            .bind::<Text, _>(&context.acr)
+            .bind::<Text, _>(amr)
+            .bind::<BigInt, _>(context.authenticated_at)
+            .bind::<BigInt, _>(context.expires_at)
+            .bind::<Nullable<BigInt>, _>(None::<i64>)
+            .bind::<BigInt, _>(now)
+            .bind::<BigInt, _>(now)
+            .execute($conn)
+            .map_err(AppError::from)?;
+        let select_sql = format!(
+            "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE id = {}",
+            ph(kind, 1)
+        );
+        sql_query(select_sql)
+            .bind::<Text, _>(context.id)
+            .get_result::<ApplicationAuthContextRecord>($conn)
+            .map_err(AppError::from)
+    }};
+}
+
+/// Apply the ordinary auth-context write on the caller's SQLite connection.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Incumbent code admission is not mounted.
+pub(super) fn insert_sqlite_application_auth_context_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    context: NewApplicationAuthContext,
+) -> AppResult<ApplicationAuthContextRecord> {
+    let now = util::now_ts();
+    let amr = serde_json::to_string(&context.amr)
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    insert_auth_context_on_conn!(conn, DatabaseKind::Sqlite, context, amr, now)
+}
+
 impl Db {
     pub async fn list_applications(
         &self,
@@ -361,40 +415,7 @@ impl Db {
         let amr = serde_json::to_string(&context.amr)
             .map_err(|err| AppError::Internal(err.to_string()))?;
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "INSERT INTO application_auth_contexts (id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                ph(kind, 1),
-                ph(kind, 2),
-                ph(kind, 3),
-                ph(kind, 4),
-                ph(kind, 5),
-                ph(kind, 6),
-                ph(kind, 7),
-                ph(kind, 8),
-                ph(kind, 9),
-                ph(kind, 10)
-            );
-            sql_query(sql)
-                .bind::<Text, _>(&context.id)
-                .bind::<Text, _>(&context.auth_domain_id)
-                .bind::<Text, _>(&context.user_id)
-                .bind::<Text, _>(&context.acr)
-                .bind::<Text, _>(amr)
-                .bind::<BigInt, _>(context.authenticated_at)
-                .bind::<BigInt, _>(context.expires_at)
-                .bind::<Nullable<BigInt>, _>(None::<i64>)
-                .bind::<BigInt, _>(now)
-                .bind::<BigInt, _>(now)
-                .execute(&mut conn)
-                .map_err(AppError::from)?;
-            let select_sql = format!(
-                "SELECT id, auth_domain_id, user_id, acr, amr, authenticated_at, expires_at, revoked_at, created_at, updated_at FROM application_auth_contexts WHERE id = {}",
-                ph(kind, 1)
-            );
-            sql_query(select_sql)
-                .bind::<Text, _>(context.id)
-                .get_result::<ApplicationAuthContextRecord>(&mut conn)
-                .map_err(AppError::from)
+            insert_auth_context_on_conn!(&mut conn, kind, context, amr, now)
         })
     }
 
@@ -1929,6 +1950,53 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn auth_context_readback_obeys_caller_rollback() {
+        use diesel::result::Error;
+
+        let (db, path) = sqlite_test_db().await;
+        let Db::Sqlite(pool) = &db else { unreachable!() };
+        let mut conn = pool.get().unwrap();
+        let rollback = conn.immediate_transaction::<(), Error, _>(|conn| {
+            let row = insert_sqlite_application_auth_context_on_conn(
+                conn,
+                NewApplicationAuthContext {
+                    id: "rolled-back-context".into(),
+                    auth_domain_id: "fixture-domain".into(),
+                    user_id: "fixture-user".into(),
+                    acr: "fixture-acr".into(),
+                    amr: vec!["pwd".into()],
+                    authenticated_at: 123,
+                    expires_at: 456,
+                },
+            ).unwrap();
+            assert_eq!(row.id, "rolled-back-context");
+            assert_eq!(row.amr, r#"["pwd"]"#);
+            assert_eq!(row.authenticated_at, 123);
+            assert_eq!(row.expires_at, 456);
+            assert!(row.revoked_at.is_none());
+            assert_eq!(
+                find_sqlite_application_auth_context_on_conn(conn, "fixture-domain", "fixture-user")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                row.id,
+            );
+            Err(Error::RollbackTransaction)
+        });
+        assert!(matches!(rollback, Err(Error::RollbackTransaction)));
+        drop(conn);
+        assert!(
+            db.find_application_auth_context("fixture-domain", "fixture-user")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cached_profile_role_id_loads_each_key_once_including_missing_roles() {
