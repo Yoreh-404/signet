@@ -2093,6 +2093,9 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         ).await.unwrap();
         let credential = util::session_id_from_cookie(session_cookie.value()).unwrap();
         set_expiry(util::now_ts() + 600);
+        let ordinary_issued = router.clone().oneshot(authorize()).await.unwrap();
+        assert_eq!(ordinary_issued.status(), StatusCode::SEE_OTHER);
+        let ordinary_code = query_value(&redirect_url(&ordinary_issued), "code");
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
             &path, &pin, &approved, &next, &other_approval, &approved_jwks,
             |conn, gate, set_gate| {
@@ -2131,6 +2134,18 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .bind::<Text,_>(&client.client_id).bind::<Text,_>(&fixture.id)
                         .get_result::<Count>(conn).unwrap().count
                 };
+                let available = |conn: &mut diesel::SqliteConnection, code: &str| {
+                    sql_query("SELECT COUNT(*) AS count FROM authorization_codes WHERE code=? AND consumed_at IS NULL")
+                        .bind::<Text,_>(code).get_result::<Count>(conn).unwrap().count
+                };
+                let redeem = |conn: &mut diesel::SqliteConnection, code: &str| {
+                    crate::db::axon_v3_incumbent_storage::sqlite::consume_incumbent_code(
+                        conn, gate, &pin, &approved, code, &client.client_id, &callback, challenge_verifier,
+                    )
+                };
+                assert_eq!(available(conn, &ordinary_code), 1);
+                assert!(matches!(redeem(conn, &ordinary_code), Err(AppError::Forbidden)));
+                assert_eq!(available(conn, &ordinary_code), 1, "ordinary code must stay untouched");
                 let before = count(conn);
                 let no_mismatch_insert = |_: &mut diesel::SqliteConnection| -> AppResult<()> {
                     panic!("a request with a different resource must never reach insertion")
@@ -2152,6 +2167,8 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .execute(conn).unwrap();
                     if role == 0 {
                         assert!(matches!(admit(conn), Err(AppError::Forbidden)));
+                        assert!(matches!(redeem(conn, &code), Err(AppError::Forbidden)));
+                        assert_eq!(available(conn, &code), 1);
                     }
                 }
                 for jwks in [&other_jwks, &approved_jwks] {
@@ -2159,6 +2176,8 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .bind::<Text,_>(jwks).bind::<Text,_>(&app.id).execute(conn).unwrap();
                     if jwks == &other_jwks {
                         assert!(matches!(admit(conn), Err(AppError::Forbidden)));
+                        assert!(matches!(redeem(conn, &code), Err(AppError::Forbidden)));
+                        assert_eq!(available(conn, &code), 1);
                     }
                 }
                 let require_mfa = |conn: &mut diesel::SqliteConnection| {
@@ -2192,7 +2211,19 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 assert!(matches!(admit(conn), Err(AppError::Forbidden)));
                 assert_eq!(count(conn), before + 1, "denials and final gate rollback must not mint");
                 assert_eq!(counts(conn), contexts_before, "new context rolled back with the code");
+                assert!(matches!(redeem(conn, &code), Err(AppError::Forbidden)));
+                assert_eq!(available(conn, &code), 1);
                 set_gate(true);
+                let redeemed = redeem(conn, &code).unwrap();
+                assert_eq!(redeemed.session_id, Some(util::session_public_id(&current.session_id)));
+                assert_eq!(available(conn, &code), 0);
+                assert!(redeem(conn, &code).is_err(), "the ordinary single-use CAS remains authoritative");
+                let markers = sql_query("SELECT COUNT(*) AS count FROM axon_v3_incumbent_code_provenance
+                    WHERE code_sha256=? AND user_id=? AND session_public_id=?")
+                    .bind::<Text,_>(util::sha256_base64url(&code)).bind::<Text,_>(&fixture.id)
+                    .bind::<Text,_>(util::session_public_id(&current.session_id))
+                    .get_result::<Count>(conn).unwrap().count;
+                assert_eq!(markers, 1);
             },
         );
         set_expiry(util::now_ts() - 1);

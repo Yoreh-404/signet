@@ -19,6 +19,21 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
     withdrawn INTEGER NOT NULL CHECK (withdrawn IN (0, 1))
 )";
 
+/// Installed only with the dormant SQLite incumbent ledger. No code or
+/// session bearer is stored: both lookups use their public/hash identities.
+pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_code_provenance (
+    code_sha256 TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL,
+    session_public_id TEXT NOT NULL,
+    application_db_id TEXT NOT NULL,
+    client_db_id TEXT NOT NULL,
+    enrollment_id TEXT NOT NULL,
+    signer_pin TEXT NOT NULL,
+    policy_sha256 TEXT NOT NULL,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    generation BIGINT NOT NULL CHECK (generation > 0)
+)";
+
 /// Current row identity for future exact compare-and-set; this is not a grant.
 #[derive(Clone, Copy)]
 pub(crate) struct Version<'a> {
@@ -174,6 +189,105 @@ pub(crate) mod sqlite {
             .bind::<BigInt, _>(p.revision).bind::<BigInt, _>(p.generation)
             .get_result::<Active>(conn).optional()?;
         Ok(active.is_some_and(|row| row.policy_json == approved.bytes()) && snapshot.unchanged())
+    }
+
+    /// Persist the exact admitted purpose beside the ordinary code in the
+    /// same transaction. The original code and session ID stay out of the ledger.
+    pub(crate) fn bind_code_provenance_on_conn(
+        conn: &mut SqliteConnection,
+        row: &crate::db::NewAuthorizationCode,
+        pin: &IncumbentPin<'_>,
+        approved: &VerifiedPolicy,
+    ) -> QueryResult<()> {
+        let policy = approved.policy();
+        let sid = row.session_id.as_deref().ok_or(Error::RollbackTransaction)?;
+        if row.application_id.as_deref() != Some(pin.application_db_id)
+            || row.client_id != policy.client_id
+        {
+            return Err(Error::RollbackTransaction);
+        }
+        sql_query("INSERT INTO axon_v3_incumbent_code_provenance
+            (code_sha256,user_id,session_public_id,application_db_id,client_db_id,
+             enrollment_id,signer_pin,policy_sha256,revision,generation)
+             VALUES (?,?,?,?,?,?,?,?,?,?)")
+            .bind::<Text,_>(crate::util::sha256_base64url(&row.code))
+            .bind::<Text,_>(&row.user_id).bind::<Text,_>(sid)
+            .bind::<Text,_>(pin.application_db_id).bind::<Text,_>(pin.client_db_id)
+            .bind::<Text,_>(&policy.enrollment_id).bind::<Text,_>(pin.signer_pin)
+            .bind::<Text,_>(approved.sha256()).bind::<BigInt,_>(policy.revision)
+            .bind::<BigInt,_>(policy.generation).execute(conn).map(|_| ())
+    }
+
+    fn code_has_current_provenance_on_conn(
+        conn: &mut SqliteConnection,
+        row: &crate::db::AuthorizationCodeRecord,
+        pin: &IncumbentPin<'_>,
+        approved: &VerifiedPolicy,
+        now: i64,
+    ) -> QueryResult<bool> {
+        #[derive(diesel::QueryableByName)]
+        struct Identity {
+            #[diesel(sql_type = Text)]
+            id: String,
+        }
+
+        let policy = approved.policy();
+        let Some(sid) = row.session_id.as_deref() else { return Ok(false); };
+        if row.application_id.as_deref() != Some(pin.application_db_id)
+            || row.client_id != policy.client_id
+        {
+            return Ok(false);
+        }
+        let key = crate::util::sha256_base64url(&row.code);
+        let marker = sql_query("SELECT code_sha256 AS id FROM axon_v3_incumbent_code_provenance
+            WHERE code_sha256=? AND user_id=? AND session_public_id=? AND application_db_id=?
+              AND client_db_id=? AND enrollment_id=? AND signer_pin=? AND policy_sha256=?
+              AND revision=? AND generation=?")
+            .bind::<Text,_>(&key).bind::<Text,_>(&row.user_id).bind::<Text,_>(sid)
+            .bind::<Text,_>(pin.application_db_id).bind::<Text,_>(pin.client_db_id)
+            .bind::<Text,_>(&policy.enrollment_id).bind::<Text,_>(pin.signer_pin)
+            .bind::<Text,_>(approved.sha256()).bind::<BigInt,_>(policy.revision)
+            .bind::<BigInt,_>(policy.generation).get_result::<Identity>(conn).optional()?;
+        if !marker.is_some_and(|marker| marker.id == key) {
+            return Ok(false);
+        }
+        // The confidential exchange does not receive the browser cookie. Use
+        // the exact existing public SID and only current sessions of this user.
+        let sessions = sql_query("SELECT s.id FROM sessions s JOIN users u ON u.id=s.user_id
+            WHERE u.id=? AND s.expires_at>? AND u.is_admin=1 AND u.is_active=1
+              AND u.archived_at IS NULL AND COALESCE(s.login_method,'')<>'authorization_code'
+              AND NOT EXISTS (SELECT 1 FROM trial_enrollments t WHERE t.user_id=u.id)")
+            .bind::<Text,_>(&row.user_id).bind::<BigInt,_>(now).load::<Identity>(conn)?;
+        Ok(sessions.into_iter().any(|session| crate::util::session_public_id(&session.id) == sid))
+    }
+
+    /// Consume only a code admitted for the active exact incumbent policy.
+    /// This is not mounted and does not grant or issue any token.
+    pub(crate) fn consume_incumbent_code(
+        conn: &mut SqliteConnection,
+        gate: &RestoreInterlock,
+        pin: &IncumbentPin<'_>,
+        approved: &VerifiedPolicy,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> crate::error::AppResult<crate::db::AuthorizationCodeRecord> {
+        use crate::error::AppError;
+        conn.immediate_transaction::<_, AppError, _>(|conn| {
+            let snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
+            if !exact_active_policy(conn, gate, pin, approved)? {
+                return Err(AppError::Forbidden);
+            }
+            let now = crate::util::now_ts();
+            let row = super::super::authorization_codes::consume_sqlite_authorization_code_for_client_on_conn(
+                conn, code, client_id, Some(redirect_uri), Some(code_verifier), true, true, now,
+            )?;
+            if !code_has_current_provenance_on_conn(conn, &row, pin, approved, now)? || !snapshot.unchanged() {
+                return Err(AppError::Forbidden);
+            }
+            Ok(row)
+        })
     }
 
     /// Dormant foreground writer. Both configured trust and the enrolled
