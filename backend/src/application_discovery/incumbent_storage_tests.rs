@@ -232,9 +232,43 @@ pub(crate) async fn signed_file_bench(
     assert_eq!(saved(&mut registry()).policy_sha256, replacement.sha256());
     assert!(active(&next_pin, replacement));
     assert!(!active(pin, approved));
+    let floor_dir = root.join("floor");
+    fs::create_dir(&floor_dir).unwrap();
+    let floor = floor_dir.join("current.json");
+    fs::write(&floor, serde_json::json!({
+        "format": "signet-incumbent-restart-floor/v1",
+        "organization_id": enrolled.organization_id,
+        "enrollment_id": enrolled.enrollment_id,
+        "application_db_id": next_pin.application_db_id,
+        "client_db_id": next_pin.client_db_id,
+        "policy_sha256": replacement.sha256(),
+        "revision": next_pin.revision,
+        "generation": next_pin.generation,
+        "permissions": replacement.policy().permissions,
+    }).to_string()).unwrap();
+    fs::set_permissions(&floor, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let material = root.join("test-process-input.json");
+    fs::write(&material, serde_json::json!({
+        "enrollment": enrolled, "trust": trust, "database": fixture_path, "floor": floor,
+        "now": replacement.verified_at() + 301,
+    }).to_string()).unwrap();
+    let restart = |expected: &str| {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "application_discovery::axon_v3_restart::tests::subprocess_restart"])
+            .env("SIGNET_TEST_RESTART_MATERIAL", &material)
+            .env("SIGNET_TEST_RESTART_EXPECTED", expected)
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(result.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}", String::from_utf8_lossy(&result.stderr));
+    };
+    restart(replacement.sha256());
     assert_eq!(sqlite::withdraw(&mut registry(), &next_pin).unwrap(), 1);
     assert!(!active(&next_pin, replacement));
+    restart("denied");
 
+    fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&marker_root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();
 }

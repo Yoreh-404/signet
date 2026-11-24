@@ -34,6 +34,8 @@ mod axon_v2;
 pub(crate) mod axon_v3_acceptance;
 pub(crate) mod axon_v3_restore;
 mod axon_v3_operator;
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(crate) mod axon_v3_restart;
 pub(crate) mod incumbent_preflight;
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) mod incumbent_storage_tests;
