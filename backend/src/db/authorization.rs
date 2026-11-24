@@ -18,7 +18,7 @@ use super::{
 };
 use super::{normalize_application_entitlement_keys, select_application_module_sql};
 use crate::application_discovery_contract::{
-    SOURCE_MODE_MANUAL, SYNC_STATUS_MANUAL, website_discovery_runtime_active,
+    DiscoveryRuntimeState, SOURCE_MODE_MANUAL, SYNC_STATUS_MANUAL, discovery_runtime_state,
 };
 use crate::config::DatabaseKind;
 use crate::error::{AppError, AppResult};
@@ -161,9 +161,12 @@ struct DiscoveryRuntimeRow {
     operator_disabled: i32,
 }
 
-fn discovery_runtime_is_active(discovery: Option<DiscoveryRuntimeRow>, now: i64) -> bool {
-    discovery.is_none_or(|discovery| {
-        website_discovery_runtime_active(
+fn resolved_discovery_runtime(
+    discovery: Option<DiscoveryRuntimeRow>,
+    now: i64,
+) -> DiscoveryRuntimeState {
+    discovery.map_or(DiscoveryRuntimeState::NotWebsiteManaged, |discovery| {
+        discovery_runtime_state(
             &discovery.management_mode,
             discovery.operator_disabled != 0,
             discovery.last_verified_revision,
@@ -316,6 +319,10 @@ pub struct AuthorizationPolicySnapshot {
     pub profile_permission_overrides: Vec<ApplicationProfilePermissionOverrideRecord>,
     pub claim_mappers: Vec<ClientClaimMapperRecord>,
     pub is_authorizable: bool,
+    // Diagnostic inputs that cannot be recovered from the combined booleans.
+    pub(crate) discovery_runtime: DiscoveryRuntimeState,
+    pub(crate) binding_protocol_matches: bool,
+    pub(crate) profile_active: bool,
 }
 
 impl AuthorizationPolicySnapshot {
@@ -798,7 +805,7 @@ macro_rules! policy_snapshot_on_connection {
                 .is_some_and(|user| user.is_active == 1 && user.archived_at.is_none())
         };
 
-        let (organization_active, membership, runtime_active) =
+        let (organization_active, membership, discovery_runtime) =
             if let Some(application) = application.as_ref() {
                 let membership_sql = format!(
                     "SELECT organizations.is_active AS organization_is_active,
@@ -851,11 +858,12 @@ macro_rules! policy_snapshot_on_connection {
                     .optional()
                     .map_err(AppError::from)?;
                 let now = crate::util::now_ts();
-                let runtime_active = discovery_runtime_is_active(discovery, now);
-                (organization_active, membership, runtime_active)
+                let discovery_runtime = resolved_discovery_runtime(discovery, now);
+                (organization_active, membership, discovery_runtime)
             } else {
-                (false, None, false)
+                (false, None, DiscoveryRuntimeState::NotWebsiteManaged)
             };
+        let runtime_active = application.is_some() && discovery_runtime.runtime_active();
 
         let application_modules = if let Some(application) = application.as_ref() {
             let module_sql = format!(
@@ -1107,6 +1115,9 @@ macro_rules! policy_snapshot_on_connection {
             profile_permission_overrides,
             claim_mappers,
             is_authorizable,
+            discovery_runtime,
+            binding_protocol_matches,
+            profile_active,
         })
     }};
 }
@@ -1214,7 +1225,8 @@ impl Db {
                         .optional()
                         .map_err(AppError::from)?;
                         let now = crate::util::now_ts();
-                        let discovery_runtime_active = discovery_runtime_is_active(discovery, now);
+                        let discovery_runtime_active =
+                            resolved_discovery_runtime(discovery, now).runtime_active();
                         let module = sql_query(format!(
                             "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key = {}",
                             ph(kind, 1),
