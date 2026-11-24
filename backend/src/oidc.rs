@@ -1003,16 +1003,23 @@ async fn assert_authorization_mfa_satisfied(
     }
 }
 
-async fn issue_authorization_code_redirect(
+// Preparation retains the ordinary checks and auth-context write. This is not an
+// authorization token: a transaction-owned path must recheck its own admission.
+struct PreparedAuthorizationCode {
+    redirect_code: String,
+    row: NewAuthorizationCode,
+}
+
+async fn prepare_authorization_code(
     context: &AuthorizationHttpContext<'_>,
     user: &UserRecord,
     session: &SessionRecord,
     client: &ClientRecord,
     authorization_snapshot: &AuthorizationSnapshot,
-    request: ResolvedAuthorizeRequest,
-    requested_scopes: Vec<String>,
+    request: &ResolvedAuthorizeRequest,
+    requested_scopes: &[String],
     website_generation: Option<&str>,
-) -> AppResult<Response> {
+) -> AppResult<PreparedAuthorizationCode> {
     ensure_trial_enrollment_client_allowed_for_user(context.state, &user.id, &client.client_id)
         .await?;
     if !authorization_snapshot.policy.is_authorizable
@@ -1055,30 +1062,54 @@ async fn issue_authorization_code_redirect(
         client,
         request.authorization_details.as_deref(),
     )?;
-    context
-        .state
-        .db
-        .insert_authorization_code(NewAuthorizationCode {
-            code: code.clone(),
-            client_id: client.client_id.clone(),
-            user_id: user.id.clone(),
-            application_id: Some(application.id.clone()),
-            authorization_profile_id: Some(client_binding.authorization_profile_id.clone()),
-            auth_context_id: Some(auth_context_id),
-            session_id: Some(util::session_public_id(&session.id)),
-            redirect_uri: request.redirect_uri.clone(),
-            scope: requested_scopes.join(" "),
-            resource: request.resource.clone(),
-            authorization_details: authorization_details.clone(),
-            nonce: request.nonce.clone(),
-            code_challenge: request.code_challenge.clone(),
-            code_challenge_method: request.code_challenge_method.clone(),
-            auth_time: session.created_at,
-            acr,
-            amr: session_assurance.amr,
-            expires_at: util::now_ts() + context.state.settings.oidc.authorization_code_ttl_seconds,
-        })
-        .await?;
+    let row = NewAuthorizationCode {
+        code: code.clone(),
+        client_id: client.client_id.clone(),
+        user_id: user.id.clone(),
+        application_id: Some(application.id.clone()),
+        authorization_profile_id: Some(client_binding.authorization_profile_id.clone()),
+        auth_context_id: Some(auth_context_id),
+        session_id: Some(util::session_public_id(&session.id)),
+        redirect_uri: request.redirect_uri.clone(),
+        scope: requested_scopes.join(" "),
+        resource: request.resource.clone(),
+        authorization_details: authorization_details.clone(),
+        nonce: request.nonce.clone(),
+        code_challenge: request.code_challenge.clone(),
+        code_challenge_method: request.code_challenge_method.clone(),
+        auth_time: session.created_at,
+        acr,
+        amr: session_assurance.amr,
+        expires_at: util::now_ts() + context.state.settings.oidc.authorization_code_ttl_seconds,
+    };
+    Ok(PreparedAuthorizationCode { redirect_code: code, row })
+}
+
+async fn issue_authorization_code_redirect(
+    context: &AuthorizationHttpContext<'_>,
+    user: &UserRecord,
+    session: &SessionRecord,
+    client: &ClientRecord,
+    authorization_snapshot: &AuthorizationSnapshot,
+    request: ResolvedAuthorizeRequest,
+    requested_scopes: Vec<String>,
+    website_generation: Option<&str>,
+) -> AppResult<Response> {
+    let PreparedAuthorizationCode {
+        redirect_code: code,
+        row,
+    } = prepare_authorization_code(
+        context,
+        user,
+        session,
+        client,
+        authorization_snapshot,
+        &request,
+        &requested_scopes,
+        website_generation,
+    )
+    .await?;
+    context.state.db.insert_authorization_code(row).await?;
     context
         .state
         .db
