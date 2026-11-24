@@ -91,6 +91,7 @@ pub(crate) fn signed_file_bench(
     replacement: &super::axon_v3_acceptance::VerifiedPolicy,
     foreign: &super::axon_v3_acceptance::VerifiedPolicy,
     enrolled_jwks: &str,
+    admission_fixture: impl FnOnce(&mut SqliteConnection, &super::axon_v3_restore::RestoreInterlock, &dyn Fn(bool)),
 ) {
     use crate::db::axon_v3_incumbent_storage::{RestoreSnapshot, sqlite};
     use super::axon_v3_restore::RestoreInterlock;
@@ -200,6 +201,7 @@ pub(crate) fn signed_file_bench(
     let active = |pin, proof| registry().immediate_transaction(|conn|
         sqlite::exact_active_policy(conn, &gate, pin, proof)).unwrap();
     assert!(active(pin, approved));
+    admission_fixture(&mut registry(), &gate, &set_gate);
     let rotated = registry().immediate_transaction::<(), diesel::result::Error, _>(|conn| {
         sql_query("UPDATE application_discovery SET signing_public_jwks='{}' WHERE application_id=?")
             .bind::<Text,_>(pin.application_db_id).execute(conn)?;

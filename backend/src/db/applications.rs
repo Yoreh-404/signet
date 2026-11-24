@@ -279,7 +279,7 @@ impl ApplicationAuthContextSelection<'_> {
 /// Resolve context persistence only. Nothing here makes an admission decision.
 #[cfg(feature = "sqlite")]
 #[allow(dead_code)] // Incumbent code admission is not mounted.
-pub(super) fn find_or_create_sqlite_application_auth_context_on_conn(
+pub(crate) fn find_or_create_sqlite_application_auth_context_on_conn(
     conn: &mut diesel::SqliteConnection,
     auth_domain_id: &str,
     user_id: &str,

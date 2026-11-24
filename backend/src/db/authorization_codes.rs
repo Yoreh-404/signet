@@ -66,7 +66,7 @@ macro_rules! insert_code_on_connection {
 /// This helper does not make any authorization decisions or start a transaction.
 #[cfg(feature = "sqlite")]
 #[allow(dead_code)] // Incumbent admission is intentionally not mounted.
-pub(super) fn insert_sqlite_authorization_code_on_conn(
+pub(crate) fn insert_sqlite_authorization_code_on_conn(
     conn: &mut diesel::SqliteConnection,
     code: NewAuthorizationCode,
     amr: String,

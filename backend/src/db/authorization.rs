@@ -1113,7 +1113,7 @@ macro_rules! policy_snapshot_on_connection {
 
 #[cfg(feature = "sqlite")]
 #[allow(dead_code)] // Incumbent admission is intentionally not mounted.
-pub(super) fn load_sqlite_oidc_policy_snapshot_on_conn(
+pub(crate) fn load_sqlite_oidc_policy_snapshot_on_conn(
     conn: &mut diesel::SqliteConnection,
     client_db_id: &str,
     user_id: &str,

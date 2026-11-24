@@ -334,6 +334,12 @@ pub use billing::{
     WalletTransactionRecord, WalletTransfer,
 };
 
+#[cfg(all(test, target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(crate) use {
+    applications::find_or_create_sqlite_application_auth_context_on_conn,
+    authorization::load_sqlite_oidc_policy_snapshot_on_conn,
+    authorization_codes::insert_sqlite_authorization_code_on_conn,
+};
 pub use authorization::{
     ApplicationOrganizationRoleAssignmentRecord,
     ApplicationProfileOrganizationRoleAssignmentRecord, ApplicationProfileRoleAssignmentRecord,

@@ -2076,8 +2076,127 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         let next_pin = IncumbentPin { policy_sha256: &next_digest, revision: 5, generation: 9, ..pin };
         assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &next, &wanted)
             .await.unwrap());
+        use crate::db::axon_v3_incumbent_storage::{RestoreSnapshot, sqlite};
+        use crate::db::{
+            find_or_create_sqlite_application_auth_context_on_conn,
+            insert_sqlite_authorization_code_on_conn, load_sqlite_oidc_policy_snapshot_on_conn,
+        };
+
+        // Resolve the same real authorize request without the provisioning
+        // runtime loader. Existing fixture settings waive consent for this client.
+        let request = authorize();
+        let query = serde_urlencoded::from_str(request.uri().query().unwrap()).unwrap();
+        let resolved = ResolvedAuthorizeRequest::from_query(query).unwrap();
+        let scopes = vec!["openid".to_owned()];
+        assert!(!requires_authorization_consent(&state, &current.user, &client, &scopes).await.unwrap());
+        let ip = state.request_ip(
+            request.headers(),
+            Some(SocketAddr::from(([127, 0, 0, 1], 43001))),
+        ).await.unwrap();
+        let credential = util::session_id_from_cookie(session_cookie.value()).unwrap();
+        set_expiry(util::now_ts() + 600);
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
-            &path, &pin, &approved, &next, &other_approval, &approved_jwks);
+            &path, &pin, &approved, &next, &other_approval, &approved_jwks,
+            |conn, gate, set_gate| {
+                let admit = |conn: &mut diesel::SqliteConnection, before_commit: &dyn Fn()| {
+                    conn.immediate_transaction::<_, AppError, _>(|conn| {
+                        let gate_snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
+                        let now = util::now_ts();
+                        let session = sqlite::current_incumbent_browser_on_conn(
+                            conn, &credential, &current.session_id, &current.user.id, now,
+                        )?.ok_or(AppError::Forbidden)?;
+                        if !sqlite::exact_active_policy(conn, gate, &pin, &approved)? {
+                            return Err(AppError::Forbidden);
+                        }
+                        validate_authorize_request_for_client(&client, &resolved)?;
+                        let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &session.user_id)?;
+                        let application = graph.application.as_ref().ok_or(AppError::Forbidden)?;
+                        let binding = graph.binding.as_ref().ok_or(AppError::Forbidden)?;
+                        if !graph.is_authorizable || !graph.is_interactive_client_runtime_active()
+                            || !graph.has_client_application_boundary(&client.id)
+                            || !graph.has_profile_application_boundary()
+                            || application.id != pin.application_db_id
+                            || !matches!(
+                                oidc_authorization_flow::authorization_mfa_decision_on_conn(
+                                    conn, &client, &session, &resolved, ip.as_deref(),
+                                )?,
+                                MfaDecision::Satisfied
+                            )
+                        {
+                            return Err(AppError::Forbidden);
+                        }
+                        let code = util::random_token(32);
+                        let requested = resolved.requested_assurance()?;
+                        let assurance = session.authentication_assurance();
+                        let acr = assurance::DefaultAssurancePolicy.select_acr(&assurance, &requested)?;
+                        assurance::DefaultAssurancePolicy.assert_amr(&assurance, &requested)?;
+                        let context_id = find_or_create_sqlite_application_auth_context_on_conn(
+                            conn, &binding.auth_domain_id, &session.user_id, &acr,
+                            &assurance.amr, session.created_at, now,
+                        )?;
+                        let details = authorization_details::normalize_authorization_details_for_client(
+                            &client, resolved.authorization_details.as_deref(),
+                        )?;
+                        let PreparedAuthorizationCode { redirect_code, row } = build_authorization_code_material(
+                            &resolved, &scopes, &session, &client, &current.user, &application.id,
+                            &binding.authorization_profile_id, context_id, code, acr, assurance.amr,
+                            details, state.settings.oidc.authorization_code_ttl_seconds,
+                        );
+                        let inserted_at = util::now_ts();
+                        let amr = util::to_json(&row.amr)?;
+                        insert_sqlite_authorization_code_on_conn(conn, row, amr, inserted_at)?;
+                        before_commit();
+                        if !gate_snapshot.unchanged() {
+                            return Err(AppError::Forbidden);
+                        }
+                        Ok(redirect_code)
+                    })
+                };
+                #[derive(diesel::QueryableByName)]
+                struct Count {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+                let count = |conn: &mut diesel::SqliteConnection| {
+                    sql_query("SELECT COUNT(*) AS count FROM authorization_codes WHERE client_id=? AND user_id=?")
+                        .bind::<Text,_>(&client.client_id).bind::<Text,_>(&fixture.id)
+                        .get_result::<Count>(conn).unwrap().count
+                };
+                let before = count(conn);
+                let code = admit(conn, &|| ()).unwrap();
+                let inserted = sql_query("SELECT COUNT(*) AS count FROM authorization_codes
+                    WHERE code=? AND application_id=? AND client_id=? AND user_id=? AND consumed_at IS NULL")
+                    .bind::<Text,_>(&code).bind::<Text,_>(&app.id).bind::<Text,_>(&client.client_id)
+                    .bind::<Text,_>(&fixture.id).get_result::<Count>(conn).unwrap().count;
+                assert_eq!(inserted, 1);
+                assert_eq!(count(conn), before + 1);
+                for role in [0, 1] {
+                    sql_query("UPDATE users SET is_admin=? WHERE id=?")
+                        .bind::<diesel::sql_types::Integer,_>(role).bind::<Text,_>(&fixture.id)
+                        .execute(conn).unwrap();
+                    if role == 0 {
+                        assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                    }
+                }
+                for jwks in [&other_jwks, &approved_jwks] {
+                    sql_query("UPDATE application_discovery SET signing_public_jwks=? WHERE application_id=?")
+                        .bind::<Text,_>(jwks).bind::<Text,_>(&app.id).execute(conn).unwrap();
+                    if jwks == &other_jwks {
+                        assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                    }
+                }
+                let reached_insert = std::cell::Cell::new(false);
+                assert!(matches!(admit(conn, &|| {
+                    reached_insert.set(true);
+                    set_gate(false);
+                }), Err(AppError::Forbidden)));
+                assert!(reached_insert.get(), "restore change must roll back an attempted insert");
+                assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                assert_eq!(count(conn), before + 1, "denials and final gate rollback must not mint");
+                set_gate(true);
+            },
+        );
+        set_expiry(util::now_ts() - 1);
     }
     for wrong in [
         RequestScope { issuer: "https://foreign.example", ..wanted },
