@@ -2042,10 +2042,10 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         policy_sha256: &digest, signer_pin: &signer_pin, revision: 4, generation: 8, withdrawn: false,
     };
     let challenge = util::sha256_base64url(challenge_verifier);
-    let wanted = RequestScope {
-        issuer, client_id: &client.client_id, resource: audience, redirected_to: &callback,
-        scope: "openid", challenge_method: "S256", challenge: &challenge,
-    };
+    let request = authorize();
+    let query = request.uri().query().unwrap();
+    let resolved = ResolvedAuthorizeRequest::from_query(serde_urlencoded::from_str(query).unwrap()).unwrap();
+    let wanted = RequestScope::from_resolved(issuer, &resolved).unwrap();
     let eligible = async |pin: Option<&IncumbentPin<'_>>, request: &RequestScope<'_>|
         incumbent_preflight::matches(&state, &jar, pin, &approved, request).await;
     assert!(eligible(Some(&pin), &wanted).await.unwrap());
@@ -2085,10 +2085,14 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
 
         // Resolve the same real authorize request without the provisioning
         // runtime loader. Existing fixture settings waive consent for this client.
-        let request = authorize();
-        let query = serde_urlencoded::from_str(request.uri().query().unwrap()).unwrap();
-        let resolved = ResolvedAuthorizeRequest::from_query(query).unwrap();
-        let scopes = vec!["openid".to_owned()];
+        let mut other_query: AuthorizeRequest = serde_urlencoded::from_str(query).unwrap();
+        other_query.resource = Some("https://axon.example/other".to_owned());
+        let wrong_resource = ResolvedAuthorizeRequest::from_query(other_query).unwrap();
+        assert!(validate_authorize_request_for_client(&client, &wrong_resource).is_ok(),
+            "standalone standard validation must not substitute for the exact signed audience");
+        let scopes = normalize_and_validate_requested_scopes(
+            &client, resolved.scope.as_deref(), &state.settings.oidc.supported_scopes,
+        ).unwrap();
         assert!(!requires_authorization_consent(&state, &current.user, &client, &scopes).await.unwrap());
         let ip = state.request_ip(
             request.headers(),
@@ -2100,6 +2104,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
             &path, &pin, &approved, &next, &other_approval, &approved_jwks,
             |conn, gate, set_gate| {
                 let admit_with = |conn: &mut diesel::SqliteConnection,
+                    resolved: &ResolvedAuthorizeRequest,
                     setup: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
                     before_commit: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
                 | {
@@ -2116,7 +2121,14 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         let client = find_sqlite_client_by_client_id_on_conn(conn, &resolved.client_id)?
                             .filter(|client| client.id == pin.client_db_id)
                             .ok_or(AppError::Forbidden)?;
-                        validate_authorize_request_for_client(&client, &resolved)?;
+                        validate_authorize_request_for_client(&client, resolved)?;
+                        let scopes = normalize_and_validate_requested_scopes(
+                            &client, resolved.scope.as_deref(), &state.settings.oidc.supported_scopes,
+                        )?;
+                        let exact = RequestScope::from_resolved(issuer, resolved).ok_or(AppError::Forbidden)?;
+                        if !incumbent_preflight::matches_signed_request(&pin, &approved, &exact) {
+                            return Err(AppError::Forbidden);
+                        }
                         let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &session.user_id)?;
                         let application = graph.application.as_ref().ok_or(AppError::Forbidden)?;
                         let binding = graph.binding.as_ref().ok_or(AppError::Forbidden)?;
@@ -2161,7 +2173,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                     })
                 };
                 let noop = |_: &mut diesel::SqliteConnection| Ok(());
-                let admit = |conn: &mut diesel::SqliteConnection| admit_with(conn, &noop, &noop);
+                let admit = |conn: &mut diesel::SqliteConnection| admit_with(conn, &resolved, &noop, &noop);
                 #[derive(diesel::QueryableByName)]
                 struct Count {
                     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -2173,6 +2185,12 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .get_result::<Count>(conn).unwrap().count
                 };
                 let before = count(conn);
+                let no_mismatch_insert = |_: &mut diesel::SqliteConnection| -> AppResult<()> {
+                    panic!("a request with a different resource must never reach insertion")
+                };
+                assert!(matches!(admit_with(conn, &wrong_resource, &noop, &no_mismatch_insert),
+                    Err(AppError::Forbidden)));
+                assert_eq!(count(conn), before, "denied scope must not yield a code or code row");
                 let code = admit(conn).unwrap();
                 let inserted = sql_query("SELECT COUNT(*) AS count FROM authorization_codes
                     WHERE code=? AND application_id=? AND client_id=? AND user_id=? AND consumed_at IS NULL AND session_id=? AND code_challenge=? AND code_challenge_method='S256'")
@@ -2204,7 +2222,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 let never_insert = |_: &mut diesel::SqliteConnection| -> AppResult<()> {
                     panic!("a client requiring new MFA must deny before inserting a code")
                 };
-                assert!(matches!(admit_with(conn, &require_mfa, &never_insert), Err(AppError::Forbidden)));
+                assert!(matches!(admit_with(conn, &resolved, &require_mfa, &never_insert), Err(AppError::Forbidden)));
                 assert_eq!(count(conn), before + 1);
                 let counts = |conn: &mut diesel::SqliteConnection| {
                     sql_query("SELECT COUNT(*) AS count FROM application_auth_contexts WHERE user_id=?")
@@ -2217,7 +2235,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                     Ok(())
                 };
                 let reached_insert = std::cell::Cell::new(false);
-                assert!(matches!(admit_with(conn, &revoke_context, &|conn| {
+                assert!(matches!(admit_with(conn, &resolved, &revoke_context, &|conn| {
                     reached_insert.set(true);
                     assert_eq!(counts(conn), contexts_before + 1);
                     set_gate(false);

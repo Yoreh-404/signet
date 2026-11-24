@@ -33,6 +33,41 @@ pub(crate) struct RequestScope<'a> {
     pub challenge: &'a str,
 }
 
+impl<'a> RequestScope<'a> {
+    pub(crate) fn from_resolved(
+        issuer: &'a str,
+        request: &'a crate::oidc::ResolvedAuthorizeRequest,
+    ) -> Option<Self> {
+        Some(Self {
+            issuer,
+            client_id: &request.client_id,
+            resource: request.resource.as_deref()?,
+            redirected_to: &request.redirect_uri,
+            scope: request.scope.as_deref()?,
+            challenge_method: request.code_challenge_method.as_deref()?,
+            challenge: request.code_challenge.as_deref()?,
+        })
+    }
+}
+
+/// Match the policy identity and exact OAuth request, without trusting a client
+/// or session record. The caller still needs current registry and browser reads.
+pub(crate) fn matches_signed_request(
+    pin: &IncumbentPin<'_>, approved: &VerifiedPolicy, request: &RequestScope<'_>,
+) -> bool {
+    let policy = approved.policy();
+    let callback = format!("{}/admin/api/auth/signet/callback", policy.origin);
+    !(pin.withdrawn
+        || pin.policy_sha256 != approved.sha256()
+        || pin.revision != policy.revision || pin.generation != policy.generation
+        || crate::dcr::is_website_client_id(request.client_id)
+        || request.issuer != policy.issuer || request.client_id != policy.client_id
+        || request.resource != policy.audience || request.redirected_to != callback
+        || request.scope != "openid" || request.challenge_method != "S256"
+        || URL_SAFE_NO_PAD.decode(request.challenge).ok().is_none_or(|value| value.len() != 32)
+    )
+}
+
 pub(crate) fn approved_enrolled_signer(approved: &VerifiedPolicy, pin: &str, jwks: &str) -> bool {
     axon_signer_pin(jwks).as_deref() == Some(pin)
         && enrolled_signer_key_sha256(jwks).as_deref() == Some(approved.signer_key_sha256())
@@ -48,15 +83,7 @@ pub(crate) async fn matches(
     let Some(pin) = configured else { return Ok(false); };
     let policy = approved.policy();
     let callback = format!("{}/admin/api/auth/signet/callback", policy.origin);
-    if pin.withdrawn
-        || pin.policy_sha256 != approved.sha256()
-        || pin.revision != policy.revision || pin.generation != policy.generation
-        || crate::dcr::is_website_client_id(request.client_id)
-        || request.issuer != policy.issuer || request.client_id != policy.client_id
-        || request.resource != policy.audience || request.redirected_to != callback
-        || request.scope != "openid" || request.challenge_method != "S256"
-        || URL_SAFE_NO_PAD.decode(request.challenge).ok().is_none_or(|value| value.len() != 32)
-    { return Ok(false); }
+    if !matches_signed_request(pin, approved, request) { return Ok(false); }
 
     let Some(application) = state.db.find_application_by_id(pin.application_db_id).await? else { return Ok(false); };
     let Some(site) = state.db.find_application_discovery(pin.application_db_id).await? else { return Ok(false); };
