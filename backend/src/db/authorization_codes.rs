@@ -77,6 +77,89 @@ pub(crate) fn insert_sqlite_authorization_code_on_conn(
 
 #[cfg(all(test, feature = "sqlite"))]
 mod insert_on_connection_tests {
+// Reuse the ordinary code binding checks and single-use CAS on the concrete
+// connection selected by the caller. The caller owns the transaction.
+macro_rules! consume_authorization_code_on_conn {
+    ($conn:expr, $kind:expr, $code:expr, $client_id:expr, $redirect_uri:expr, $verifier:expr,
+        $require_pkce:expr, $require_s256_pkce:expr, $now:expr) => {{
+        let (kind, code, client_id, redirect_uri, code_verifier, require_pkce, require_s256_pkce, now) =
+            ($kind, $code, $client_id, $redirect_uri, $verifier, $require_pkce, $require_s256_pkce, $now);
+        let select_sql = format!(
+            "SELECT code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
+            ph(kind, 1)
+        );
+        let record = sql_query(select_sql)
+            .bind::<Text, _>(&code)
+            .get_result::<AuthorizationCodeRecord>($conn)
+            .optional()
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::Oidc("invalid authorization code".to_string()))?;
+        if record.expires_at < now {
+            return Err(AppError::Oidc("authorization code expired".to_string()));
+        }
+        if record.consumed_at.is_some() {
+            return Err(AppError::Oidc(
+                "authorization code already consumed".to_string(),
+            ));
+        }
+        if record.client_id != client_id {
+            return Err(AppError::Oidc(
+                "authorization code was issued to a different client".to_string(),
+            ));
+        }
+        if redirect_uri
+            .as_deref()
+            .is_some_and(|uri| uri != record.redirect_uri)
+        {
+            return Err(AppError::Oidc("redirect_uri mismatch".to_string()));
+        }
+        util::check_pkce(
+            record.code_challenge.as_deref(),
+            record.code_challenge_method.as_deref(),
+            code_verifier.as_deref(),
+            require_pkce,
+            require_s256_pkce,
+        )?;
+        let update_sql = format!(
+            "UPDATE authorization_codes SET consumed_at = {} WHERE code = {} AND consumed_at IS NULL",
+            ph(kind, 1),
+            ph(kind, 2)
+        );
+        let affected = sql_query(update_sql)
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(&code)
+            .execute($conn)
+            .map_err(AppError::from)?;
+        if affected != 1 {
+            return Err(AppError::Oidc(
+                "authorization code already consumed".to_string(),
+            ));
+        }
+        Ok(record)
+    }};
+}
+
+/// Exchange validation and consumption only. Call only within the caller's
+/// transaction. A successful read is not authorization to issue tokens.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // No incumbent exchange route is mounted.
+pub(super) fn consume_sqlite_authorization_code_for_client_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    code: &str,
+    client_id: &str,
+    redirect_uri: Option<&str>,
+    code_verifier: Option<&str>,
+    require_pkce: bool,
+    require_s256_pkce: bool,
+    now: i64,
+) -> AppResult<AuthorizationCodeRecord> {
+    consume_authorization_code_on_conn!(
+        conn, DatabaseKind::Sqlite, code.to_owned(), client_id.to_owned(),
+        redirect_uri.map(ToOwned::to_owned), code_verifier.map(ToOwned::to_owned),
+        require_pkce, require_s256_pkce, now
+    )
+}
+
     use super::*;
     use diesel::{connection::SimpleConnection, result::Error, SqliteConnection};
 
@@ -92,7 +175,7 @@ mod insert_on_connection_tests {
             authorization_profile_id: Some("profile".into()), auth_context_id: Some("context".into()),
             session_id: Some("session".into()), redirect_uri: "https://app.invalid/callback".into(),
             scope: "openid".into(), resource: None, authorization_details: None, nonce: None,
-            code_challenge: Some("synthetic-challenge".into()), code_challenge_method: Some("S256".into()),
+            code_challenge: Some(util::sha256_base64url("synthetic-verifier-012345678901234567890123456789")), code_challenge_method: Some("S256".into()),
             auth_time: 1, acr: "fixture".into(), amr: vec!["pwd".into()], expires_at: 60,
         };
         let amr = util::to_json(&synthetic.amr).unwrap();
@@ -121,6 +204,33 @@ mod insert_on_connection_tests {
         assert_eq!((row.redirect_uri, row.amr, row.created_at, row.consumed_at),
             (synthetic.redirect_uri.clone(), amr.clone(), 17, None));
         assert!(insert(&mut conn).is_err(), "ordinary duplicate handling is unchanged");
+
+        let consume = |conn: &mut SqliteConnection, client, redirect, verifier| {
+            consume_sqlite_authorization_code_for_client_on_conn(
+                conn, &synthetic.code, client, Some(redirect), Some(verifier), true, true, 18,
+            )
+        };
+        for (client, redirect, verifier) in [
+            ("other", synthetic.redirect_uri.as_str(), "synthetic-verifier-012345678901234567890123456789"),
+            ("client", "https://other.invalid/callback", "synthetic-verifier-012345678901234567890123456789"),
+            ("client", synthetic.redirect_uri.as_str(), "incorrect-verifier-012345678901234567890123456789"),
+        ] {
+            assert!(conn.immediate_transaction(|conn| consume(conn, client, redirect, verifier)).is_err());
+            assert_eq!(read(&mut conn).unwrap().consumed_at, None);
+        }
+        let redeem = |conn: &mut SqliteConnection| {
+            consume(conn, "client", &synthetic.redirect_uri, "synthetic-verifier-012345678901234567890123456789")
+        };
+        let rolled_back: AppResult<()> = conn.immediate_transaction(|conn| {
+            redeem(conn)?;
+            assert_eq!(read(conn).unwrap().consumed_at, Some(18));
+            Err(Error::RollbackTransaction.into())
+        });
+        assert!(rolled_back.is_err());
+        assert_eq!(read(&mut conn).unwrap().consumed_at, None);
+        conn.immediate_transaction(redeem).unwrap();
+        assert_eq!(read(&mut conn).unwrap().consumed_at, Some(18));
+        assert!(conn.immediate_transaction(redeem).is_err(), "committed code remains single-use");
     }
 }
 
@@ -294,58 +404,10 @@ impl Db {
         let now = util::now_ts();
         with_conn!(self, |conn, kind| {
             conn.transaction::<AuthorizationCodeRecord, AppError, _>(|conn| {
-                let select_sql = format!(
-                    "SELECT code, client_id, user_id, application_id, authorization_profile_id, auth_context_id, session_id, redirect_uri, scope, resource, authorization_details, nonce, code_challenge, code_challenge_method, COALESCE(auth_time, created_at) AS auth_time, COALESCE(acr, '') AS acr, COALESCE(amr, '[]') AS amr, expires_at, consumed_at, created_at FROM authorization_codes WHERE code = {}",
-                    ph(kind, 1)
-                );
-                let record = sql_query(select_sql)
-                    .bind::<Text, _>(&code)
-                    .get_result::<AuthorizationCodeRecord>(conn)
-                    .optional()
-                    .map_err(AppError::from)?
-                    .ok_or_else(|| AppError::Oidc("invalid authorization code".to_string()))?;
-                if record.expires_at < now {
-                    return Err(AppError::Oidc("authorization code expired".to_string()));
-                }
-                if record.consumed_at.is_some() {
-                    return Err(AppError::Oidc(
-                        "authorization code already consumed".to_string(),
-                    ));
-                }
-                if record.client_id != client_id {
-                    return Err(AppError::Oidc(
-                        "authorization code was issued to a different client".to_string(),
-                    ));
-                }
-                if redirect_uri
-                    .as_deref()
-                    .is_some_and(|uri| uri != record.redirect_uri)
-                {
-                    return Err(AppError::Oidc("redirect_uri mismatch".to_string()));
-                }
-                util::check_pkce(
-                    record.code_challenge.as_deref(),
-                    record.code_challenge_method.as_deref(),
-                    code_verifier.as_deref(),
-                    require_pkce,
-                    require_s256_pkce,
-                )?;
-                let update_sql = format!(
-                    "UPDATE authorization_codes SET consumed_at = {} WHERE code = {} AND consumed_at IS NULL",
-                    ph(kind, 1),
-                    ph(kind, 2)
-                );
-                let affected = sql_query(update_sql)
-                    .bind::<BigInt, _>(now)
-                    .bind::<Text, _>(&code)
-                    .execute(conn)
-                    .map_err(AppError::from)?;
-                if affected != 1 {
-                    return Err(AppError::Oidc(
-                        "authorization code already consumed".to_string(),
-                    ));
-                }
-                Ok(record)
+                consume_authorization_code_on_conn!(
+                    conn, kind, code, client_id, redirect_uri, code_verifier,
+                    require_pkce, require_s256_pkce, now
+                )
             })
         })
     }
