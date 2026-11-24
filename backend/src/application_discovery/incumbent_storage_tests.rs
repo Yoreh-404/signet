@@ -85,6 +85,7 @@ fn axon_v3_incumbent_storage_is_singleton_and_cas_does_not_resurrect_withdrawal(
 /// matched the real session, current registry and enrolled signer.
 #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage"))]
 pub(crate) async fn signed_file_bench(
+    migrated_db: &crate::db::Db,
     fixture_path: &std::path::Path,
     pin: &super::incumbent_preflight::IncumbentPin<'_>,
     approved: &super::axon_v3_acceptance::VerifiedPolicy,
@@ -169,9 +170,14 @@ pub(crate) async fn signed_file_bench(
     };
     let registry = || SqliteConnection::establish(fixture_path.to_str().unwrap()).unwrap();
     let mut registry_conn = registry();
-    registry_conn.batch_execute(SCHEMA).unwrap();
-    registry_conn.batch_execute(crate::db::axon_v3_incumbent_storage::CODE_PROVENANCE_SCHEMA).unwrap();
-    registry_conn.batch_execute(crate::db::axon_v3_incumbent_storage::ACCESS_PROOF_SCHEMA).unwrap();
+    // These tables must already exist through the normal fresh migration.
+    #[derive(diesel::QueryableByName)]
+    struct Count { #[diesel(sql_type = BigInt)] total: i64 }
+    for table in ["axon_v3_incumbent_activation", "axon_v3_incumbent_code_provenance",
+                  "axon_v3_incumbent_access_proof"] {
+        assert_eq!(sql_query(format!("SELECT COUNT(*) AS total FROM {table}"))
+            .get_result::<Count>(&mut registry_conn).unwrap().total, 0);
+    }
     assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &trust, None, foreign).is_err());
     let wrong_site = crate::config::AxonAdminTrust { origin: "https://foreign.example".into(), ..trust.clone() };
     assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &wrong_site, None, approved).is_err());
@@ -198,6 +204,11 @@ pub(crate) async fn signed_file_bench(
         policy_sha256, signer_pin FROM axon_v3_incumbent_activation WHERE singleton=1")
         .get_result::<Saved>(conn).unwrap();
     drop(registry_conn);
+    // Model an already enrolled ledger predating the two proof tables.
+    registry().batch_execute("DROP TABLE axon_v3_incumbent_code_provenance;
+        DROP TABLE axon_v3_incumbent_access_proof;").unwrap();
+    migrated_db.migrate().await.unwrap();
+    migrated_db.migrate().await.unwrap();
     let written = saved(&mut registry());
     assert_eq!((written.application_db_id.as_str(), written.client_db_id.as_str(),
         written.policy_sha256.as_str(), written.signer_pin.as_str()),

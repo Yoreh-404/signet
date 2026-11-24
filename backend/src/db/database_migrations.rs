@@ -56,6 +56,14 @@ impl Db {
                 .map_err(AppError::from)?;
             Ok(())
         })?;
+        #[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+        if let Db::Sqlite(pool) = self {
+            let pool = pool.clone();
+            blocking(move || {
+                let mut conn = pool.get().map_err(|err| AppError::Database(err.to_string()))?;
+                super::axon_v3_incumbent_storage::install_schema(&mut conn).map_err(AppError::from)
+            }).await?;
+        }
         Ok(())
     }
 }

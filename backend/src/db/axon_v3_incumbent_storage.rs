@@ -1,10 +1,10 @@
-//! Inactive incumbent ledger definition. Compiling this module does not
-//! register a migration or provide an operator or authorization caller.
+//! Optional incumbent SQLite ledger. Installing empty tables does not
+//! establish enrollment, accept a receipt, or grant access.
 #![allow(dead_code)]
 
 use crate::application_discovery::axon_v3_restore::{Reconciliation, RestoreInterlock};
 
-pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
+pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_incumbent_activation (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     profile TEXT NOT NULL CHECK (profile = 'incumbent_v1'),
     application_db_id TEXT NOT NULL,
@@ -23,7 +23,7 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
 
 /// Installed only with the dormant SQLite incumbent ledger. No code or
 /// session bearer is stored: both lookups use their public/hash identities.
-pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_code_provenance (
+pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_incumbent_code_provenance (
     code_sha256 TEXT PRIMARY KEY NOT NULL,
     user_sha256 TEXT NOT NULL,
     session_public_id TEXT NOT NULL,
@@ -37,7 +37,7 @@ pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_
     code_expires_at BIGINT NOT NULL
 )";
 /// Opt-in SQLite purpose index. No JWT, raw identity, or extra lifetime.
-pub(crate) const ACCESS_PROOF_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_access_proof (
+pub(crate) const ACCESS_PROOF_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS axon_v3_incumbent_access_proof (
     jti TEXT PRIMARY KEY NOT NULL,
     user_sha256 TEXT NOT NULL,
     session_public_id TEXT NOT NULL,
@@ -54,6 +54,17 @@ pub(crate) const ACCESS_PROOF_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_acc
     expires_at BIGINT NOT NULL
 )";
 
+#[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(super) fn install_schema(conn: &mut diesel::SqliteConnection) -> diesel::QueryResult<()> {
+    use diesel::connection::SimpleConnection;
+
+    conn.immediate_transaction(|conn| {
+        for ddl in [SCHEMA, CODE_PROVENANCE_SCHEMA, ACCESS_PROOF_SCHEMA] {
+            conn.batch_execute(ddl)?;
+        }
+        Ok(())
+    })
+}
 
 /// Current row identity for future exact compare-and-set; this is not a grant.
 #[derive(Clone, Copy)]

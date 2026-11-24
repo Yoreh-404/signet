@@ -2118,7 +2118,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         assert_eq!(ordinary_issued.status(), StatusCode::SEE_OTHER);
         let ordinary_code = query_value(&redirect_url(&ordinary_issued), "code");
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
-            &path, &pin, &approved, &next, &other_approval, &approved_jwks,
+            &state.db, &path, &pin, &approved, &next, &other_approval, &approved_jwks,
             async |conn, gate, set_gate| {
                 let admit_with = |conn: &mut diesel::SqliteConnection,
                     resolved: &ResolvedAuthorizeRequest,
