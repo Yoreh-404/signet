@@ -197,11 +197,22 @@ pub(crate) fn signed_file_bench(
     assert_eq!((written.application_db_id.as_str(), written.client_db_id.as_str(),
         written.policy_sha256.as_str(), written.signer_pin.as_str()),
         (pin.application_db_id, pin.client_db_id, approved.sha256(), pin.signer_pin));
-    let active = |pin, proof| sqlite::exact_active_policy(&mut registry(), &gate, pin, enrolled_jwks, proof).unwrap();
+    let active = |pin, proof| registry().immediate_transaction(|conn|
+        sqlite::exact_active_policy(conn, &gate, pin, proof)).unwrap();
     assert!(active(pin, approved));
+    let rotated = registry().immediate_transaction::<(), diesel::result::Error, _>(|conn| {
+        sql_query("UPDATE application_discovery SET signing_public_jwks='{}' WHERE application_id=?")
+            .bind::<Text,_>(pin.application_db_id).execute(conn)?;
+        assert!(!sqlite::exact_active_policy(conn, &gate, pin, approved)?,
+            "unchanged ledger cannot authorize with a different current registry signer");
+        Err(diesel::result::Error::RollbackTransaction)
+    });
+    assert!(matches!(rotated, Err(diesel::result::Error::RollbackTransaction)));
+    assert!(active(pin, approved), "rollback restores exact enrolled authority");
     assert!(!active(pin, foreign));
     assert!(!active(&next_pin, replacement));
     assert_eq!(disable_site(&mut competing).unwrap(), 1, "write is possible after the incumbent transaction");
+    assert!(!active(pin, approved), "unchanged ledger cannot authorize a disabled site");
     assert!(sqlite::write_enrolled_incumbent(&mut registry(), &enrolled, &trust, Some(a), replacement).is_err());
     assert_eq!(saved(&mut registry()).policy_sha256, approved.sha256());
     sql_query("UPDATE application_discovery SET operator_disabled=0 WHERE application_id=?")

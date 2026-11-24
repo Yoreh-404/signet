@@ -86,19 +86,76 @@ pub(crate) mod sqlite {
             .map(|row| row.is_some_and(|row| row.id == session_id))
     }
 
+    // Resolve the exact existing site registration on the caller's connection.
+        #[derive(diesel::QueryableByName)]
+        struct BindingRow {
+            #[diesel(sql_type = Text)]
+            application_db_id: String,
+            #[diesel(sql_type = Text)]
+            client_db_id: String,
+            #[diesel(sql_type = Text)]
+            enrolled_jwks: String,
+            #[diesel(sql_type = Text)]
+            redirect_uris: String,
+            #[diesel(sql_type = Text)]
+            scopes: String,
+            #[diesel(sql_type = Text)]
+            grant_types: String,
+            #[diesel(sql_type = Text)]
+            response_types: String,
+        }
+        fn exactly(raw: &str, expected: &str) -> bool {
+            serde_json::from_str::<Vec<String>>(raw).is_ok_and(|v| v == [expected])
+        }
+    fn enrolled_registry_on_conn(
+        conn: &mut SqliteConnection, approved: &VerifiedPolicy,
+    ) -> QueryResult<Option<BindingRow>> {
+        let p = approved.policy();
+        let callback = format!("{}/admin/api/auth/signet/callback", p.origin);
+        let rows: Vec<BindingRow> = sql_query("SELECT a.id AS application_db_id,
+            c.id AS client_db_id, d.signing_public_jwks AS enrolled_jwks,
+            c.redirect_uris, c.scopes, c.grant_types, c.response_types
+            FROM applications a
+            JOIN organizations o ON o.id = a.organization_id AND o.is_active = 1
+            JOIN application_discovery d ON d.application_id = a.id
+            JOIN application_client_bindings b ON b.application_id = a.id
+            JOIN clients c ON c.id = b.client_db_id AND c.organization_id = o.id
+            WHERE o.id = ? AND a.slug = ? AND a.is_active = 1
+            AND d.management_mode = 'website_managed' AND d.operator_disabled = 0 AND d.website_url = ?
+            AND c.client_id = ? AND c.audience = ? AND c.is_active = 1
+            AND b.is_active = 1 AND b.protocol IN ('oidc', 'oauth2_oidc')
+            AND c.token_endpoint_auth_method = 'none'
+            AND c.require_pkce = 1 AND c.require_s256_pkce = 1
+            LIMIT 2")
+            .bind::<Text, _>(&p.organization_id).bind::<Text, _>(&p.application_id)
+            .bind::<Text, _>(&p.origin).bind::<Text, _>(&p.client_id)
+            .bind::<Text, _>(&p.audience).load(conn)?;
+        let [row] = rows.as_slice() else { return Ok(None); };
+        if !exactly(&row.redirect_uris, &callback) || !exactly(&row.scopes, "openid")
+            || !exactly(&row.grant_types, "authorization_code") || !exactly(&row.response_types, "code")
+        {
+            return Ok(None);
+        }
+        Ok(rows.into_iter().next())
+    }
+
+
     /// Read-side prerequisite only. The caller must also establish current
     /// interactive browser eligibility with the same exact verified pin and
     /// recheck the authorities atomically at code admission. This cannot
     /// construct verified policy from unauthenticated ledger bytes.
     pub(crate) fn exact_active_policy(
         conn: &mut SqliteConnection, gate: &RestoreInterlock, pin: &IncumbentPin<'_>,
-        enrolled_jwks: &str, approved: &VerifiedPolicy,
+        approved: &VerifiedPolicy,
     ) -> QueryResult<bool> {
         let Some(snapshot) = RestoreSnapshot::capture(gate) else { return Ok(false); };
         let p = approved.policy();
+        let Some(registration) = enrolled_registry_on_conn(conn, approved)? else { return Ok(false); };
         if pin.withdrawn || pin.policy_sha256 != approved.sha256()
             || pin.revision != p.revision || pin.generation != p.generation
-            || !approved_enrolled_signer(approved, pin.signer_pin, enrolled_jwks)
+            || registration.application_db_id != pin.application_db_id
+            || registration.client_db_id != pin.client_db_id
+            || !approved_enrolled_signer(approved, pin.signer_pin, &registration.enrolled_jwks)
         {
             return Ok(false);
         }
@@ -157,53 +214,9 @@ pub(crate) mod sqlite {
             .ok_or(Error::RollbackTransaction)?;
         let gate = RestoreInterlock::new(enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid);
         let initial = RestoreSnapshot::capture(&gate).ok_or(Error::RollbackTransaction)?;
-        let callback = format!("{}/admin/api/auth/signet/callback", p.origin);
-        #[derive(diesel::QueryableByName)]
-        struct BindingRow {
-            #[diesel(sql_type = Text)]
-            application_db_id: String,
-            #[diesel(sql_type = Text)]
-            client_db_id: String,
-            #[diesel(sql_type = Text)]
-            enrolled_jwks: String,
-            #[diesel(sql_type = Text)]
-            redirect_uris: String,
-            #[diesel(sql_type = Text)]
-            scopes: String,
-            #[diesel(sql_type = Text)]
-            grant_types: String,
-            #[diesel(sql_type = Text)]
-            response_types: String,
-        }
-        fn exactly(raw: &str, expected: &str) -> bool {
-            serde_json::from_str::<Vec<String>>(raw).is_ok_and(|v| v == [expected])
-        }
         // Resolution and CAS share one writer lock; the inner CAS is a savepoint.
         conn.immediate_transaction(|conn| {
-            let rows: Vec<BindingRow> = sql_query("SELECT a.id AS application_db_id,
-                c.id AS client_db_id, d.signing_public_jwks AS enrolled_jwks,
-                c.redirect_uris, c.scopes, c.grant_types, c.response_types
-                FROM applications a
-                JOIN organizations o ON o.id = a.organization_id AND o.is_active = 1
-                JOIN application_discovery d ON d.application_id = a.id
-                JOIN application_client_bindings b ON b.application_id = a.id
-                JOIN clients c ON c.id = b.client_db_id AND c.organization_id = o.id
-                WHERE o.id = ? AND a.slug = ? AND a.is_active = 1
-                AND d.management_mode = 'website_managed' AND d.operator_disabled = 0 AND d.website_url = ?
-                AND c.client_id = ? AND c.audience = ? AND c.is_active = 1
-                AND b.is_active = 1 AND b.protocol IN ('oidc', 'oauth2_oidc')
-                AND c.token_endpoint_auth_method = 'none'
-                AND c.require_pkce = 1 AND c.require_s256_pkce = 1
-                LIMIT 2")
-                .bind::<Text, _>(&p.organization_id).bind::<Text, _>(&p.application_id)
-                .bind::<Text, _>(&p.origin).bind::<Text, _>(&p.client_id)
-                .bind::<Text, _>(&p.audience).load(conn)?;
-            let [row] = rows.as_slice() else { return Err(Error::RollbackTransaction); };
-            if !exactly(&row.redirect_uris, &callback) || !exactly(&row.scopes, "openid")
-                || !exactly(&row.grant_types, "authorization_code") || !exactly(&row.response_types, "code")
-            {
-                return Err(Error::RollbackTransaction);
-            }
+            let row = enrolled_registry_on_conn(conn, next)?.ok_or(Error::RollbackTransaction)?;
             after_registry_read();
             compare_and_set(conn, &gate, &IncumbentPin {
                 application_db_id: &row.application_db_id, client_db_id: &row.client_db_id,
