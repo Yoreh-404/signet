@@ -1841,7 +1841,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
-    let (state, path) = test_app_state().await;
+    let (mut state, path) = test_app_state().await;
     let fixture = insert_refresh_test_user(&state, "incumbent-preflight").await;
     let client = test_refresh_client(&state).await;
     let binding = state.db.find_application_client_binding_by_public_client_id(&client.client_id)
@@ -1850,6 +1850,23 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let origin = "https://axon.example";
     let issuer = "https://signet.example";
     let audience = "https://axon.example/admin";
+    state.settings.oidc.issuer = issuer.to_owned();
+    let verifier = insert_test_oidc_client(
+        &state, "incumbent-website-verifier", "https://verifier.example/callback", "",
+    ).await;
+    let verifier_secret = "synthetic-incumbent-website-verifier";
+    state.settings.discovery.axon_admin_v3 = Some(crate::config::AxonAdminV3Enrollment {
+        organization_id: app.organization_id.clone(),
+        enrollment_id: "explicit-incumbent-test".into(),
+        application_id: app.slug.clone(),
+        issuer: issuer.to_owned(),
+        client_id: client.client_id.clone(),
+        introspection_client_id: verifier.client_id.clone(),
+        audience: audience.into(),
+        origin: origin.into(),
+        restore_marker_path: path.with_extension("unused-incumbent-restore"),
+        restore_marker_owner_uid: rustix::process::geteuid().as_raw(),
+    });
     let callback = format!("{origin}/admin/api/auth/signet/callback");
     let now = util::now_ts();
     let public = SigningKey::from_bytes(&[9; 32]).verifying_key();
@@ -1868,6 +1885,11 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
     {
         let mut conn = pool.get().unwrap();
+        sql_query("UPDATE clients SET organization_id=?, audience=?,
+            token_endpoint_auth_method='client_secret_basic', client_secret_hash=? WHERE id=?")
+            .bind::<Text,_>(&app.organization_id).bind::<Text,_>(audience)
+            .bind::<Text,_>(util::hash_password(verifier_secret).unwrap())
+            .bind::<Text,_>(&verifier.id).execute(&mut conn).unwrap();
         sql_query("UPDATE users SET is_admin=1 WHERE id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
         sql_query("DELETE FROM organization_members WHERE user_id=?").bind::<Text,_>(&fixture.id).execute(&mut conn).unwrap();
         sql_query("UPDATE clients SET organization_id=?,audience=?,redirect_uris=?,scopes='[\"openid\"]',
@@ -1905,14 +1927,17 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert_eq!(location.path(), "/admin/api/auth/signet/callback");
     assert_eq!(query_value(&location, "state"), "incumbent-generic");
     let code = query_value(&location, "code");
-    let body = serde_urlencoded::to_string([
-        ("grant_type","authorization_code"), ("code",code.as_str()),
-        ("redirect_uri", callback.as_str()), ("code_verifier",challenge_verifier),
-        ("client_id",client.client_id.as_str()),
-    ]).unwrap();
-    let response = router.clone().oneshot(Request::post("/oauth2/token")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(Body::from(body)).unwrap()).await.unwrap();
+    let exchange = |code: &str| {
+        let body = serde_urlencoded::to_string([
+            ("grant_type","authorization_code"), ("code",code),
+            ("redirect_uri", callback.as_str()), ("code_verifier",challenge_verifier),
+            ("client_id",client.client_id.as_str()),
+        ]).unwrap();
+        Request::post("/oauth2/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body)).unwrap()
+    };
+    let response = router.clone().oneshot(exchange(&code)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = oidc_http_body_json(response).await;
     let token = response["access_token"].as_str().unwrap();
@@ -1920,9 +1945,62 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let body: serde_json::Value = serde_json::from_slice(
         &URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
     assert!(body.get("axon_admin_authority_v3").is_none());
-    sql_query("UPDATE application_discovery SET last_verified_expires_at=? WHERE application_id=?")
-        .bind::<diesel::sql_types::BigInt,_>(util::now_ts()-1).bind::<Text,_>(&app.id)
-        .execute(&mut pool.get().unwrap()).unwrap();
+    let introspect = |hint: &str| {
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{verifier_secret}", verifier.client_id));
+        Request::post("/oauth2/introspect")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::AUTHORIZATION, format!("Basic {auth}"))
+            .body(Body::from(format!("token_type_hint={hint}&token={token}"))).unwrap()
+    };
+    // The incumbent purpose verifier is not mounted for website registrations.
+    // Its inactive response is a distinct observation, not positive authority.
+    for (hint, active) in [("access_token", true), ("axon_admin_authority_v3", false)] {
+        let result = router.clone().oneshot(introspect(hint)).await.unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        let result = oidc_http_body_json(result).await;
+        assert_eq!(result["active"], active, "{hint} before expiry");
+        assert!(result.get("axon_admin_authority_v3").is_none());
+    }
+    let issued = router.clone().oneshot(authorize()).await.unwrap();
+    assert_eq!(issued.status(), StatusCode::SEE_OTHER);
+    let pending = query_value(&redirect_url(&issued), "code");
+    assert_ne!(code, pending);
+    #[derive(diesel::QueryableByName)]
+    struct CodeState {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        consumed_at: Option<i64>,
+    }
+    let consumed_at = || sql_query("SELECT consumed_at FROM authorization_codes WHERE code=?")
+        .bind::<Text,_>(&pending)
+        .get_result::<CodeState>(&mut pool.get().unwrap()).unwrap().consumed_at;
+    assert_eq!(consumed_at(), None);
+    let set_expiry = |expires| {
+        sql_query("UPDATE application_discovery SET last_verified_expires_at=? WHERE application_id=?")
+            .bind::<diesel::sql_types::BigInt,_>(expires).bind::<Text,_>(&app.id)
+            .execute(&mut pool.get().unwrap()).unwrap();
+    };
+    set_expiry(util::now_ts()-1);
+    let denied = router.clone().oneshot(exchange(&pending)).await.unwrap();
+    assert!(denied.status().is_client_error());
+    let denied = oidc_http_body_json(denied).await;
+    assert!(denied.get("access_token").is_none());
+    let consumed = consumed_at();
+    assert!(consumed.is_some(), "expiry denial follows one-use consumption");
+    for hint in ["access_token", "axon_admin_authority_v3"] {
+        let result = router.clone().oneshot(introspect(hint)).await.unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        assert_eq!(oidc_http_body_json(result).await, json!({"active":false}), "{hint} after expiry");
+    }
+    assert!(state.db.list_user_sessions(&current.user.id).await.unwrap().iter()
+        .any(|session| session.id == current.session_id && session.expires_at > util::now_ts()));
+    set_expiry(util::now_ts()+600);
+    let retry = router.clone().oneshot(exchange(&pending)).await.unwrap();
+    assert!(retry.status().is_client_error(), "restoring site freshness cannot revive a code");
+    assert_eq!(consumed_at(), consumed);
+    let baseline = router.clone().oneshot(introspect("access_token")).await.unwrap();
+    assert_eq!(oidc_http_body_json(baseline).await["active"], true);
+    set_expiry(util::now_ts()-1);
     let after = router.oneshot(authorize()).await.unwrap();
     if after.status().is_redirection() {
         assert!(!redirect_url(&after).query_pairs().any(|(key,_)| key=="code"));
