@@ -8,7 +8,20 @@ use crate::util;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel::{OptionalExtension, RunQueryDsl, sql_query};
 
+fn default_security_policy_sql() -> String {
+    format!("{} WHERE id = 'default'", select_security_policy_sql())
+}
+
 impl Db {
+    #[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+    pub(crate) fn sqlite_security_policy_on_conn(
+        conn: &mut diesel::SqliteConnection,
+    ) -> AppResult<SecurityPolicyRecord> {
+        sql_query(default_security_policy_sql())
+            .get_result::<SecurityPolicyRecord>(conn)
+            .map_err(AppError::from)
+    }
+
     pub async fn registration_settings(&self) -> AppResult<RegistrationSettingsRecord> {
         with_conn!(self, |conn, _kind| {
             sql_query("SELECT id, allow_password_registration, require_email_verification, require_phone_verification, allow_external_oidc_registration, require_invitation, first_user_direct_admin, default_user_active, updated_at FROM registration_settings WHERE id = 'default'")
@@ -81,10 +94,7 @@ impl Db {
 
     pub async fn security_policy(&self) -> AppResult<SecurityPolicyRecord> {
         with_conn!(self, |conn, _kind| {
-            sql_query(format!(
-                "{} WHERE id = 'default'",
-                select_security_policy_sql()
-            ))
+            sql_query(default_security_policy_sql())
             .get_result::<SecurityPolicyRecord>(&mut conn)
             .map_err(AppError::from)
         })

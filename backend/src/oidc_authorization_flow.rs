@@ -72,16 +72,37 @@ pub(super) async fn authorization_mfa_decision(
         .is_some();
     let policy = context.state.db.security_policy().await?;
     let requested_assurance = request.requested_assurance()?;
-    let policy_requires_mfa = policy.requires_mfa_for_ip(
-        context
-            .state
-            .request_ip(context.headers, context.remote_addr)
-            .await?
-            .as_deref(),
-    )? || assurance::DefaultAssurancePolicy
-        .requires_mfa(&requested_assurance);
+    let ip = context.state.request_ip(context.headers, context.remote_addr).await?;
+    decide_authorization_mfa(&policy, client, session, user_has_totp, ip.as_deref(), &requested_assurance)
+}
+
+/// Request IP must be resolved by AppState::request_ip (including the effective
+/// proxy-trust cache), not taken from a caller-supplied header or fresh SQL row.
+#[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(super) fn authorization_mfa_decision_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    client: &ClientRecord,
+    session: &SessionRecord,
+    request: &ResolvedAuthorizeRequest,
+    request_ip: Option<&str>,
+) -> AppResult<MfaDecision> {
+    let user_has_totp = crate::db::Db::sqlite_has_totp_on_conn(conn, &session.user_id)?;
+    let policy = crate::db::Db::sqlite_security_policy_on_conn(conn)?;
+    decide_authorization_mfa(&policy, client, session, user_has_totp, request_ip, &request.requested_assurance()?)
+}
+
+fn decide_authorization_mfa(
+    policy: &crate::db::SecurityPolicyRecord,
+    client: &ClientRecord,
+    session: &SessionRecord,
+    user_has_totp: bool,
+    ip: Option<&str>,
+    requested_assurance: &assurance::RequestedAssurance,
+) -> AppResult<MfaDecision> {
+    let policy_requires_mfa = policy.requires_mfa_for_ip(ip)?
+        || assurance::DefaultAssurancePolicy.requires_mfa(requested_assurance);
     auth_flow::oidc_authorization_mfa_decision(
-        &policy,
+        policy,
         client,
         session,
         user_has_totp,

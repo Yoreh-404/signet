@@ -17,7 +17,23 @@ use diesel::{
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 
+fn select_totp_method_sql(kind: DatabaseKind) -> String {
+    format!("SELECT user_id, secret, last_used_step, enabled_at, created_at, updated_at FROM mfa_totp_methods WHERE user_id = {}", ph(kind, 1))
+}
+
 impl Db {
+    #[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+    pub(crate) fn sqlite_has_totp_on_conn(
+        conn: &mut diesel::SqliteConnection,
+        user_id: &str,
+    ) -> AppResult<bool> {
+        Ok(sql_query(select_totp_method_sql(DatabaseKind::Sqlite))
+            .bind::<Text, _>(user_id)
+            .get_result::<MfaTotpMethodRecord>(conn)
+            .optional()?
+            .is_some())
+    }
+
     pub async fn create_mfa_totp_setup(
         &self,
         user_id: &str,
@@ -95,11 +111,7 @@ impl Db {
     pub async fn find_totp_method(&self, user_id: &str) -> AppResult<Option<MfaTotpMethodRecord>> {
         let user_id = user_id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!(
-                "SELECT user_id, secret, last_used_step, enabled_at, created_at, updated_at FROM mfa_totp_methods WHERE user_id = {}",
-                ph(kind, 1)
-            );
-            sql_query(sql)
+            sql_query(select_totp_method_sql(kind))
                 .bind::<Text, _>(user_id)
                 .get_result::<MfaTotpMethodRecord>(&mut conn)
                 .optional()
