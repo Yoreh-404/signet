@@ -2076,13 +2076,6 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         let next_pin = IncumbentPin { policy_sha256: &next_digest, revision: 5, generation: 9, ..pin };
         assert!(incumbent_preflight::matches(&state, &jar, Some(&next_pin), &next, &wanted)
             .await.unwrap());
-        use crate::db::axon_v3_incumbent_storage::{RestoreSnapshot, sqlite};
-        use crate::db::{
-            find_or_create_sqlite_application_auth_context_on_conn,
-            insert_sqlite_authorization_code_on_conn, load_sqlite_oidc_policy_snapshot_on_conn,
-            find_sqlite_client_by_client_id_on_conn,
-        };
-
         // Resolve the same real authorize request without the provisioning
         // runtime loader. Existing fixture settings waive consent for this client.
         let mut other_query: AuthorizeRequest = serde_urlencoded::from_str(query).unwrap();
@@ -2108,69 +2101,23 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                     setup: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
                     before_commit: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
                 | {
-                    conn.immediate_transaction::<_, AppError, _>(|conn| {
-                        setup(conn)?;
-                        let gate_snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
-                        let now = util::now_ts();
-                        let session = sqlite::current_incumbent_browser_on_conn(
-                            conn, &credential, &current.session_id, &current.user.id, now,
-                        )?.ok_or(AppError::Forbidden)?;
-                        if !sqlite::exact_active_policy(conn, gate, &pin, &approved)? {
-                            return Err(AppError::Forbidden);
-                        }
-                        let client = find_sqlite_client_by_client_id_on_conn(conn, &resolved.client_id)?
-                            .filter(|client| client.id == pin.client_db_id)
-                            .ok_or(AppError::Forbidden)?;
-                        validate_authorize_request_for_client(&client, resolved)?;
-                        let scopes = normalize_and_validate_requested_scopes(
-                            &client, resolved.scope.as_deref(), &state.settings.oidc.supported_scopes,
-                        )?;
-                        let exact = RequestScope::from_resolved(issuer, resolved).ok_or(AppError::Forbidden)?;
-                        if !incumbent_preflight::matches_signed_request(&pin, &approved, &exact) {
-                            return Err(AppError::Forbidden);
-                        }
-                        let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &session.user_id)?;
-                        let application = graph.application.as_ref().ok_or(AppError::Forbidden)?;
-                        let binding = graph.binding.as_ref().ok_or(AppError::Forbidden)?;
-                        if !graph.is_authorizable || !graph.is_interactive_client_runtime_active()
-                            || !graph.has_client_application_boundary(&client.id)
-                            || !graph.has_profile_application_boundary()
-                            || application.id != pin.application_db_id
-                            || !matches!(
-                                oidc_authorization_flow::authorization_mfa_decision_on_conn(
-                                    conn, &client, &session, &resolved, ip.as_deref(),
-                                )?,
-                                MfaDecision::Satisfied
-                            )
-                        {
-                            return Err(AppError::Forbidden);
-                        }
-                        let code = util::random_token(32);
-                        let requested = resolved.requested_assurance()?;
-                        let assurance = session.authentication_assurance();
-                        let acr = assurance::DefaultAssurancePolicy.select_acr(&assurance, &requested)?;
-                        assurance::DefaultAssurancePolicy.assert_amr(&assurance, &requested)?;
-                        let context_id = find_or_create_sqlite_application_auth_context_on_conn(
-                            conn, &binding.auth_domain_id, &session.user_id, &acr,
-                            &assurance.amr, session.created_at, now,
-                        )?;
-                        let details = authorization_details::normalize_authorization_details_for_client(
-                            &client, resolved.authorization_details.as_deref(),
-                        )?;
-                        let PreparedAuthorizationCode { redirect_code, row } = build_authorization_code_material(
-                            &resolved, &scopes, &session, &client, &current.user, &application.id,
-                            &binding.authorization_profile_id, context_id, code, acr, assurance.amr,
-                            details, state.settings.oidc.authorization_code_ttl_seconds,
-                        );
-                        let inserted_at = util::now_ts();
-                        let amr = util::to_json(&row.amr)?;
-                        insert_sqlite_authorization_code_on_conn(conn, row, amr, inserted_at)?;
-                        before_commit(conn)?;
-                        if !gate_snapshot.unchanged() {
-                            return Err(AppError::Forbidden);
-                        }
-                        Ok(redirect_code)
-                    })
+                    store_incumbent_authorization_code(
+                        conn,
+                        IncumbentAuthorizationInput {
+                            state: &state,
+                            resolved,
+                            issuer,
+                            ip: ip.as_deref(),
+                            credential: &credential,
+                            session_id: &current.session_id,
+                            user: &current.user,
+                            pin: &pin,
+                            approved: &approved,
+                            gate,
+                        },
+                        setup,
+                        before_commit,
+                    )
                 };
                 let noop = |_: &mut diesel::SqliteConnection| Ok(());
                 let admit = |conn: &mut diesel::SqliteConnection| admit_with(conn, &resolved, &noop, &noop);

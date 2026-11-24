@@ -1010,6 +1010,115 @@ struct PreparedAuthorizationCode {
     row: NewAuthorizationCode,
 }
 
+// This lane is deliberately not mounted. A trusted operator binding must
+// select the verified policy and its restore interlock before a future call.
+// That caller must get issuer and IP from AppState's existing resolution and
+// satisfy the standard interaction, freshness and consent checks; this
+// function does not furnish a redirect, exchange a code or project authority.
+//
+// The caller supplies its SQLite connection. BEGIN IMMEDIATE holds the current
+// registry, browser, authorizability and context together through insertion.
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+#[allow(dead_code)] // No HTTP or operator consumer until exchange and authority are wired.
+struct IncumbentAuthorizationInput<'a> {
+    state: &'a AppState,
+    resolved: &'a ResolvedAuthorizeRequest,
+    issuer: &'a str,
+    ip: Option<&'a str>,
+    credential: &'a str,
+    session_id: &'a str,
+    user: &'a UserRecord,
+    pin: &'a crate::application_discovery::incumbent_preflight::IncumbentPin<'a>,
+    approved: &'a crate::application_discovery::axon_v3_acceptance::VerifiedPolicy,
+    gate: &'a crate::application_discovery::axon_v3_restore::RestoreInterlock,
+}
+
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+#[allow(dead_code)] // Unmounted; the exact migrated fixture exercises this routine.
+fn store_incumbent_authorization_code(
+    conn: &mut diesel::SqliteConnection,
+    input: IncumbentAuthorizationInput<'_>,
+    #[cfg(test)] setup: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
+    #[cfg(test)] before_commit: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
+) -> AppResult<String> {
+    use crate::application_discovery::incumbent_preflight::{self, RequestScope};
+    use crate::db::{
+        axon_v3_incumbent_storage::{RestoreSnapshot, sqlite},
+        find_or_create_sqlite_application_auth_context_on_conn,
+        find_sqlite_client_by_client_id_on_conn, insert_sqlite_authorization_code_on_conn,
+        load_sqlite_oidc_policy_snapshot_on_conn,
+    };
+
+    let IncumbentAuthorizationInput {
+        state, resolved, issuer, ip, credential, session_id, user, pin, approved, gate,
+    } = input;
+    conn.immediate_transaction::<_, AppError, _>(|conn| {
+        #[cfg(test)]
+        setup(conn)?;
+        let gate_snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
+        let now = util::now_ts();
+        let session = sqlite::current_incumbent_browser_on_conn(
+            conn, credential, session_id, &user.id, now,
+        )?.ok_or(AppError::Forbidden)?;
+        if !sqlite::exact_active_policy(conn, gate, pin, approved)? {
+            return Err(AppError::Forbidden);
+        }
+        let client = find_sqlite_client_by_client_id_on_conn(conn, &resolved.client_id)?
+            .filter(|client| client.id == pin.client_db_id)
+            .ok_or(AppError::Forbidden)?;
+        validate_authorize_request_for_client(&client, resolved)?;
+        let scopes = normalize_and_validate_requested_scopes(
+            &client, resolved.scope.as_deref(), &state.settings.oidc.supported_scopes,
+        )?;
+        let exact = RequestScope::from_resolved(issuer, resolved).ok_or(AppError::Forbidden)?;
+        if !incumbent_preflight::matches_signed_request(pin, approved, &exact) {
+            return Err(AppError::Forbidden);
+        }
+        let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &session.user_id)?;
+        let application = graph.application.as_ref().ok_or(AppError::Forbidden)?;
+        let binding = graph.binding.as_ref().ok_or(AppError::Forbidden)?;
+        if !graph.is_authorizable || !graph.is_interactive_client_runtime_active()
+            || !graph.has_client_application_boundary(&client.id)
+            || !graph.has_profile_application_boundary()
+            || application.id != pin.application_db_id
+            || !matches!(
+                oidc_authorization_flow::authorization_mfa_decision_on_conn(
+                    conn, &client, &session, resolved, ip,
+                )?,
+                MfaDecision::Satisfied
+            )
+        {
+            return Err(AppError::Forbidden);
+        }
+        let code = util::random_token(32);
+        let requested = resolved.requested_assurance()?;
+        let assurance = session.authentication_assurance();
+        let acr = assurance::DefaultAssurancePolicy.select_acr(&assurance, &requested)?;
+        assurance::DefaultAssurancePolicy.assert_amr(&assurance, &requested)?;
+        let context_id = find_or_create_sqlite_application_auth_context_on_conn(
+            conn, &binding.auth_domain_id, &session.user_id, &acr,
+            &assurance.amr, session.created_at, now,
+        )?;
+        let details = authorization_details::normalize_authorization_details_for_client(
+            &client, resolved.authorization_details.as_deref(),
+        )?;
+        let PreparedAuthorizationCode { redirect_code, row } = build_authorization_code_material(
+            resolved, &scopes, &session, &client, user, &application.id,
+            &binding.authorization_profile_id, context_id, code, acr, assurance.amr,
+            details, state.settings.oidc.authorization_code_ttl_seconds,
+        );
+        let inserted_at = util::now_ts();
+        let amr = util::to_json(&row.amr)?;
+        insert_sqlite_authorization_code_on_conn(conn, row, amr, inserted_at)?;
+        #[cfg(test)]
+        before_commit(conn)?;
+        if !gate_snapshot.unchanged() {
+            return Err(AppError::Forbidden);
+        }
+        Ok(redirect_code)
+    })
+}
+
 // Assemble the existing code row only after the caller has resolved its
 // auth context and normalized the request. This does not admit or store it.
 fn build_authorization_code_material(

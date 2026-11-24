@@ -28,7 +28,7 @@ macro_rules! find_client_by_client_id_on_conn {
     }};
 }
 
-#[cfg(all(test, target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
 pub(crate) fn find_sqlite_client_by_client_id_on_conn(
     conn: &mut diesel::SqliteConnection,
     client_id: &str,
