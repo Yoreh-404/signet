@@ -34,6 +34,24 @@ pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_
     generation BIGINT NOT NULL CHECK (generation > 0),
     code_expires_at BIGINT NOT NULL
 )";
+/// Opt-in SQLite purpose index. No JWT, raw identity, or extra lifetime.
+pub(crate) const ACCESS_PROOF_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_access_proof (
+    jti TEXT PRIMARY KEY NOT NULL,
+    user_sha256 TEXT NOT NULL,
+    session_public_id TEXT NOT NULL,
+    application_db_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    client_db_id TEXT NOT NULL,
+    enrollment_id TEXT NOT NULL,
+    signer_key_sha256 TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    policy_sha256 TEXT NOT NULL,
+    revision BIGINT NOT NULL,
+    generation BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL
+)";
+
 
 /// Current row identity for future exact compare-and-set; this is not a grant.
 #[derive(Clone, Copy)]
@@ -326,13 +344,105 @@ pub(crate) mod sqlite {
         }
         // The confidential exchange does not receive the browser cookie. Use
         // the exact existing public SID and only current sessions of this user.
+        current_admin_session_by_public_sid_on_conn(conn, &row.user_id, sid, now)
+    }
+
+    fn current_admin_session_by_public_sid_on_conn(
+        conn: &mut SqliteConnection, user_id: &str, sid: &str, now: i64,
+    ) -> QueryResult<Option<SessionRecord>> {
         let sessions = sql_query("SELECT s.id, s.user_id, s.csrf_token, s.ip_address, s.user_agent,
             s.login_method, s.expires_at, s.created_at FROM sessions s JOIN users u ON u.id=s.user_id
             WHERE u.id=? AND s.expires_at>? AND u.is_admin=1 AND u.is_active=1
               AND u.archived_at IS NULL AND COALESCE(s.login_method,'')<>'authorization_code'
               AND NOT EXISTS (SELECT 1 FROM trial_enrollments t WHERE t.user_id=u.id)")
-            .bind::<Text,_>(&row.user_id).bind::<BigInt,_>(now).load::<SessionRecord>(conn)?;
+            .bind::<Text,_>(user_id).bind::<BigInt,_>(now).load::<SessionRecord>(conn)?;
         Ok(sessions.into_iter().find(|session| crate::util::session_public_id(&session.id) == sid))
+    }
+
+    /// Bind only an access token actually signed by the normal signer inside
+    /// this exact issuance transaction. There is no bearer in the index.
+    pub(crate) fn bind_access_proof_on_conn(
+        conn: &mut SqliteConnection,
+        evidence: &CommittedIncumbentCode<'_>,
+        claims: &crate::jwt::TokenClaims,
+    ) -> QueryResult<()> {
+        let approved = evidence.approved_policy();
+        let signed = approved.policy();
+        let jti = claims.jti.as_deref().filter(|value| !value.is_empty())
+            .ok_or(Error::RollbackTransaction)?;
+        if claims.iss != signed.issuer || claims.aud != signed.audience
+            || claims.client_id != signed.client_id || claims.scope != evidence.scope()
+            || claims.sub != evidence.user_id() || claims.sid.as_deref() != Some(evidence.public_sid())
+            || claims.application_id.as_deref() != Some(evidence.application_db_id())
+            || claims.authorization_profile_id.as_deref() != Some(evidence.profile_id())
+            || claims.exp <= claims.iat
+        {
+            return Err(Error::RollbackTransaction);
+        }
+        sql_query("DELETE FROM axon_v3_incumbent_access_proof WHERE expires_at<=?")
+            .bind::<BigInt,_>(claims.iat).execute(conn)?;
+        sql_query("INSERT INTO axon_v3_incumbent_access_proof
+            (jti,user_sha256,session_public_id,application_db_id,profile_id,client_db_id,
+             enrollment_id,signer_key_sha256,issuer,audience,policy_sha256,revision,generation,expires_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind::<Text,_>(jti).bind::<Text,_>(crate::util::sha256_base64url(&claims.sub))
+            .bind::<Text,_>(evidence.public_sid()).bind::<Text,_>(evidence.application_db_id())
+            .bind::<Text,_>(evidence.profile_id()).bind::<Text,_>(evidence.client_db_id())
+            .bind::<Text,_>(&signed.enrollment_id).bind::<Text,_>(approved.signer_key_sha256()).bind::<Text,_>(&claims.iss).bind::<Text,_>(&claims.aud)
+            .bind::<Text,_>(approved.sha256()).bind::<BigInt,_>(signed.revision)
+            .bind::<BigInt,_>(signed.generation).bind::<BigInt,_>(claims.exp)
+            .execute(conn).map(|_| ())
+    }
+
+    // This predicate accepts only claims verified by the existing JWT manager.
+    // The outer reader must authenticate the configured confidential verifier.
+    pub(crate) fn read_live_access_proof_on_conn(
+        conn: &mut SqliteConnection,
+        gate: &RestoreInterlock,
+        pin: &IncumbentPin<'_>,
+        approved: &VerifiedPolicy,
+        claims: &crate::jwt::TokenClaims,
+        now: i64,
+    ) -> crate::error::AppResult<bool> {
+        #[derive(diesel::QueryableByName)]
+        struct Proof {
+            #[diesel(sql_type = Text)] jti: String,
+        }
+        let signed = approved.policy();
+        let (Some(jti), Some(sid), Some(profile)) = (claims.jti.as_deref(), claims.sid.as_deref(),
+            claims.authorization_profile_id.as_deref()) else { return Ok(false); };
+        if jti.is_empty() || claims.iss != signed.issuer || claims.aud != signed.audience
+            || claims.client_id != signed.client_id || claims.scope != "openid"
+            || claims.application_id.as_deref() != Some(pin.application_db_id)
+            || claims.exp <= now || claims.iat > now || claims.iat <= 0
+            || !exact_active_policy(conn, gate, pin, approved)?
+        {
+            return Ok(false);
+        }
+        let proof = sql_query("SELECT jti FROM axon_v3_incumbent_access_proof
+            WHERE jti=? AND user_sha256=? AND session_public_id=? AND application_db_id=?
+              AND profile_id=? AND client_db_id=? AND enrollment_id=? AND signer_key_sha256=? AND issuer=?
+              AND audience=? AND policy_sha256=? AND revision=? AND generation=? AND expires_at=?")
+            .bind::<Text,_>(jti).bind::<Text,_>(crate::util::sha256_base64url(&claims.sub))
+            .bind::<Text,_>(sid).bind::<Text,_>(pin.application_db_id).bind::<Text,_>(profile)
+            .bind::<Text,_>(pin.client_db_id).bind::<Text,_>(&signed.enrollment_id).bind::<Text,_>(approved.signer_key_sha256())
+            .bind::<Text,_>(&claims.iss).bind::<Text,_>(&claims.aud).bind::<Text,_>(approved.sha256())
+            .bind::<BigInt,_>(signed.revision).bind::<BigInt,_>(signed.generation).bind::<BigInt,_>(claims.exp)
+            .get_result::<Proof>(conn).optional()?;
+        if !proof.is_some_and(|row| row.jti == jti)
+            || current_admin_session_by_public_sid_on_conn(conn, &claims.sub, sid, now)?.is_none()
+        {
+            return Ok(false);
+        }
+        let graph = crate::db::load_sqlite_oidc_policy_snapshot_on_conn(conn, pin.client_db_id, &claims.sub)?;
+        // Incumbent policy freshness is the live exact ledger/restore/registry
+        // check above, not the generic website metadata's deadline.
+        Ok(graph.has_client_application_boundary(pin.client_db_id)
+            && graph.has_profile_application_boundary()
+            && graph.protocol_enabled
+            && graph.application.as_ref().is_some_and(|row| row.id == pin.application_db_id)
+            && graph.binding.as_ref().is_some_and(|row| row.authorization_profile_id == profile)
+            && graph.profile.as_ref().is_some_and(|row| row.id == profile))
     }
 
     /// Consume only a code admitted for the active exact incumbent policy.

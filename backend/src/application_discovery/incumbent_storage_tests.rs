@@ -171,6 +171,7 @@ pub(crate) async fn signed_file_bench(
     let mut registry_conn = registry();
     registry_conn.batch_execute(SCHEMA).unwrap();
     registry_conn.batch_execute(crate::db::axon_v3_incumbent_storage::CODE_PROVENANCE_SCHEMA).unwrap();
+    registry_conn.batch_execute(crate::db::axon_v3_incumbent_storage::ACCESS_PROOF_SCHEMA).unwrap();
     assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &trust, None, foreign).is_err());
     let wrong_site = crate::config::AxonAdminTrust { origin: "https://foreign.example".into(), ..trust.clone() };
     assert!(sqlite::write_enrolled_incumbent(&mut registry_conn, &enrolled, &wrong_site, None, approved).is_err());

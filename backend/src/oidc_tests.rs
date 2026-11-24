@@ -1866,7 +1866,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         introspection_client_id: verifier.client_id.clone(),
         audience: audience.into(),
         origin: origin.into(),
-        restore_marker_path: path.with_extension("unused-incumbent-restore"),
+        restore_marker_path: path.with_extension("incumbent-private").join("restore/current.json"),
         restore_marker_owner_uid: rustix::process::geteuid().as_raw(),
     });
     let callback = format!("{origin}/admin/api/auth/signet/callback");
@@ -2249,6 +2249,35 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 assert_eq!(token_claims.scope, "openid");
                 assert_eq!(token_claims.sid.as_deref(), Some(redeemed.public_sid()));
                 assert_eq!(token_claims.exp - token_claims.iat, state.settings.oidc.access_token_ttl_seconds);
+                let verify = |conn: &mut diesel::SqliteConnection, verifier_id: &str, bearer: &str| {
+                    verify_incumbent_access_proof(conn, &state, verifier_id, issuer, &pin, &approved, bearer)
+                        .unwrap()
+                };
+                assert!(verify(conn, &verifier.id, &access_token));
+                let update_site_expiry = |conn: &mut diesel::SqliteConnection, expiry| {
+                    sql_query("UPDATE application_discovery SET last_verified_expires_at=? WHERE application_id=?")
+                        .bind::<diesel::sql_types::BigInt,_>(expiry).bind::<Text,_>(&app.id)
+                        .execute(conn).unwrap()
+                };
+                assert_eq!(update_site_expiry(conn, util::now_ts() - 1), 1);
+                assert!(verify(conn, &verifier.id, &access_token),
+                    "the unchanged live incumbent proof does not inherit a separate site-metadata deadline");
+                assert_eq!(update_site_expiry(conn, util::now_ts() + 600), 1);
+                assert!(!verify(conn, &client.id, &access_token));
+                assert!(!verify(conn, &verifier.id, token), "ordinary signed token does not acquire a purpose row");
+                sql_query("UPDATE users SET is_admin=0 WHERE id=?")
+                    .bind::<Text,_>(&fixture.id).execute(conn).unwrap();
+                assert!(!verify(conn, &verifier.id, &access_token));
+                sql_query("UPDATE users SET is_admin=1 WHERE id=?")
+                    .bind::<Text,_>(&fixture.id).execute(conn).unwrap();
+                set_gate(false);
+                assert!(!verify(conn, &verifier.id, &access_token));
+                set_gate(true);
+                assert!(verify(conn, &verifier.id, &access_token));
+                assert_eq!(sql_query("DELETE FROM axon_v3_incumbent_access_proof WHERE jti=?")
+                    .bind::<Text,_>(token_claims.jti.as_deref().unwrap())
+                    .execute(conn).unwrap(), 1);
+                assert!(!verify(conn, &verifier.id, &access_token), "revoked JTI stays inactive");
                 let signed_payload: serde_json::Value = serde_json::from_slice(
                     &URL_SAFE_NO_PAD.decode(access_token.split('.').nth(1).unwrap()).unwrap(),
                 ).unwrap();

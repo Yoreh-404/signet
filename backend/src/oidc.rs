@@ -1170,7 +1170,7 @@ fn exchange_incumbent_access_token<'a>(
             claims.insert("authorization_profile_id".into(), evidence.profile_id().into());
             oidc_token::insert_sid_claim(&mut claims, Some(evidence.public_sid()));
 
-            state.jwt.sign_access_token_with_issuer_and_claims(
+            let token = state.jwt.sign_access_token_with_issuer_and_claims(
                 effective_issuer,
                 crate::jwt::TokenSubject {
                     user: &user,
@@ -1182,9 +1182,63 @@ fn exchange_incumbent_access_token<'a>(
                 },
                 state.settings.oidc.access_token_ttl_seconds,
                 claims,
-            )
+            )?;
+            let claims = state.jwt.verify_access_token_for_introspection(&token, &[effective_issuer])?;
+            sqlite::bind_access_proof_on_conn(conn, evidence, &claims)?;
+            Ok(token)
         },
     )
+}
+
+/// Internal verifier candidate. The authenticated caller identity and effective
+/// issuer are supplied by the existing server auth/issuer path, not HTTP data.
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+#[allow(dead_code)] // Not mounted in ordinary introspection or any other route.
+fn verify_incumbent_access_proof(
+    conn: &mut diesel::SqliteConnection,
+    state: &AppState,
+    authenticated_verifier_db_id: &str,
+    effective_issuer: &str,
+    pin: &crate::application_discovery::incumbent_preflight::IncumbentPin<'_>,
+    approved: &crate::application_discovery::axon_v3_acceptance::VerifiedPolicy,
+    token: &str,
+) -> AppResult<bool> {
+    use diesel::Connection;
+    use crate::db::{
+        axon_v3_incumbent_storage::{RestoreSnapshot, sqlite},
+        find_sqlite_client_by_client_id_on_conn,
+    };
+
+    let Some(enrolled) = state.settings.discovery.axon_admin_v3.as_ref() else { return Ok(false); };
+    let gate = crate::application_discovery::axon_v3_restore::RestoreInterlock::new(
+        enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid,
+    );
+    let signed = approved.policy();
+    if effective_issuer != signed.issuer || signed.issuer != enrolled.issuer
+        || signed.organization_id != enrolled.organization_id || signed.enrollment_id != enrolled.enrollment_id
+        || signed.application_id != enrolled.application_id || signed.client_id != enrolled.client_id
+        || signed.audience != enrolled.audience || signed.origin != enrolled.origin
+        || enrolled.introspection_client_id == enrolled.client_id
+    {
+        return Ok(false);
+    }
+    let Ok(claims) = state.jwt.verify_access_token_for_introspection(token, &[effective_issuer])
+        else { return Ok(false); };
+
+    conn.transaction::<_, AppError, _>(|conn| {
+        let Some(snapshot) = RestoreSnapshot::capture(&gate) else { return Ok(false); };
+        let Some(verifier) = find_sqlite_client_by_client_id_on_conn(conn, &enrolled.introspection_client_id)?
+            else { return Ok(false); };
+        if verifier.id != authenticated_verifier_db_id || verifier.is_active != 1
+            || verifier.token_endpoint_auth_method == "none"
+            || verifier.organization_id.as_deref() != Some(enrolled.organization_id.as_str())
+            || verifier.audience != enrolled.audience
+        {
+            return Ok(false);
+        }
+        Ok(sqlite::read_live_access_proof_on_conn(conn, &gate, pin, approved, &claims, util::now_ts())?
+            && snapshot.unchanged())
+    })
 }
 
 
