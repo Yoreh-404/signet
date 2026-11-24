@@ -17,9 +17,17 @@ use serde::Deserialize;
 use std::{io::Read, path::Path};
 
 #[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FloorState {
+    Active,
+    Stopped,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RestartFloor {
     format: String,
+    state: FloorState,
     organization_id: String,
     enrollment_id: String,
     application_db_id: String,
@@ -58,7 +66,8 @@ pub(super) fn restore_from_operator_floor(
 ) -> QueryResult<Option<VerifiedPolicy>> {
     let owner = enrolled.restore_marker_owner_uid;
     let Some(floor) = read_floor(floor_path, owner) else { return Ok(None); };
-    if floor.organization_id != enrolled.organization_id
+    if floor.state != FloorState::Active
+        || floor.organization_id != enrolled.organization_id
         || floor.enrollment_id != enrolled.enrollment_id
         || trust.organization_id != enrolled.organization_id
         || trust.application_id != enrolled.application_id
@@ -94,7 +103,7 @@ pub(super) fn restore_from_operator_floor(
             policy_sha256: &floor.policy_sha256,
             revision: floor.revision,
             generation: floor.generation,
-            halted: false,
+            halted: floor.state == FloorState::Stopped,
         },
     }, now)?;
     Ok(verified.filter(|_| read_floor(floor_path, owner).as_ref() == Some(&floor)))

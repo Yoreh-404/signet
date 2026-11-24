@@ -235,8 +235,9 @@ pub(crate) async fn signed_file_bench(
     let floor_dir = root.join("floor");
     fs::create_dir(&floor_dir).unwrap();
     let floor = floor_dir.join("current.json");
-    fs::write(&floor, serde_json::json!({
+    let mut protected_floor = serde_json::json!({
         "format": "signet-incumbent-restart-floor/v1",
+        "state": "active",
         "organization_id": enrolled.organization_id,
         "enrollment_id": enrolled.enrollment_id,
         "application_db_id": next_pin.application_db_id,
@@ -245,14 +246,16 @@ pub(crate) async fn signed_file_bench(
         "revision": next_pin.revision,
         "generation": next_pin.generation,
         "permissions": replacement.policy().permissions,
-    }).to_string()).unwrap();
+    });
+    fs::write(&floor, protected_floor.to_string()).unwrap();
     fs::set_permissions(&floor, fs::Permissions::from_mode(0o400)).unwrap();
     fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o500)).unwrap();
     let material = root.join("test-process-input.json");
-    fs::write(&material, serde_json::json!({
+    let mut process_input = serde_json::json!({
         "enrollment": enrolled, "trust": trust, "database": fixture_path, "floor": floor,
         "now": replacement.verified_at() + 301,
-    }).to_string()).unwrap();
+    });
+    fs::write(&material, process_input.to_string()).unwrap();
     let restart = |expected: &str| {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "application_discovery::axon_v3_restart::tests::subprocess_restart"])
@@ -264,8 +267,32 @@ pub(crate) async fn signed_file_bench(
             "{stdout}\n{}", String::from_utf8_lossy(&result.stderr));
     };
     restart(replacement.sha256());
+    // Take a consistent pre-withdrawal DB copy, including committed WAL data.
+    let old_database = root.join("before-withdrawal.sqlite3");
+    sql_query("VACUUM INTO ?").bind::<Text, _>(old_database.to_str().unwrap())
+        .execute(&mut registry()).unwrap();
+    process_input["database"] = serde_json::json!(old_database);
+    fs::write(&material, process_input.to_string()).unwrap();
+    restart(replacement.sha256());
     assert_eq!(sqlite::withdraw(&mut registry(), &next_pin).unwrap(), 1);
     assert!(!active(&next_pin, replacement));
+    process_input["database"] = serde_json::json!(fixture_path);
+    fs::write(&material, process_input.to_string()).unwrap();
+    restart("denied"); // The live DB withdrawal still works with an active floor.
+    process_input["database"] = serde_json::json!(old_database);
+    fs::write(&material, process_input.to_string()).unwrap();
+    // The independent provisioner would publish this protected state on
+    // withdrawal. The test performs that operation against its fixture only.
+    protected_floor["state"] = serde_json::json!("stopped");
+    fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let next_floor = floor_dir.join("next.json");
+    fs::write(&next_floor, protected_floor.to_string()).unwrap();
+    fs::set_permissions(&next_floor, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::rename(next_floor, &floor).unwrap();
+    fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    restart("denied"); // Same pre-withdrawal database, now independently denied.
+    process_input["database"] = serde_json::json!(fixture_path);
+    fs::write(&material, process_input.to_string()).unwrap();
     restart("denied");
 
     fs::set_permissions(&floor_dir, fs::Permissions::from_mode(0o700)).unwrap();
