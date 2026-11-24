@@ -17,6 +17,25 @@ struct ClientOverviewCountRow {
     active: i64,
 }
 
+macro_rules! find_client_by_client_id_on_conn {
+    ($conn:expr, $kind:expr, $client_id:expr) => {{
+        let sql = format!("{} WHERE client_id = {}", select_client_sql(), ph($kind, 1));
+        sql_query(sql)
+            .bind::<Text, _>($client_id)
+            .get_result::<ClientRecord>($conn)
+            .optional()
+            .map_err(AppError::from)
+    }};
+}
+
+#[cfg(all(test, target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(crate) fn find_sqlite_client_by_client_id_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    client_id: &str,
+) -> AppResult<Option<ClientRecord>> {
+    find_client_by_client_id_on_conn!(conn, DatabaseKind::Sqlite, client_id)
+}
+
 impl Db {
     pub async fn find_client_by_client_id(
         &self,
@@ -24,12 +43,7 @@ impl Db {
     ) -> AppResult<Option<ClientRecord>> {
         let client_id = client_id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE client_id = {}", select_client_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(client_id)
-                .get_result::<ClientRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
+            find_client_by_client_id_on_conn!(&mut conn, kind, client_id)
         })
     }
 

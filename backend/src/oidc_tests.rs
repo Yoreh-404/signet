@@ -2080,6 +2080,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         use crate::db::{
             find_or_create_sqlite_application_auth_context_on_conn,
             insert_sqlite_authorization_code_on_conn, load_sqlite_oidc_policy_snapshot_on_conn,
+            find_sqlite_client_by_client_id_on_conn,
         };
 
         // Resolve the same real authorize request without the provisioning
@@ -2098,8 +2099,12 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         crate::application_discovery::incumbent_storage_tests::signed_file_bench(
             &path, &pin, &approved, &next, &other_approval, &approved_jwks,
             |conn, gate, set_gate| {
-                let admit = |conn: &mut diesel::SqliteConnection, before_commit: &dyn Fn()| {
+                let admit_with = |conn: &mut diesel::SqliteConnection,
+                    setup: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
+                    before_commit: &dyn Fn(&mut diesel::SqliteConnection) -> AppResult<()>,
+                | {
                     conn.immediate_transaction::<_, AppError, _>(|conn| {
+                        setup(conn)?;
                         let gate_snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
                         let now = util::now_ts();
                         let session = sqlite::current_incumbent_browser_on_conn(
@@ -2108,6 +2113,9 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         if !sqlite::exact_active_policy(conn, gate, &pin, &approved)? {
                             return Err(AppError::Forbidden);
                         }
+                        let client = find_sqlite_client_by_client_id_on_conn(conn, &resolved.client_id)?
+                            .filter(|client| client.id == pin.client_db_id)
+                            .ok_or(AppError::Forbidden)?;
                         validate_authorize_request_for_client(&client, &resolved)?;
                         let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &session.user_id)?;
                         let application = graph.application.as_ref().ok_or(AppError::Forbidden)?;
@@ -2145,13 +2153,15 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         let inserted_at = util::now_ts();
                         let amr = util::to_json(&row.amr)?;
                         insert_sqlite_authorization_code_on_conn(conn, row, amr, inserted_at)?;
-                        before_commit();
+                        before_commit(conn)?;
                         if !gate_snapshot.unchanged() {
                             return Err(AppError::Forbidden);
                         }
                         Ok(redirect_code)
                     })
                 };
+                let noop = |_: &mut diesel::SqliteConnection| Ok(());
+                let admit = |conn: &mut diesel::SqliteConnection| admit_with(conn, &noop, &noop);
                 #[derive(diesel::QueryableByName)]
                 struct Count {
                     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -2163,11 +2173,12 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .get_result::<Count>(conn).unwrap().count
                 };
                 let before = count(conn);
-                let code = admit(conn, &|| ()).unwrap();
+                let code = admit(conn).unwrap();
                 let inserted = sql_query("SELECT COUNT(*) AS count FROM authorization_codes
-                    WHERE code=? AND application_id=? AND client_id=? AND user_id=? AND consumed_at IS NULL")
+                    WHERE code=? AND application_id=? AND client_id=? AND user_id=? AND consumed_at IS NULL AND session_id=? AND code_challenge=? AND code_challenge_method='S256'")
                     .bind::<Text,_>(&code).bind::<Text,_>(&app.id).bind::<Text,_>(&client.client_id)
-                    .bind::<Text,_>(&fixture.id).get_result::<Count>(conn).unwrap().count;
+                    .bind::<Text,_>(&fixture.id).bind::<Text,_>(util::session_public_id(&current.session_id))
+                    .bind::<Text,_>(&challenge).get_result::<Count>(conn).unwrap().count;
                 assert_eq!(inserted, 1);
                 assert_eq!(count(conn), before + 1);
                 for role in [0, 1] {
@@ -2175,24 +2186,47 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .bind::<diesel::sql_types::Integer,_>(role).bind::<Text,_>(&fixture.id)
                         .execute(conn).unwrap();
                     if role == 0 {
-                        assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                        assert!(matches!(admit(conn), Err(AppError::Forbidden)));
                     }
                 }
                 for jwks in [&other_jwks, &approved_jwks] {
                     sql_query("UPDATE application_discovery SET signing_public_jwks=? WHERE application_id=?")
                         .bind::<Text,_>(jwks).bind::<Text,_>(&app.id).execute(conn).unwrap();
                     if jwks == &other_jwks {
-                        assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                        assert!(matches!(admit(conn), Err(AppError::Forbidden)));
                     }
                 }
+                let require_mfa = |conn: &mut diesel::SqliteConnection| {
+                    sql_query("UPDATE clients SET require_mfa=1 WHERE id=?")
+                        .bind::<Text,_>(&client.id).execute(conn)?;
+                    Ok(())
+                };
+                let never_insert = |_: &mut diesel::SqliteConnection| -> AppResult<()> {
+                    panic!("a client requiring new MFA must deny before inserting a code")
+                };
+                assert!(matches!(admit_with(conn, &require_mfa, &never_insert), Err(AppError::Forbidden)));
+                assert_eq!(count(conn), before + 1);
+                let counts = |conn: &mut diesel::SqliteConnection| {
+                    sql_query("SELECT COUNT(*) AS count FROM application_auth_contexts WHERE user_id=?")
+                        .bind::<Text,_>(&fixture.id).get_result::<Count>(conn).unwrap().count
+                };
+                let contexts_before = counts(conn);
+                let revoke_context = |conn: &mut diesel::SqliteConnection| {
+                    sql_query("UPDATE application_auth_contexts SET revoked_at=0 WHERE user_id=?")
+                        .bind::<Text,_>(&fixture.id).execute(conn)?;
+                    Ok(())
+                };
                 let reached_insert = std::cell::Cell::new(false);
-                assert!(matches!(admit(conn, &|| {
+                assert!(matches!(admit_with(conn, &revoke_context, &|conn| {
                     reached_insert.set(true);
+                    assert_eq!(counts(conn), contexts_before + 1);
                     set_gate(false);
+                    Ok(())
                 }), Err(AppError::Forbidden)));
                 assert!(reached_insert.get(), "restore change must roll back an attempted insert");
-                assert!(matches!(admit(conn, &|| ()), Err(AppError::Forbidden)));
+                assert!(matches!(admit(conn), Err(AppError::Forbidden)));
                 assert_eq!(count(conn), before + 1, "denials and final gate rollback must not mint");
+                assert_eq!(counts(conn), contexts_before, "new context rolled back with the code");
                 set_gate(true);
             },
         );

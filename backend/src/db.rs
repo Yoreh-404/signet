@@ -339,6 +339,7 @@ pub(crate) use {
     applications::find_or_create_sqlite_application_auth_context_on_conn,
     authorization::load_sqlite_oidc_policy_snapshot_on_conn,
     authorization_codes::insert_sqlite_authorization_code_on_conn,
+    client_applications::find_sqlite_client_by_client_id_on_conn,
 };
 pub use authorization::{
     ApplicationOrganizationRoleAssignmentRecord,
