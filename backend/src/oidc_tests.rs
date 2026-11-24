@@ -1841,7 +1841,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
-    let (mut state, path) = test_app_state().await;
+    let (mut state, path) = test_app_state_with_issuer(Some("https://signet.example")).await;
     let fixture = insert_refresh_test_user(&state, "incumbent-preflight").await;
     let client = test_refresh_client(&state).await;
     let binding = state.db.find_application_client_binding_by_public_client_id(&client.client_id)
@@ -1849,6 +1849,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let app = state.db.find_application_by_id(&binding.application_id).await.unwrap().unwrap();
     let origin = "https://axon.example";
     let effective_issuer = state.effective_issuer(&HeaderMap::new()).await.unwrap();
+    assert_eq!(effective_issuer, "https://signet.example");
     let issuer = effective_issuer.as_str();
     assert!(state.accepted_issuers(&HeaderMap::new()).await.unwrap().contains(&effective_issuer));
     let audience = "https://axon.example/admin";
@@ -3376,9 +3377,16 @@ async fn insert_test_oidc_client(
 }
 
 async fn test_app_state() -> (AppState, PathBuf) {
+    test_app_state_with_issuer(None).await
+}
+
+async fn test_app_state_with_issuer(issuer: Option<&str>) -> (AppState, PathBuf) {
     let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/default.toml");
     let raw = std::fs::read_to_string(config_path).unwrap();
     let mut settings: crate::Settings = toml::from_str(&raw).unwrap();
+    if let Some(issuer) = issuer {
+        settings.oidc.issuer = issuer.to_owned();
+    }
     // The production profile now requires explicit consent before a
     // delegated scope is granted. These fixture-based HTTP tests exercise
     // the post-login protocol path and historically assume the browser
