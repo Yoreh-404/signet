@@ -224,13 +224,78 @@ pub(crate) mod sqlite {
             .execute(conn).map(|_| ())
     }
 
-    fn code_has_current_provenance_on_conn(
+    /// Immutable committed exchange evidence. This is neither a token nor a
+    /// promise that authority stays live after the consuming transaction.
+    /// It holds no authorization code, cookie, raw session ID or CSRF value.
+    pub(crate) struct CommittedIncumbentCode<'a> {
+        approved: &'a VerifiedPolicy,
+        user_id: String,
+        public_sid: String,
+        scope: String,
+        application_db_id: String,
+        client_db_id: String,
+        profile_id: String,
+        auth_context_id: String,
+        auth_time: i64,
+        code_assurance: crate::assurance::AuthenticationAssurance,
+        session_assurance: crate::assurance::AuthenticationAssurance,
+    }
+
+    impl<'a> CommittedIncumbentCode<'a> {
+        fn from_current_exchange(
+            row: crate::db::AuthorizationCodeRecord,
+            session: SessionRecord,
+            pin: &IncumbentPin<'_>,
+            approved: &'a VerifiedPolicy,
+        ) -> crate::error::AppResult<Self> {
+            use crate::{assurance::SessionAuthenticationAssurance, error::AppError};
+            if row.scope != "openid"
+                || row.resource.as_deref() != Some(approved.policy().audience.as_str())
+                || row.user_id != session.user_id
+                || row.session_id.as_deref() != Some(crate::util::session_public_id(&session.id).as_str())
+                || row.auth_time != session.created_at
+            {
+                return Err(AppError::Forbidden);
+            }
+            let session_assurance = session.authentication_assurance();
+            Ok(Self {
+                approved,
+                user_id: row.user_id,
+                public_sid: row.session_id.ok_or(AppError::Forbidden)?,
+                scope: row.scope,
+                application_db_id: row.application_id.ok_or(AppError::Forbidden)?,
+                client_db_id: pin.client_db_id.to_owned(),
+                profile_id: row.authorization_profile_id.ok_or(AppError::Forbidden)?,
+                auth_context_id: row.auth_context_id.ok_or(AppError::Forbidden)?,
+                auth_time: row.auth_time,
+                code_assurance: crate::assurance::AuthenticationAssurance {
+                    acr: row.acr,
+                    amr: crate::util::from_json(&row.amr)?,
+                },
+                session_assurance,
+            })
+        }
+
+        pub(crate) fn approved_policy(&self) -> &VerifiedPolicy { self.approved }
+        pub(crate) fn user_id(&self) -> &str { &self.user_id }
+        pub(crate) fn public_sid(&self) -> &str { &self.public_sid }
+        pub(crate) fn scope(&self) -> &str { &self.scope }
+        pub(crate) fn application_db_id(&self) -> &str { &self.application_db_id }
+        pub(crate) fn client_db_id(&self) -> &str { &self.client_db_id }
+        pub(crate) fn profile_id(&self) -> &str { &self.profile_id }
+        pub(crate) fn auth_context_id(&self) -> &str { &self.auth_context_id }
+        pub(crate) fn auth_time(&self) -> i64 { self.auth_time }
+        pub(crate) fn code_assurance(&self) -> &crate::assurance::AuthenticationAssurance { &self.code_assurance }
+        pub(crate) fn session_assurance(&self) -> &crate::assurance::AuthenticationAssurance { &self.session_assurance }
+    }
+
+    fn current_exchange_session_on_conn(
         conn: &mut SqliteConnection,
         row: &crate::db::AuthorizationCodeRecord,
         pin: &IncumbentPin<'_>,
         approved: &VerifiedPolicy,
         now: i64,
-    ) -> QueryResult<bool> {
+    ) -> QueryResult<Option<SessionRecord>> {
         #[derive(diesel::QueryableByName)]
         struct Identity {
             #[diesel(sql_type = Text)]
@@ -238,11 +303,11 @@ pub(crate) mod sqlite {
         }
 
         let policy = approved.policy();
-        let Some(sid) = row.session_id.as_deref() else { return Ok(false); };
+        let Some(sid) = row.session_id.as_deref() else { return Ok(None); };
         if row.application_id.as_deref() != Some(pin.application_db_id)
             || row.client_id != policy.client_id
         {
-            return Ok(false);
+            return Ok(None);
         }
         let key = crate::util::sha256_base64url(&row.code);
         let marker = sql_query("SELECT code_sha256 AS id FROM axon_v3_incumbent_code_provenance
@@ -257,30 +322,31 @@ pub(crate) mod sqlite {
             .bind::<BigInt,_>(policy.generation).bind::<BigInt,_>(row.expires_at)
             .get_result::<Identity>(conn).optional()?;
         if !marker.is_some_and(|marker| marker.id == key) {
-            return Ok(false);
+            return Ok(None);
         }
         // The confidential exchange does not receive the browser cookie. Use
         // the exact existing public SID and only current sessions of this user.
-        let sessions = sql_query("SELECT s.id FROM sessions s JOIN users u ON u.id=s.user_id
+        let sessions = sql_query("SELECT s.id, s.user_id, s.csrf_token, s.ip_address, s.user_agent,
+            s.login_method, s.expires_at, s.created_at FROM sessions s JOIN users u ON u.id=s.user_id
             WHERE u.id=? AND s.expires_at>? AND u.is_admin=1 AND u.is_active=1
               AND u.archived_at IS NULL AND COALESCE(s.login_method,'')<>'authorization_code'
               AND NOT EXISTS (SELECT 1 FROM trial_enrollments t WHERE t.user_id=u.id)")
-            .bind::<Text,_>(&row.user_id).bind::<BigInt,_>(now).load::<Identity>(conn)?;
-        Ok(sessions.into_iter().any(|session| crate::util::session_public_id(&session.id) == sid))
+            .bind::<Text,_>(&row.user_id).bind::<BigInt,_>(now).load::<SessionRecord>(conn)?;
+        Ok(sessions.into_iter().find(|session| crate::util::session_public_id(&session.id) == sid))
     }
 
     /// Consume only a code admitted for the active exact incumbent policy.
     /// This is not mounted and does not grant or issue any token.
-    pub(crate) fn consume_incumbent_code(
+    pub(crate) fn consume_incumbent_code<'a>(
         conn: &mut SqliteConnection,
         gate: &RestoreInterlock,
         pin: &IncumbentPin<'_>,
-        approved: &VerifiedPolicy,
+        approved: &'a VerifiedPolicy,
         code: &str,
         client_id: &str,
         redirect_uri: &str,
         code_verifier: &str,
-    ) -> crate::error::AppResult<crate::db::AuthorizationCodeRecord> {
+    ) -> crate::error::AppResult<CommittedIncumbentCode<'a>> {
         use crate::error::AppError;
         conn.immediate_transaction::<_, AppError, _>(|conn| {
             let snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
@@ -291,15 +357,14 @@ pub(crate) mod sqlite {
             let row = super::super::authorization_codes::consume_sqlite_authorization_code_for_client_on_conn(
                 conn, code, client_id, Some(redirect_uri), Some(code_verifier), true, true, now,
             )?;
-            if !code_has_current_provenance_on_conn(conn, &row, pin, approved, now)? {
-                return Err(AppError::Forbidden);
-            }
+            let session = current_exchange_session_on_conn(conn, &row, pin, approved, now)?
+                .ok_or(AppError::Forbidden)?;
             let cleared = sql_query("DELETE FROM axon_v3_incumbent_code_provenance WHERE code_sha256=?")
                 .bind::<Text,_>(crate::util::sha256_base64url(&row.code)).execute(conn)?;
             if cleared != 1 || !snapshot.unchanged() {
                 return Err(AppError::Forbidden);
             }
-            Ok(row)
+            CommittedIncumbentCode::from_current_exchange(row, session, pin, approved)
         })
     }
 
