@@ -2006,6 +2006,27 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert_eq!(consumed_at(), consumed);
     let baseline = router.clone().oneshot(introspect("access_token")).await.unwrap();
     assert_eq!(oidc_http_body_json(baseline).await["active"], true);
+    // Disable a website whose verified metadata and OAuth session remain
+    // current. This isolates operator disablement from expiry and logout.
+    let set_disabled = |disabled: i32| {
+        sql_query("UPDATE application_discovery SET operator_disabled=? WHERE application_id=?")
+            .bind::<diesel::sql_types::Integer,_>(disabled).bind::<Text,_>(&app.id)
+            .execute(&mut pool.get().unwrap()).unwrap()
+    };
+    assert_eq!(set_disabled(1), 1);
+    for hint in ["access_token", "axon_admin_authority_v3"] {
+        let denied = router.clone().oneshot(introspect(hint)).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        assert_eq!(oidc_http_body_json(denied).await, json!({"active":false}),
+            "{hint} on a still-fresh but disabled website");
+    }
+    assert_eq!(set_disabled(0), 1);
+    let restored = router.clone().oneshot(introspect("access_token")).await.unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert_eq!(oidc_http_body_json(restored).await["active"], true);
+    let no_privilege = router.clone().oneshot(introspect("axon_admin_authority_v3")).await.unwrap();
+    assert_eq!(no_privilege.status(), StatusCode::OK);
+    assert_eq!(oidc_http_body_json(no_privilege).await, json!({"active":false}));
     set_expiry(util::now_ts()-1);
     let after = router.clone().oneshot(authorize()).await.unwrap();
     if after.status().is_redirection() {
