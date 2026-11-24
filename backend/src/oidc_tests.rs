@@ -3608,6 +3608,148 @@ async fn insert_test_oidc_client(
         .unwrap()
 }
 
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() {
+    use crate::{application_discovery, db::NewApplicationDiscovery};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+    use ed25519_dalek::SigningKey;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    let (mut state, path) = test_app_state_with_issuer(Some("https://sso.example")).await;
+    state.settings.discovery.allow_private_networks = true;
+    state.settings.discovery.encryption_key = URL_SAFE_NO_PAD.encode([23_u8; 32]);
+    let client = test_refresh_client(&state).await;
+    let app = state.db.insert_application(crate::db::NewApplication {
+        organization_id: client.organization_id.unwrap(),
+        slug: "axon".into(),
+        name: "Discovery fixture".into(),
+        description: None,
+        access_mode: applications::ACCESS_ALL_SIGNET_USERS.into(),
+        registration_mode: applications::REGISTRATION_DISABLED.into(),
+        account_selection_mode: applications::ACCOUNT_SELECTION_OPTIONAL.into(),
+        unique_identity_factors: Vec::new(),
+        is_active: true,
+    }).await.unwrap();
+    let manager = insert_refresh_test_user(&state, "discovery-manager").await;
+    let other = insert_refresh_test_user(&state, "discovery-nonmanager").await;
+    let crate::db::Db::Sqlite(pool) = &state.db else { unreachable!() };
+    {
+        let mut conn = pool.get().unwrap();
+        sql_query("UPDATE users SET is_admin=1 WHERE id=?")
+            .bind::<Text,_>(&manager.id).execute(&mut conn).unwrap();
+        sql_query("DELETE FROM organization_members WHERE user_id=?")
+            .bind::<Text,_>(&manager.id).execute(&mut conn).unwrap();
+    }
+    let manager_jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
+        None, &manager, "password", auth::LoginEventContext::default()).await.unwrap();
+    let other_jar = auth::issue_session_with_login_event(&state, CookieJar::new(), &HeaderMap::new(),
+        None, &other, "password", auth::LoginEventContext::default()).await.unwrap();
+    assert_eq!(auth::require_current_user(&state, &manager_jar).await.unwrap().user.is_admin, 1);
+
+    // The only fetch target is an in-process loopback website. The actual sync
+    // transport, authentication, signature verifier and owner lease are used.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let website = format!("http://{}", listener.local_addr().unwrap());
+    let fetch_secret = "discovery-local-fixture-secret";
+    let key = SigningKey::from_bytes(&[24_u8; 32]);
+    let (first, jwks) = application_discovery::signed_contract_fixture(&key, &website, 2);
+    let payload = Arc::new(Mutex::new(first));
+    let fetched = Arc::new(AtomicUsize::new(0));
+    let site_payload = payload.clone();
+    let site_counter = fetched.clone();
+    let website_router = axum::Router::new().route(
+        application_discovery::DISCOVERY_PATH,
+        axum::routing::get(move |headers: HeaderMap| {
+            let payload = site_payload.clone();
+            let fetched = site_counter.clone();
+            async move {
+                fetched.fetch_add(1, Ordering::Relaxed);
+                if headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
+                    != Some(format!("Bearer {fetch_secret}").as_str())
+                {
+                    return (StatusCode::UNAUTHORIZED, Vec::new());
+                }
+                (StatusCode::OK, payload.lock().unwrap().clone())
+            }
+        }),
+    );
+    let site_task = tokio::spawn(async move { axum::serve(listener, website_router).await.unwrap() });
+    state.db.upsert_application_discovery(NewApplicationDiscovery {
+        application_id: app.id.clone(),
+        management_mode: application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
+        website_url: website.clone(),
+        fetch_secret_ciphertext: util::encrypt_discovery_secret(
+            &state.settings.discovery.encryption_key, fetch_secret,
+        ).unwrap(),
+        signing_public_jwks: jwks,
+        last_verified_revision: None,
+        last_verified_version: None,
+        last_verified_digest: None,
+        last_verified_expires_at: None,
+        sync_status: application_discovery::SYNC_PENDING.into(),
+        last_fetched_at: None,
+        last_success_at: None,
+        last_error: None,
+        snapshot_json: None,
+        operator_disabled: false,
+    }).await.unwrap();
+
+    let get_path = format!("/api/admin/applications/{}/discovery", app.id);
+    let sync_path = format!("{get_path}/sync");
+    let router = crate::admin::routes().with_state(state.clone());
+    let request = |method, path: &str, jar: &CookieJar| {
+        let cookie = jar.get(&state.settings.security.cookie_name).unwrap();
+        Request::builder().method(method).uri(path)
+            .header(header::COOKIE, format!("{}={}", cookie.name(), cookie.value()))
+            .body(Body::empty()).unwrap()
+    };
+    let get = |jar| request(axum::http::Method::GET, &get_path, jar);
+    let sync = |jar| request(axum::http::Method::POST, &sync_path, jar);
+    let first = router.clone().oneshot(sync(&manager_jar)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = oidc_http_body_json(first).await;
+    assert_eq!(first["last_verified_revision"], 2);
+    let digest_before = first["last_verified_digest"].as_str().unwrap().to_owned();
+
+    *payload.lock().unwrap() = application_discovery::signed_contract_fixture(&key, &website, 3).0;
+    let calls = fetched.load(Ordering::Relaxed);
+    for denied in [get(&other_jar), sync(&other_jar)] {
+        let denied = router.clone().oneshot(denied).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(fetched.load(Ordering::Relaxed), calls);
+    let unchanged = router.clone().oneshot(get(&manager_jar)).await.unwrap();
+    assert_eq!(unchanged.status(), StatusCode::OK);
+    let unchanged = oidc_http_body_json(unchanged).await;
+    assert_eq!(unchanged["last_verified_revision"], 2);
+    assert_eq!(unchanged["last_verified_digest"], digest_before);
+
+    let update = router.clone().oneshot(sync(&manager_jar)).await.unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let readback = router.clone().oneshot(get(&manager_jar)).await.unwrap();
+    assert_eq!(readback.status(), StatusCode::OK);
+    let readback = oidc_http_body_json(readback).await;
+    assert_eq!(readback["last_verified_revision"], 3);
+    let digest = readback["last_verified_digest"].as_str().unwrap();
+    assert_ne!(digest, digest_before);
+
+    let wrong_signer = SigningKey::from_bytes(&[25_u8; 32]);
+    *payload.lock().unwrap() = application_discovery::signed_contract_fixture(&wrong_signer, &website, 4).0;
+    let invalid = router.clone().oneshot(sync(&manager_jar)).await.unwrap();
+    assert!(invalid.status().is_client_error());
+    let after = router.oneshot(get(&manager_jar)).await.unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    let after = oidc_http_body_json(after).await;
+    assert_eq!(after["last_verified_revision"], 3);
+    assert_eq!(after["last_verified_digest"], digest);
+
+    site_task.abort();
+    drop(state);
+    std::fs::remove_file(path).unwrap();
+}
+
 async fn test_app_state() -> (AppState, PathBuf) {
     test_app_state_with_issuer(None).await
 }

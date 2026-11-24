@@ -1792,6 +1792,8 @@ pub fn spawn_periodic_sync(state: AppState) -> DiscoverySyncWorker {
 }
 
 #[cfg(test)]
+pub(crate) use tests::signed_contract_fixture;
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Router, http::header, routing::get};
@@ -1800,7 +1802,12 @@ mod tests {
     use rand_core::OsRng;
 
     fn signed_contract() -> (Vec<u8>, String) {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        signed_contract_fixture(&SigningKey::generate(&mut OsRng), "https://axon.example", 2)
+    }
+
+    pub(crate) fn signed_contract_fixture(
+        signing_key: &SigningKey, website_issuer: &str, revision: i64,
+    ) -> (Vec<u8>, String) {
         let verifying_key = signing_key.verifying_key();
         let jwks = serde_json::json!({
             "keys": [{
@@ -1817,9 +1824,9 @@ mod tests {
         let payload = serde_json::json!({
             "format": crate::application_contract::FORMAT,
             "application_id": "axon",
-            "revision": 2,
+            "revision": revision,
             "version": "v3-test",
-            "iss": "https://axon.example",
+            "iss": website_issuer,
             "aud": ["https://sso.example", "signet:application:axon"],
             "iat": now,
             "exp": now + 300,
