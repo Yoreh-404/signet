@@ -658,6 +658,503 @@ macro_rules! insert_migrated_profile_edge {
     }};
 }
 
+// Read the same policy graph on each concrete Diesel connection type.
+// The caller owns transaction boundaries and any backend-specific isolation.
+macro_rules! policy_snapshot_on_connection {
+    ($conn:expr, $kind:expr, $boundary:expr, $user_id:expr) => {{
+        let (conn, kind, boundary, user_id) = ($conn, $kind, $boundary, $user_id);
+        let (client_id, requested_application_id, requested_profile_id) =
+            match &boundary {
+                PolicyBoundary::Application { application_id } => {
+                    (
+                        None,
+                        Some(application_id.clone()),
+                        Some("default".to_string()),
+                    )
+                }
+                PolicyBoundary::Client { client_db_id, .. } => {
+                    (Some(client_db_id.clone()), None, None)
+                }
+                PolicyBoundary::Profile {
+                    application_id,
+                    profile_id,
+                } => (
+                    None,
+                    Some(application_id.clone()),
+                    Some(profile_id.clone()),
+                ),
+            };
+
+        let client_boundary = if let Some(client_id) = client_id.as_ref() {
+            let sql = format!(
+                "SELECT clients.organization_id,
+                                clients.is_active AS client_is_active,
+                                application_client_bindings.application_id AS binding_application_id,
+                                application_client_bindings.client_db_id AS binding_client_db_id,
+                                application_client_bindings.protocol AS binding_protocol,
+                                application_client_bindings.authorization_profile_id AS binding_authorization_profile_id,
+                                application_client_bindings.auth_domain_id AS binding_auth_domain_id,
+                                application_client_bindings.is_active AS binding_is_active,
+                                application_client_bindings.created_at AS binding_created_at,
+                                application_client_bindings.updated_at AS binding_updated_at
+                         FROM clients
+                         LEFT JOIN application_client_bindings
+                           ON application_client_bindings.client_db_id = clients.id
+                         WHERE clients.id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(client_id)
+                .get_result::<ClientBindingBoundaryRow>(conn)
+                .optional()
+                .map_err(AppError::from)?
+        } else {
+            None
+        };
+        let client_state = client_boundary.as_ref().map(|boundary| ClientActivityRow {
+            organization_id: boundary.organization_id.clone(),
+            is_active: boundary.client_is_active,
+        });
+        let binding = client_boundary.as_ref().and_then(|boundary| {
+            Some(ApplicationClientBindingRecord {
+                application_id: boundary.binding_application_id.clone()?,
+                client_db_id: boundary.binding_client_db_id.clone()?,
+                protocol: boundary.binding_protocol.clone()?,
+                authorization_profile_id: boundary
+                    .binding_authorization_profile_id
+                    .clone()?,
+                auth_domain_id: boundary.binding_auth_domain_id.clone()?,
+                is_active: boundary.binding_is_active?,
+                created_at: boundary.binding_created_at?,
+                updated_at: boundary.binding_updated_at?,
+            })
+        });
+
+        let application_id = requested_application_id
+            .as_deref()
+            .or_else(|| binding.as_ref().map(|value| value.application_id.as_str()));
+        let application = if let Some(application_id) = application_id {
+            let sql = format!(
+                "{} WHERE id = {}",
+                select_application_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(application_id)
+                .get_result::<ApplicationRecord>(conn)
+                .optional()
+                .map_err(AppError::from)?
+        } else {
+            None
+        };
+
+        let profile_selector = requested_profile_id.or_else(|| {
+            binding
+                .as_ref()
+                .map(|value| value.authorization_profile_id.clone())
+        });
+        let profile = match (application.as_ref(), profile_selector.as_deref()) {
+            (Some(application), Some("default")) => {
+                let sql = format!(
+                    "{} WHERE application_id = {} AND profile_key = {}",
+                    select_application_authorization_profile_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(&application.id)
+                    .bind::<Text, _>("default")
+                    .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+            }
+            (Some(application), Some(profile_id)) => {
+                let sql = format!(
+                    "{} WHERE id = {} AND application_id = {}",
+                    select_application_authorization_profile_sql(),
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                sql_query(sql)
+                    .bind::<Text, _>(profile_id)
+                    .bind::<Text, _>(&application.id)
+                    .get_result::<ApplicationAuthorizationProfileRecord>(conn)
+                    .optional()
+                    .map_err(AppError::from)?
+            }
+            _ => None,
+        };
+
+        let user_active = {
+            let sql = format!(
+                "SELECT is_active, archived_at FROM users WHERE id = {}",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&user_id)
+                .get_result::<UserActivityRow>(conn)
+                .optional()
+                .map_err(AppError::from)?
+                .is_some_and(|user| user.is_active == 1 && user.archived_at.is_none())
+        };
+
+        let (organization_active, membership, runtime_active) =
+            if let Some(application) = application.as_ref() {
+                let membership_sql = format!(
+                    "SELECT organizations.is_active AS organization_is_active,
+                                    organizations.id AS membership_id,
+                                    organizations.slug AS membership_slug,
+                                    organizations.name AS membership_name,
+                                    COALESCE(organizations.kind, 'tenant') AS membership_kind,
+                                    organizations.description AS membership_description,
+                                    organizations.is_active AS membership_is_active,
+                                    organization_members.role AS membership_role,
+                                    organization_members.created_at AS membership_created_at,
+                                    organization_members.updated_at AS membership_updated_at
+                             FROM organizations
+                             LEFT JOIN organization_members
+                               ON organization_members.organization_id = organizations.id
+                              AND organization_members.user_id = {}
+                             WHERE organizations.id = {}",
+                    ph(kind, 1),
+                    ph(kind, 2)
+                );
+                let organization_membership = sql_query(membership_sql)
+                    .bind::<Text, _>(&user_id)
+                    .bind::<Text, _>(&application.organization_id)
+                    .get_result::<PolicyOrganizationMembershipRow>(conn)
+                    .optional()
+                    .map_err(AppError::from)?;
+                let organization_active = organization_membership
+                    .as_ref()
+                    .is_some_and(|organization| organization.organization_is_active == 1);
+                let membership = organization_membership.and_then(|row| {
+                    Some(UserOrganizationRecord {
+                        id: row.membership_id?,
+                        slug: row.membership_slug?,
+                        name: row.membership_name?,
+                        kind: row.membership_kind?,
+                        description: row.membership_description,
+                        is_active: row.membership_is_active?,
+                        role: row.membership_role?,
+                        membership_created_at: row.membership_created_at?,
+                        membership_updated_at: row.membership_updated_at?,
+                    })
+                });
+                let discovery_sql = format!(
+                    "SELECT management_mode, last_verified_revision, last_verified_expires_at, snapshot_json, operator_disabled FROM application_discovery WHERE application_id = {}",
+                    ph(kind, 1)
+                );
+                let discovery = sql_query(discovery_sql)
+                    .bind::<Text, _>(&application.id)
+                    .get_result::<DiscoveryRuntimeRow>(conn)
+                    .optional()
+                    .map_err(AppError::from)?;
+                let now = crate::util::now_ts();
+                let runtime_active = discovery_runtime_is_active(discovery, now);
+                (organization_active, membership, runtime_active)
+            } else {
+                (false, None, false)
+            };
+
+        let application_modules = if let Some(application) = application.as_ref() {
+            let module_sql = format!(
+                "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key IN ({}, {})",
+                ph(kind, 1),
+                ph(kind, 2),
+                ph(kind, 3)
+            );
+            let modules = sql_query(module_sql)
+                .bind::<Text, _>(&application.id)
+                .bind::<Text, _>("authorization")
+                .bind::<Text, _>("protocols")
+                .load::<ApplicationModuleRecord>(conn)
+                .map_err(AppError::from)?;
+            let mut modules_by_key = BTreeMap::new();
+            for module in modules {
+                if modules_by_key
+                    .insert(module.module_key.clone(), module)
+                    .is_some()
+                {
+                    return Err(AppError::Internal(
+                        "duplicate application module key".to_string(),
+                    ));
+                }
+            }
+            modules_by_key
+        } else {
+            BTreeMap::new()
+        };
+
+        let authorization_config = authorization_config(
+            application_modules.get("authorization").cloned(),
+        )?;
+        let required_protocol = match &boundary {
+            PolicyBoundary::Client {
+                required_protocol, ..
+            } => required_protocol.as_deref(),
+            _ => None,
+        };
+        let protocol_enabled = if client_id.is_some() {
+            let protocol = required_protocol.or_else(|| {
+                binding
+                    .as_ref()
+                    .map(|value| value.protocol.as_str())
+            });
+            if let Some(_application) = application.as_ref() {
+                protocol_module_enabled(
+                    application_modules.get("protocols").cloned(),
+                    protocol,
+                )?
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        let binding_protocol_matches = required_protocol.is_none_or(|required| {
+            binding.as_ref().is_some_and(|binding| {
+                protocol_key(&binding.protocol) == protocol_key(required)
+            })
+        });
+        let inherit_enterprise = authorization_config
+            .get("inherit_enterprise_roles")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let scoped_subject = user_active
+            && organization_active
+            && membership.as_ref().is_some_and(|value| value.is_active == 1);
+
+        let groups = if scoped_subject {
+            let sql = format!(
+                "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN group_members ON access_groups.id = group_members.group_id WHERE group_members.user_id = {} ORDER BY access_groups.name ASC, access_groups.id ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&user_id)
+                .load::<GroupRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+        let group_ids = groups
+            .iter()
+            .map(|group| group.id.clone())
+            .collect::<Vec<_>>();
+
+        let enterprise_roles = if scoped_subject && inherit_enterprise {
+            let sql = format!(
+                "SELECT roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN user_roles ON roles.id = user_roles.role_id WHERE user_roles.user_id = {} ORDER BY roles.name ASC, roles.id ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&user_id)
+                .load::<RoleRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+
+        let enterprise_group_roles = if scoped_subject && inherit_enterprise {
+            load_group_roles!(conn, kind, &group_ids)?
+        } else {
+            BTreeMap::new()
+        };
+        let mut enterprise_role_ids = BTreeSet::new();
+        enterprise_role_ids.extend(enterprise_roles.iter().map(|role| role.id.clone()));
+        for roles in enterprise_group_roles.values() {
+            enterprise_role_ids.extend(roles.iter().map(|role| role.id.clone()));
+        }
+        let enterprise_role_permissions =
+            load_role_permissions!(conn, kind, &enterprise_role_ids)?;
+
+        let profile_roles = if let Some(profile) = profile.as_ref() {
+            let sql = format!(
+                "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC, id ASC",
+                select_application_profile_role_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile.id)
+                .load::<ApplicationProfileRoleRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+        let profile_user_assignments = if let Some(profile) = profile.as_ref() {
+            let sql = format!(
+                "SELECT profile_id, user_id AS subject_id, role_id, is_active FROM application_profile_user_roles WHERE profile_id = {} AND user_id = {} ORDER BY role_id ASC",
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile.id)
+                .bind::<Text, _>(&user_id)
+                .load::<ApplicationProfileRoleAssignmentRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+        let profile_group_assignments = if let Some(profile) = profile.as_ref() {
+            load_profile_group_assignments!(conn, kind, &profile.id, &group_ids)?
+        } else {
+            Vec::new()
+        };
+        let profile_organization_assignments = if let Some(profile) = profile.as_ref() {
+            let sql = format!(
+                "SELECT profile_id, organization_role, role_id, is_active FROM application_profile_organization_roles WHERE profile_id = {} ORDER BY organization_role ASC, role_id ASC",
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile.id)
+                .load::<ApplicationProfileOrganizationRoleAssignmentRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+        let profile_permission_overrides = if let Some(profile) = profile.as_ref() {
+            let sql = format!(
+                "{} WHERE profile_id = {} AND user_id = {} ORDER BY permission ASC",
+                select_application_profile_permission_override_sql(),
+                ph(kind, 1),
+                ph(kind, 2)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(&profile.id)
+                .bind::<Text, _>(&user_id)
+                .load::<ApplicationProfilePermissionOverrideRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+
+        let claim_mappers = if let Some(client_id) = client_id.as_ref() {
+            let sql = format!(
+                "{} WHERE client_db_id = {} ORDER BY sort_order ASC, created_at ASC",
+                select_client_claim_mapper_sql(),
+                ph(kind, 1)
+            );
+            sql_query(sql)
+                .bind::<Text, _>(client_id)
+                .load::<ClientClaimMapperRecord>(conn)
+                .map_err(AppError::from)?
+        } else {
+            Vec::new()
+        };
+        let application_matches_client = match (application.as_ref(), client_state.as_ref()) {
+            (Some(application), Some(client)) => client.organization_id.as_deref()
+                == Some(application.organization_id.as_str()),
+            (None, _) => false,
+            (_, None) if client_id.is_some() => false,
+            (_, None) => true,
+        };
+        let binding_active = client_id.as_ref().is_none_or(|client_id| {
+            binding.as_ref().is_some_and(|binding| {
+                binding.client_db_id == *client_id
+                    && binding.is_active == 1
+                    && application
+                        .as_ref()
+                        .is_some_and(|application| binding.application_id == application.id)
+            })
+        });
+        let profile_active = profile.as_ref().is_some_and(|profile| {
+            application
+                .as_ref()
+                .is_some_and(|application| profile.application_id == application.id)
+        });
+        let client_active = client_id.as_ref().is_none_or(|_| {
+            client_state.as_ref().is_some_and(|client| client.is_active == 1)
+        });
+        let is_authorizable = application.as_ref().is_some_and(|application| {
+            application.is_active == 1
+                && application_runtime_active(
+                    application,
+                    organization_active,
+                    runtime_active,
+                )
+        }) && user_active
+            && application_matches_client
+            && client_active
+            && binding_active
+            && protocol_enabled
+            && binding_protocol_matches
+            && profile_active;
+
+        Ok(AuthorizationPolicySnapshot {
+            application,
+            binding,
+            profile,
+            user_id,
+            user_active,
+            client_id,
+            client_active,
+            client_organization_id: client_state
+                .as_ref()
+                .and_then(|client| client.organization_id.clone()),
+            organization_active,
+            membership,
+            groups,
+            enterprise_roles,
+            enterprise_group_roles,
+            enterprise_role_permissions,
+            authorization_config,
+            application_runtime_active: runtime_active,
+            protocol_enabled,
+            profile_roles,
+            profile_user_assignments,
+            profile_group_assignments,
+            profile_organization_assignments,
+            profile_permission_overrides,
+            claim_mappers,
+            is_authorizable,
+        })
+    }};
+}
+
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Incumbent admission is intentionally not mounted.
+pub(super) fn load_sqlite_oidc_policy_snapshot_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    client_db_id: &str,
+    user_id: &str,
+) -> AppResult<AuthorizationPolicySnapshot> {
+    let boundary = PolicyBoundary::Client {
+        client_db_id: client_db_id.to_owned(),
+        required_protocol: Some("oauth2_oidc".to_owned()),
+    };
+    policy_snapshot_on_connection!(conn, DatabaseKind::Sqlite, boundary, user_id.to_owned())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+#[tokio::test]
+async fn unbound_client_on_caller_transaction_is_visible_but_not_provisioned() {
+    let (db, path) = super::tests::sqlite_test_db().await;
+    let Db::Sqlite(pool) = &db else { unreachable!() };
+    let mut conn = pool.get().unwrap();
+    conn.immediate_transaction::<(), AppError, _>(|conn| {
+        conn.batch_execute(
+            "INSERT INTO clients (id,client_id,client_name,redirect_uris,post_logout_redirect_uris,
+                scopes,audience,grant_types,response_types,token_endpoint_auth_method,require_pkce,
+                require_s256_pkce,is_active,created_at,updated_at)
+             VALUES ('unbound-db','unbound-client','Unbound','[]','[]','[]','fixture',
+                '[]','[]','none',1,1,1,0,0)",
+        )?;
+        let changes = |conn: &mut diesel::SqliteConnection| {
+            sql_query("SELECT total_changes() AS count").get_result::<CountRow>(conn)
+        };
+        let before = changes(conn)?.count;
+        let snapshot = load_sqlite_oidc_policy_snapshot_on_conn(conn, "unbound-db", "subject")?;
+        assert!(snapshot.client_active);
+        assert!(snapshot.application.is_none() && snapshot.binding.is_none());
+        assert!(!snapshot.is_authorizable);
+        assert_eq!(changes(conn)?.count, before);
+        Ok(())
+    }).unwrap();
+    drop(conn);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
 impl Db {
     /// Reads only the live admission boundary in one transaction. Full
     /// entitlement graphs are deliberately not loaded for login checks.
@@ -1346,451 +1843,7 @@ impl Db {
                 // membership, and assignment reads must observe one MVCC
                 // point rather than a mixture of revisions.
                 initialize_consistent_read(conn, kind)?;
-                let (client_id, requested_application_id, requested_profile_id) =
-                    match &boundary {
-                        PolicyBoundary::Application { application_id } => {
-                            (
-                                None,
-                                Some(application_id.clone()),
-                                Some("default".to_string()),
-                            )
-                        }
-                        PolicyBoundary::Client { client_db_id, .. } => {
-                            (Some(client_db_id.clone()), None, None)
-                        }
-                        PolicyBoundary::Profile {
-                            application_id,
-                            profile_id,
-                        } => (
-                            None,
-                            Some(application_id.clone()),
-                            Some(profile_id.clone()),
-                        ),
-                    };
-
-                let client_boundary = if let Some(client_id) = client_id.as_ref() {
-                    let sql = format!(
-                        "SELECT clients.organization_id,
-                                clients.is_active AS client_is_active,
-                                application_client_bindings.application_id AS binding_application_id,
-                                application_client_bindings.client_db_id AS binding_client_db_id,
-                                application_client_bindings.protocol AS binding_protocol,
-                                application_client_bindings.authorization_profile_id AS binding_authorization_profile_id,
-                                application_client_bindings.auth_domain_id AS binding_auth_domain_id,
-                                application_client_bindings.is_active AS binding_is_active,
-                                application_client_bindings.created_at AS binding_created_at,
-                                application_client_bindings.updated_at AS binding_updated_at
-                         FROM clients
-                         LEFT JOIN application_client_bindings
-                           ON application_client_bindings.client_db_id = clients.id
-                         WHERE clients.id = {}",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(client_id)
-                        .get_result::<ClientBindingBoundaryRow>(conn)
-                        .optional()
-                        .map_err(AppError::from)?
-                } else {
-                    None
-                };
-                let client_state = client_boundary.as_ref().map(|boundary| ClientActivityRow {
-                    organization_id: boundary.organization_id.clone(),
-                    is_active: boundary.client_is_active,
-                });
-                let binding = client_boundary.as_ref().and_then(|boundary| {
-                    Some(ApplicationClientBindingRecord {
-                        application_id: boundary.binding_application_id.clone()?,
-                        client_db_id: boundary.binding_client_db_id.clone()?,
-                        protocol: boundary.binding_protocol.clone()?,
-                        authorization_profile_id: boundary
-                            .binding_authorization_profile_id
-                            .clone()?,
-                        auth_domain_id: boundary.binding_auth_domain_id.clone()?,
-                        is_active: boundary.binding_is_active?,
-                        created_at: boundary.binding_created_at?,
-                        updated_at: boundary.binding_updated_at?,
-                    })
-                });
-
-                let application_id = requested_application_id
-                    .as_deref()
-                    .or_else(|| binding.as_ref().map(|value| value.application_id.as_str()));
-                let application = if let Some(application_id) = application_id {
-                    let sql = format!(
-                        "{} WHERE id = {}",
-                        select_application_sql(),
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(application_id)
-                        .get_result::<ApplicationRecord>(conn)
-                        .optional()
-                        .map_err(AppError::from)?
-                } else {
-                    None
-                };
-
-                let profile_selector = requested_profile_id.or_else(|| {
-                    binding
-                        .as_ref()
-                        .map(|value| value.authorization_profile_id.clone())
-                });
-                let profile = match (application.as_ref(), profile_selector.as_deref()) {
-                    (Some(application), Some("default")) => {
-                        let sql = format!(
-                            "{} WHERE application_id = {} AND profile_key = {}",
-                            select_application_authorization_profile_sql(),
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        sql_query(sql)
-                            .bind::<Text, _>(&application.id)
-                            .bind::<Text, _>("default")
-                            .get_result::<ApplicationAuthorizationProfileRecord>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                    }
-                    (Some(application), Some(profile_id)) => {
-                        let sql = format!(
-                            "{} WHERE id = {} AND application_id = {}",
-                            select_application_authorization_profile_sql(),
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        sql_query(sql)
-                            .bind::<Text, _>(profile_id)
-                            .bind::<Text, _>(&application.id)
-                            .get_result::<ApplicationAuthorizationProfileRecord>(conn)
-                            .optional()
-                            .map_err(AppError::from)?
-                    }
-                    _ => None,
-                };
-
-                let user_active = {
-                    let sql = format!(
-                        "SELECT is_active, archived_at FROM users WHERE id = {}",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&user_id)
-                        .get_result::<UserActivityRow>(conn)
-                        .optional()
-                        .map_err(AppError::from)?
-                        .is_some_and(|user| user.is_active == 1 && user.archived_at.is_none())
-                };
-
-                let (organization_active, membership, runtime_active) =
-                    if let Some(application) = application.as_ref() {
-                        let membership_sql = format!(
-                            "SELECT organizations.is_active AS organization_is_active,
-                                    organizations.id AS membership_id,
-                                    organizations.slug AS membership_slug,
-                                    organizations.name AS membership_name,
-                                    COALESCE(organizations.kind, 'tenant') AS membership_kind,
-                                    organizations.description AS membership_description,
-                                    organizations.is_active AS membership_is_active,
-                                    organization_members.role AS membership_role,
-                                    organization_members.created_at AS membership_created_at,
-                                    organization_members.updated_at AS membership_updated_at
-                             FROM organizations
-                             LEFT JOIN organization_members
-                               ON organization_members.organization_id = organizations.id
-                              AND organization_members.user_id = {}
-                             WHERE organizations.id = {}",
-                            ph(kind, 1),
-                            ph(kind, 2)
-                        );
-                        let organization_membership = sql_query(membership_sql)
-                            .bind::<Text, _>(&user_id)
-                            .bind::<Text, _>(&application.organization_id)
-                            .get_result::<PolicyOrganizationMembershipRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?;
-                        let organization_active = organization_membership
-                            .as_ref()
-                            .is_some_and(|organization| organization.organization_is_active == 1);
-                        let membership = organization_membership.and_then(|row| {
-                            Some(UserOrganizationRecord {
-                                id: row.membership_id?,
-                                slug: row.membership_slug?,
-                                name: row.membership_name?,
-                                kind: row.membership_kind?,
-                                description: row.membership_description,
-                                is_active: row.membership_is_active?,
-                                role: row.membership_role?,
-                                membership_created_at: row.membership_created_at?,
-                                membership_updated_at: row.membership_updated_at?,
-                            })
-                        });
-                        let discovery_sql = format!(
-                            "SELECT management_mode, last_verified_revision, last_verified_expires_at, snapshot_json, operator_disabled FROM application_discovery WHERE application_id = {}",
-                            ph(kind, 1)
-                        );
-                        let discovery = sql_query(discovery_sql)
-                            .bind::<Text, _>(&application.id)
-                            .get_result::<DiscoveryRuntimeRow>(conn)
-                            .optional()
-                            .map_err(AppError::from)?;
-                        let now = crate::util::now_ts();
-                        let runtime_active = discovery_runtime_is_active(discovery, now);
-                        (organization_active, membership, runtime_active)
-                    } else {
-                        (false, None, false)
-                    };
-
-                let application_modules = if let Some(application) = application.as_ref() {
-                    let module_sql = format!(
-                        "SELECT application_id, module_key, config_json, is_enabled, created_at, updated_at FROM application_modules WHERE application_id = {} AND module_key IN ({}, {})",
-                        ph(kind, 1),
-                        ph(kind, 2),
-                        ph(kind, 3)
-                    );
-                    let modules = sql_query(module_sql)
-                        .bind::<Text, _>(&application.id)
-                        .bind::<Text, _>("authorization")
-                        .bind::<Text, _>("protocols")
-                        .load::<ApplicationModuleRecord>(conn)
-                        .map_err(AppError::from)?;
-                    let mut modules_by_key = BTreeMap::new();
-                    for module in modules {
-                        if modules_by_key
-                            .insert(module.module_key.clone(), module)
-                            .is_some()
-                        {
-                            return Err(AppError::Internal(
-                                "duplicate application module key".to_string(),
-                            ));
-                        }
-                    }
-                    modules_by_key
-                } else {
-                    BTreeMap::new()
-                };
-
-                let authorization_config = authorization_config(
-                    application_modules.get("authorization").cloned(),
-                )?;
-                let required_protocol = match &boundary {
-                    PolicyBoundary::Client {
-                        required_protocol, ..
-                    } => required_protocol.as_deref(),
-                    _ => None,
-                };
-                let protocol_enabled = if client_id.is_some() {
-                    let protocol = required_protocol.or_else(|| {
-                        binding
-                            .as_ref()
-                            .map(|value| value.protocol.as_str())
-                    });
-                    if let Some(_application) = application.as_ref() {
-                        protocol_module_enabled(
-                            application_modules.get("protocols").cloned(),
-                            protocol,
-                        )?
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                };
-                let binding_protocol_matches = required_protocol.is_none_or(|required| {
-                    binding.as_ref().is_some_and(|binding| {
-                        protocol_key(&binding.protocol) == protocol_key(required)
-                    })
-                });
-                let inherit_enterprise = authorization_config
-                    .get("inherit_enterprise_roles")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let scoped_subject = user_active
-                    && organization_active
-                    && membership.as_ref().is_some_and(|value| value.is_active == 1);
-
-                let groups = if scoped_subject {
-                    let sql = format!(
-                        "SELECT access_groups.id, access_groups.name, access_groups.description, access_groups.created_at, access_groups.updated_at, access_groups.version FROM access_groups INNER JOIN group_members ON access_groups.id = group_members.group_id WHERE group_members.user_id = {} ORDER BY access_groups.name ASC, access_groups.id ASC",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&user_id)
-                        .load::<GroupRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-                let group_ids = groups
-                    .iter()
-                    .map(|group| group.id.clone())
-                    .collect::<Vec<_>>();
-
-                let enterprise_roles = if scoped_subject && inherit_enterprise {
-                    let sql = format!(
-                        "SELECT roles.id, roles.name, roles.description, roles.is_system, roles.created_at, roles.updated_at FROM roles INNER JOIN user_roles ON roles.id = user_roles.role_id WHERE user_roles.user_id = {} ORDER BY roles.name ASC, roles.id ASC",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&user_id)
-                        .load::<RoleRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-
-                let enterprise_group_roles = if scoped_subject && inherit_enterprise {
-                    load_group_roles!(conn, kind, &group_ids)?
-                } else {
-                    BTreeMap::new()
-                };
-                let mut enterprise_role_ids = BTreeSet::new();
-                enterprise_role_ids.extend(enterprise_roles.iter().map(|role| role.id.clone()));
-                for roles in enterprise_group_roles.values() {
-                    enterprise_role_ids.extend(roles.iter().map(|role| role.id.clone()));
-                }
-                let enterprise_role_permissions =
-                    load_role_permissions!(conn, kind, &enterprise_role_ids)?;
-
-                let profile_roles = if let Some(profile) = profile.as_ref() {
-                    let sql = format!(
-                        "{} WHERE profile_id = {} ORDER BY is_active DESC, name ASC, id ASC",
-                        select_application_profile_role_sql(),
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile.id)
-                        .load::<ApplicationProfileRoleRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-                let profile_user_assignments = if let Some(profile) = profile.as_ref() {
-                    let sql = format!(
-                        "SELECT profile_id, user_id AS subject_id, role_id, is_active FROM application_profile_user_roles WHERE profile_id = {} AND user_id = {} ORDER BY role_id ASC",
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile.id)
-                        .bind::<Text, _>(&user_id)
-                        .load::<ApplicationProfileRoleAssignmentRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-                let profile_group_assignments = if let Some(profile) = profile.as_ref() {
-                    load_profile_group_assignments!(conn, kind, &profile.id, &group_ids)?
-                } else {
-                    Vec::new()
-                };
-                let profile_organization_assignments = if let Some(profile) = profile.as_ref() {
-                    let sql = format!(
-                        "SELECT profile_id, organization_role, role_id, is_active FROM application_profile_organization_roles WHERE profile_id = {} ORDER BY organization_role ASC, role_id ASC",
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile.id)
-                        .load::<ApplicationProfileOrganizationRoleAssignmentRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-                let profile_permission_overrides = if let Some(profile) = profile.as_ref() {
-                    let sql = format!(
-                        "{} WHERE profile_id = {} AND user_id = {} ORDER BY permission ASC",
-                        select_application_profile_permission_override_sql(),
-                        ph(kind, 1),
-                        ph(kind, 2)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(&profile.id)
-                        .bind::<Text, _>(&user_id)
-                        .load::<ApplicationProfilePermissionOverrideRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-
-                let claim_mappers = if let Some(client_id) = client_id.as_ref() {
-                    let sql = format!(
-                        "{} WHERE client_db_id = {} ORDER BY sort_order ASC, created_at ASC",
-                        select_client_claim_mapper_sql(),
-                        ph(kind, 1)
-                    );
-                    sql_query(sql)
-                        .bind::<Text, _>(client_id)
-                        .load::<ClientClaimMapperRecord>(conn)
-                        .map_err(AppError::from)?
-                } else {
-                    Vec::new()
-                };
-                let application_matches_client = match (application.as_ref(), client_state.as_ref()) {
-                    (Some(application), Some(client)) => client.organization_id.as_deref()
-                        == Some(application.organization_id.as_str()),
-                    (None, _) => false,
-                    (_, None) if client_id.is_some() => false,
-                    (_, None) => true,
-                };
-                let binding_active = client_id.as_ref().is_none_or(|client_id| {
-                    binding.as_ref().is_some_and(|binding| {
-                        binding.client_db_id == *client_id
-                            && binding.is_active == 1
-                            && application
-                                .as_ref()
-                                .is_some_and(|application| binding.application_id == application.id)
-                    })
-                });
-                let profile_active = profile.as_ref().is_some_and(|profile| {
-                    application
-                        .as_ref()
-                        .is_some_and(|application| profile.application_id == application.id)
-                });
-                let client_active = client_id.as_ref().is_none_or(|_| {
-                    client_state.as_ref().is_some_and(|client| client.is_active == 1)
-                });
-                let is_authorizable = application.as_ref().is_some_and(|application| {
-                    application.is_active == 1
-                        && application_runtime_active(
-                            application,
-                            organization_active,
-                            runtime_active,
-                        )
-                }) && user_active
-                    && application_matches_client
-                    && client_active
-                    && binding_active
-                    && protocol_enabled
-                    && binding_protocol_matches
-                    && profile_active;
-
-                Ok(AuthorizationPolicySnapshot {
-                    application,
-                    binding,
-                    profile,
-                    user_id,
-                    user_active,
-                    client_id,
-                    client_active,
-                    client_organization_id: client_state
-                        .as_ref()
-                        .and_then(|client| client.organization_id.clone()),
-                    organization_active,
-                    membership,
-                    groups,
-                    enterprise_roles,
-                    enterprise_group_roles,
-                    enterprise_role_permissions,
-                    authorization_config,
-                    application_runtime_active: runtime_active,
-                    protocol_enabled,
-                    profile_roles,
-                    profile_user_assignments,
-                    profile_group_assignments,
-                    profile_organization_assignments,
-                    profile_permission_overrides,
-                    claim_mappers,
-                    is_authorizable,
-                })
+                policy_snapshot_on_connection!(conn, kind, boundary, user_id)
             })
         })
     }
