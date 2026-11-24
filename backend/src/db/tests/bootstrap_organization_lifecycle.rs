@@ -2,6 +2,96 @@ use super::*;
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn bootstrap_verified_website_mode_conflict_leaves_incumbent_intact() {
+    use crate::application_discovery_contract::{
+        MANAGEMENT_MODE_SIGNET, MANAGEMENT_MODE_WEBSITE, SYNC_ACCEPTED,
+    };
+
+    let (db, path) = sqlite_test_db().await;
+    let system = db.system_organization().await.unwrap();
+    let mut settings: Settings =
+        toml::from_str(include_str!("../../../../config/default.toml")).unwrap();
+    settings.bootstrap.admin.create_on_startup = false;
+    settings.external_oidc_providers.clear();
+    settings.bootstrap.applications = vec![toml::from_str(
+        r#"
+        application_id = "incumbent-fixture"
+        name = "Existing website"
+        website_url = "https://incumbent.example"
+        management_mode = "website_managed"
+        "#,
+    )
+    .unwrap()];
+    settings.bootstrap.clients = vec![bootstrap_client("fixture-client-secret")];
+    db.seed(&settings).await.unwrap();
+    let application = db
+        .find_application_by_slug_in_organization(&system.id, "incumbent-fixture")
+        .await
+        .unwrap()
+        .unwrap();
+    let discovery = db.find_application_discovery(&application.id).await.unwrap().unwrap();
+    let now = util::now_ts();
+    db.upsert_application_discovery(
+        NewApplicationDiscovery {
+            application_id: application.id.clone(),
+            management_mode: MANAGEMENT_MODE_WEBSITE.into(),
+            website_url: discovery.website_url,
+            fetch_secret_ciphertext: discovery.fetch_secret_ciphertext,
+            signing_public_jwks: r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}"#.into(),
+            last_verified_revision: Some(7),
+            last_verified_version: Some("v1".into()),
+            last_verified_digest: Some("fixture-digest".into()),
+            last_verified_expires_at: Some(now + 3600),
+            sync_status: SYNC_ACCEPTED.into(),
+            last_fetched_at: Some(now),
+            last_success_at: Some(now),
+            last_error: None,
+            snapshot_json: None,
+            operator_disabled: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    db.seed(&settings).await.unwrap();
+    let before = db.find_application_discovery(&application.id).await.unwrap().unwrap();
+    assert_eq!(before.last_verified_revision, Some(7));
+    assert_eq!(before.sync_status, SYNC_ACCEPTED);
+    let client_id = settings.bootstrap.clients[0].client_id.clone();
+    let client = db.find_client_by_client_id(&client_id).await.unwrap().unwrap();
+
+    settings.bootstrap.applications[0].management_mode = MANAGEMENT_MODE_SIGNET.into();
+    settings.bootstrap.applications[0].name = "Must not replace existing website".into();
+    settings.bootstrap.clients[0].client_name = "Must not replace existing client".into();
+    assert!(matches!(
+        db.seed(&settings).await,
+        Err(AppError::Configuration(message)) if message.contains("changes management_mode")
+    ));
+    let after_app = db.find_application_by_slug_in_organization(&system.id, "incumbent-fixture")
+        .await.unwrap().unwrap();
+    assert_eq!(after_app.id, application.id);
+    assert_eq!(after_app.name, application.name);
+    assert_eq!(after_app.access_mode, application.access_mode);
+    assert_eq!(after_app.registration_mode, application.registration_mode);
+    assert_eq!(after_app.is_active, application.is_active);
+    let after = db.find_application_discovery(&application.id).await.unwrap().unwrap();
+    assert_eq!(after.management_mode, before.management_mode);
+    assert_eq!(after.website_url, before.website_url);
+    assert_eq!(after.last_verified_revision, before.last_verified_revision);
+    assert_eq!(after.last_verified_digest, before.last_verified_digest);
+    assert_eq!(after.sync_status, before.sync_status);
+    let after_client = db.find_client_by_client_id(&client_id).await.unwrap().unwrap();
+    assert_eq!(after_client.id, client.id);
+    assert_eq!(after_client.client_name, client.client_name);
+    assert_eq!(after_client.redirect_uris, client.redirect_uris);
+    assert_eq!(after_client.grant_types, client.grant_types);
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn bootstrap_scoped_axon_requires_pinned_bearer_and_never_reparents() {
     let (db, path) = sqlite_test_db().await;
     let target = db.insert_organization(test_organization("scoped-axon", "Scoped Axon")).await.unwrap();

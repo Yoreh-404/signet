@@ -799,6 +799,23 @@ impl Db {
                 application.application_id.trim(),
             )
             .await?;
+        let existing_discovery = match &existing {
+            Some(app) => self.find_application_discovery(&app.id).await?,
+            None => None,
+        };
+        if let Some(discovery) = existing_discovery.as_ref()
+            && bootstrap_management_mode_change_requires_admin(
+                &discovery.management_mode,
+                &application.management_mode,
+                discovery.last_verified_revision.is_some(),
+                application.is_active,
+            )
+        {
+            return Err(AppError::Configuration(format!(
+                "bootstrap application {} changes management_mode after a verified Discovery snapshot; switch it through the admin API",
+                application.application_id
+            )));
+        }
         let application_record = if let Some(existing) = existing {
             self.update_application(
                 &existing.id,
@@ -831,22 +848,6 @@ impl Db {
             })
             .await?
         };
-        let existing_discovery = self
-            .find_application_discovery(&application_record.id)
-            .await?;
-        if let Some(existing_discovery) = existing_discovery.as_ref()
-            && bootstrap_management_mode_change_requires_admin(
-                &existing_discovery.management_mode,
-                &application.management_mode,
-                existing_discovery.last_verified_revision.is_some(),
-                application.is_active,
-            )
-        {
-            return Err(AppError::Configuration(format!(
-                "bootstrap application {} changes management_mode after a verified Discovery snapshot; switch it through the admin API",
-                application.application_id
-            )));
-        }
         let (fetch_secret_ciphertext, fetch_secret_changed) =
             resolve_bootstrap_discovery_fetch_secret(
                 existing_discovery
