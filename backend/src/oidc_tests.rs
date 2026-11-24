@@ -1848,9 +1848,10 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         .await.unwrap().unwrap();
     let app = state.db.find_application_by_id(&binding.application_id).await.unwrap().unwrap();
     let origin = "https://axon.example";
-    let issuer = "https://signet.example";
+    let effective_issuer = state.effective_issuer(&HeaderMap::new()).await.unwrap();
+    let issuer = effective_issuer.as_str();
+    assert!(state.accepted_issuers(&HeaderMap::new()).await.unwrap().contains(&effective_issuer));
     let audience = "https://axon.example/admin";
-    state.settings.oidc.issuer = issuer.to_owned();
     let verifier = insert_test_oidc_client(
         &state, "incumbent-website-verifier", "https://verifier.example/callback", "",
     ).await;
@@ -1941,7 +1942,11 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert_eq!(response.status(), StatusCode::OK);
     let response = oidc_http_body_json(response).await;
     let token = response["access_token"].as_str().unwrap();
-    assert_eq!(state.jwt.verify_access_token(token).unwrap().sub, current.user.id);
+    let claims = state.jwt.verify_access_token_for_introspection(token, &[issuer])
+        .expect("fixture token must verify against the configured purpose issuer");
+    assert_eq!(claims.sub, current.user.id);
+    assert_eq!(claims.iss, issuer);
+    assert_eq!(claims.aud, audience);
     let body: serde_json::Value = serde_json::from_slice(
         &URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
     assert!(body.get("axon_admin_authority_v3").is_none());
