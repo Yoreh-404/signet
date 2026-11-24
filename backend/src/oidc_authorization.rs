@@ -363,6 +363,18 @@ impl AuthorizationSnapshot {
             .db
             .load_client_policy_snapshot_for_protocol(&client.id, &user.id, "oauth2_oidc")
             .await?;
+        Self::from_current_policy(state, client, user, policy)
+    }
+
+    /// Apply ordinary interactive checks and derive ordinary claim state from
+    /// the caller's current graph, without provisioning or a second checkout.
+    /// This does not identify or grant an incumbent token purpose.
+    pub(crate) fn from_current_policy(
+        state: &AppState,
+        client: &ClientRecord,
+        user: &UserRecord,
+        policy: authorization::AuthorizationPolicySnapshot,
+    ) -> AppResult<Self> {
         if !policy.is_authorizable
             || !policy.is_interactive_client_runtime_active()
             || !policy.has_client_application_boundary(&client.id)
