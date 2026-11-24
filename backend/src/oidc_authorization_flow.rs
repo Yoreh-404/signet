@@ -3,14 +3,12 @@ use crate::{
     AppState,
     assurance::{self, AssurancePolicy},
     auth,
-    auth_domain::ApplicationAuthContext,
     auth_flow,
     consent::OidcConsentPolicy,
-    db::{ClientRecord, NewApplicationAuthContext, SessionRecord, UserRecord},
+    db::{ClientRecord, SessionRecord, UserRecord},
     error::AppResult,
     mfa_policy::MfaDecision,
     network_policy::TrustedNetworkPolicy,
-    util,
 };
 use axum::http::HeaderMap;
 use std::net::SocketAddr;
@@ -89,47 +87,4 @@ pub(super) async fn authorization_mfa_decision(
         user_has_totp,
         policy_requires_mfa,
     )
-}
-
-pub(super) async fn find_or_create_application_auth_context(
-    state: &AppState,
-    auth_domain_id: &str,
-    user_id: &str,
-    acr: &str,
-    amr: &[String],
-    authenticated_at: i64,
-    now: i64,
-) -> AppResult<String> {
-    if let Some(existing) = state
-        .db
-        .find_application_auth_context(auth_domain_id, user_id)
-        .await?
-    {
-        let existing_context = ApplicationAuthContext {
-            id: existing.id,
-            auth_domain_id: existing.auth_domain_id,
-            user_id: existing.user_id,
-            acr: existing.acr,
-            amr: util::from_json(&existing.amr)?,
-            authenticated_at: existing.authenticated_at,
-            expires_at: existing.expires_at,
-        };
-        if existing_context.can_satisfy(Some(acr), now) {
-            return Ok(existing_context.id);
-        }
-    }
-
-    Ok(state
-        .db
-        .insert_application_auth_context(NewApplicationAuthContext {
-            id: uuid::Uuid::new_v4().to_string(),
-            auth_domain_id: auth_domain_id.to_string(),
-            user_id: user_id.to_string(),
-            acr: acr.to_string(),
-            amr: amr.to_vec(),
-            authenticated_at,
-            expires_at: now + 3600,
-        })
-        .await?
-        .id)
 }

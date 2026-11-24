@@ -230,6 +230,74 @@ pub(super) fn insert_sqlite_application_auth_context_on_conn(
     insert_auth_context_on_conn!(conn, DatabaseKind::Sqlite, context, amr, now)
 }
 
+struct ApplicationAuthContextSelection<'a> {
+    auth_domain_id: &'a str,
+    user_id: &'a str,
+    acr: &'a str,
+    amr: &'a [String],
+    authenticated_at: i64,
+    now: i64,
+}
+
+enum ApplicationAuthContextDisposition {
+    Reuse(String),
+    Insert(NewApplicationAuthContext),
+}
+
+impl ApplicationAuthContextSelection<'_> {
+    fn select(
+        self,
+        existing: Option<ApplicationAuthContextRecord>,
+    ) -> AppResult<ApplicationAuthContextDisposition> {
+        if let Some(existing) = existing {
+            let existing_context = crate::auth_domain::ApplicationAuthContext {
+                id: existing.id,
+                auth_domain_id: existing.auth_domain_id,
+                user_id: existing.user_id,
+                acr: existing.acr,
+                amr: util::from_json(&existing.amr)?,
+                authenticated_at: existing.authenticated_at,
+                expires_at: existing.expires_at,
+            };
+            if existing_context.can_satisfy(Some(self.acr), self.now) {
+                return Ok(ApplicationAuthContextDisposition::Reuse(existing_context.id));
+            }
+        }
+
+        Ok(ApplicationAuthContextDisposition::Insert(NewApplicationAuthContext {
+            id: uuid::Uuid::new_v4().to_string(),
+            auth_domain_id: self.auth_domain_id.to_string(),
+            user_id: self.user_id.to_string(),
+            acr: self.acr.to_string(),
+            amr: self.amr.to_vec(),
+            authenticated_at: self.authenticated_at,
+            expires_at: self.now + 3600,
+        }))
+    }
+}
+
+/// Resolve context persistence only. Nothing here makes an admission decision.
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)] // Incumbent code admission is not mounted.
+pub(super) fn find_or_create_sqlite_application_auth_context_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    auth_domain_id: &str,
+    user_id: &str,
+    acr: &str,
+    amr: &[String],
+    authenticated_at: i64,
+    now: i64,
+) -> AppResult<String> {
+    let input = ApplicationAuthContextSelection { auth_domain_id, user_id, acr, amr, authenticated_at, now };
+    let existing = find_sqlite_application_auth_context_on_conn(conn, auth_domain_id, user_id)?;
+    match input.select(existing)? {
+        ApplicationAuthContextDisposition::Reuse(id) => Ok(id),
+        ApplicationAuthContextDisposition::Insert(context) => {
+            Ok(insert_sqlite_application_auth_context_on_conn(conn, context)?.id)
+        }
+    }
+}
+
 impl Db {
     pub async fn list_applications(
         &self,
@@ -417,6 +485,25 @@ impl Db {
         with_conn!(self, |conn, kind| {
             insert_auth_context_on_conn!(&mut conn, kind, context, amr, now)
         })
+    }
+
+    pub(crate) async fn find_or_create_application_auth_context(
+        &self,
+        auth_domain_id: &str,
+        user_id: &str,
+        acr: &str,
+        amr: &[String],
+        authenticated_at: i64,
+        now: i64,
+    ) -> AppResult<String> {
+        let input = ApplicationAuthContextSelection { auth_domain_id, user_id, acr, amr, authenticated_at, now };
+        let existing = self.find_application_auth_context(auth_domain_id, user_id).await?;
+        match input.select(existing)? {
+            ApplicationAuthContextDisposition::Reuse(id) => Ok(id),
+            ApplicationAuthContextDisposition::Insert(context) => {
+                Ok(self.insert_application_auth_context(context).await?.id)
+            }
+        }
     }
 
     pub async fn list_application_client_bindings(
@@ -1984,6 +2071,21 @@ mod tests {
                     .id,
                 row.id,
             );
+            let amr = vec!["pwd".to_owned()];
+            let reused = find_or_create_sqlite_application_auth_context_on_conn(
+                conn, "fixture-domain", "fixture-user", "fixture-acr", &amr, 124, 456,
+            ).unwrap();
+            assert_eq!(reused, row.id, "context remains usable at its inclusive expiry");
+            let refreshed = find_or_create_sqlite_application_auth_context_on_conn(
+                conn, "fixture-domain", "fixture-user", "fixture-acr", &amr, 124, 457,
+            ).unwrap();
+            assert_ne!(refreshed, row.id);
+            let latest = find_sqlite_application_auth_context_on_conn(conn, "fixture-domain", "fixture-user")
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.id, refreshed);
+            assert_eq!(latest.authenticated_at, 124);
+            assert_eq!(latest.expires_at, 457 + 3600);
             Err(Error::RollbackTransaction)
         });
         assert!(matches!(rollback, Err(Error::RollbackTransaction)));

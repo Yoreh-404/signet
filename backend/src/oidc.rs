@@ -59,7 +59,7 @@ mod oidc_values;
 mod website_token;
 use oidc_authorization_flow::{
     AuthorizationHttpContext, AuthorizationSessionFreshness, authorization_mfa_decision,
-    find_or_create_application_auth_context, requires_authorization_consent,
+    requires_authorization_consent,
 };
 #[cfg(test)]
 use oidc_browser_interaction::{
@@ -1048,16 +1048,18 @@ async fn prepare_authorization_code(
         assurance::DefaultAssurancePolicy.select_acr(&session_assurance, &requested_assurance)?;
     assurance::DefaultAssurancePolicy.assert_amr(&session_assurance, &requested_assurance)?;
     let now = util::now_ts();
-    let auth_context_id = find_or_create_application_auth_context(
-        context.state,
-        &client_binding.auth_domain_id,
-        &user.id,
-        &acr,
-        &session_assurance.amr,
-        session.created_at,
-        now,
-    )
-    .await?;
+    let auth_context_id = context
+        .state
+        .db
+        .find_or_create_application_auth_context(
+            &client_binding.auth_domain_id,
+            &user.id,
+            &acr,
+            &session_assurance.amr,
+            session.created_at,
+            now,
+        )
+        .await?;
     let authorization_details = authorization_details::normalize_authorization_details_for_client(
         client,
         request.authorization_details.as_deref(),
