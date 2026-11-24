@@ -1010,6 +1010,46 @@ struct PreparedAuthorizationCode {
     row: NewAuthorizationCode,
 }
 
+// Assemble the existing code row only after the caller has resolved its
+// auth context and normalized the request. This does not admit or store it.
+fn build_authorization_code_material(
+    request: &ResolvedAuthorizeRequest,
+    requested_scopes: &[String],
+    session: &SessionRecord,
+    client: &ClientRecord,
+    user: &UserRecord,
+    application_id: &str,
+    profile_id: &str,
+    auth_context_id: String,
+    code: String,
+    acr: String,
+    amr: Vec<String>,
+    authorization_details: Option<String>,
+    ttl_seconds: i64,
+) -> PreparedAuthorizationCode {
+    let row = NewAuthorizationCode {
+        code: code.clone(),
+        client_id: client.client_id.clone(),
+        user_id: user.id.clone(),
+        application_id: Some(application_id.to_owned()),
+        authorization_profile_id: Some(profile_id.to_owned()),
+        auth_context_id: Some(auth_context_id),
+        session_id: Some(util::session_public_id(&session.id)),
+        redirect_uri: request.redirect_uri.clone(),
+        scope: requested_scopes.join(" "),
+        resource: request.resource.clone(),
+        authorization_details: authorization_details.clone(),
+        nonce: request.nonce.clone(),
+        code_challenge: request.code_challenge.clone(),
+        code_challenge_method: request.code_challenge_method.clone(),
+        auth_time: session.created_at,
+        acr,
+        amr: amr,
+        expires_at: util::now_ts() + ttl_seconds,
+    };
+    PreparedAuthorizationCode { redirect_code: code, row }
+}
+
 async fn prepare_authorization_code(
     context: &AuthorizationHttpContext<'_>,
     user: &UserRecord,
@@ -1064,27 +1104,21 @@ async fn prepare_authorization_code(
         client,
         request.authorization_details.as_deref(),
     )?;
-    let row = NewAuthorizationCode {
-        code: code.clone(),
-        client_id: client.client_id.clone(),
-        user_id: user.id.clone(),
-        application_id: Some(application.id.clone()),
-        authorization_profile_id: Some(client_binding.authorization_profile_id.clone()),
-        auth_context_id: Some(auth_context_id),
-        session_id: Some(util::session_public_id(&session.id)),
-        redirect_uri: request.redirect_uri.clone(),
-        scope: requested_scopes.join(" "),
-        resource: request.resource.clone(),
-        authorization_details: authorization_details.clone(),
-        nonce: request.nonce.clone(),
-        code_challenge: request.code_challenge.clone(),
-        code_challenge_method: request.code_challenge_method.clone(),
-        auth_time: session.created_at,
+    Ok(build_authorization_code_material(
+        request,
+        requested_scopes,
+        session,
+        client,
+        user,
+        &application.id,
+        &client_binding.authorization_profile_id,
+        auth_context_id,
+        code,
         acr,
-        amr: session_assurance.amr,
-        expires_at: util::now_ts() + context.state.settings.oidc.authorization_code_ttl_seconds,
-    };
-    Ok(PreparedAuthorizationCode { redirect_code: code, row })
+        session_assurance.amr,
+        authorization_details,
+        context.state.settings.oidc.authorization_code_ttl_seconds,
+    ))
 }
 
 async fn issue_authorization_code_redirect(
