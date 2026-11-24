@@ -337,7 +337,7 @@ pub(crate) mod sqlite {
 
     /// Consume only a code admitted for the active exact incumbent policy.
     /// This is not mounted and does not grant or issue any token.
-    pub(crate) fn consume_incumbent_code<'a>(
+    pub(crate) fn consume_incumbent_code<'a, T>(
         conn: &mut SqliteConnection,
         gate: &RestoreInterlock,
         pin: &IncumbentPin<'_>,
@@ -346,7 +346,8 @@ pub(crate) mod sqlite {
         client_id: &str,
         redirect_uri: &str,
         code_verifier: &str,
-    ) -> crate::error::AppResult<CommittedIncumbentCode<'a>> {
+        complete: impl FnOnce(&mut SqliteConnection, &CommittedIncumbentCode<'a>) -> crate::error::AppResult<T>,
+    ) -> crate::error::AppResult<(CommittedIncumbentCode<'a>, T)> {
         use crate::error::AppError;
         conn.immediate_transaction::<_, AppError, _>(|conn| {
             let snapshot = RestoreSnapshot::capture(gate).ok_or(AppError::Forbidden)?;
@@ -361,10 +362,12 @@ pub(crate) mod sqlite {
                 .ok_or(AppError::Forbidden)?;
             let cleared = sql_query("DELETE FROM axon_v3_incumbent_code_provenance WHERE code_sha256=?")
                 .bind::<Text,_>(crate::util::sha256_base64url(&row.code)).execute(conn)?;
+            let proof = CommittedIncumbentCode::from_current_exchange(row, session, pin, approved)?;
+            let result = complete(conn, &proof)?;
             if cleared != 1 || !snapshot.unchanged() {
                 return Err(AppError::Forbidden);
             }
-            CommittedIncumbentCode::from_current_exchange(row, session, pin, approved)
+            Ok((proof, result))
         })
     }
 

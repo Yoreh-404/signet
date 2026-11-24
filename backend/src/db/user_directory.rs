@@ -20,6 +20,25 @@ use diesel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+macro_rules! find_user_by_id_on_conn {
+    ($conn:expr, $kind:expr, $id:expr) => {{
+        let sql = format!("{} WHERE id = {}", select_user_sql(), ph($kind, 1));
+        sql_query(sql)
+            .bind::<Text, _>($id)
+            .get_result::<UserRecord>($conn)
+            .optional()
+            .map_err(AppError::from)
+    }};
+}
+
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+pub(crate) fn find_sqlite_user_by_id_on_conn(
+    conn: &mut diesel::SqliteConnection,
+    user_id: &str,
+) -> AppResult<Option<UserRecord>> {
+    find_user_by_id_on_conn!(conn, DatabaseKind::Sqlite, user_id)
+}
+
 #[derive(Debug, diesel::QueryableByName)]
 struct UserOverviewCountRow {
     #[diesel(sql_type = BigInt)]
@@ -352,12 +371,7 @@ impl Db {
     pub async fn find_user_by_id(&self, id: &str) -> AppResult<Option<UserRecord>> {
         let id = id.to_string();
         with_conn!(self, |conn, kind| {
-            let sql = format!("{} WHERE id = {}", select_user_sql(), ph(kind, 1));
-            sql_query(sql)
-                .bind::<Text, _>(id)
-                .get_result::<UserRecord>(&mut conn)
-                .optional()
-                .map_err(AppError::from)
+            find_user_by_id_on_conn!(&mut conn, kind, id)
         })
     }
 

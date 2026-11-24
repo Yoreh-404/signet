@@ -1119,6 +1119,74 @@ fn store_incumbent_authorization_code(
         Ok(redirect_code)
     })
 }
+/// Complete the exact incumbent exchange using the normal access signer and
+/// claim machinery. No route calls this and the token embeds no admin authority.
+#[cfg(all(target_os = "linux", feature = "sqlite", feature = "axon-incumbent-storage"))]
+#[allow(dead_code)] // Mounting requires an exact operator input and live verifier.
+fn exchange_incumbent_access_token<'a>(
+    conn: &mut diesel::SqliteConnection,
+    state: &AppState,
+    effective_issuer: &str,
+    gate: &crate::application_discovery::axon_v3_restore::RestoreInterlock,
+    pin: &crate::application_discovery::incumbent_preflight::IncumbentPin<'_>,
+    approved: &'a crate::application_discovery::axon_v3_acceptance::VerifiedPolicy,
+    code: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> AppResult<(crate::db::axon_v3_incumbent_storage::sqlite::CommittedIncumbentCode<'a>, String)> {
+    use crate::db::{
+        axon_v3_incumbent_storage::sqlite, find_sqlite_client_by_client_id_on_conn,
+        find_sqlite_user_by_id_on_conn, load_sqlite_oidc_policy_snapshot_on_conn,
+    };
+
+    if effective_issuer != approved.policy().issuer {
+        return Err(AppError::Forbidden);
+    }
+    sqlite::consume_incumbent_code(
+        conn, gate, pin, approved, code, client_id, redirect_uri, verifier,
+        |conn, evidence| {
+            let user = find_sqlite_user_by_id_on_conn(conn, evidence.user_id())?
+                .ok_or(AppError::Forbidden)?;
+            let signed = evidence.approved_policy().policy();
+            let client = find_sqlite_client_by_client_id_on_conn(conn, &signed.client_id)?
+                .filter(|client| client.id == evidence.client_db_id())
+                .ok_or(AppError::Forbidden)?;
+            let graph = load_sqlite_oidc_policy_snapshot_on_conn(conn, &client.id, &user.id)?;
+            if !graph.has_profile_application_boundary()
+                || !graph.application.as_ref().is_some_and(|row| row.id == evidence.application_db_id())
+                || !graph.profile.as_ref().is_some_and(|row| row.id == evidence.profile_id())
+                || !graph.binding.as_ref().is_some_and(|row| row.authorization_profile_id == evidence.profile_id())
+            {
+                return Err(AppError::Forbidden);
+            }
+            let snapshot = AuthorizationSnapshot::from_current_policy(state, &client, &user, graph)?;
+            let mut claims = snapshot.claims_for_user(
+                &client, &user, evidence.scope(), crate::claim_mapper::ClaimOutputTarget::AccessToken,
+            )?;
+            claims.remove("axon_admin");
+            claims.remove("axon_admin_authority_v3");
+            claims.insert("application_id".into(), evidence.application_db_id().into());
+            claims.insert("authorization_profile_id".into(), evidence.profile_id().into());
+            oidc_token::insert_sid_claim(&mut claims, Some(evidence.public_sid()));
+
+            state.jwt.sign_access_token_with_issuer_and_claims(
+                effective_issuer,
+                crate::jwt::TokenSubject {
+                    user: &user,
+                    client_id: &signed.client_id,
+                    audience: Some(&signed.audience),
+                    scope: evidence.scope(),
+                    nonce: None,
+                    auth_time: Some(evidence.auth_time()),
+                },
+                state.settings.oidc.access_token_ttl_seconds,
+                claims,
+            )
+        },
+    )
+}
+
 
 // Assemble the existing code row only after the caller has resolved its
 // auth context and normalized the request. This does not admit or store it.

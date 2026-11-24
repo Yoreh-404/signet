@@ -2139,8 +2139,9 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .bind::<Text,_>(code).get_result::<Count>(conn).unwrap().count
                 };
                 let redeem = |conn: &mut diesel::SqliteConnection, code: &str| {
-                    crate::db::axon_v3_incumbent_storage::sqlite::consume_incumbent_code(
-                        conn, gate, &pin, &approved, code, &client.client_id, &callback, challenge_verifier,
+                    exchange_incumbent_access_token(
+                        conn, &state, issuer, gate, &pin, &approved, code,
+                        &client.client_id, &callback, challenge_verifier,
                     )
                 };
                 assert_eq!(available(conn, &ordinary_code), 1);
@@ -2228,7 +2229,32 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                         .get_result::<Count>(conn).unwrap().count
                 };
                 assert_eq!(markers(conn), 1, "failed admission must not leave a second marker");
-                let redeemed = redeem(conn, &code).unwrap();
+                let set_profile = |conn: &mut diesel::SqliteConnection, profile_id: &str| {
+                    sql_query("UPDATE application_client_bindings SET authorization_profile_id=? WHERE application_id=? AND client_db_id=?")
+                        .bind::<Text,_>(profile_id).bind::<Text,_>(&app.id).bind::<Text,_>(&client.id)
+                        .execute(conn).unwrap()
+                };
+                assert_eq!(set_profile(conn, "no-longer-the-code-profile"), 1);
+                assert!(matches!(redeem(conn, &code), Err(AppError::Forbidden)));
+                assert_eq!(available(conn, &code), 1);
+                assert_eq!(markers(conn), 1, "profile denial must roll back consume and marker deletion");
+                assert_eq!(set_profile(conn, &binding.authorization_profile_id), 1);
+                let (redeemed, access_token) = redeem(conn, &code).unwrap();
+                let token_claims = state.jwt.verify_access_token_for_introspection(&access_token, &[issuer])
+                    .expect("ordinary signer returned the current scoped access token");
+                assert_eq!(token_claims.iss, issuer);
+                assert_eq!(token_claims.sub, current.user.id);
+                assert_eq!(token_claims.aud, audience);
+                assert_eq!(token_claims.client_id, client.client_id);
+                assert_eq!(token_claims.scope, "openid");
+                assert_eq!(token_claims.sid.as_deref(), Some(redeemed.public_sid()));
+                assert_eq!(token_claims.exp - token_claims.iat, state.settings.oidc.access_token_ttl_seconds);
+                let signed_payload: serde_json::Value = serde_json::from_slice(
+                    &URL_SAFE_NO_PAD.decode(access_token.split('.').nth(1).unwrap()).unwrap(),
+                ).unwrap();
+                for claim in ["axon_admin", "axon_admin_authority", "axon_admin_authority_v3"] {
+                    assert!(signed_payload.get(claim).is_none());
+                }
                 assert_eq!(redeemed.public_sid(), util::session_public_id(&current.session_id));
                 assert_eq!(redeemed.user_id(), current.user.id);
                 assert_eq!(redeemed.scope(), "openid");
