@@ -23,7 +23,7 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_activation (
 /// session bearer is stored: both lookups use their public/hash identities.
 pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_code_provenance (
     code_sha256 TEXT PRIMARY KEY NOT NULL,
-    user_id TEXT NOT NULL,
+    user_sha256 TEXT NOT NULL,
     session_public_id TEXT NOT NULL,
     application_db_id TEXT NOT NULL,
     client_db_id TEXT NOT NULL,
@@ -31,7 +31,8 @@ pub(crate) const CODE_PROVENANCE_SCHEMA: &str = "CREATE TABLE axon_v3_incumbent_
     signer_pin TEXT NOT NULL,
     policy_sha256 TEXT NOT NULL,
     revision BIGINT NOT NULL CHECK (revision > 0),
-    generation BIGINT NOT NULL CHECK (generation > 0)
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    code_expires_at BIGINT NOT NULL
 )";
 
 /// Current row identity for future exact compare-and-set; this is not a grant.
@@ -198,6 +199,7 @@ pub(crate) mod sqlite {
         row: &crate::db::NewAuthorizationCode,
         pin: &IncumbentPin<'_>,
         approved: &VerifiedPolicy,
+        now: i64,
     ) -> QueryResult<()> {
         let policy = approved.policy();
         let sid = row.session_id.as_deref().ok_or(Error::RollbackTransaction)?;
@@ -206,16 +208,20 @@ pub(crate) mod sqlite {
         {
             return Err(Error::RollbackTransaction);
         }
+        // Bound retention to the existing code expiry; no extra clock or job.
+        sql_query("DELETE FROM axon_v3_incumbent_code_provenance WHERE code_expires_at < ?")
+            .bind::<BigInt,_>(now).execute(conn)?;
         sql_query("INSERT INTO axon_v3_incumbent_code_provenance
-            (code_sha256,user_id,session_public_id,application_db_id,client_db_id,
-             enrollment_id,signer_pin,policy_sha256,revision,generation)
-             VALUES (?,?,?,?,?,?,?,?,?,?)")
+            (code_sha256,user_sha256,session_public_id,application_db_id,client_db_id,
+             enrollment_id,signer_pin,policy_sha256,revision,generation,code_expires_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)")
             .bind::<Text,_>(crate::util::sha256_base64url(&row.code))
-            .bind::<Text,_>(&row.user_id).bind::<Text,_>(sid)
+            .bind::<Text,_>(crate::util::sha256_base64url(&row.user_id)).bind::<Text,_>(sid)
             .bind::<Text,_>(pin.application_db_id).bind::<Text,_>(pin.client_db_id)
             .bind::<Text,_>(&policy.enrollment_id).bind::<Text,_>(pin.signer_pin)
             .bind::<Text,_>(approved.sha256()).bind::<BigInt,_>(policy.revision)
-            .bind::<BigInt,_>(policy.generation).execute(conn).map(|_| ())
+            .bind::<BigInt,_>(policy.generation).bind::<BigInt,_>(row.expires_at)
+            .execute(conn).map(|_| ())
     }
 
     fn code_has_current_provenance_on_conn(
@@ -240,14 +246,16 @@ pub(crate) mod sqlite {
         }
         let key = crate::util::sha256_base64url(&row.code);
         let marker = sql_query("SELECT code_sha256 AS id FROM axon_v3_incumbent_code_provenance
-            WHERE code_sha256=? AND user_id=? AND session_public_id=? AND application_db_id=?
+            WHERE code_sha256=? AND user_sha256=? AND session_public_id=? AND application_db_id=?
               AND client_db_id=? AND enrollment_id=? AND signer_pin=? AND policy_sha256=?
-              AND revision=? AND generation=?")
-            .bind::<Text,_>(&key).bind::<Text,_>(&row.user_id).bind::<Text,_>(sid)
+              AND revision=? AND generation=? AND code_expires_at=?")
+            .bind::<Text,_>(&key).bind::<Text,_>(crate::util::sha256_base64url(&row.user_id))
+            .bind::<Text,_>(sid)
             .bind::<Text,_>(pin.application_db_id).bind::<Text,_>(pin.client_db_id)
             .bind::<Text,_>(&policy.enrollment_id).bind::<Text,_>(pin.signer_pin)
             .bind::<Text,_>(approved.sha256()).bind::<BigInt,_>(policy.revision)
-            .bind::<BigInt,_>(policy.generation).get_result::<Identity>(conn).optional()?;
+            .bind::<BigInt,_>(policy.generation).bind::<BigInt,_>(row.expires_at)
+            .get_result::<Identity>(conn).optional()?;
         if !marker.is_some_and(|marker| marker.id == key) {
             return Ok(false);
         }
@@ -283,7 +291,12 @@ pub(crate) mod sqlite {
             let row = super::super::authorization_codes::consume_sqlite_authorization_code_for_client_on_conn(
                 conn, code, client_id, Some(redirect_uri), Some(code_verifier), true, true, now,
             )?;
-            if !code_has_current_provenance_on_conn(conn, &row, pin, approved, now)? || !snapshot.unchanged() {
+            if !code_has_current_provenance_on_conn(conn, &row, pin, approved, now)? {
+                return Err(AppError::Forbidden);
+            }
+            let cleared = sql_query("DELETE FROM axon_v3_incumbent_code_provenance WHERE code_sha256=?")
+                .bind::<Text,_>(crate::util::sha256_base64url(&row.code)).execute(conn)?;
+            if cleared != 1 || !snapshot.unchanged() {
                 return Err(AppError::Forbidden);
             }
             Ok(row)

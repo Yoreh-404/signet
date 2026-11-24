@@ -2007,7 +2007,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     let baseline = router.clone().oneshot(introspect("access_token")).await.unwrap();
     assert_eq!(oidc_http_body_json(baseline).await["active"], true);
     set_expiry(util::now_ts()-1);
-    let after = router.oneshot(authorize()).await.unwrap();
+    let after = router.clone().oneshot(authorize()).await.unwrap();
     if after.status().is_redirection() {
         assert!(!redirect_url(&after).query_pairs().any(|(key,_)| key=="code"));
         assert!(redirect_url(&after).query_pairs().any(|(key,_)| key=="error"));
@@ -2214,18 +2214,28 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
                 assert!(matches!(redeem(conn, &code), Err(AppError::Forbidden)));
                 assert_eq!(available(conn, &code), 1);
                 set_gate(true);
+                let markers = |conn: &mut diesel::SqliteConnection| {
+                    sql_query("SELECT COUNT(*) AS count FROM axon_v3_incumbent_code_provenance
+                        WHERE user_sha256=? AND session_public_id=?")
+                        .bind::<Text,_>(util::sha256_base64url(&fixture.id))
+                        .bind::<Text,_>(util::session_public_id(&current.session_id))
+                        .get_result::<Count>(conn).unwrap().count
+                };
+                assert_eq!(markers(conn), 1, "failed admission must not leave a second marker");
                 let redeemed = redeem(conn, &code).unwrap();
                 assert_eq!(redeemed.session_id, Some(util::session_public_id(&current.session_id)));
                 assert_eq!(available(conn, &code), 0);
                 assert!(redeem(conn, &code).is_err(), "the ordinary single-use CAS remains authoritative");
-                let markers = sql_query("SELECT COUNT(*) AS count FROM axon_v3_incumbent_code_provenance
-                    WHERE code_sha256=? AND user_id=? AND session_public_id=?")
-                    .bind::<Text,_>(util::sha256_base64url(&code)).bind::<Text,_>(&fixture.id)
-                    .bind::<Text,_>(util::session_public_id(&current.session_id))
-                    .get_result::<Count>(conn).unwrap().count;
-                assert_eq!(markers, 1);
+                assert_eq!(markers(conn), 0, "successful consumption retires the purpose marker");
             },
         );
+        let ordinary_token = router.clone().oneshot(exchange(&ordinary_code)).await.unwrap();
+        assert_eq!(ordinary_token.status(), StatusCode::OK);
+        let ordinary_body = oidc_http_body_json(ordinary_token).await;
+        let ordinary_claims = state.jwt.verify_access_token(
+            ordinary_body["access_token"].as_str().unwrap(),
+        ).unwrap();
+        assert_eq!(ordinary_claims.sub, current.user.id);
         set_expiry(util::now_ts() - 1);
     }
     for wrong in [

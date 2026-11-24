@@ -1109,7 +1109,7 @@ fn store_incumbent_authorization_code(
         );
         let inserted_at = util::now_ts();
         let amr = util::to_json(&row.amr)?;
-        sqlite::bind_code_provenance_on_conn(conn, &row, pin, approved)?;
+        sqlite::bind_code_provenance_on_conn(conn, &row, pin, approved, inserted_at)?;
         insert_sqlite_authorization_code_on_conn(conn, row, amr, inserted_at)?;
         #[cfg(test)]
         before_commit(conn)?;
