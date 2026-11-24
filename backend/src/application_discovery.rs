@@ -1017,6 +1017,18 @@ pub async fn fetch_and_verify_auto_registration(
     Ok((verified, pinned_jwks))
 }
 
+// Unit fixtures may supply bytes after normal URL validation. The transport
+// override is task-local, cannot be set by a request, and does not exist in
+// service builds. Signature, trust, lease and database paths remain real.
+#[cfg(test)]
+pub(crate) type DiscoveryTestTransport =
+    Box<dyn Fn(&Url, Option<&str>, Option<&str>) -> AppResult<Vec<u8>> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static DISCOVERY_TEST_TRANSPORT: DiscoveryTestTransport;
+}
+
 async fn fetch_discovery_body(
     discovery_url: &str,
     fetch_secret: Option<&str>,
@@ -1024,6 +1036,12 @@ async fn fetch_discovery_body(
     allow_private_networks: bool,
 ) -> AppResult<Vec<u8>> {
     let discovery_url = validate_fetch_url(discovery_url, allow_private_networks)?;
+    #[cfg(test)]
+    if let Ok(response) = DISCOVERY_TEST_TRANSPORT.try_with(|transport|
+        transport(&discovery_url, fetch_secret, challenge))
+    {
+        return response;
+    }
     let resolved_address = resolve_public_host(&discovery_url, allow_private_networks).await?;
     let host = discovery_url
         .host_str()

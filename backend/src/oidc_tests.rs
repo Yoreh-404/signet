@@ -3618,7 +3618,7 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
     use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
     let (mut state, path) = test_app_state_with_issuer(Some("https://sso.example")).await;
-    state.settings.discovery.allow_private_networks = true;
+    state.settings.discovery.allow_private_networks = false;
     state.settings.discovery.encryption_key = URL_SAFE_NO_PAD.encode([23_u8; 32]);
     let client = test_refresh_client(&state).await;
     let app = state.db.insert_application(crate::db::NewApplication {
@@ -3648,10 +3648,9 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
         None, &other, "password", auth::LoginEventContext::default()).await.unwrap();
     assert_eq!(auth::require_current_user(&state, &manager_jar).await.unwrap().user.is_admin, 1);
 
-    // The only fetch target is an in-process loopback website. The actual sync
-    // transport, authentication, signature verifier and owner lease are used.
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let website = format!("http://{}", listener.local_addr().unwrap());
+    // Use a policy-valid synthetic HTTPS origin. No HTTP client or DNS lookup
+    // runs in this test; only the validated outbound transport supplies bytes.
+    let website = "https://fixture-axon.example".to_owned();
     let fetch_secret = "discovery-local-fixture-secret";
     let key = SigningKey::from_bytes(&[24_u8; 32]);
     let (first, jwks) = application_discovery::signed_contract_fixture(&key, &website, 2);
@@ -3659,23 +3658,14 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
     let fetched = Arc::new(AtomicUsize::new(0));
     let site_payload = payload.clone();
     let site_counter = fetched.clone();
-    let website_router = axum::Router::new().route(
-        application_discovery::DISCOVERY_PATH,
-        axum::routing::get(move |headers: HeaderMap| {
-            let payload = site_payload.clone();
-            let fetched = site_counter.clone();
-            async move {
-                fetched.fetch_add(1, Ordering::Relaxed);
-                if headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
-                    != Some(format!("Bearer {fetch_secret}").as_str())
-                {
-                    return (StatusCode::UNAUTHORIZED, Vec::new());
-                }
-                (StatusCode::OK, payload.lock().unwrap().clone())
-            }
-        }),
-    );
-    let site_task = tokio::spawn(async move { axum::serve(listener, website_router).await.unwrap() });
+    let expected_url = application_discovery::default_discovery_url(&website).unwrap();
+    let transport: application_discovery::DiscoveryTestTransport = Box::new(move |url, secret, challenge| {
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(secret, Some(fetch_secret));
+        assert!(challenge.is_none());
+        site_counter.fetch_add(1, Ordering::Relaxed);
+        Ok(site_payload.lock().unwrap().clone())
+    });
     state.db.upsert_application_discovery(NewApplicationDiscovery {
         application_id: app.id.clone(),
         management_mode: application_discovery::MANAGEMENT_MODE_WEBSITE.into(),
@@ -3698,6 +3688,7 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
 
     let get_path = format!("/api/admin/applications/{}/discovery", app.id);
     let sync_path = format!("{get_path}/sync");
+    application_discovery::DISCOVERY_TEST_TRANSPORT.scope(transport, async {
     let router = crate::admin::routes().with_state(state.clone());
     let request = |method, path: &str, jar: &CookieJar| {
         let cookie = jar.get(&state.settings.security.cookie_name).unwrap();
@@ -3745,7 +3736,7 @@ async fn existing_manager_refreshes_pinned_website_discovery_via_admin_routes() 
     assert_eq!(after["last_verified_revision"], 3);
     assert_eq!(after["last_verified_digest"], digest);
 
-    site_task.abort();
+    }).await;
     drop(state);
     std::fs::remove_file(path).unwrap();
 }
