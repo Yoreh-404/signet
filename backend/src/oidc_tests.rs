@@ -2102,19 +2102,28 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
     assert!(!incumbent_preflight::matches(&state, &CookieJar::new(), Some(&pin),
         &approved, &wanted).await.unwrap());
     #[cfg(feature = "axon-incumbent-storage")]
-    let browser_live = || {
+    let checked_browser = || {
         let credential = util::session_id_from_cookie(session_cookie.value()).unwrap();
-        crate::db::axon_v3_incumbent_storage::sqlite::current_incumbent_browser_on_conn(
-            &mut pool.get().unwrap(), &credential, &current.session_id,
-            &fixture.id, util::now_ts(),
-        ).unwrap()
+        pool.get().unwrap().immediate_transaction(|conn| {
+            crate::db::axon_v3_incumbent_storage::sqlite::current_incumbent_browser_on_conn(
+                conn, &credential, &current.session_id, &fixture.id, util::now_ts(),
+            )
+        }).unwrap()
     };
     #[cfg(feature = "axon-incumbent-storage")]
-    assert!(browser_live());
+    {
+        use crate::assurance::SessionAuthenticationAssurance;
+        let session = checked_browser().expect("exact current incumbent browser");
+        assert_eq!(session.user_id, fixture.id);
+        assert_eq!(util::session_public_id(&session.id), util::session_public_id(&current.session_id));
+        let assurance = session.authentication_assurance();
+        assert_eq!(assurance.acr, crate::assurance::ACR_PASSWORD);
+        assert_eq!(assurance.amr, ["pwd"]);
+    }
     sql_query("UPDATE users SET is_admin=0 WHERE id=?")
         .bind::<Text,_>(&fixture.id).execute(&mut pool.get().unwrap()).unwrap();
     #[cfg(feature = "axon-incumbent-storage")]
-    assert!(!browser_live());
+    assert!(checked_browser().is_none());
     assert!(!eligible(Some(&pin), &wanted).await.unwrap());
     sql_query("UPDATE users SET is_admin=1 WHERE id=?")
         .bind::<Text,_>(&fixture.id).execute(&mut pool.get().unwrap()).unwrap();
@@ -2125,7 +2134,7 @@ async fn axon_v3_incumbent_preflight_never_changes_existing_website_oauth_eligib
         .bind::<Text,_>(&app.id).execute(&mut pool.get().unwrap()).unwrap();
     state.db.delete_session(&current.session_id).await.unwrap();
     #[cfg(feature = "axon-incumbent-storage")]
-    assert!(!browser_live());
+    assert!(checked_browser().is_none());
     assert!(!eligible(Some(&pin), &wanted).await.unwrap());
     // Acceptance checks the signed bytes only. It never enables a website
     // registration or tags an ordinary OAuth request with special authority.

@@ -53,25 +53,25 @@ pub(crate) mod sqlite {
         axon_v3_acceptance::VerifiedPolicy,
         incumbent_preflight::{IncumbentPin, approved_enrolled_signer},
     };
+    use crate::db::SessionRecord;
     use diesel::{Connection, QueryResult, RunQueryDsl, SqliteConnection, result::Error,
         sql_query, sql_types::{BigInt, Text}};
     use diesel::OptionalExtension;
 
     /// Transaction-owned browser predicate; the caller supplies the
     /// server-derived hash and exact authenticated session, never HTTP data.
-    /// Returns no material usable as a bearer and does not authorize a code.
+    /// Returns the current session for ordinary assurance derivation, not
+    /// permission to admit a code. Keep the record internal to the caller.
     pub(crate) fn current_incumbent_browser_on_conn(
         conn: &mut SqliteConnection, credential_id: &str, session_id: &str,
         user_id: &str, now: i64,
-    ) -> QueryResult<bool> {
-        #[derive(diesel::QueryableByName)]
-        struct Match {
-            #[diesel(sql_type = Text)] id: String,
-        }
+    ) -> QueryResult<Option<SessionRecord>> {
         // Match session_from_cookie: prefer a current credential mapping,
         // then allow the original direct session ID. Check the exact resolved
         // session even if another session belongs to the same account.
-        sql_query("SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id
+        sql_query("SELECT s.id, s.user_id, s.csrf_token, s.ip_address, s.user_agent,
+            s.login_method, s.expires_at, s.created_at
+            FROM sessions s JOIN users u ON u.id = s.user_id
             WHERE s.id = COALESCE((
                 SELECT mapped.id FROM session_credentials sc
                 JOIN sessions mapped ON mapped.id = sc.session_id
@@ -82,8 +82,8 @@ pub(crate) mod sqlite {
             AND NOT EXISTS (SELECT 1 FROM trial_enrollments t WHERE t.user_id = u.id)")
             .bind::<Text, _>(credential_id).bind::<BigInt, _>(now).bind::<BigInt, _>(now)
             .bind::<Text, _>(credential_id).bind::<Text, _>(session_id).bind::<Text, _>(user_id)
-            .bind::<BigInt, _>(now).get_result::<Match>(conn).optional()
-            .map(|row| row.is_some_and(|row| row.id == session_id))
+            .bind::<BigInt, _>(now).get_result::<SessionRecord>(conn).optional()
+            .map(|row| row.filter(|session| session.id == session_id))
     }
 
     // Resolve the exact existing site registration on the caller's connection.
