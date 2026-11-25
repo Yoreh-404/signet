@@ -833,6 +833,14 @@ pub(super) async fn issue_tokens_for_user(
             serde_json::Value::String(binding.authorization_profile_id.clone()),
         );
     }
+    if consent_bound_code.is_some() && login_code_level.is_none() && sid.is_some()
+        && client.require_pkce == 1 && client.require_s256_pkce == 1
+        && let Some(snapshot) = authorization_snapshot.as_ref()
+    {
+        crate::oidc_authorization::apply_axon_login_snapshot(
+            state, snapshot, client, &user, &mut id_claims,
+        ).await?;
+    }
     insert_sid_claim(&mut id_claims, sid.as_deref());
     if let Some(level) = login_code_level {
         id_claims.insert(

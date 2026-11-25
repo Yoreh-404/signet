@@ -44,6 +44,57 @@ pub(crate) async fn apply_axon_admin_claim(
     Ok(())
 }
 
+/// The registered Axon browser gets an application authorization snapshot at
+/// login, not a global Signet role or a capability asserted by the browser.
+pub(crate) async fn apply_axon_login_snapshot(
+    state: &AppState,
+    snapshot: &AuthorizationSnapshot,
+    client: &ClientRecord,
+    user: &UserRecord,
+    claims: &mut Map<String, Value>,
+) -> AppResult<()> {
+    use crate::application_discovery_contract::{SOURCE_MODE_DISCOVERY, SOURCE_WEBSITE, SYNC_STATUS_SYNCED};
+    use std::collections::BTreeSet;
+
+    let (Some(app), Some(binding), Some(profile)) =
+        (&snapshot.application, &snapshot.binding, &snapshot.policy.profile) else { return Ok(()); };
+    let Some((trust, _, row)) = trusted_axon_enrollment(state, client, app, binding).await?
+        else { return Ok(()); };
+    // Bind role rows to the very same accepted declaration and OIDC client.
+    // Changing website trust clears the persisted verification metadata.
+    if row.operator_disabled != 0 || row.snapshot_json.is_none()
+        || row.sync_status != SYNC_STATUS_SYNCED || row.last_verified_revision.is_none()
+        || row.last_verified_expires_at.is_some_and(|exp| exp <= crate::util::now_ts())
+        || row.last_verified_digest.is_none() || profile.remote_digest != row.last_verified_digest
+        || profile.sync_status != SYNC_STATUS_SYNCED || profile.source_mode != SOURCE_MODE_DISCOVERY
+        || profile.application_id != app.id || profile.id != binding.authorization_profile_id
+        || profile.profile_key != client.client_id
+    {
+        return Ok(());
+    }
+    let mut policy = snapshot.policy.clone();
+    // An enterprise role with the same name is not an Axon role assignment.
+    policy.authorization_config.insert("inherit_enterprise_roles".into(), Value::Bool(false));
+    policy.profile_roles.retain(|role| role.profile_id == profile.id && role.is_active == 1
+        && role.source == SOURCE_WEBSITE && !(role.role_key == "admin" && role.is_default == 1));
+    let declared: BTreeSet<_> = policy.profile_roles.iter().map(|r| r.role_key.as_str()).collect();
+    let mut available = BTreeSet::new();
+    for role in &policy.profile_roles { available.extend(role.permission_keys()?); }
+    let effective = authorization::resolve_entitlements_from_snapshot(&policy, user)?;
+    let mut roles: BTreeSet<_> = effective.roles.into_iter()
+        .filter(|r| declared.contains(r.as_str())).collect();
+    let mut permissions: BTreeSet<_> = effective.permissions.into_iter()
+        .filter(|p| available.contains(p)).collect();
+    if user.is_admin == 1 && let Some(admin) = policy.profile_roles.iter().find(|r| r.role_key == "admin") {
+        roles.insert(admin.role_key.clone());
+        permissions.extend(admin.permission_keys()?);
+    }
+    claims.insert("app_id".into(), Value::String(trust.application_id.clone()));
+    claims.insert("app_roles".into(), serde_json::json!(roles));
+    claims.insert("app_permissions".into(), serde_json::json!(permissions));
+    Ok(())
+}
+
 async fn trusted_axon_client<'a>(
     state: &'a AppState,
     client: &ClientRecord,
@@ -483,5 +534,8 @@ fn client_claims_for_user(
         },
         target,
     )?);
+    // Also reject pre-existing/custom mapper values for these reserved fields:
+    // only the interactive login projection above may supply them.
+    for key in ["app_id", "app_roles", "app_permissions"] { claims.remove(key); }
     Ok(claims)
 }

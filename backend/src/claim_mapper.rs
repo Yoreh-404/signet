@@ -273,6 +273,9 @@ pub fn client_field_names() -> &'static [&'static str] {
 }
 
 const STRUCTURAL_RESERVED_CLAIMS: &[&str] = &[
+    "app_id",
+    "app_roles",
+    "app_permissions",
     AXON_ADMIN_AUTHORITY_CLAIM,
     "iss",
     "sub",
