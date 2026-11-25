@@ -56,30 +56,37 @@ pub(super) fn write_incumbent_from_foreground(
     settings: &Settings, db: &Db, policy: &str, approval: &str, expected: &str,
     previous: Option<PreviousIncumbent<'_>>,
 ) -> AppResult<()> {
-    #[cfg(all(feature = "sqlite", feature = "axon-incumbent-storage"))]
+    #[cfg(all(any(feature = "sqlite", feature = "postgres"), feature = "axon-incumbent-storage"))]
     {
-        #[allow(unreachable_patterns)]
-        let pool = match db {
-            Db::Sqlite(pool) => pool,
-            _ => return Err(AppError::Forbidden),
-        };
         let enrolled = settings.discovery.axon_admin_v3.as_ref().ok_or(AppError::Forbidden)?;
         let trust = settings.discovery.axon_admin_trust.as_ref().ok_or(AppError::Forbidden)?;
         let gate = RestoreInterlock::new(enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid);
         if gate.reconciled().is_none() { return Err(AppError::Forbidden); }
         let verified = verified_activation(enrolled, trust, policy, approval, expected)?;
-        let mut conn = pool.get()?;
         let previous = previous.map(|p| crate::db::axon_v3_incumbent_storage::Version {
             digest: p.digest, revision: p.revision, generation: p.generation,
         });
-        return crate::db::axon_v3_incumbent_storage::sqlite::write_enrolled_incumbent(
-            &mut conn, enrolled, trust, previous, &verified,
-        ).map_err(|error| match error {
+        use crate::db::axon_v3_incumbent_storage as ledger;
+        #[allow(unreachable_patterns)]
+        let result = match db {
+            #[cfg(feature = "sqlite")]
+            Db::Sqlite(pool) => {
+                let mut conn = pool.get()?;
+                ledger::sqlite::write_enrolled_incumbent(&mut conn, enrolled, trust, previous, &verified)
+            }
+            #[cfg(feature = "postgres")]
+            Db::Postgres(pool) => {
+                let mut conn = pool.get()?;
+                ledger::postgres::write_enrolled_incumbent(&mut conn, enrolled, trust, previous, &verified)
+            }
+            _ => return Err(AppError::Forbidden),
+        };
+        return result.map_err(|error| match error {
             diesel::result::Error::RollbackTransaction => AppError::Forbidden,
             other => AppError::from(other),
         });
     }
-    #[cfg(not(all(feature = "sqlite", feature = "axon-incumbent-storage")))]
+    #[cfg(not(all(any(feature = "sqlite", feature = "postgres"), feature = "axon-incumbent-storage")))]
     {
         let _ = (settings, db, policy, approval, expected, previous);
         Err(AppError::Forbidden)

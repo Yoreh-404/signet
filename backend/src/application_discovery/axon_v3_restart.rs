@@ -8,11 +8,10 @@ use super::{
     axon_v3_restore::RestoreInterlock,
     incumbent_preflight::IncumbentPin,
 };
-use crate::{
-    config::{AxonAdminTrust, AxonAdminV3Enrollment},
-    db::axon_v3_incumbent_storage::sqlite,
-};
-use diesel::{QueryResult, SqliteConnection};
+use crate::config::{AxonAdminTrust, AxonAdminV3Enrollment};
+use diesel::QueryResult;
+#[cfg(feature = "sqlite")]
+use diesel::SqliteConnection;
 use serde::Deserialize;
 use std::{io::Read, path::Path};
 
@@ -57,12 +56,41 @@ fn read_floor(path: &Path, owner: u32) -> Option<RestartFloor> {
 
 /// The protected floor is separately provisioned, never synthesized from a
 /// database row or the restore marker. Restoring it does not grant access.
+#[cfg(feature = "sqlite")]
 pub(super) fn restore_from_operator_floor(
     conn: &mut SqliteConnection,
     floor_path: &Path,
     enrolled: &AxonAdminV3Enrollment,
     trust: &AxonAdminTrust,
     now: i64,
+) -> QueryResult<Option<VerifiedPolicy>> {
+    restore_using_operator_floor(floor_path, enrolled, trust, now, |gate, pin, trusted, now| {
+        crate::db::axon_v3_incumbent_storage::sqlite::restore_accepted_policy(
+            conn, gate, pin, trusted, now)
+    })
+}
+
+#[cfg(feature = "postgres")]
+pub(super) fn restore_from_postgres_operator_floor(
+    conn: &mut diesel::PgConnection,
+    floor_path: &Path,
+    enrolled: &AxonAdminV3Enrollment,
+    trust: &AxonAdminTrust,
+    now: i64,
+) -> QueryResult<Option<VerifiedPolicy>> {
+    restore_using_operator_floor(floor_path, enrolled, trust, now, |gate, pin, trusted, now| {
+        crate::db::axon_v3_incumbent_storage::postgres::restore_accepted_policy(
+            conn, gate, pin, trusted, now)
+    })
+}
+
+fn restore_using_operator_floor(
+    floor_path: &Path,
+    enrolled: &AxonAdminV3Enrollment,
+    trust: &AxonAdminTrust,
+    now: i64,
+    read: impl FnOnce(&RestoreInterlock, &IncumbentPin<'_>, &TrustedRegistration<'_>, i64)
+        -> QueryResult<Option<VerifiedPolicy>>,
 ) -> QueryResult<Option<VerifiedPolicy>> {
     let owner = enrolled.restore_marker_owner_uid;
     let Some(floor) = read_floor(floor_path, owner) else { return Ok(None); };
@@ -88,7 +116,7 @@ pub(super) fn restore_from_operator_floor(
         generation: floor.generation,
         withdrawn: false,
     };
-    let verified = sqlite::restore_accepted_policy(conn, &gate, &pin, &TrustedRegistration {
+    let verified = read(&gate, &pin, &TrustedRegistration {
         organization_id: &enrolled.organization_id,
         enrollment_id: &enrolled.enrollment_id,
         application_id: &enrolled.application_id,
@@ -109,7 +137,7 @@ pub(super) fn restore_from_operator_floor(
     Ok(verified.filter(|_| read_floor(floor_path, owner).as_ref() == Some(&floor)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use diesel::Connection;
