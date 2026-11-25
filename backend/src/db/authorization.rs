@@ -1136,6 +1136,16 @@ pub(crate) fn load_sqlite_oidc_policy_snapshot_on_conn(
     policy_snapshot_on_connection!(conn, DatabaseKind::Sqlite, boundary, user_id.to_owned())
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) fn load_postgres_oidc_policy_snapshot_on_conn(
+    conn: &mut diesel::PgConnection, client_db_id: &str, user_id: &str,
+) -> AppResult<AuthorizationPolicySnapshot> {
+    let boundary = PolicyBoundary::Client {
+        client_db_id: client_db_id.to_owned(), required_protocol: Some("oauth2_oidc".to_owned()),
+    };
+    policy_snapshot_on_connection!(conn, DatabaseKind::Postgres, boundary, user_id.to_owned())
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 #[tokio::test]
 async fn unbound_client_on_caller_transaction_is_visible_but_not_provisioned() {

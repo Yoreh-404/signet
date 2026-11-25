@@ -158,6 +158,18 @@ pub(super) fn consume_sqlite_authorization_code_for_client_on_conn(
     )
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(super) fn consume_postgres_authorization_code_for_client_on_conn(
+    conn: &mut diesel::PgConnection, code: &str, client_id: &str, redirect_uri: Option<&str>,
+    code_verifier: Option<&str>, require_pkce: bool, require_s256_pkce: bool, now: i64,
+) -> AppResult<AuthorizationCodeRecord> {
+    consume_authorization_code_on_conn!(
+        conn, DatabaseKind::Postgres, code.to_owned(), client_id.to_owned(),
+        redirect_uri.map(ToOwned::to_owned), code_verifier.map(ToOwned::to_owned),
+        require_pkce, require_s256_pkce, now
+    )
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod insert_on_connection_tests {
     use super::*;
