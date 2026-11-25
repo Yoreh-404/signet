@@ -701,6 +701,22 @@ pub(super) async fn issue_tokens_for_user(
     {
         return Err(invalid_refresh_token_grant());
     }
+    // The app snapshot and its OIDC session binding are issued together from
+    // the same verified browser code. This does not depend on the old
+    // access-token administrator projection being present.
+    let mut axon_login_claims = serde_json::Map::new();
+    if consent_bound_code.is_some() && login_code_level.is_none()
+        && sid.as_deref().is_some_and(|value| !value.is_empty())
+        && client.require_pkce == 1 && client.require_s256_pkce == 1
+        && let Some(snapshot) = authorization_snapshot.as_ref()
+        && let Some(trust) = state.settings.discovery.axon_admin_trust.as_ref()
+        && issuer == state.settings.oidc.issuer.trim_end_matches('/')
+        && resource.as_deref().or(Some(client.audience.as_str())) == Some(trust.audience.as_str())
+    {
+        crate::oidc_authorization::apply_axon_login_snapshot(
+            state, snapshot, client, &user, &mut axon_login_claims,
+        ).await?;
+    }
     tracing::info!(
         client_id = %client.client_id,
         user_id = %user.id,
@@ -770,6 +786,9 @@ pub(super) async fn issue_tokens_for_user(
         let token_audience = resource
             .as_deref()
             .or_else(|| (!client.audience.trim().is_empty()).then_some(client.audience.as_str()));
+        if axon_login_claims.contains_key("app_id") {
+            insert_sid_claim(&mut access_claims, sid.as_deref());
+        }
         if login_code_level.is_none() && application_id.is_some()
             && let (Some(snapshot), Some(public_sid)) = (authorization_snapshot.as_ref(), sid.as_deref())
         {
@@ -833,14 +852,7 @@ pub(super) async fn issue_tokens_for_user(
             serde_json::Value::String(binding.authorization_profile_id.clone()),
         );
     }
-    if consent_bound_code.is_some() && login_code_level.is_none() && sid.is_some()
-        && client.require_pkce == 1 && client.require_s256_pkce == 1
-        && let Some(snapshot) = authorization_snapshot.as_ref()
-    {
-        crate::oidc_authorization::apply_axon_login_snapshot(
-            state, snapshot, client, &user, &mut id_claims,
-        ).await?;
-    }
+    id_claims.extend(axon_login_claims);
     insert_sid_claim(&mut id_claims, sid.as_deref());
     if let Some(level) = login_code_level {
         id_claims.insert(
