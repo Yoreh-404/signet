@@ -279,6 +279,9 @@ pub(super) async fn token_from_authorization_code(
             payload.code_verifier.as_deref(),
             client.require_pkce == 1,
             client.require_s256_pkce == 1,
+            state.settings.discovery.axon_admin_v3.as_ref()
+                .filter(|enrolled| enrolled.client_id == client.client_id)
+                .map(|enrolled| (&*enrolled.organization_id, &*enrolled.application_id)),
         )
         .await?;
     let amr = util::from_json::<Vec<String>>(&record.amr)?;

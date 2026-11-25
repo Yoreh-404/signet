@@ -396,7 +396,12 @@ impl Db {
         code_verifier: Option<&str>,
         require_pkce: bool,
         require_s256_pkce: bool,
+        configured_site: Option<(&str, &str)>,
     ) -> AppResult<AuthorizationCodeRecord> {
+        #[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+        let configured_site = configured_site.map(|(org, app)| (org.to_owned(), app.to_owned()));
+        #[cfg(not(all(feature = "postgres", feature = "axon-incumbent-storage")))]
+        let _ = configured_site;
         let code = code.to_string();
         let client_id = client_id.to_string();
         let redirect_uri = redirect_uri.map(ToOwned::to_owned);
@@ -428,11 +433,26 @@ impl Db {
                     // A code admitted to the incumbent flow must never be
                     // consumed by the ordinary OAuth exchange. Use the same
                     // transaction and schema resolution as the migration.
-                    let marked = sql_query("SELECT COUNT(*) AS count
-                        FROM axon_v3_incumbent_code_provenance WHERE code_sha256=$1")
-                        .bind::<Text, _>(util::sha256_base64url(&code))
-                        .get_result::<CountRow>(conn).map_err(AppError::from)?.count != 0;
-                    if marked {
+                    let installed = sql_query("SELECT COUNT(to_regclass(
+                        'axon_v3_incumbent_code_provenance')) AS count")
+                        .get_result::<CountRow>(conn)?.count != 0;
+                    let deny = if installed {
+                        sql_query("SELECT COUNT(*) AS count
+                            FROM axon_v3_incumbent_code_provenance WHERE code_sha256=$1")
+                            .bind::<Text, _>(util::sha256_base64url(&code))
+                            .get_result::<CountRow>(conn)?.count != 0
+                    } else if let Some((org, app)) = configured_site.as_ref() {
+                        // External migrations may be disabled. An unrelated
+                        // normal login must not require an incumbent table;
+                        // the configured existing website cannot fall back.
+                        sql_query("SELECT COUNT(*) AS count FROM applications a
+                            JOIN application_discovery d ON d.application_id=a.id
+                            WHERE a.organization_id=$1 AND a.slug=$2
+                            AND d.management_mode='website_managed'")
+                            .bind::<Text, _>(org).bind::<Text, _>(app)
+                            .get_result::<CountRow>(conn)?.count != 0
+                    } else { false };
+                    if deny {
                         return Err(AppError::Oidc("invalid authorization code".to_string()));
                     }
                 }
