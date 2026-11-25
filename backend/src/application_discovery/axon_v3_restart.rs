@@ -171,6 +171,58 @@ fn restore_using_operator_floor(
         .map(|policy| RestoredIncumbent { floor, signer, policy }))
 }
 
+pub(super) fn apply_selected_operator_floor(settings: &crate::Settings, db: &crate::db::Db,
+    expected: &str, approved: Option<&VerifiedPolicy>) -> crate::error::AppResult<()> {
+    use crate::{db::{Db, axon_v3_incumbent_storage as ledger}, error::AppError};
+    let config = &settings.discovery;
+    let enrolled = config.axon_admin_v3.as_ref().ok_or(AppError::Forbidden)?;
+    let trust = config.axon_admin_trust.as_ref().ok_or(AppError::Forbidden)?;
+    let path = config.axon_admin_incumbent_floor.as_ref().ok_or(AppError::Forbidden)?;
+    let owner = enrolled.restore_marker_owner_uid;
+    let floor = read_floor(path, owner).ok_or(AppError::Forbidden)?;
+    if floor.policy_sha256 != expected || floor.organization_id != enrolled.organization_id
+        || floor.enrollment_id != enrolled.enrollment_id || trust.organization_id != enrolled.organization_id
+        || trust.application_id != enrolled.application_id || trust.client_id != enrolled.client_id
+        || trust.audience != enrolled.audience || trust.origin != enrolled.origin
+        || floor.revision < 1 || floor.generation < 1
+    { return Err(AppError::Forbidden); }
+    if let Some(receipt) = approved {
+        let p = receipt.policy();
+        if floor.state != FloorState::Active || receipt.sha256() != expected
+            || p.revision != floor.revision || p.generation != floor.generation
+            || p.permissions != floor.permissions
+        { return Err(AppError::Forbidden); }
+    }
+    let signer = axon_signer_pin(&trust.signing_public_jwks).ok_or(AppError::Forbidden)?;
+    let gate = RestoreInterlock::new(enrolled.restore_marker_path.clone(), owner);
+    let pin = IncumbentPin { application_db_id: &floor.application_db_id, client_db_id: &floor.client_db_id,
+        policy_sha256: expected, signer_pin: &signer, revision: floor.revision,
+        generation: floor.generation, withdrawn: floor.state == FloorState::Stopped };
+    let current = || read_floor(path, owner).as_ref() == Some(&floor);
+    #[allow(unreachable_patterns)]
+    let changed = match db {
+        #[cfg(feature = "sqlite")]
+        Db::Sqlite(pool) => {
+            let mut conn = pool.get()?;
+            ledger::sqlite::apply_selected_floor(&mut conn, &gate, &pin, approved, current)
+        }
+        #[cfg(feature = "postgres")]
+        Db::Postgres(pool) => {
+            let mut conn = pool.get()?;
+            ledger::postgres::apply_selected_floor(&mut conn, &gate, &pin, approved, current)
+        }
+        _ => return Err(AppError::Forbidden),
+    };
+    changed.map_err(|err| match err {
+        diesel::result::Error::RollbackTransaction => AppError::Forbidden,
+        other => AppError::from(other),
+    })?;
+    if approved.is_none() && floor.state != FloorState::Stopped {
+        return Err(AppError::BadRequest("withdrawn in the database; the independent operator floor is still active and must be stopped for restore-resistant withdrawal".into()));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;

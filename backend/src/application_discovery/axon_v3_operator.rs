@@ -97,6 +97,10 @@ pub async fn run_axon_v3_operator_command(settings: &Settings, db: &Db, args: &[
     let Some(enrolled) = settings.discovery.axon_admin_v3.as_ref() else { return Err(AppError::Forbidden); };
     match args {
         [command, expected] if command == "withdraw" && valid_digest(expected) => {
+            #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+            if settings.discovery.axon_admin_incumbent_floor.is_some() {
+                return super::axon_v3_restart::apply_selected_operator_floor(settings, db, expected, None);
+            }
             db.withdraw_axon_v3_policy(enrolled.clone(), expected.clone()).await
         }
         [command, policy, approval, expected] if command == "activate" && valid_digest(expected) => {
@@ -109,6 +113,10 @@ pub async fn run_axon_v3_operator_command(settings: &Settings, db: &Db, args: &[
             let gate = RestoreInterlock::new(enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid);
             if gate.reconciled().is_none() { return Err(AppError::Forbidden); }
             let verified = verified_activation(enrolled, trust, policy, approval, expected)?;
+            #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+            if settings.discovery.axon_admin_incumbent_floor.is_some() {
+                return super::axon_v3_restart::apply_selected_operator_floor(settings, db, expected, Some(&verified));
+            }
             db.stage_axon_v3_policy(verified).await?;
             db.activate_axon_v3_policy(enrolled.clone(), expected.clone(), &gate).await
         }

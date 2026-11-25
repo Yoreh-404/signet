@@ -260,6 +260,49 @@ fn compare_and_set_checked(
     })
 }
 
+/// The server-derived current row is used only for compare-and-set, not
+/// as an identity or permission source. Both arrive from the protected
+/// floor and the enrolled site's signed receipt.
+pub(crate) fn apply_selected_floor(
+    conn: &mut BackendConn, gate: &RestoreInterlock, pin: &IncumbentPin<'_>,
+    approved: Option<&VerifiedPolicy>, floor_still_current: impl FnOnce() -> bool,
+) -> QueryResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)] policy_sha256: String,
+        #[diesel(sql_type = BigInt)] revision: i64,
+        #[diesel(sql_type = BigInt)] generation: i64,
+        #[diesel(sql_type = diesel::sql_types::Integer)] withdrawn: i32,
+    }
+    registry_write_transaction(conn, |conn| {
+        let row = sql_query("SELECT policy_sha256, revision, generation, withdrawn
+            FROM axon_v3_incumbent_activation WHERE singleton=1 AND profile='incumbent_v1'
+            AND application_db_id=$1 AND client_db_id=$2 AND signer_pin=$3")
+            .bind::<Text,_>(pin.application_db_id).bind::<Text,_>(pin.client_db_id)
+            .bind::<Text,_>(pin.signer_pin).get_result::<Row>(conn).optional()?;
+        let same = row.as_ref().is_some_and(|r| r.policy_sha256 == pin.policy_sha256
+            && r.revision == pin.revision && r.generation == pin.generation);
+        if let Some(receipt) = approved {
+            let binding = enrolled_registry_on_conn(conn, receipt)?.ok_or(Error::RollbackTransaction)?;
+            if pin.withdrawn || binding.application_db_id != pin.application_db_id
+                || binding.client_db_id != pin.client_db_id
+                || !approved_enrolled_signer(receipt, pin.signer_pin, &binding.enrolled_jwks)
+            { return Err(Error::RollbackTransaction); }
+            if same {
+                if !exact_active_policy(conn, gate, pin, receipt)? { return Err(Error::RollbackTransaction); }
+            } else {
+                let previous = row.as_ref().map(|r| Version { digest: &r.policy_sha256,
+                    revision: r.revision, generation: r.generation });
+                compare_and_set(conn, gate, pin, &binding.enrolled_jwks, previous, receipt)?;
+            }
+        } else if !same || (row.is_some_and(|r| r.withdrawn == 0) && withdraw(conn, pin)? != 1) {
+            return Err(Error::RollbackTransaction);
+        }
+        if !floor_still_current() { return Err(Error::RollbackTransaction); }
+        Ok(())
+    })
+}
+
 /// Exact tombstone; intentionally does not require the restore gate to be open.
 pub(crate) fn withdraw(conn: &mut BackendConn, binding: &IncumbentPin<'_>)
     -> QueryResult<usize> {
