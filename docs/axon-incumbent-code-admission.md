@@ -1,47 +1,40 @@
-# Incumbent authorization-code admission boundary
+# Existing Signet website and Axon administration
 
-The website-managed incumbent writer and its readback are dormant. They
-cannot authorize or mint an OAuth code. The existing generic website OAuth
-path remains unchanged.
+The registered OpenSponge website keeps its original Signet application, OAuth client,
+callback, and users. Signet checks the user's current global administrator status.
+An ordinary sign-in does not grant management access.
 
-`oidc::issue_authorization_code_redirect` accepts previously resolved
-request, user, session and policy snapshots. Trial eligibility, application
-auth-context creation and `Db::insert_authorization_code` are separate
-database calls. The last call uses its own pooled connection and inserts the
-provided row without checking that the original browser still exists or is a
-global admin. Adding an incumbent check before this call leaves a race with
-logout, demotion, enrollment change, policy withdrawal or restore hold.
+On Linux, build the backend with the deployment's database drivers and
+`axon-incumbent-storage`. Normal database migration creates the incumbent storage
+on PostgreSQL or SQLite. If migrations are managed separately, provision that schema
+before activating the incumbent. MySQL remains available for ordinary Signet use.
 
-The narrow callable boundary is **inside the existing authorization-code
-insertion on the caller's transaction connection**, not a preflight API.
-Thread one private non-serializable incumbent input from the already parsed
-request, containing the original server-resolved browser credential/session,
-exact app/client binding, already verified incumbent activation identity,
-and prepared code row. In one transaction:
+The opt-in `discovery.axon_admin_incumbent_floor` names **existing, independently
+provisioned** operator state for this specific application. It is not generated at
+startup or inferred from a database row. Use the enrolled signer and binding in
+`discovery.axon_admin_trust` and `discovery.axon_admin_v3`. Without valid/current
+input this site cannot project administrator authority. Do not generate an approval
+from the service's own database, change the site's management mode or use a different
+client to make a deployment appear successful.
 
-1. Re-resolve the original browser credential and exact session against the
-   current user. Require active, unarchived, non-trial, interactive session
-   and a current global admin. A different session for the same user is
-   insufficient. Use the existing credential parsing/expiry semantics.
-2. Recheck exact organization, website enrollment and enrolled signing key,
-   app/client binding, audience, S256 and exact callback/openid, nonwithdrawn
-   ledger row and stable bytes, and the existing restore marker. Keep all
-   existing assurance and consent checks; never treat this tuple as a grant.
-3. Bind the existing authorization-code insert and any necessary auth-context
-   write to that same connection. Expose only its exact committed result:
-   never return an authorization marker that can reach a later transaction,
-   never fall back to the generic issuer, and never use a probe as admission.
+- The existing foreground `axon-v3 activate` accepts the enrolled signer's receipt.
+  It compares the selected application, client, policy, revision, generation and
+  permission set with operator state before writing the activation.
+- Standard authorize, token and confidential introspection endpoints serve this
+  path; there is no public administrative toggle or new OAuth scope. The original
+  browser, user, live role, exact registration, S256 proof, code purpose and access
+  token are checked. An unrelated ordinary code cannot become an administrator
+  token by presenting it to the verifier. Role proof is returned only to the
+  registered confidential verifier, not embedded as bearer authority.
+- Withdrawal tombstones the exact activation. A demoted user or revoked session
+  cannot continue managing through an existing token. When running the foreground
+  withdrawal, also stop the independently maintained floor. If it is still active,
+  the command reports that the database has been updated but a roll-back-resistant
+  withdrawal is incomplete. Restoring only an older database does not override
+  stopped operator state.
+- SQLite uses an immediate write transaction. PostgreSQL uses a serializable write
+  transaction for the same code admission and exchange, locks the matched
+  registration rows, and checks protected state again before returning the result.
 
-The SQLite candidate's `BEGIN IMMEDIATE` can serialize the reads and write.
-For PostgreSQL, require a qualified transaction covering the exact signer,
-site, binding, activation, credential, session, user and context rows, plus
-protection against new trial rows/other negative-predicate changes (not
-just row locks on existing rows). Verify lock order and transaction/restore
-rollback before enabling it. Do not switch the configured database.
-
-The synthetic discriminator is same-user old browser vs another browser,
-with a role or credential change after preliminary checks: only the exact
-same-transaction current query may pass; no authorization code is minted.
-Follow-up native tests must exercise those cases at the existing code
-insert and assert no inserted row/redirect on denial, along with ordinary
-website continuity unchanged.
+This is the source/runtime contract, not evidence that the deployment has been
+configured or that end-to-end acceptance has been performed.

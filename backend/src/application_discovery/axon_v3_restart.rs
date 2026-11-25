@@ -1,4 +1,5 @@
-//! Private restart policy material. No command, listener or route calls it.
+//! Reconstruct the explicitly selected incumbent policy from signed storage
+//! and independently protected operator state. Never trusts a restored DB alone.
 #![allow(dead_code)]
 
 use super::{

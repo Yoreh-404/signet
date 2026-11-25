@@ -1017,14 +1017,8 @@ struct PreparedAuthorizationCode {
     row: NewAuthorizationCode,
 }
 
-// This lane is deliberately not mounted. A trusted operator binding must
-// select the verified policy and its restore interlock before a future call.
-// That caller must get issuer and IP from AppState's existing resolution and
-// satisfy the standard interaction, freshness and consent checks; this
-// function does not furnish a redirect, exchange a code or project authority.
-//
-// The caller supplies its SQLite connection. BEGIN IMMEDIATE holds the current
-// registry, browser, authorizability and context together through insertion.
+// The normal authorization flow supplies its already resolved browser and
+// request. Only verified backend-owned operator state may select the incumbent.
 #[cfg(all(target_os = "linux", any(feature = "sqlite", feature = "postgres"), feature = "axon-incumbent-storage"))]
 #[allow(dead_code)]
 struct IncumbentAuthorizationInput<'a> {
@@ -1204,22 +1198,12 @@ async fn issue_authorization_code_redirect(
     let code = if let Some(code) = incumbent {
         code
     } else {
-    let PreparedAuthorizationCode {
-        redirect_code: code,
-        row,
-    } = prepare_authorization_code(
-        context,
-        user,
-        session,
-        client,
-        authorization_snapshot,
-        &request,
-        &requested_scopes,
-        website_generation,
-    )
-    .await?;
-    context.state.db.insert_authorization_code(row).await?;
-    code
+        let PreparedAuthorizationCode { redirect_code, row } = prepare_authorization_code(
+            context, user, session, client, authorization_snapshot, &request, &requested_scopes,
+            website_generation,
+        ).await?;
+        context.state.db.insert_authorization_code(row).await?;
+        redirect_code
     };
     context
         .state
