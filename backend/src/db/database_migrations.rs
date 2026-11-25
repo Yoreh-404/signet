@@ -64,6 +64,21 @@ impl Db {
                 super::axon_v3_incumbent_storage::install_schema(&mut conn).map_err(AppError::from)
             }).await?;
         }
+        #[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+        if let Db::Postgres(pool) = self {
+            use diesel::Connection;
+            use super::axon_v3_incumbent_storage::{SCHEMA, CODE_PROVENANCE_SCHEMA, ACCESS_PROOF_SCHEMA};
+            let pool = pool.clone();
+            blocking(move || {
+                let mut conn = pool.get().map_err(|err| AppError::Database(err.to_string()))?;
+                conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                    for ddl in [SCHEMA, CODE_PROVENANCE_SCHEMA, ACCESS_PROOF_SCHEMA] {
+                        conn.batch_execute(ddl)?;
+                    }
+                    Ok(())
+                }).map_err(AppError::from)
+            }).await?;
+        }
         Ok(())
     }
 }

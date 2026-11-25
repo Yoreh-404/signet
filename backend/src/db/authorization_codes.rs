@@ -422,6 +422,20 @@ impl Db {
                         }
                     }
                 }
+                #[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+                if matches!(kind, DatabaseKind::Postgres) {
+                    use super::CountRow;
+                    // A code admitted to the incumbent flow must never be
+                    // consumed by the ordinary OAuth exchange. Use the same
+                    // transaction and schema resolution as the migration.
+                    let marked = sql_query("SELECT COUNT(*) AS count
+                        FROM axon_v3_incumbent_code_provenance WHERE code_sha256=$1")
+                        .bind::<Text, _>(util::sha256_base64url(&code))
+                        .get_result::<CountRow>(conn).map_err(AppError::from)?.count != 0;
+                    if marked {
+                        return Err(AppError::Oidc("invalid authorization code".to_string()));
+                    }
+                }
                 consume_authorization_code_on_conn!(
                     conn, kind, code, client_id, redirect_uri, code_verifier,
                     require_pkce, require_s256_pkce, now
