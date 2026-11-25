@@ -91,6 +91,19 @@ pub(super) fn authorization_mfa_decision_on_conn(
     decide_authorization_mfa(&policy, client, session, user_has_totp, request_ip, &request.requested_assurance()?)
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(super) fn postgres_authorization_mfa_decision_on_conn(
+    conn: &mut diesel::PgConnection,
+    client: &ClientRecord,
+    session: &SessionRecord,
+    request: &ResolvedAuthorizeRequest,
+    request_ip: Option<&str>,
+) -> AppResult<MfaDecision> {
+    let user_has_totp = crate::db::Db::postgres_has_totp_on_conn(conn, &session.user_id)?;
+    let policy = crate::db::Db::postgres_security_policy_on_conn(conn)?;
+    decide_authorization_mfa(&policy, client, session, user_has_totp, request_ip, &request.requested_assurance()?)
+}
+
 fn decide_authorization_mfa(
     policy: &crate::db::SecurityPolicyRecord,
     client: &ClientRecord,

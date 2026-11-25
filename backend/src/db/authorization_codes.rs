@@ -75,6 +75,16 @@ pub(crate) fn insert_sqlite_authorization_code_on_conn(
     insert_code_on_connection!(conn, DatabaseKind::Sqlite, code, amr, now)
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) fn insert_postgres_authorization_code_on_conn(
+    conn: &mut diesel::PgConnection,
+    code: NewAuthorizationCode,
+    amr: String,
+    now: i64,
+) -> AppResult<()> {
+    insert_code_on_connection!(conn, DatabaseKind::Postgres, code, amr, now)
+}
+
 // Reuse the ordinary code binding checks and single-use CAS on the concrete
 // connection selected by the caller. The caller owns the transaction.
 macro_rules! consume_authorization_code_on_conn {

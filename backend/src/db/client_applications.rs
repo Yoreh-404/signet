@@ -36,6 +36,14 @@ pub(crate) fn find_sqlite_client_by_client_id_on_conn(
     find_client_by_client_id_on_conn!(conn, DatabaseKind::Sqlite, client_id)
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) fn find_postgres_client_by_client_id_on_conn(
+    conn: &mut diesel::PgConnection,
+    client_id: &str,
+) -> AppResult<Option<ClientRecord>> {
+    find_client_by_client_id_on_conn!(conn, DatabaseKind::Postgres, client_id)
+}
+
 impl Db {
     pub async fn find_client_by_client_id(
         &self,

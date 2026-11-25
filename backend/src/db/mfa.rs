@@ -34,6 +34,18 @@ impl Db {
             .is_some())
     }
 
+    #[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+    pub(crate) fn postgres_has_totp_on_conn(
+        conn: &mut diesel::PgConnection,
+        user_id: &str,
+    ) -> AppResult<bool> {
+        Ok(sql_query(select_totp_method_sql(DatabaseKind::Postgres))
+            .bind::<Text, _>(user_id)
+            .get_result::<MfaTotpMethodRecord>(conn)
+            .optional()?
+            .is_some())
+    }
+
     pub async fn create_mfa_totp_setup(
         &self,
         user_id: &str,

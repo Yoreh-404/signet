@@ -176,6 +176,13 @@ pub(super) fn find_sqlite_application_auth_context_on_conn(
     find_auth_context_on_conn!(conn, DatabaseKind::Sqlite, auth_domain_id, user_id)
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(super) fn find_postgres_application_auth_context_on_conn(
+    conn: &mut diesel::PgConnection, auth_domain_id: &str, user_id: &str,
+) -> AppResult<Option<ApplicationAuthContextRecord>> {
+    find_auth_context_on_conn!(conn, DatabaseKind::Postgres, auth_domain_id, user_id)
+}
+
 // Keep insertion and full readback on the same concrete Diesel connection.
 macro_rules! insert_auth_context_on_conn {
     ($conn:expr, $kind:expr, $context:expr, $amr:expr, $now:expr) => {{
@@ -228,6 +235,17 @@ pub(super) fn insert_sqlite_application_auth_context_on_conn(
     let amr = serde_json::to_string(&context.amr)
         .map_err(|err| AppError::Internal(err.to_string()))?;
     insert_auth_context_on_conn!(conn, DatabaseKind::Sqlite, context, amr, now)
+}
+
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(super) fn insert_postgres_application_auth_context_on_conn(
+    conn: &mut diesel::PgConnection,
+    context: NewApplicationAuthContext,
+) -> AppResult<ApplicationAuthContextRecord> {
+    let now = util::now_ts();
+    let amr = serde_json::to_string(&context.amr)
+        .map_err(|err| AppError::Internal(err.to_string()))?;
+    insert_auth_context_on_conn!(conn, DatabaseKind::Postgres, context, amr, now)
 }
 
 struct ApplicationAuthContextSelection<'a> {
@@ -294,6 +312,26 @@ pub(crate) fn find_or_create_sqlite_application_auth_context_on_conn(
         ApplicationAuthContextDisposition::Reuse(id) => Ok(id),
         ApplicationAuthContextDisposition::Insert(context) => {
             Ok(insert_sqlite_application_auth_context_on_conn(conn, context)?.id)
+        }
+    }
+}
+
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) fn find_or_create_postgres_application_auth_context_on_conn(
+    conn: &mut diesel::PgConnection,
+    auth_domain_id: &str,
+    user_id: &str,
+    acr: &str,
+    amr: &[String],
+    authenticated_at: i64,
+    now: i64,
+) -> AppResult<String> {
+    let input = ApplicationAuthContextSelection { auth_domain_id, user_id, acr, amr, authenticated_at, now };
+    let existing = find_postgres_application_auth_context_on_conn(conn, auth_domain_id, user_id)?;
+    match input.select(existing)? {
+        ApplicationAuthContextDisposition::Reuse(id) => Ok(id),
+        ApplicationAuthContextDisposition::Insert(context) => {
+            Ok(insert_postgres_application_auth_context_on_conn(conn, context)?.id)
         }
     }
 }

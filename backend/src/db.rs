@@ -342,6 +342,14 @@ pub(crate) use {
     client_applications::find_sqlite_client_by_client_id_on_conn,
     user_directory::find_sqlite_user_by_id_on_conn,
 };
+#[cfg(all(target_os = "linux", feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) use {
+    applications::find_or_create_postgres_application_auth_context_on_conn,
+    authorization::load_postgres_oidc_policy_snapshot_on_conn,
+    authorization_codes::insert_postgres_authorization_code_on_conn,
+    client_applications::find_postgres_client_by_client_id_on_conn,
+    user_directory::find_postgres_user_by_id_on_conn,
+};
 pub use authorization::{
     ApplicationOrganizationRoleAssignmentRecord,
     ApplicationProfileOrganizationRoleAssignmentRecord, ApplicationProfileRoleAssignmentRecord,

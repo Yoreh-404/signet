@@ -39,6 +39,14 @@ pub(crate) fn find_sqlite_user_by_id_on_conn(
     find_user_by_id_on_conn!(conn, DatabaseKind::Sqlite, user_id)
 }
 
+#[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+pub(crate) fn find_postgres_user_by_id_on_conn(
+    conn: &mut diesel::PgConnection,
+    user_id: &str,
+) -> AppResult<Option<UserRecord>> {
+    find_user_by_id_on_conn!(conn, DatabaseKind::Postgres, user_id)
+}
+
 #[derive(Debug, diesel::QueryableByName)]
 struct UserOverviewCountRow {
     #[diesel(sql_type = BigInt)]

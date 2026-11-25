@@ -22,6 +22,15 @@ impl Db {
             .map_err(AppError::from)
     }
 
+    #[cfg(all(feature = "postgres", feature = "axon-incumbent-storage"))]
+    pub(crate) fn postgres_security_policy_on_conn(
+        conn: &mut diesel::PgConnection,
+    ) -> AppResult<SecurityPolicyRecord> {
+        sql_query(default_security_policy_sql())
+            .get_result::<SecurityPolicyRecord>(conn)
+            .map_err(AppError::from)
+    }
+
     pub async fn registration_settings(&self) -> AppResult<RegistrationSettingsRecord> {
         with_conn!(self, |conn, _kind| {
             sql_query("SELECT id, allow_password_registration, require_email_verification, require_phone_verification, allow_external_oidc_registration, require_invitation, first_user_direct_admin, default_user_active, updated_at FROM registration_settings WHERE id = 'default'")

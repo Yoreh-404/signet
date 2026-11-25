@@ -114,9 +114,9 @@ pub(crate) mod sqlite {
     pub(crate) fn registry_write_transaction<T, E: From<Error>>(
         conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> Result<T, E>,
     ) -> Result<T, E> { conn.immediate_transaction(f) }
-    fn registry_read_transaction<T>(
-        conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> QueryResult<T>,
-    ) -> QueryResult<T> { conn.transaction(f) }
+    pub(crate) fn registry_read_transaction<T, E: From<Error>>(
+        conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> Result<T, E>,
+    ) -> Result<T, E> { conn.transaction(f) }
 
     include!("axon_v3_incumbent_registry.rs");
 
@@ -146,9 +146,9 @@ pub(crate) mod postgres {
     pub(crate) fn registry_write_transaction<T, E: From<Error>>(
         conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> Result<T, E>,
     ) -> Result<T, E> { conn.build_transaction().serializable().run(f) }
-    fn registry_read_transaction<T>(
-        conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> QueryResult<T>,
-    ) -> QueryResult<T> { conn.build_transaction().repeatable_read().run(f) }
+    pub(crate) fn registry_read_transaction<T, E: From<Error>>(
+        conn: &mut BackendConn, f: impl FnOnce(&mut BackendConn) -> Result<T, E>,
+    ) -> Result<T, E> { conn.build_transaction().repeatable_read().run(f) }
 
     include!("axon_v3_incumbent_registry.rs");
     include!("axon_v3_incumbent_exchange.rs");
