@@ -258,6 +258,10 @@ pub struct DiscoverySettings {
     pub axon_admin_v2: Option<AxonAdminV2Policy>,
     #[serde(default)]
     pub axon_admin_v3: Option<AxonAdminV3Enrollment>,
+    /// Protected operator floor for this exact incumbent. Nothing is granted
+    /// when absent; in particular the database cannot supply its own floor.
+    #[serde(default)]
+    pub axon_admin_incumbent_floor: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -327,6 +331,7 @@ impl Default for DiscoverySettings {
             axon_admin_trust: None,
             axon_admin_v2: None,
             axon_admin_v3: None,
+            axon_admin_incumbent_floor: None,
         }
     }
 }
@@ -1321,6 +1326,16 @@ impl Settings {
                 || crate::dcr::is_website_client_id(&v3.introspection_client_id))
         {
             anyhow::bail!("discovery.axon_admin_v3 requires an exact registered binding and independent restore marker");
+        }
+        if let Some(floor) = &self.discovery.axon_admin_incumbent_floor {
+            if !cfg!(all(target_os = "linux", feature = "axon-incumbent-storage"))
+                || self.discovery.axon_admin_trust.is_none()
+                || self.discovery.axon_admin_v3.as_ref().is_none_or(|enrolled|
+                    !floor.is_absolute() || floor == &enrolled.restore_marker_path)
+                || !matches!(self.database.kind, DatabaseKind::Postgres | DatabaseKind::Sqlite)
+            {
+                anyhow::bail!("incumbent authorization requires the existing Signet enrollment, signer, and a separate protected floor");
+            }
         }
         validate_billing_settings(&self.billing)?;
         if self.performance.runtime_settings_cache_millis > 60_000 {

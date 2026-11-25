@@ -66,6 +66,8 @@ pub(crate) struct CommittedIncumbentCode<'a> {
     user_id: String,
     public_sid: String,
     scope: String,
+    nonce: Option<String>,
+    authorization_details: Option<String>,
     application_db_id: String,
     client_db_id: String,
     profile_id: String,
@@ -97,6 +99,8 @@ impl<'a> CommittedIncumbentCode<'a> {
             user_id: row.user_id,
             public_sid: row.session_id.ok_or(AppError::Forbidden)?,
             scope: row.scope,
+            nonce: row.nonce,
+            authorization_details: row.authorization_details,
             application_db_id: row.application_id.ok_or(AppError::Forbidden)?,
             client_db_id: pin.client_db_id.to_owned(),
             profile_id: row.authorization_profile_id.ok_or(AppError::Forbidden)?,
@@ -114,6 +118,8 @@ impl<'a> CommittedIncumbentCode<'a> {
     pub(crate) fn user_id(&self) -> &str { &self.user_id }
     pub(crate) fn public_sid(&self) -> &str { &self.public_sid }
     pub(crate) fn scope(&self) -> &str { &self.scope }
+    pub(crate) fn nonce(&self) -> Option<&str> { self.nonce.as_deref() }
+    pub(crate) fn authorization_details(&self) -> Option<&str> { self.authorization_details.as_deref() }
     pub(crate) fn application_db_id(&self) -> &str { &self.application_db_id }
     pub(crate) fn client_db_id(&self) -> &str { &self.client_db_id }
     pub(crate) fn profile_id(&self) -> &str { &self.profile_id }

@@ -47,7 +47,7 @@ pub(super) fn store_incumbent_authorization_code(
         {
             return Err(AppError::Forbidden);
         }
-        let code = util::random_token(32);
+        let code = format!("{}{}", super::INCUMBENT_CODE_PREFIX, util::random_token(32));
         let requested = resolved.requested_assurance()?;
         let assurance = session.authentication_assurance();
         let acr = assurance::DefaultAssurancePolicy.select_acr(&assurance, &requested)?;
@@ -77,7 +77,8 @@ pub(super) fn store_incumbent_authorization_code(
     })
 }
 /// Complete the exact incumbent exchange using the normal access signer and
-/// claim machinery. No route calls this and the token embeds no admin authority.
+/// claim machinery. The access token embeds no admin authority.
+#[cfg(test)]
 pub(super) fn exchange_incumbent_access_token<'a>(
     conn: &mut BackendConn,
     state: &AppState,
@@ -90,7 +91,19 @@ pub(super) fn exchange_incumbent_access_token<'a>(
     redirect_uri: &str,
     verifier: &str,
 ) -> AppResult<(ledger::CommittedIncumbentCode<'a>, String)> {
+    exchange_incumbent_tokens(conn, state, effective_issuer, gate, pin, approved,
+        code, client_id, redirect_uri, verifier, None, None, None)
+        .map(|(evidence, response)| (evidence, response.access_token))
+}
 
+pub(super) fn exchange_incumbent_tokens<'a>(
+    conn: &mut BackendConn, state: &AppState, effective_issuer: &str,
+    gate: &crate::application_discovery::axon_v3_restore::RestoreInterlock,
+    pin: &crate::application_discovery::incumbent_preflight::IncumbentPin<'_>,
+    approved: &'a crate::application_discovery::axon_v3_acceptance::VerifiedPolicy,
+    code: &str, client_id: &str, redirect_uri: &str, verifier: &str,
+    resource: Option<String>, details: Option<String>, dpop: Option<&crate::dpop::DpopBinding>,
+) -> AppResult<(ledger::CommittedIncumbentCode<'a>, oidc_token::TokenResponse)> {
     if effective_issuer != approved.policy().issuer {
         return Err(AppError::Forbidden);
     }
@@ -112,6 +125,9 @@ pub(super) fn exchange_incumbent_access_token<'a>(
                 return Err(AppError::Forbidden);
             }
             let snapshot = AuthorizationSnapshot::from_current_policy(state, &client, &user, graph)?;
+            let _ = merge_token_resource(Some(signed.audience.clone()), resource)?;
+            let details = authorization_details::merge_authorization_details(
+                evidence.authorization_details().map(ToOwned::to_owned), details, &client)?;
             let mut claims = snapshot.claims_for_user(
                 &client, &user, evidence.scope(), crate::claim_mapper::ClaimOutputTarget::AccessToken,
             )?;
@@ -120,6 +136,8 @@ pub(super) fn exchange_incumbent_access_token<'a>(
             claims.insert("application_id".into(), evidence.application_db_id().into());
             claims.insert("authorization_profile_id".into(), evidence.profile_id().into());
             oidc_token::insert_sid_claim(&mut claims, Some(evidence.public_sid()));
+            crate::dpop::add_cnf_claim(&mut claims, dpop);
+            authorization_details::insert_claim(&mut claims, details.as_deref())?;
 
             let token = state.jwt.sign_access_token_with_issuer_and_claims(
                 effective_issuer,
@@ -136,7 +154,27 @@ pub(super) fn exchange_incumbent_access_token<'a>(
             )?;
             let claims = state.jwt.verify_access_token_for_introspection(&token, &[effective_issuer])?;
             ledger::bind_access_proof_on_conn(conn, evidence, &claims)?;
-            Ok(token)
+            let mut id_claims = snapshot.claims_for_user(
+                &client, &user, evidence.scope(), crate::claim_mapper::ClaimOutputTarget::IdToken)?;
+            id_claims.remove("axon_admin");
+            id_claims.remove("axon_admin_authority_v3");
+            id_claims.insert("application_id".into(), evidence.application_db_id().into());
+            id_claims.insert("authorization_profile_id".into(), evidence.profile_id().into());
+            oidc_token::insert_sid_claim(&mut id_claims, Some(evidence.public_sid()));
+            assurance::insert_id_token_assurance_claims(&mut id_claims, evidence.code_assurance(),
+                &assurance::RequestedAssurance::default())?;
+            let subject = crate::subject::subject_for_client(effective_issuer, &user, &client)?;
+            let id_token = state.jwt.sign_id_token_with_subject_and_claims(effective_issuer,
+                crate::jwt::TokenSubject { user: &user, client_id: &signed.client_id,
+                    audience: None, scope: evidence.scope(), nonce: evidence.nonce(),
+                    auth_time: Some(evidence.auth_time()) },
+                &subject, state.settings.oidc.id_token_ttl_seconds, id_claims)?;
+            Ok(oidc_token::TokenResponse {
+                access_token: token, issued_token_type: None, token_type: crate::dpop::token_type(dpop),
+                expires_in: state.settings.oidc.access_token_ttl_seconds, id_token: Some(id_token),
+                refresh_token: None, scope: evidence.scope().to_owned(),
+                authorization_details: authorization_details::authorization_details_json(details.as_deref())?,
+            })
         },
     )
 }

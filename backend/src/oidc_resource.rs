@@ -384,6 +384,15 @@ async fn introspect_durable_axon_admin(
     let interlock = crate::application_discovery::axon_v3_restore::RestoreInterlock::new(
         enrolled.restore_marker_path.clone(), enrolled.restore_marker_owner_uid,
     );
+    #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+    if state.settings.discovery.axon_admin_incumbent_floor.is_some() {
+        let Some(live) = super::incumbent_http::introspect(state, &verifier.id, &enrolled.issuer,
+            token, &claims.sub).await? else { return inactive(); };
+        return Ok(Json(json!({
+            "active":true, "iss":claims.iss, "sub":claims.sub, "client_id":claims.client_id,
+            "aud":claims.aud, "iat":claims.iat, "exp":claims.exp, (AXON_ADMIN_V3_HINT):live,
+        })));
+    }
     let Some(live) = state.db.read_active_axon_v3_policy(crate::db::AxonV3CheckedScope {
         organization_id: enrolled.organization_id.clone(), enrollment_id: enrolled.enrollment_id.clone(),
         application_id: enrolled.application_id.clone(), issuer: claims.iss.clone(),

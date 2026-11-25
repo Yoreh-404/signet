@@ -270,6 +270,14 @@ pub(super) async fn token_from_authorization_code(
         .redirect_uri
         .as_deref()
         .ok_or_else(|| AppError::Oidc("redirect_uri is required".to_string()))?;
+    if code.starts_with(super::INCUMBENT_CODE_PREFIX) {
+        #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+        return super::incumbent_http::exchange(&state, &client, issuer, code, redirect_uri.to_owned(),
+            payload.code_verifier, payload.resource, payload.authorization_details, dpop)
+            .await?.map(Json).ok_or_else(|| AppError::Oidc("invalid authorization code".into()));
+        #[cfg(not(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite"))))]
+        return Err(AppError::Oidc("invalid authorization code".into()));
+    }
     let record = state
         .db
         .consume_authorization_code_for_client(
@@ -280,7 +288,8 @@ pub(super) async fn token_from_authorization_code(
             client.require_pkce == 1,
             client.require_s256_pkce == 1,
             state.settings.discovery.axon_admin_v3.as_ref()
-                .filter(|enrolled| enrolled.client_id == client.client_id)
+                .filter(|enrolled| state.settings.discovery.axon_admin_incumbent_floor.is_some()
+                    && enrolled.client_id == client.client_id)
                 .map(|enrolled| (&*enrolled.organization_id, &*enrolled.application_id)),
         )
         .await?;

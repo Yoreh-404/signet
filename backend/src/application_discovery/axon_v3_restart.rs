@@ -54,6 +54,30 @@ fn read_floor(path: &Path, owner: u32) -> Option<RestartFloor> {
     (floor.format == "signet-incumbent-restart-floor/v1").then_some(floor)
 }
 
+pub(crate) struct RestoredIncumbent {
+    floor: RestartFloor,
+    signer: String,
+    pub(crate) policy: VerifiedPolicy,
+}
+
+impl RestoredIncumbent {
+    pub(crate) fn pin(&self) -> IncumbentPin<'_> {
+        IncumbentPin {
+            application_db_id: &self.floor.application_db_id,
+            client_db_id: &self.floor.client_db_id,
+            policy_sha256: &self.floor.policy_sha256,
+            signer_pin: &self.signer,
+            revision: self.floor.revision,
+            generation: self.floor.generation,
+            withdrawn: self.floor.state == FloorState::Stopped,
+        }
+    }
+
+    pub(crate) fn still_current(&self, path: &Path, owner: u32) -> bool {
+        read_floor(path, owner).as_ref() == Some(&self.floor)
+    }
+}
+
 /// The protected floor is separately provisioned, never synthesized from a
 /// database row or the restore marker. Restoring it does not grant access.
 #[cfg(feature = "sqlite")]
@@ -64,6 +88,15 @@ pub(super) fn restore_from_operator_floor(
     trust: &AxonAdminTrust,
     now: i64,
 ) -> QueryResult<Option<VerifiedPolicy>> {
+    restore_sqlite_material(conn, floor_path, enrolled, trust, now)
+        .map(|value| value.map(|material| material.policy))
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn restore_sqlite_material(
+    conn: &mut SqliteConnection, floor_path: &Path, enrolled: &AxonAdminV3Enrollment,
+    trust: &AxonAdminTrust, now: i64,
+) -> QueryResult<Option<RestoredIncumbent>> {
     restore_using_operator_floor(floor_path, enrolled, trust, now, |gate, pin, trusted, now| {
         crate::db::axon_v3_incumbent_storage::sqlite::restore_accepted_policy(
             conn, gate, pin, trusted, now)
@@ -71,13 +104,13 @@ pub(super) fn restore_from_operator_floor(
 }
 
 #[cfg(feature = "postgres")]
-pub(super) fn restore_from_postgres_operator_floor(
+pub(crate) fn restore_postgres_material(
     conn: &mut diesel::PgConnection,
     floor_path: &Path,
     enrolled: &AxonAdminV3Enrollment,
     trust: &AxonAdminTrust,
     now: i64,
-) -> QueryResult<Option<VerifiedPolicy>> {
+) -> QueryResult<Option<RestoredIncumbent>> {
     restore_using_operator_floor(floor_path, enrolled, trust, now, |gate, pin, trusted, now| {
         crate::db::axon_v3_incumbent_storage::postgres::restore_accepted_policy(
             conn, gate, pin, trusted, now)
@@ -91,7 +124,7 @@ fn restore_using_operator_floor(
     now: i64,
     read: impl FnOnce(&RestoreInterlock, &IncumbentPin<'_>, &TrustedRegistration<'_>, i64)
         -> QueryResult<Option<VerifiedPolicy>>,
-) -> QueryResult<Option<VerifiedPolicy>> {
+) -> QueryResult<Option<RestoredIncumbent>> {
     let owner = enrolled.restore_marker_owner_uid;
     let Some(floor) = read_floor(floor_path, owner) else { return Ok(None); };
     if floor.state != FloorState::Active
@@ -134,7 +167,8 @@ fn restore_using_operator_floor(
             halted: floor.state == FloorState::Stopped,
         },
     }, now)?;
-    Ok(verified.filter(|_| read_floor(floor_path, owner).as_ref() == Some(&floor)))
+    Ok(verified.filter(|_| read_floor(floor_path, owner).as_ref() == Some(&floor))
+        .map(|policy| RestoredIncumbent { floor, signer, policy }))
 }
 
 #[cfg(all(test, feature = "sqlite"))]

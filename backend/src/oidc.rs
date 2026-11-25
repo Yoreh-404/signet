@@ -39,8 +39,15 @@ mod oidc_authorization_flow;
 mod oidc_browser_interaction;
 #[path = "oidc_metadata.rs"]
 mod oidc_metadata;
+#[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+mod incumbent_http {
+    include!("oidc_incumbent_http.rs");
+}
 #[path = "oidc_request.rs"]
 mod oidc_request;
+// A routing discriminator, never proof: redemption requires a verified signed
+// policy, bound provenance and a currently eligible browser session.
+const INCUMBENT_CODE_PREFIX: &str = "inc1.";
 #[path = "oidc_request_validation.rs"]
 mod oidc_request_validation;
 #[path = "oidc_resource.rs"]
@@ -1190,6 +1197,13 @@ async fn issue_authorization_code_redirect(
     requested_scopes: Vec<String>,
     website_generation: Option<&str>,
 ) -> AppResult<Response> {
+    #[cfg(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite")))]
+    let incumbent = incumbent_http::admit(context, user, session, client, &request).await?;
+    #[cfg(not(all(target_os = "linux", feature = "axon-incumbent-storage", any(feature = "postgres", feature = "sqlite"))))]
+    let incumbent: Option<String> = None;
+    let code = if let Some(code) = incumbent {
+        code
+    } else {
     let PreparedAuthorizationCode {
         redirect_code: code,
         row,
@@ -1205,6 +1219,8 @@ async fn issue_authorization_code_redirect(
     )
     .await?;
     context.state.db.insert_authorization_code(row).await?;
+    code
+    };
     context
         .state
         .db
